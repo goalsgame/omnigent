@@ -577,6 +577,7 @@ def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
 
 
 def _check_injection_cancelled() -> None:
+    """Stop a delivery worker when its caller sets the bound cancellation flag."""
     cancel_event = _INJECTION_CANCEL_EVENT.get()
     if cancel_event is not None and cancel_event.is_set():
         raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
@@ -3988,10 +3989,10 @@ def _paste_and_submit(
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
     The delivery core of :func:`inject_user_message` (see its docstring for
-    the full hazard notes): clear any leftover draft, bracketed-paste the
-    payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
-    visibly commit, submit, and verify the draft left the box — re-sending
-    Enter while it verifiably hasn't.
+    the full hazard notes): clear a leftover draft with framed control keys,
+    deliver bracketed paste, wait for the draft to visibly commit,
+    submit, and verify the draft left the box — re-sending Enter while it
+    verifiably hasn't.
 
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
@@ -4007,15 +4008,19 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # Claude can parse adjacent raw control bytes as text in large stdin chunks.
+    # CSI-u ESC[codepoint;modifieru encodes a/k (97/107) with Ctrl (5 = 1 + 4).
+    # tmux -l sends these sequences literally for Claude to decode as key events.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
+    # Recheck cancellation and questions before pasting into a possibly changed UI.
+    # These guards do not acknowledge clearing or require an empty composer.
+    _check_injection_cancelled()
+    _raise_if_user_prompt_pending(bridge_dir, _capture_pane(socket_path, tmux_target))
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; message not sent."
+        )
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4097,6 +4102,7 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    accepted_dialog_hint: str | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4116,6 +4122,7 @@ def _verify_submit_accepted(
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param accepted_dialog_hint: Expected settings dialog proving a slash command submitted.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4127,6 +4134,13 @@ def _verify_submit_accepted(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         if not _draft_in_input_box(pane, needle):
+            if accepted_dialog_hint is not None and accepted_dialog_hint in pane:
+                return True
+            if _composer_row(pane) is None:
+                # A clipped/repainting frame cannot prove that the draft left.
+                _check_injection_cancelled()
+                _raise_if_user_prompt_pending(bridge_dir, pane)
+                continue
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4384,6 +4398,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            accepted_dialog_hint=dialog_hint,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -5581,31 +5596,31 @@ def _submit_needle(content: str) -> str:
 
 
 def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """
-    Return whether the pasted draft is visible in Claude's input box.
+    """Find the draft inside the live composer, including continuation rows.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`, e.g.
-        ``"fix the bug"``. Empty means the draft can't be identified;
-        only the paste placeholder is then considered.
-    :returns: ``True`` when the draft is still sitting in the input box.
+    A draft can itself contain horizontal rules. Search past those rules for
+    the prompt row and use the last rule as the closing boundary, rather than
+    letting a separator in the message hide the opening frame.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if not rules:
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
-        return True
-    return bool(needle) and needle in tail
+    # Prefer a closed frame to the shortcuts footer below its closing rule.
+    candidates = [*reversed(rules[:-1]), rules[-1]]
+    for opening in candidates:
+        row_index = opening + 1
+        if row_index >= len(lines):
+            continue
+        row = lines[row_index].lstrip()
+        if row[:1] not in _COMPOSER_MODE_GLYPHS:
+            continue
+        if not row.startswith(_CLAUDE_PROMPT_GLYPH):
+            return False
+        end = rules[-1] if rules[-1] > opening else len(lines)
+        text = "\n".join(lines[row_index:end])
+        return _PASTED_PLACEHOLDER_PREFIX in text or (bool(needle) and needle in text)
+    return False
 
 
 def _format_terminal_failure_tail(pane: str) -> str:

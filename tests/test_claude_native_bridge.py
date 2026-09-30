@@ -3915,14 +3915,15 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # C-a, C-k (clear), load-buffer, paste-buffer, Enter — fewer than 5
+    # CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer, Enter — fewer than 5
     # means a delivery step was dropped.
     assert len(captured) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), got {len(captured)}."
+        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
+        f"got {len(captured)}."
     )
     clear_home, clear_kill, load, paste, submit = captured
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
+    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
     # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
@@ -4408,18 +4409,18 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     inject_user_message(bridge_dir, content="hello")
 
     # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (C-a, C-k, load-buffer, paste-buffer, Enter)
+    # five delivery calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter)
     # fired.
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
     assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), "
+        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
         f"got {len(send_keys)}."
     )
     clear_home, clear_kill, load, paste, submit = send_keys
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
+    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -10261,7 +10262,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
 
     tails = [cmd[-1] for cmd in captured]
     # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "C-a", "C-k"], (
+    assert tails[:3] == ["Escape", "\x1b[97;5u", "\x1b[107;5u"], (
         f"Expected the occupying surface to be Escaped before the clear; got {tails}."
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
@@ -11604,3 +11605,134 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+_BLANK_PROMPT_ROW_MULTILINE_PANE = """\
+startup hook completed
+──────────────────────────────
+❯
+  Reply with exactly this token and nothing else: TEST_TOKEN
+
+──────────────────────────────
+  ⏸ manual mode on
+"""
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_BLANK_PROMPT_ROW_MULTILINE_PANE, True),
+        (_composer_pane("\n[Pasted text #1 +3 lines]"), True),
+        (_composer_pane("Reply with exactly this token ❯ extra text"), True),
+        ("❯ Reply with exactly this token\n" + _composer_pane(), False),
+        (_composer_pane() + "status: Reply with exactly this token\n", False),
+        (_BLANK_PROMPT_ROW_MULTILINE_PANE.replace("❯", "!"), False),
+        ("❯ Reply with exactly this token\n", False),
+    ],
+    ids=[
+        "continuation-row",
+        "continuation-placeholder",
+        "glyph-inside-draft",
+        "transcript-echo",
+        "footer-text",
+        "shell-composer",
+        "unframed-transcript",
+    ],
+)
+def test_draft_detection_stays_inside_chat_composer(pane: str, expected: bool) -> None:
+    assert (
+        claude_native_bridge._draft_in_input_box(pane, "Reply with exactly this token") is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "placeholder",
+        "clear-to-placeholder",
+        "literal-try",
+        "continuation-before",
+        "continuation-after",
+        "separator",
+        "partial-frame",
+    ],
+)
+def test_inject_user_message_frames_clear_and_verifies_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    """Terminal I/O is simulated to exercise delivery ordering and lost Enter."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.3)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    hint = 'Try "fix lint errors"'
+    content = "Review this" + ("\n───" if scenario == "separator" else "")
+    draft = hint if scenario in ("placeholder", "literal-try") else "old draft"
+    if scenario.startswith("continuation") or scenario in ("separator", "partial-frame"):
+        draft = ""
+    state = {"pane": _composer_pane(draft), "enters": 0, "clipped": 0}
+    calls: list[tuple[float, tuple[str, ...]]] = []
+    payloads: list[bytes] = []
+    retry = scenario in ("continuation-before", "continuation-after", "separator", "partial-frame")
+
+    def run(_socket: str, *args: str) -> None:
+        calls.append((clock.now, args))
+        if args[0] == "send-keys" and args[-1] == "\x1b[107;5u":
+            state["pane"] = _composer_pane(
+                hint if scenario in ("placeholder", "clear-to-placeholder") else ""
+            )
+        elif args[0] == "load-buffer":
+            payloads.append(Path(args[-1]).read_bytes())
+        elif args[0] == "paste-buffer":
+            state["pane"] = _composer_pane(
+                ("\n" if scenario == "continuation-before" else "") + content
+            )
+        elif args[0] == "send-keys" and args[-1] == "Enter":
+            state["enters"] += 1
+            if retry and state["enters"] == 1:
+                if scenario == "continuation-after":
+                    state["pane"] = _composer_pane("\n" + content)
+                if scenario == "partial-frame":
+                    state["clipped"] = 2
+            else:
+                state["pane"] = _composer_pane()
+
+    def capture(_socket: str, _target: str) -> str:
+        if state["clipped"]:
+            state["clipped"] -= 1
+            return "❯ " + content
+        return state["pane"]
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    inject_user_message(bridge_dir, content=content)
+    clear_time = next(t for t, args in calls if args[-1] == "\x1b[107;5u")
+    paste_time = next(t for t, args in calls if args[0] == "paste-buffer")
+    assert paste_time == clear_time
+    assert [args for _, args in calls[:2]] == [
+        ("send-keys", "-l", "-t", "claude:0.0", "\x1b[97;5u"),
+        ("send-keys", "-l", "-t", "claude:0.0", "\x1b[107;5u"),
+    ]
+    assert payloads == [content.replace("\n", "\r").encode() + b"\r"]
+    assert state["enters"] == (2 if retry else 1)
+    assert state["pane"] == _composer_pane()
+
+
+def test_submit_verification_does_not_accept_unknown_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: "")
+    sends: list[tuple[str, ...]] = []
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: sends.append(args))
+    assert not claude_native_bridge._verify_submit_accepted(
+        "socket",
+        "pane",
+        needle="Review this",
+        what="test message",
+    )
+    assert sends == []

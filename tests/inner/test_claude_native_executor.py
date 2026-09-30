@@ -1895,3 +1895,63 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+async def test_unaccepted_draft_keeps_terminal_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exercise real delivery; only terminal I/O and time are simulated."""
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def time(self) -> float:
+            return self.now
+
+        def sleep(self, seconds: float) -> None:
+            self.now += seconds
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    claude_bridge.write_tmux_target(
+        bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main"
+    )
+    monkeypatch.setattr(claude_bridge, "time", Clock())
+    monkeypatch.setattr(claude_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    rule = "─" * 40
+    state = {"draft": ""}
+    operations: list[tuple[str, ...]] = []
+
+    def run(_socket: str, *args: str) -> None:
+        operations.append(args)
+        if args[0] == "paste-buffer":
+            state["draft"] = "Review this"
+
+    monkeypatch.setattr(claude_bridge, "_run_tmux", run)
+    monkeypatch.setattr(
+        claude_bridge, "_capture_pane", lambda *_: f"{rule}\n❯ {state['draft']}\n{rule}\n"
+    )
+    killed: list[Path] = []
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda path, **_: killed.append(path)
+    )
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Review this"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+    assert any(args[0] == "paste-buffer" for args in operations)
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert "not delivered" in events[0].message
+    assert killed == []
+    assert state["draft"] == "Review this"
