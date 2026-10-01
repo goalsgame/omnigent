@@ -2670,6 +2670,7 @@ class HostProcess:
         # Summary for the import_local_finished event (the server only sees
         # what arrives, not why the host stopped).
         outcome = "failed"
+        failures: list[dict[str, object]] = []
         sent_count = 0
         chunked_count = 0
         started_at = time.monotonic()
@@ -2702,7 +2703,6 @@ class HostProcess:
             ordered = list(reversed(targets))
             total = len(ordered)
             progress_total = total
-            failures: list[dict[str, object]] = []
             for source, session_id in ordered:
                 # Before each session so a failed one advances the count too.
                 await _send_progress()
@@ -2814,7 +2814,7 @@ class HostProcess:
                     status=outcome,
                     sent=sent_count,
                     chunked=chunked_count,
-                    failed=progress_done - sent_count,
+                    failed=len(failures),
                     total=progress_total,
                 ),
             )
