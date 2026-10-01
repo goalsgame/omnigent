@@ -5367,7 +5367,7 @@ describe("chatStore — delivered-but-unacked send", () => {
     });
     await useChatStore.getState().send("summarize the deploy status", "agent_xyz");
     const draft = useChatStore.getState().failedSendDraft;
-    expect(draft).toMatchObject({ text: "summarize the deploy status" });
+    expect(draft).toMatchObject({ text: "summarize the deploy status", serverRefused: false });
     const stableId = draft?.stableId;
     expect(stableId).toBeTruthy();
 
@@ -5441,6 +5441,30 @@ describe("chatStore — delivered-but-unacked send", () => {
 
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("marks the draft server-refused when the POST is answered with an Omnigent error", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    // The server persisted the message, then the runner rejected the forward.
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: "Runner rejected the message: busy" } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "summarize the deploy status",
+      serverRefused: true,
+    });
   });
 
   // The body of the events POST `send()` issued for conv_existing.
@@ -11928,6 +11952,105 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const state = useChatStore.getState();
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  // A restored failed-send draft reconciles against the snapshot too: its
+  // `session_input_consumed` proof is never replayed after a reconnect.
+  it("retracts an ack-lost restored draft when the reconnect snapshot holds its item", async () => {
+    const stableId = "c".repeat(32);
+    const before = userMessage("draft_pre", "before the gap");
+    seedSession("conv_draft_acklost", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_draft_acklost",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      // The POST got no answer at all; the composer restored the text.
+      restoredSendDraft: {
+        conversationId: "conv_draft_acklost",
+        stableId,
+        text: "resend me",
+        files: [],
+        serverRefused: false,
+        delivered: false,
+      },
+      pendingRetryStableId: stableId,
+    });
+
+    const loop = startStreamPump("conv_draft_acklost", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The send had reached the server: its item committed under the stable id
+    // while the socket was dead, so the consumed event fired into the void.
+    seedSessionItems("conv_draft_acklost", [
+      before,
+      { ...userMessage("draft_gap", "resend me"), id: stableId },
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
+    expect(state.pendingRetryStableId).toBeNull();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, stableId]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps a server-refused restored draft when the snapshot holds its persisted item", async () => {
+    const stableId = "d".repeat(32);
+    const before = userMessage("refused_pre", "before the gap");
+    seedSession("conv_draft_refused", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_draft_refused",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      // The server persisted the message but answered the POST with an error:
+      // the runner never took it, so nothing is going to run it.
+      restoredSendDraft: {
+        conversationId: "conv_draft_refused",
+        stableId,
+        text: "resend me",
+        files: [],
+        serverRefused: true,
+        delivered: false,
+      },
+      pendingRetryStableId: stableId,
+    });
+
+    const loop = startStreamPump("conv_draft_refused", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    seedSessionItems("conv_draft_refused", [
+      before,
+      { ...userMessage("refused_gap", "resend me"), id: stableId },
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    // The persisted item is history, not delivery: the text stays available to
+    // resend, under the same id so the store dedupes it against that item.
+    const state = useChatStore.getState();
+    expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: false });
+    expect(state.pendingRetryStableId).toBe(stableId);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, stableId]);
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");

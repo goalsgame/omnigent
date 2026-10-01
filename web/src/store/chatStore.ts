@@ -809,6 +809,16 @@ export interface ConversationState {
     files: File[];
     stableId?: string;
     replyDraft?: StoredReplyDraft;
+    /**
+     * `true` when the server answered the POST with an error of its own (an
+     * {@link ApiError} carrying an Omnigent error code, e.g. the runner
+     * rejected the forward). The message is then persisted but was never
+     * dispatched (the server persists before it forwards), so a snapshot that
+     * holds its item is not delivery evidence; only a live
+     * `session_input_consumed` is. `false` for a transport failure, where the
+     * item's presence proves the acknowledgement alone was lost.
+     */
+    serverRefused?: boolean;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -828,6 +838,8 @@ export interface ConversationState {
     text: string;
     files: File[];
     replyDraft?: StoredReplyDraft;
+    /** Carried over from `failedSendDraft.serverRefused`; see there. */
+    serverRefused?: boolean;
     delivered: boolean;
   } | null;
   /**
@@ -2469,6 +2481,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       const deliveredDespiteFailure = hasCommittedItem(draftState.blocks, stableId);
+      // An Omnigent error code means the server itself answered: it persisted
+      // the message but refused to dispatch it (e.g. the runner rejected the
+      // forward), so the item turning up in a later snapshot must not retract
+      // the draft. A transport failure or a code-less proxy error leaves the
+      // send's fate unknown, and a persisted item then does prove delivery.
+      const serverRefused = err instanceof ApiError && err.code !== null;
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
@@ -2481,6 +2499,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             text,
             files: files ?? [],
             stableId,
+            serverRefused,
             ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
           },
         });
@@ -4899,9 +4918,9 @@ async function rehydrateWindowOnReconnect(
     );
     return {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
-      // Same delivery proof as the backfill path: a rehydrated item can be
-      // a send whose POST died in the gap.
-      ...retractDeliveredSendDraft(s, freshItemIds),
+      // Same persisted-item proof as the reconnect path: a rehydrated item
+      // can be a send whose POST died in the gap.
+      ...retractDeliveredSendDraft(s, freshItemIds, "persisted"),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -5048,8 +5067,9 @@ async function reconcileOnReconnect(
     const patch: Partial<ChatState> = {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
       // A gap-committed item can be a send whose POST died in the gap — its
-      // presence in the snapshot proves delivery, so retract the draft.
-      ...retractDeliveredSendDraft(s, snapshotItemIds),
+      // presence in the snapshot proves delivery (unless the server refused
+      // the send outright; see `retractDeliveredSendDraft`), so retract it.
+      ...retractDeliveredSendDraft(s, snapshotItemIds, "persisted"),
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -6316,33 +6336,53 @@ function restoredSendDraftUnchanged(
  * Retract a failed-send draft once its message is proven delivered.
  *
  * A committed item under the send's `stable_id` means the POST reached the
- * server and only its acknowledgement was lost. Clears an un-restored draft,
- * flips a restored one to `delivered` so the composer drops its text, and
- * stops the next send from reusing the id (the store would dedupe it away).
+ * server. Clears an un-restored draft, flips a restored one to `delivered` so
+ * the composer drops its text, and stops the next send from reusing the id
+ * (the store would dedupe it away).
+ *
+ * The server persists before it forwards, so a persisted item alone does not
+ * prove the runner took the message. `"persisted"` proof (a reconnect
+ * snapshot or window rehydrate) therefore retracts only a draft whose send
+ * got no server answer: the acknowledgement was lost and the item is its
+ * durable trace. A draft the server refused (`serverRefused`) keeps its text
+ * and retry id until a live `"consumed"` acknowledgement, which the server
+ * publishes only after a successful forward.
  *
  * @param s - The conversation's state.
  * @param committedItemIds - Item ids just committed (live event or snapshot).
+ * @param proof - `"consumed"` for a `session_input_consumed` event,
+ *   `"persisted"` for items read back from a snapshot.
  * @returns The state patch, empty when nothing matches.
  */
 function retractDeliveredSendDraft(
   s: ChatState,
   committedItemIds: ReadonlySet<string>,
+  proof: "consumed" | "persisted",
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {};
-  const delivered = (id: string | null | undefined): boolean =>
-    id != null && committedItemIds.has(id);
-  if (s.failedSendDraft !== null && delivered(s.failedSendDraft.stableId)) {
+  type Tracked = { stableId?: string; serverRefused?: boolean } | null;
+  const delivered = (draft: Tracked): boolean => {
+    const stableId = draft?.stableId;
+    if (stableId === undefined || !committedItemIds.has(stableId)) return false;
+    return proof === "consumed" || draft?.serverRefused !== true;
+  };
+  if (delivered(s.failedSendDraft)) {
     patch.failedSendDraft = null;
   }
   if (
     s.restoredSendDraft !== null &&
     !s.restoredSendDraft.delivered &&
-    delivered(s.restoredSendDraft.stableId)
+    delivered(s.restoredSendDraft)
   ) {
     patch.restoredSendDraft = { ...s.restoredSendDraft, delivered: true };
   }
-  if (delivered(s.pendingRetryStableId)) {
-    patch.pendingRetryStableId = null;
+  // The retry id belongs to the restored draft it came from, so a refused
+  // send keeps it: an untouched resend must still dedupe against the item.
+  const retryId = s.pendingRetryStableId;
+  if (retryId !== null) {
+    const owner =
+      s.restoredSendDraft?.stableId === retryId ? s.restoredSendDraft : { stableId: retryId };
+    if (delivered(owner)) patch.pendingRetryStableId = null;
   }
   return patch;
 }
@@ -7141,7 +7181,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt.
-      applyToConversation((s) => retractDeliveredSendDraft(s, new Set([event.itemId])));
+      applyToConversation((s) =>
+        retractDeliveredSendDraft(s, new Set([event.itemId]), "consumed"),
+      );
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;

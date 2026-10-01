@@ -118,14 +118,19 @@ def test_stable_id_reuse_by_another_author_is_refused() -> None:
 
 
 def _stub_runner(
-    monkeypatch: pytest.MonkeyPatch, forwarded: list[dict[str, Any]] | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    forwarded: list[dict[str, Any]] | None = None,
+    *,
+    status: int = 202,
 ) -> httpx.AsyncClient:
-    """Accept every forwarded turn with 202, recording each body in ``forwarded``."""
+    """Answer every forwarded turn with ``status``, recording each body in ``forwarded``."""
 
     def accept(request: httpx.Request) -> httpx.Response:
         if forwarded is not None:
             forwarded.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": True})
+        if status >= 400:
+            return httpx.Response(status, json={"error": "no process manager"})
+        return httpx.Response(status, json={"queued": True})
 
     fake_runner = httpx.AsyncClient(
         transport=httpx.MockTransport(accept),
@@ -168,6 +173,42 @@ async def test_web_send_persists_under_its_stable_id_and_dedupes_a_retry(
     # may have died) -- against the one persisted item, never a second copy.
     turns = [turn for turn in forwarded if turn.get("type") == "message"]
     assert [turn["persisted_item_id"] for turn in turns] == [_STABLE_ID, _STABLE_ID]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejected_send_stays_persisted_without_delivery_acknowledgement(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused forward keeps the item (persist-before-forward) but acknowledges nothing.
+
+    The web client leans on this split: a persisted item proves delivery only for a
+    send whose acknowledgement was lost, never for one the server answered with an
+    error -- that draft stays in the composer until a live ``session.input.consumed``.
+    """
+    consumed: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._publish_input_consumed",
+        lambda _session_id, item, *_args, **_kwargs: consumed.append(item.id),
+    )
+    fake_runner = _stub_runner(monkeypatch, status=501)
+    try:
+        agent = await create_test_agent(client)
+        create = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert create.status_code == 201, create.text
+        session_id = create.json()["id"]
+        refused = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "message", "data": _user_message()},
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert refused.status_code == 503, refused.text
+    assert refused.json()["error"]["code"] == ErrorCode.RUNNER_UNAVAILABLE
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [it["id"] for it in items if it["type"] == "message"] == [_STABLE_ID]
+    assert consumed == []
 
 
 @pytest.mark.asyncio

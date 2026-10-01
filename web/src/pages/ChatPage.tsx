@@ -2966,6 +2966,7 @@ function ComposerImpl(
           text: failedSendDraft.text,
           files: failedSendDraft.files,
           replyDraft: failedSendDraft.replyDraft,
+          serverRefused: failedSendDraft.serverRefused,
           delivered: false,
         },
       });
