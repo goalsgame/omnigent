@@ -3983,6 +3983,39 @@ describe("Composer reply quotes", () => {
     expect(getSessionDraft("conv_test")).toBeUndefined();
   });
 
+  it("restores a server-refused draft even though its persisted item is in the transcript", () => {
+    const stableId = "9".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const persisted: UserMessageBlock = {
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: stableId },
+      content: [{ type: "input_text", text: "resend me" }],
+    };
+    // The server persisted the message but refused to dispatch it, and a
+    // snapshot merge rendered the item before the user came back. That is not
+    // delivery: the text and its retry id must come back for a resend.
+    act(() =>
+      useChatStore.setState({
+        blocks: [persisted],
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+          serverRefused: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBe(stableId);
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId,
+      serverRefused: true,
+      delivered: false,
+    });
+  });
+
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.

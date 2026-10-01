@@ -89,9 +89,9 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
-  hasCommittedItem,
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
@@ -2933,10 +2933,9 @@ function ComposerImpl(
     // The send may have proven delivered since the render that scheduled this
     // effect: its committed item landed under the send's stable id (see
     // `retractDeliveredSendDraft`), so restoring now would prime a duplicate.
-    if (
-      failedSendDraft.stableId !== undefined &&
-      hasCommittedItem(useChatStore.getState().blocks, failedSendDraft.stableId)
-    ) {
+    // Not so for a send the server refused: its item is persisted too, but the
+    // runner never took it, so the text must come back for a resend.
+    if (committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft)) {
       useChatStore.setState({ failedSendDraft: null });
       return;
     }

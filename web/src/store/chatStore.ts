@@ -2475,18 +2475,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
+      // An Omnigent error code means the server itself answered: it persisted
+      // the message but refused to dispatch it (e.g. the runner rejected the
+      // forward), so the item turning up in the transcript, now or in a later
+      // snapshot, must not retract the draft. A transport failure or a
+      // code-less proxy error leaves the send's fate unknown, and a persisted
+      // item then does prove delivery.
+      const serverRefused = err instanceof ApiError && err.code !== null;
       // A network failure can lose only the POST's response: if the message's
       // committed item already came back over the stream, the send was delivered
       // and restoring a draft would repopulate the composer with a sent prompt.
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
-      const deliveredDespiteFailure = hasCommittedItem(draftState.blocks, stableId);
-      // An Omnigent error code means the server itself answered: it persisted
-      // the message but refused to dispatch it (e.g. the runner rejected the
-      // forward), so the item turning up in a later snapshot must not retract
-      // the draft. A transport failure or a code-less proxy error leaves the
-      // send's fate unknown, and a persisted item then does prove delivery.
-      const serverRefused = err instanceof ApiError && err.code !== null;
+      const deliveredDespiteFailure = committedItemProvesDelivery(draftState.blocks, {
+        stableId,
+        serverRefused,
+      });
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
@@ -6302,6 +6306,29 @@ export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
 }
 
 /**
+ * Whether a committed item proves a failed send was delivered.
+ *
+ * The item under the send's stable id must be in `blocks`, and the server must
+ * not have refused the send: a refused message is persisted too, so its
+ * presence in the transcript says nothing about the runner having taken it
+ * (see `retractDeliveredSendDraft`).
+ *
+ * @param blocks - The conversation's rendered blocks.
+ * @param draft - The failed send's stable id and refusal status.
+ * @returns `true` when restoring the draft would prime a duplicate send.
+ */
+export function committedItemProvesDelivery(
+  blocks: AnyBlock[],
+  draft: { stableId?: string; serverRefused?: boolean },
+): boolean {
+  return (
+    draft.stableId !== undefined &&
+    draft.serverRefused !== true &&
+    hasCommittedItem(blocks, draft.stableId)
+  );
+}
+
+/**
  * Whether a resend matches the restored failed-send draft exactly.
  *
  * Only then may it reuse the draft's stable id: the server dedupes a repeated
@@ -7181,9 +7208,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt.
-      applyToConversation((s) =>
-        retractDeliveredSendDraft(s, new Set([event.itemId]), "consumed"),
-      );
+      applyToConversation((s) => retractDeliveredSendDraft(s, new Set([event.itemId]), "consumed"));
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;
