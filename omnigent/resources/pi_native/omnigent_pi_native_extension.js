@@ -1926,6 +1926,13 @@ module.exports = function (pi) {
     });
   });
 
+  pi.on("before_agent_start", async (event) => {
+    const latest = readConfig() || config;
+    const instructions = latest && latest.systemPrompt;
+    if (typeof instructions !== "string" || !instructions.trim()) return;
+    return { systemPrompt: `${event.systemPrompt}\n\n${instructions}` };
+  });
+
   pi.on("agent_start", async (_event, ctx) => {
     rememberContext(ctx);
     // A brand-new agent loop must never inherit a replay window armed before it

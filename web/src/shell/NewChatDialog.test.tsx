@@ -5063,19 +5063,15 @@ describe("NewChatLandingScreen", () => {
       "#B1A7FF",
     );
     expect(codex.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    for (const id of ["a_pi", "a_kiro"]) {
-      expect(screen.queryByTestId(`new-chat-landing-agent-${id}`)).toBeNull();
-    }
+    const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
+    expect(codex.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pi.querySelector("img")).toHaveClass("size-4", "dark:invert");
+    expect(screen.queryByTestId("new-chat-landing-agent-a_kiro")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    const morePi = screen.getByTestId("new-chat-landing-agent-a_pi");
-    const moreKiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
-    expect(morePi.querySelector("img")).toHaveClass("size-4", "dark:invert");
-    expect(
-      morePi.compareDocumentPosition(moreKiro) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-a_kiro")).toBeTruthy();
   });
 
-  it("promotes the selected secondary harness on reopen without interrupting configuration", () => {
+  it("keeps Pi in the main list while configuring and reopening", () => {
     mockAgents([
       {
         id: "a_claude",
@@ -5097,7 +5093,6 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
     const picker = screen.getByTestId("new-chat-landing-agent-select");
     fireEvent.pointerDown(picker, { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
     const otherMenu = pi.closest('[role="menu"]');
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a_pi"));
@@ -5117,8 +5112,6 @@ describe("NewChatLandingScreen", () => {
 
     selectAgent("a_claude");
     fireEvent.pointerDown(picker, { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     expect(screen.getByTestId("new-chat-landing-agent-a_pi")).not.toHaveAttribute("data-active");
   });
 
@@ -5289,48 +5282,23 @@ describe("NewChatLandingScreen", () => {
     ]);
   }
 
-  it("keeps a previously-launched secondary harness in Other", () => {
-    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["pi-native"]));
-    mockClaudeAndPi();
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-harness-more")).toHaveTextContent("Other...");
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
-  });
-
-  it("leaves an unused harness under 'More'", () => {
-    // Control for the test above: same fixture, empty recents → Pi stays behind
-    // "More", proving the promotion comes from the stored list.
-    mockClaudeAndPi();
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
-  });
-
-  it("keeps the same grouping for a stored reversed harness alias", () => {
-    localStorage.setItem("omnigent:recent-harnesses", JSON.stringify(["native-pi"]));
-    mockClaudeAndPi();
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
-  });
-
-  it("ignores a malformed recent-harnesses entry", () => {
-    // A corrupted value must not crash the picker — it falls back to the
-    // support-level split.
-    localStorage.setItem("omnigent:recent-harnesses", "{not json");
-    mockClaudeAndPi();
-    renderLanding();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.getByTestId("new-chat-landing-agent-a_claude")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
-  });
+  it.each([null, "pi-native", "native-pi", "malformed"])(
+    "shows Pi in the main harness list with preference %s",
+    (preference) => {
+      if (preference) {
+        localStorage.setItem(
+          "omnigent:recent-harnesses",
+          preference === "malformed" ? "{not json" : JSON.stringify([preference]),
+        );
+      }
+      mockClaudeAndPi();
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-agent-a_claude")).toBeTruthy();
+      expect(screen.getByTestId("new-chat-landing-agent-a_pi")).toBeTruthy();
+      expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
+    },
+  );
 
   it("keeps the hide-unconfigured preference ahead of a recent harness", () => {
     // Recency promotes within what can launch here; it must not resurrect a
@@ -8732,7 +8700,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     },
   );
 
-  it("promotes a secondary harness after returning from mobile configuration", () => {
+  it("keeps Pi in the main list after returning from mobile configuration", () => {
     mockAgents(
       NATIVE_CODING_AGENTS.filter((native) =>
         ["claude", "pi", "opencode"].includes(native.key),
@@ -8747,7 +8715,6 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     );
     renderLanding();
     openPicker();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a_pi"));
     expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
     fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));

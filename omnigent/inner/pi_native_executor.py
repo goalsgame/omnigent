@@ -11,6 +11,7 @@ from omnigent.harnesses.pi_native.bridge import (
     PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     enqueue_user_message,
     refresh_config_auth_headers,
+    refresh_config_system_prompt,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -86,18 +87,22 @@ class PiNativeExecutor(Executor):
         :param messages: Conversation history in executor message shape.
         :param tools: Tool schemas from Omnigent. Ignored for now; native
             Pi owns its configured tool surface.
-        :param system_prompt: System prompt from the agent spec. Ignored
-            because the native Pi terminal controls its own prompt/settings.
+        :param system_prompt: Composed instructions appended to Pi’s own prompt.
         :param config: Per-turn executor config. Unused.
         :yields: :class:`TurnComplete` after the input was queued, or an
             :class:`ExecutorError` when no user text can be sent.
         """
-        del tools, system_prompt, config
+        del tools, config
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="Pi native turn had no user text to send")
             return
         self._refresh_auth_headers()
+        try:
+            refresh_config_system_prompt(self._bridge_dir, system_prompt)
+        except (OSError, ValueError) as exc:
+            yield ExecutorError(message=f"Unable to deliver Pi instructions: {type(exc).__name__}")
+            return
         enqueue_user_message(self._bridge_dir, text)
         yield TurnComplete(response=None)
 

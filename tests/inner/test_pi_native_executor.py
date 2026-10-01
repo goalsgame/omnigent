@@ -12,12 +12,20 @@ the same shape the peer native ``test_goose_native_executor.py`` uses.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from omnigent.inner import pi_native_executor as pne
 from omnigent.inner.executor import ExecutorError, TurnComplete
+
+
+@pytest.fixture(autouse=True)
+def _extension_config(tmp_path: Path) -> None:
+    from omnigent.harnesses.pi_native.bridge import config_path
+
+    config_path(tmp_path).write_text(json.dumps({"authHeaders": {"X-Test": "kept"}, "tools": []}))
 
 
 def test_supports_flags(tmp_path: Path) -> None:
@@ -73,6 +81,11 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
 
     # The latest user turn (not the earlier one) is what reaches Pi.
     assert enqueued == [(tmp_path, "do it")]
+    from omnigent.harnesses.pi_native.bridge import config_path
+
+    config = json.loads(config_path(tmp_path).read_text())
+    assert config["systemPrompt"] == "system prompt"
+    assert config["authHeaders"] == {"X-Test": "kept"}
     assert len(events) == 1 and isinstance(events[0], TurnComplete)
     # pi-native does not synthesize an assistant response — the extension
     # mirrors Pi's output back over HTTP, so the executor returns no response.
@@ -148,3 +161,20 @@ async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
     # Turn still completes; the swallowed mint error means no rewrite was tried.
     assert len(events) == 1 and isinstance(events[0], TurnComplete)
     assert called == []
+
+
+async def test_run_turn_refuses_message_when_instructions_cannot_be_delivered(
+    tmp_path: Path,
+) -> None:
+    from omnigent.harnesses.pi_native.bridge import config_path
+
+    config_path(tmp_path).unlink()
+    events = [
+        e
+        async for e in pne.PiNativeExecutor(tmp_path).run_turn(
+            [{"role": "user", "content": "hello"}], [], "required instructions"
+        )
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert "Unable to deliver Pi instructions" in events[0].message
+    assert not (tmp_path / "inbox").exists()

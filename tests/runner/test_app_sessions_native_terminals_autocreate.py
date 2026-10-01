@@ -231,6 +231,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     mcp_spec = AgentSpec(
         spec_version=1,
         name="pi-agent",
+        instructions="Always give concise answers.",
         mcp_servers=(
             []
             if mcp_status == "absent"
@@ -280,6 +281,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     config = json.loads(
         Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
     )
+    assert "Always give concise answers." in config["systemPrompt"]
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
     assert ("search__find" in tool_names) == (mcp_status == "available")

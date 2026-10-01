@@ -3424,3 +3424,57 @@ def test_send_delivery_falls_back_to_agent_loop_state() -> None:
 """
     )
     _run_extension_script(node, _extension_path(), script)
+
+
+def test_before_agent_start_appends_fresh_instructions_without_accumulating(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real extension hook across updates, clear and reload."""
+    node = shutil.which("node")
+    assert node is not None, "node is required for the Pi extension tests"
+    extension = (
+        Path(__file__).resolve().parents[1]
+        / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"
+    )
+    script = tmp_path / "instructions.cjs"
+    script.write_text(r"""
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const configPath = path.join(process.argv[3], "config.json");
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+function save(prompt) {
+  fs.writeFileSync(configPath, JSON.stringify({ systemPrompt: prompt, tools: [] }));
+}
+function load() {
+  const handlers = {};
+  require(process.argv[2])({
+    on(name, handler) { handlers[name] = handler; },
+    registerCommand() {},
+  });
+  return handlers.before_agent_start;
+}
+(async () => {
+  save("authored + request + framework");
+  const hook = load();
+  const base = { systemPrompt: "Pi base and other extension instructions" };
+  assert.equal((await hook(base)).systemPrompt,
+    base.systemPrompt + "\n\nauthored + request + framework");
+  assert.equal((await hook(base)).systemPrompt,
+    base.systemPrompt + "\n\nauthored + request + framework");
+  save("revised instructions");
+  assert.equal((await hook(base)).systemPrompt, base.systemPrompt + "\n\nrevised instructions");
+  assert.equal((await load()(base)).systemPrompt, base.systemPrompt + "\n\nrevised instructions");
+  save("");
+  assert.equal(await hook(base), undefined);
+  save("   ");
+  assert.equal(await hook(base), undefined);
+})().catch((error) => { console.error(error); process.exit(1); });
+""")
+    result = subprocess.run(
+        [node, str(script), str(extension), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr

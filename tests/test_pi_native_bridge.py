@@ -441,3 +441,18 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+@pytest.mark.parametrize("prompt", ["updated instructions", ""])
+def test_refresh_system_prompt_preserves_auth_tools_and_clears_old_text(
+    tmp_path: Path, prompt: str
+) -> None:
+    path = pi_native_bridge.config_path(tmp_path)
+    original = {
+        "systemPrompt": "old",
+        "authHeaders": {"X-Test": "kept"},
+        "tools": [{"name": "search"}],
+    }
+    path.write_text(json.dumps(original))
+    pi_native_bridge.refresh_config_system_prompt(tmp_path, prompt)
+    assert json.loads(path.read_text()) == {**original, "systemPrompt": prompt}
