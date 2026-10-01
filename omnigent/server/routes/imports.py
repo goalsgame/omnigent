@@ -545,10 +545,8 @@ async def _stream_local_sessions_from_host(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise _time_limit_error()
-            # One wait bounded by whichever ends first. Which bound ended it is
-            # decided here, not by re-reading the clock afterwards: an event
-            # loop with a coarse clock (uvloop's is in ms) can fire the timer a
-            # hair before the deadline, which read as a silent host.
+            # Decide which bound fired here, not by re-reading the clock: a coarse
+            # event-loop clock (uvloop) can fire a hair early, reading as a silent host.
             deadline_bound = remaining <= frame_timeout
             try:
                 kind, data = await asyncio.wait_for(
@@ -998,8 +996,10 @@ def create_imports_router(
                     raise _already_imported_error(
                         "This source session has already been imported", conversation_id
                     ) from exc
-                _logger.warning("Replacing an abandoned partial import %s", conversation_id)
-                await conversation_store.delete_conversation(conversation_id)
+                if not await _discard_abandoned_import(existing):
+                    raise _already_imported_error(
+                        "This source session has already been imported", conversation_id
+                    ) from exc
                 try:
                     await asyncio.to_thread(_create)
                 except ConversationAlreadyExistsError as again:
@@ -1070,6 +1070,22 @@ def create_imports_router(
                 return False
         return await _importer_owns_partial(conversation.id, user_id)
 
+    async def _discard_abandoned_import(conversation: Any) -> bool:
+        """Delete a half-written import judged abandoned, unless it was replaced since.
+
+        The judgment awaits reads, so a concurrent import may already have
+        replaced the row with a complete one; a changed ``created_at`` means
+        that happened, and the fresh row is kept (``False``).
+        """
+        current = await asyncio.to_thread(conversation_store.get_conversation, conversation.id)
+        if current is not None and getattr(current, "created_at", None) != getattr(
+            conversation, "created_at", None
+        ):
+            return False
+        _logger.warning("Replacing an abandoned partial import %s", conversation.id)
+        await conversation_store.delete_conversation(conversation.id)
+        return True
+
     async def _importer_owns_partial(conversation_id: str, user_id: str | None) -> bool:
         """Whether ``user_id`` may discard a half-written import row.
 
@@ -1118,9 +1134,12 @@ def create_imports_router(
             existing, body.source, body.external_session_id, user_id
         ):
             # Half-written by a request that died: replace it, don't report it.
-            _logger.warning("Replacing an abandoned partial import %s", existing.id)
-            await conversation_store.delete_conversation(existing.id)
-            existing = None
+            if await _discard_abandoned_import(existing):
+                existing = None
+            else:
+                existing = await asyncio.to_thread(
+                    conversation_store.get_conversation, existing.id
+                )
         if existing is not None:
             await require_access(
                 user_id,
@@ -1156,10 +1175,8 @@ def create_imports_router(
             # Already a deliberate response (e.g. an unknown project).
             raise
         except Exception as exc:
-            # A storage failure the backend recognizes (oversized item, save
-            # timeout, encryption key unavailable) gets its status and message;
-            # anything else is `internal` with the id of its log line, instead
-            # of a generic 500 nobody can trace.
+            # A storage failure the backend recognizes gets its status and message;
+            # anything else is `internal` with the id of its log line.
             failure = _session_store_error(conversation_store, exc)
             error_id = failure.details.get("error_id")
             add_audit_attrs(
@@ -1321,9 +1338,8 @@ def create_imports_router(
                 if existing is not None and await _is_abandoned_import(
                     existing, source, external_session_id, user_id
                 ):
-                    _logger.warning("Replacing an abandoned partial import %s", existing.id)
-                    await conversation_store.delete_conversation(existing.id)
-                    existing = None
+                    if await _discard_abandoned_import(existing):
+                        existing = None
                 if existing is not None:
                     counts["already_imported"] += 1
                     confirmed.append(external_session_id)
@@ -1585,11 +1601,9 @@ def create_imports_router(
                         {"event": "session", "session_id": event.session_id, "title": event.title}
                     )
             except Exception as exc:  # noqa: BLE001 - the stream must always end with done
-                # The read dropped/stalled mid-stream, or something unexpected
-                # broke. The 200 + partial body is already sent, so report the
-                # failure inline; a body that just stops reads as a network
-                # error and loses the tally. Cancellation (client gone) is a
-                # BaseException and still propagates.
+                # The 200 + partial body is already sent, so report the failure inline;
+                # a body that just stops reads as a network error and loses the tally.
+                # Cancellation (client gone) is a BaseException and still propagates.
                 error = _record_local_import_failure(exc)
             except BaseException:
                 # Client gone or server shutting down: nothing more can be sent,

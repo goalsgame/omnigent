@@ -335,3 +335,82 @@ async def test_create_race_is_already_imported_not_a_failure(
     assert (done["imported"], done["already_imported"], done["failed"]) == (0, 1, 0)
     assert cid in store.conversations
     assert store.deleted == []
+
+
+class _ReplacedDuringJudgmentStore(FakeConversationStore):
+    """A store where a concurrent import replaces the partial while it is being judged.
+
+    The swap happens on the judgment's read (``list_items`` for a findable
+    partial, else the first ``get_conversation``), before any delete.
+    """
+
+    def __init__(self, conversation_id: str, external_id: str, *, on: str) -> None:
+        super().__init__()
+        self._conversation_id = conversation_id
+        self._external_id = external_id
+        self._on = on
+        self.swapped = False
+
+    def _swap(self) -> None:
+        if self.swapped:
+            return
+        self.swapped = True
+        # The concurrent import deleted the partial and wrote a complete row.
+        del self.conversations[self._conversation_id]
+        self.create_conversation(conversation_id=self._conversation_id, title="fresh")
+        self.conversations[self._conversation_id].created_at += 1
+        self.items[self._conversation_id] = [message_item("fresh")]
+        self.set_external_session_id(self._conversation_id, self._external_id)
+
+    def list_items(self, conversation_id: str, limit: int = 100, **kwargs: Any) -> Any:
+        page = super().list_items(conversation_id, limit, **kwargs)
+        if self._on == "list_items":
+            self._swap()
+        return page
+
+    def get_conversation(self, conversation_id: str) -> Any:
+        conversation = super().get_conversation(conversation_id)
+        if self._on == "get_conversation":
+            self._swap()
+        return conversation
+
+
+def _assert_fresh_row_kept(store: _ReplacedDuringJudgmentStore, conversation_id: str) -> None:
+    assert store.swapped
+    assert store.deleted == []
+    assert store.conversations[conversation_id].title == "fresh"
+    assert store.items[conversation_id] == [message_item("fresh")]
+
+
+async def test_cli_import_keeps_a_partial_replaced_while_judged() -> None:
+    """``/v1/imports`` never deletes a row a concurrent import completed; it answers 409."""
+    store = _ReplacedDuringJudgmentStore(_CID, _EXT, on="list_items")
+    _leftover(store, age_s=3600, external=True, items=0)
+    response = await _post_cli(store)
+    assert response.status_code == 409, response.text
+    error = response.json()["error"]
+    assert (error["import_code"], error["session_id"]) == ("already_imported", _CID)
+    _assert_fresh_row_kept(store, _CID)
+
+
+async def test_create_collision_keeps_a_partial_replaced_while_judged() -> None:
+    """A create that hits a partial replaced meanwhile reports already imported, keeping it."""
+    store = _ReplacedDuringJudgmentStore(_CID, _EXT, on="get_conversation")
+    # Not findable by external id, so only the create collides with it.
+    _leftover(store, age_s=3600, external=False, items=5)
+    response = await _post_cli(store)
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["import_code"] == "already_imported"
+    _assert_fresh_row_kept(store, _CID)
+
+
+async def test_local_import_keeps_a_partial_replaced_while_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batch counts a partial replaced during its judgment as already imported."""
+    cid = imports_module._import_conversation_id("claude", "s0")
+    store = _ReplacedDuringJudgmentStore(cid, "s0", on="list_items")
+    _leftover(store, age_s=3600, external=True, items=0, conversation_id=cid, external_id="s0")
+    done = await _stream_one(monkeypatch, store, "s0")
+    assert (done["imported"], done["already_imported"], done["failed"]) == (0, 1, 0)
+    _assert_fresh_row_kept(store, cid)

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
 
 from omnigent.host import connect as host_connect
 from omnigent.host.frames import (
@@ -131,6 +132,47 @@ async def test_heartbeats_cover_a_slow_read(monkeypatch: pytest.MonkeyPatch) -> 
     assert len(ws.sent) == sent
 
 
+class _HeartbeatFailingWs(RecordingWs):
+    """Records frames, but heartbeats sent from the background task raise ``exc``."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self.exc = exc
+        self.handler_task: asyncio.Task[Any] | None = None
+        self.heartbeat_attempts = 0
+
+    async def send(self, text: str) -> None:
+        is_progress = json.loads(text)["kind"] == "host.import_local_progress"
+        if is_progress and asyncio.current_task() is not self.handler_task:
+            self.heartbeat_attempts += 1
+            raise self.exc
+        await super().send(text)
+
+
+@pytest.mark.parametrize(
+    ("exc", "stops"),
+    [(ConnectionClosedError(None, None), True), (RuntimeError("send failed"), False)],
+    ids=["connection-closed", "other-error"],
+)
+async def test_heartbeat_stops_on_a_closed_tunnel_and_survives_other_errors(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception, stops: bool
+) -> None:
+    """A heartbeat on a closed tunnel gives up after one try; other send errors keep it going."""
+    monkeypatch.setattr(host_connect, "_IMPORT_PROGRESS_INTERVAL_S", 0.02)
+    serve_local_sessions(monkeypatch, {"s0": local_session("s0")}, load_delay_s=0.3)
+    ws = _HeartbeatFailingWs(exc)
+    request = HostImportLocalFrame(request_id="r", source="all", limit=5, progress=True)
+    task = asyncio.create_task(make_host()._handle_import_local(ws.as_ws(), request))
+    ws.handler_task = task
+    await task
+    # The import itself still finishes; only the background beats failed.
+    assert _done(ws).status == "ok"
+    if stops:
+        assert ws.heartbeat_attempts == 1
+    else:
+        assert ws.heartbeat_attempts >= 3
+
+
 async def test_cancel_frame_stops_the_named_import(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -209,22 +251,48 @@ async def test_missing_sqlite_session_failure_carries_its_code(
     ]
 
 
-async def test_single_harness_listing_error_fails_the_import(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Any error listing one requested harness becomes the import's failed done frame."""
+async def _list_failing_with(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> RecordingWs:
+    """Import one harness whose session listing raises ``exc``."""
 
     def _broken(_source: str, *, limit: int) -> list[str]:
-        raise ModuleNotFoundError(_MISSING_SQLITE)
+        raise exc
 
-    monkeypatch.setattr("omnigent.session_import.local.list_recent_local_session_ids", _broken)
+    monkeypatch.setattr(local_import, "list_recent_local_session_ids", _broken)
     ws = RecordingWs()
     await make_host()._handle_import_local(
         ws.as_ws(), HostImportLocalFrame(request_id="r", source="codex", limit=5)
     )
+    return ws
+
+
+async def test_listing_missing_sqlite_passes_its_text_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing-SQLite listing error keeps its text so the server can name the fix."""
+    ws = await _list_failing_with(monkeypatch, ModuleNotFoundError(_MISSING_SQLITE))
     done = _done(ws)
     assert done.status == "failed"
-    assert mentions_missing_sqlite(done.error)
+    assert done.error == _MISSING_SQLITE
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError("permission denied: /Users/alice/.codex/sessions"),
+        ImportError("No module named 'yaml' (/Users/alice/venv)"),
+        RuntimeError("index corrupt at /Users/alice/.codex/session_index.jsonl"),
+    ],
+    ids=["os-error", "other-import-error", "unexpected"],
+)
+async def test_listing_error_is_reported_without_its_text(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    """Any other listing error fails the import with a generic message, never local paths."""
+    ws = await _list_failing_with(monkeypatch, exc)
+    done = _done(ws)
+    assert done.status == "failed"
+    assert done.error == "Local sessions could not be listed on the host."
+    assert not any("/Users/alice" in text for text in ws.sent)
 
 
 async def test_host_logs_start_and_finish_with_counts(

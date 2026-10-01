@@ -693,10 +693,9 @@ def _codex_native_title(home: Path, session_id: str) -> str | None:
     if indexed:
         return indexed
     try:
-        # Imported here, not at module load: some Python builds (pyenv or
-        # Homebrew without the SQLite headers) lack ``_sqlite3``, and an eager
-        # import made every session on such a machine unimportable. Without it
-        # the title falls back to the first user message.
+        # Lazy import: some Python builds (pyenv/Homebrew without SQLite
+        # headers) lack ``_sqlite3``; without it the title falls back to the
+        # first user message.
         import sqlite3
     except ImportError:
         return None

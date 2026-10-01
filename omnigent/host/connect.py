@@ -2599,8 +2599,13 @@ class HostProcess:
                 ids = list_recent_local_session_ids(source, limit=frame.limit)
             except SessionImportNotFoundError:
                 return [], None
-            except Exception as exc:  # noqa: BLE001 - reported as the import's error
-                return [], str(exc)
+            except Exception as exc:
+                _logger.exception("import_local: listing sessions failed source=%r", source)
+                # The raw text may hold local paths; only the missing-SQLite text
+                # is passed on, so the server can say how to fix it.
+                if isinstance(exc, ImportError) and mentions_missing_sqlite(str(exc)):
+                    return [], str(exc)
+                return [], "Local sessions could not be listed on the host."
             return [(source, sid) for sid in ids], None
 
         def _load(
@@ -2670,8 +2675,12 @@ class HostProcess:
             # Covers the gaps no session frame fills: enumeration and slow reads.
             while True:
                 await asyncio.sleep(_IMPORT_PROGRESS_INTERVAL_S)
-                with contextlib.suppress(Exception):
+                try:
                     await _send_progress()
+                except ConnectionClosed:
+                    return  # dead tunnel: the import handler owns recovery
+                except Exception:  # noqa: BLE001 - a heartbeat must not end the import
+                    _logger.debug("import heartbeat send failed", exc_info=True)
 
         current = asyncio.current_task()
         if current is not None:
