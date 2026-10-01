@@ -472,10 +472,14 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
+        machine_verifier: OIDCMachineVerifier | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
         self._accounts_config = accounts_config
+        if machine_verifier is not None and source != "oidc":
+            raise RuntimeError("OIDC machine authentication requires oidc auth mode")
+        self.machine_verifier = machine_verifier
         self._local_single_user = (
             local_single_user if local_single_user is not None else local_single_user_enabled()
         )
@@ -642,6 +646,7 @@ class UnifiedAuthProvider(AuthProvider):
             return None
         cookie_name = cookie_config.session_cookie_name
         token = request.cookies.get(cookie_name)
+        from_cookie = bool(token)
         if not token:
             # Fall back to Bearer token for CLI clients.
             auth_header = request.headers.get("Authorization", "")
@@ -662,11 +667,24 @@ class UnifiedAuthProvider(AuthProvider):
                 algorithms=["HS256"],
             )
         except jwt.InvalidTokenError:
+            if not from_cookie and self.machine_verifier is not None:
+                if delegated_path_allowed(request.url.path):
+                    return self.machine_verifier.authenticate(token)
             return None
 
         user_id = payload.get("sub")
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
+
+        from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
+
+        if user_id.startswith(MACHINE_PRINCIPAL_PREFIX):
+            if self.machine_verifier is None or not self.machine_verifier.principal_allowed(
+                user_id
+            ):
+                return None
+            # Runner callbacks use Omnigent-issued owner JWTs; never cache their admin check.
+            return user_id
 
         # Machine-issued tokens carry ``grant_id`` (store-backed grant),
         # ``scope`` (restricted authority), or both. Each claim gets its own
@@ -889,10 +907,22 @@ def create_auth_provider() -> AuthProvider:
 
         accounts_config = AccountsConfig.from_env()
 
+    from omnigent.server.oidc_machine_auth import OIDCMachineConfig, OIDCMachineVerifier
+    from omnigent.server.server_config import load_server_config
+
+    machine_config = OIDCMachineConfig.parse(load_server_config().get("oidc_machine_auth"))
+    if machine_config is not None and (source != "oidc" or oidc_config is None):
+        raise RuntimeError("oidc_machine_auth requires oidc auth mode")
+    machine_verifier = (
+        OIDCMachineVerifier(machine_config, oidc_config)
+        if machine_config is not None and oidc_config is not None
+        else None
+    )
     return UnifiedAuthProvider(
         source=source,
         oidc_config=oidc_config,
         accounts_config=accounts_config,
+        machine_verifier=machine_verifier,
     )
 
 
@@ -904,3 +934,4 @@ if TYPE_CHECKING:
 
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig
+    from omnigent.server.oidc_machine_auth import OIDCMachineVerifier

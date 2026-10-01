@@ -405,7 +405,9 @@ def create_auth_router(
             )
 
         # Reject reserved user names.
-        if email in _RESERVED_USERS:
+        from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
+
+        if email in _RESERVED_USERS or email.startswith(MACHINE_PRINCIPAL_PREFIX):
             return JSONResponse(
                 status_code=403,
                 content={"error": f"Reserved user name {email!r}"},

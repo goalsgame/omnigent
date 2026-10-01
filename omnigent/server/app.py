@@ -1880,6 +1880,21 @@ def create_app(
     from omnigent.server.admin_list import load_admin_list, promote_if_listed
 
     admin_list = load_admin_list(extra=frozenset(admins or ()))
+    if (
+        isinstance(auth_provider, UnifiedAuthProvider)
+        and auth_provider.machine_verifier is not None
+    ):
+        from omnigent.server.auth import AccountAuthenticationMiddleware
+
+        if permission_store is None:
+            raise RuntimeError("OIDC machine authentication requires a permission store")
+        auth_provider.machine_verifier.set_principal_check(
+            lambda principal: (
+                not admin_list.is_admin(principal) and not permission_store.is_admin(principal)
+            )
+        )
+        # JWKS refresh and permission queries run in a worker, including WebSocket handshakes.
+        app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
     # Session-sharing policy, normalized to a per-request callable, plus a
     # ``sharing_mode_writable`` flag gating the admin ``PUT /v1/sharing``
     # endpoint.
