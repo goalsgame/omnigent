@@ -26,6 +26,11 @@ class AgentStore(ABC):
             filesystem path for file-backed stores.
         """
         self.storage_location = storage_location
+        self.catalog_names: frozenset[str] | None = None
+
+    def is_catalog_agent(self, name: str) -> bool:
+        """Whether a template is enabled for discovery and new sessions."""
+        return self.catalog_names is None or name in self.catalog_names
 
     @abstractmethod
     def create(

@@ -234,6 +234,12 @@ async def validate_session_agent(
             code=ErrorCode.NOT_FOUND,
         )
 
+    if agent.session_id is None and not agent_store.is_catalog_agent(agent.name):
+        raise OmnigentError(
+            f"Agent is not enabled in the server catalog: {agent.name!r}",
+            code=ErrorCode.FORBIDDEN,
+        )
+
     # Session-scoped agents belong to a specific session. The caller must have
     # at least READ access to that owning session — otherwise they can execute
     # another user's private agent by guessing the raw agent id.
