@@ -656,6 +656,48 @@ describe("ImportSessionsPanel import outcomes", () => {
     expect(screen.queryByTestId("import-outcome")).toBeNull();
   });
 
+  it.each([
+    {
+      shape: "S12 time limit",
+      code: "time_limit_reached",
+      message: "Imported 10 of 14 before the time limit — run it again to continue.",
+    },
+    {
+      shape: "S7 host disconnected",
+      code: "host_disconnected",
+      message: "mac-laptop disconnected after 10 of 20 sessions.",
+    },
+  ])(
+    "never says 'Nothing new to import' when the run stopped early ($shape)",
+    async ({ code, message }) => {
+      await runImport(
+        result({
+          alreadyImported: 10,
+          complete: false,
+          error: importError({ code, message }),
+        }),
+      );
+      const summary = screen.getByTestId("import-result");
+      expect(summary).toHaveTextContent("Imported 0 · 10 already imported · stopped early");
+      expect(summary).not.toHaveTextContent("Nothing new");
+      expect(screen.getByTestId("import-error-message")).toHaveTextContent(message);
+    },
+  );
+
+  it("marks a partial tally as stopped early", async () => {
+    await runImport(
+      result({
+        imported: 3,
+        alreadyImported: 2,
+        complete: false,
+        error: importError({ code: "time_limit_reached" }),
+      }),
+    );
+    expect(screen.getByTestId("import-result")).toHaveTextContent(
+      "Imported 3 · 2 already imported · stopped early",
+    );
+  });
+
   it("names the machine when a wrong_replica outlives the re-address", async () => {
     withOnlineHost();
     importLocalSessionsMock.mockRejectedValue(

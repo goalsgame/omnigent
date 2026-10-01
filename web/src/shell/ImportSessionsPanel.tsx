@@ -60,14 +60,23 @@ function hostListLooksStale(error: ImportErrorInfo, thrown: unknown): boolean {
 
 /**
  * "Imported 12 · 3 already imported · 2 failed" (zero parts omitted), or
- * null when there is nothing to report beside an error.
+ * null when there is nothing to report beside an error. A run that stopped
+ * early (`complete: false`) never reads "Nothing new to import": it leads with
+ * what it imported and says it stopped, e.g. "Imported 0 · 10 already
+ * imported · stopped early".
  */
 function importSummary(result: LocalImportResult): string | null {
+  const stoppedEarly = !result.complete || result.error !== null;
   const parts = [
     result.imported > 0 ? `Imported ${result.imported}` : null,
     result.alreadyImported > 0 ? `${result.alreadyImported} already imported` : null,
     result.failed > 0 ? `${result.failed} failed` : null,
   ].filter((p): p is string => p !== null);
+  if (stoppedEarly) {
+    if (parts.length === 0) return null;
+    if (result.imported === 0) parts.unshift("Imported 0");
+    return [...parts, "stopped early"].join(" · ");
+  }
   if (result.imported === 0 && result.failed === 0) {
     if (result.alreadyImported > 0) return `Nothing new to import · ${parts.join(" · ")}`;
     return result.error === null ? "No sessions to import." : null;
