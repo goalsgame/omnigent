@@ -435,15 +435,6 @@ export type SidebarDropAction =
  * - Dropped on the pin zone while already pinned → `none`.
  * - Dropped on nothing → `none`.
  */
-/**
- * Whether the Sessions list accepts a dragged session: a filed one (ungroup) or
- * a pinned one (unpin). Grouped views already list filed sessions in place, so
- * there it only unpins a pin that has no project to lose.
- */
-export function sessionsListAcceptsDrop(source: SidebarDragSource, grouped: boolean): boolean {
-  return grouped ? source.isPinned && !source.project : !!source.project || source.isPinned;
-}
-
 export function resolveSidebarDrop(
   source: SidebarDragSource,
   target: SidebarDropTarget,
@@ -465,4 +456,13 @@ export function resolveSidebarDrop(
   if (source.project) return { kind: "ungroup", project: source.project, unpin: source.isPinned };
   // No project label: only meaningful if pinned (unpin → it drops into Chats).
   return source.isPinned ? { kind: "unpin" } : { kind: "none" };
+}
+
+/**
+ * Whether the Sessions list accepts a dragged session: a filed one (ungroup) or
+ * a pinned one (unpin). Grouped views already list filed sessions in place, so
+ * there it only unpins a pin that has no project to lose.
+ */
+export function sessionsListAcceptsDrop(source: SidebarDragSource, grouped: boolean): boolean {
+  return grouped ? source.isPinned && !source.project : !!source.project || source.isPinned;
 }
