@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -6501,6 +6502,111 @@ class _SessionImportResult:
     link: str | None = None
     message: str | None = None
     raw_exc: BaseException | None = None
+    # Stable import code from the server (``ImportErrorCode``), when it sent one.
+    code: str | None = None
+    retryable: bool = True
+    # Shell commands that fix the failure, printed indented under the message.
+    fix_commands: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ImportErrorBody:
+    """What a failed ``POST /v1/imports`` response says, across server versions."""
+
+    message: str
+    import_code: str | None = None
+    retryable: bool = True
+    fix_commands: tuple[str, ...] = ()
+    # The existing session a duplicate (409) import points at.
+    session_id: str | None = None
+
+
+# Older servers name the existing session only in the 409 message.
+_EXISTING_SESSION_RE = re.compile(r"already exists as (\S+?)\.?$")
+
+
+def _parse_import_error(response: Any) -> _ImportErrorBody:  # type: ignore[explicit-any]
+    """Extract a readable failure from an import error response.
+
+    Newer servers send ``{"error": {"message", "import_code", "retryable",
+    ...}}``; older ones only ``message`` (or FastAPI's ``detail``). Falls back
+    to the raw body so nothing is ever reported blank.
+    """
+    from omnigent.session_import.errors import import_code_is_retryable
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message")
+        import_code = error.get("import_code")
+        code = import_code if isinstance(import_code, str) and import_code else None
+        retryable = error.get("retryable")
+        fixes = error.get("fix_commands")
+        session_id = error.get("session_id")
+        if not isinstance(session_id, str) and isinstance(message, str):
+            match = _EXISTING_SESSION_RE.search(message)
+            session_id = match.group(1) if match else None
+        return _ImportErrorBody(
+            session_id=session_id if isinstance(session_id, str) and session_id else None,
+            message=message if isinstance(message, str) and message else response.text,
+            import_code=code,
+            retryable=(
+                retryable
+                if isinstance(retryable, bool)
+                else (import_code_is_retryable(code) if code else True)
+            ),
+            fix_commands=(
+                tuple(cmd for cmd in fixes if isinstance(cmd, str))
+                if isinstance(fixes, list)
+                else ()
+            ),
+        )
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, str) and detail:
+        return _ImportErrorBody(message=detail)
+    if isinstance(detail, list):
+        readable = _first_validation_message(detail)
+        if readable is not None:
+            return _ImportErrorBody(
+                message=readable, import_code="invalid_request", retryable=False
+            )
+    return _ImportErrorBody(message=response.text or f"HTTP {response.status_code}")
+
+
+# A field path longer than this reads worse than the bare message.
+_MAX_VALIDATION_PATH_CHARS = 40
+
+
+def _first_validation_message(detail: list[object]) -> str | None:
+    """The first readable message of a FastAPI 422 ``detail`` list.
+
+    E.g. ``items.0.response_id: String should have at most 64 characters``
+    rather than the raw pydantic error list.
+    """
+    for entry in detail:
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("msg")
+        if not isinstance(msg, str) or not msg:
+            continue
+        msg = msg.removeprefix("Value error, ")
+        loc = entry.get("loc")
+        parts = [str(part) for part in loc if part != "body"] if isinstance(loc, list) else []
+        path = ".".join(parts)
+        if path and len(path) <= _MAX_VALIDATION_PATH_CHARS:
+            return f"{path}: {msg}"
+        return msg
+    return None
+
+
+def _echo_import_failure(prefix: str, outcome: _SessionImportResult) -> None:
+    """Print one failed session: the reason, then any fix commands indented."""
+    click.echo(f"{prefix}{outcome.message}", err=True)
+    for command in outcome.fix_commands:
+        click.echo(f"    {command}", err=True)
 
 
 @cli.command("import")
@@ -6637,9 +6743,13 @@ def import_session_command(
         try:
             imported = load_local_session(current_source, sid)
         except SessionImportNotFoundError as exc:
-            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
+            return _SessionImportResult(
+                sid, "load_error", message=str(exc), raw_exc=exc, retryable=False
+            )
         except (OSError, TypeError, ValueError) as exc:
-            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
+            return _SessionImportResult(
+                sid, "load_error", message=str(exc), raw_exc=exc, retryable=False
+            )
 
         payload: dict[str, object] = {
             "source": imported.source,
@@ -6674,14 +6784,28 @@ def import_session_command(
             )
 
         if response.is_error:
-            try:
-                body = response.json()
-                detail = body.get("error", {}).get("message") or body.get("detail")
-            except (ValueError, AttributeError):
-                detail = None
-            message = f"Import failed ({response.status_code}): {detail or response.text}"
-            status = "already" if response.status_code == 409 else "failed"
-            return _SessionImportResult(sid, status, message=message)
+            error = _parse_import_error(response)
+            message = f"Import failed ({response.status_code}): {error.message}"
+            # A 409 is a duplicate unless a newer server classified it as
+            # something else (e.g. the host's Python lacks SQLite).
+            duplicate = response.status_code == 409 and error.import_code in (
+                None,
+                "already_imported",
+            )
+            status = "already" if duplicate else "failed"
+            return _SessionImportResult(
+                sid,
+                status,
+                link=(
+                    conversation_url(base_url, error.session_id)
+                    if duplicate and error.session_id
+                    else None
+                ),
+                message=message,
+                code=error.import_code,
+                retryable=error.retryable,
+                fix_commands=error.fix_commands,
+            )
 
         try:
             result = response.json()
@@ -6709,6 +6833,12 @@ def import_session_command(
         if result.status == "imported":
             click.echo(f"Imported {result.item_count} item(s) into {result.link}")
             return
+        if result.status == "already":
+            # Re-running an import is the common case (and the batch path
+            # already treats it as a skip), so it is not an error.
+            where = f" as {result.link}" if result.link else ""
+            click.echo(f"Already imported{where} (use --force to replace)")
+            return
         if result.status == "load_error":
             # A missing session is a clean CLI error; a corrupt transcript keeps
             # its original exception so the traceback points at the parse fault.
@@ -6716,7 +6846,8 @@ def import_session_command(
                 raise click.ClickException(str(result.raw_exc)) from result.raw_exc
             assert result.raw_exc is not None
             raise result.raw_exc
-        raise click.ClickException(result.message or "Import failed")
+        fixes = "".join(f"\n    {command}" for command in result.fix_commands)
+        raise click.ClickException(f"{result.message or 'Import failed'}{fixes}")
 
     # Distinct sessions are independent conversations on the server (their own
     # ids, row locks, and position counters), so importing them concurrently
@@ -6738,6 +6869,7 @@ def import_session_command(
     imported_count = 0
     already_imported_count = 0
     failed_count = 0
+    retryable_count = 0
     # Report in the caller's requested order, not worker completion order.
     for target in import_targets:
         sid = target[1]
@@ -6747,15 +6879,23 @@ def import_session_command(
             click.echo(f"Imported {outcome.item_count} item(s) from {sid} into {outcome.link}")
         elif outcome.status == "already":
             already_imported_count += 1
-            click.echo(f"Already imported {sid}; skipped.")
+            where = f" as {outcome.link}" if outcome.link else ""
+            click.echo(f"Already imported {sid}{where}; skipped.")
         else:
             failed_count += 1
-            click.echo(f"Failed {sid}: {outcome.message}", err=True)
+            if outcome.retryable:
+                retryable_count += 1
+            _echo_import_failure(f"Failed {sid}: ", outcome)
 
     click.echo(f"\nImported: {imported_count}")
     click.echo(f"Already imported: {already_imported_count}")
     click.echo(f"Failed: {failed_count}")
     if failed_count:
+        if retryable_count:
+            click.echo(
+                "Run the same command again to retry; sessions already imported are skipped.",
+                err=True,
+            )
         raise click.ClickException(f"{failed_count} session(s) failed to import")
 
 

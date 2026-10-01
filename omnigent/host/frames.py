@@ -149,6 +149,8 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_SESSION_CHUNK = "host.import_local_session_chunk"
     IMPORT_LOCAL_DONE = "host.import_local_done"
+    IMPORT_LOCAL_PROGRESS = "host.import_local_progress"
+    IMPORT_LOCAL_CANCEL = "host.import_local_cancel"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -1065,12 +1067,16 @@ class HostImportLocalFrame:
     :param allow_session_chunks: Whether the requesting server understands
         ``host.import_local_session_chunk``. Missing from older servers, so the
         safe default is legacy whole-session framing.
+    :param progress: Whether the requesting server understands
+        :class:`HostImportLocalProgressFrame`. A host only sends heartbeats when
+        this is set, so an older server never sees an unknown frame kind.
     """
 
     request_id: str
     source: str
     limit: int = 10
     allow_session_chunks: bool = False
+    progress: bool = False
 
 
 @dataclass
@@ -1082,12 +1088,14 @@ class HostImportLocalByIdFrame:
     :param session_id: Exact harness-native session id to load.
     :param allow_session_chunks: Whether the requesting server understands
         ``host.import_local_session_chunk``. Missing from older servers.
+    :param progress: As on :class:`HostImportLocalFrame`.
     """
 
     request_id: str
     source: str
     session_id: str
     allow_session_chunks: bool = False
+    progress: bool = False
 
 
 @dataclass
@@ -1154,6 +1162,39 @@ class HostImportLocalDoneFrame:
     failures: list[_JsonObject] = field(default_factory=list)
 
 
+@dataclass
+class HostImportLocalProgressFrame:
+    """Host → server: import heartbeat with the sessions processed so far.
+
+    Sent roughly every 10 s while the host enumerates or reads a slow transcript,
+    and after each session, only when the request set ``progress``. It tells the
+    server the host is alive (so a silent host is caught quickly) and lets the
+    UI show "Importing 7 of 20".
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param done: Sessions finished so far (sent or failed on the host).
+    :param total: Sessions the host will process, or ``None`` while still
+        enumerating.
+    """
+
+    request_id: str
+    done: int
+    total: int | None = None
+
+
+@dataclass
+class HostImportLocalCancelFrame:
+    """Server → host: stop an in-flight import (deadline hit or client left).
+
+    Hosts that predate it drop the unknown kind and finish the import; the
+    server has already stopped reading, so their frames are ignored.
+
+    :param request_id: The import to stop.
+    """
+
+    request_id: str
+
+
 HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
@@ -1197,6 +1238,8 @@ HostFrame = (
     | HostImportLocalSessionFrame
     | HostImportLocalSessionChunkFrame
     | HostImportLocalDoneFrame
+    | HostImportLocalProgressFrame
+    | HostImportLocalCancelFrame
 )
 
 
@@ -1624,6 +1667,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "source": frame.source,
                 "limit": frame.limit,
                 "allow_session_chunks": frame.allow_session_chunks,
+                "progress": frame.progress,
             }
         )
     if isinstance(frame, HostImportLocalByIdFrame):
@@ -1634,6 +1678,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "source": frame.source,
                 "session_id": frame.session_id,
                 "allow_session_chunks": frame.allow_session_chunks,
+                "progress": frame.progress,
             }
         )
     if isinstance(frame, HostImportLocalSessionFrame):
@@ -1665,6 +1710,22 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
                 "failed": frame.failed,
                 "failures": frame.failures,
+            }
+        )
+    if isinstance(frame, HostImportLocalProgressFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_PROGRESS.value,
+                "request_id": frame.request_id,
+                "done": frame.done,
+                "total": frame.total,
+            }
+        )
+    if isinstance(frame, HostImportLocalCancelFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_CANCEL.value,
+                "request_id": frame.request_id,
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
@@ -2002,6 +2063,14 @@ def _decode_known_host_frame(
             return _decode_import_local_session_chunk(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
+        case HostFrameKind.IMPORT_LOCAL_PROGRESS:
+            return HostImportLocalProgressFrame(
+                request_id=_required_str(msg, "request_id"),
+                done=_required_int(msg, "done"),
+                total=total if isinstance(total := msg.get("total"), int) else None,
+            )
+        case HostFrameKind.IMPORT_LOCAL_CANCEL:
+            return HostImportLocalCancelFrame(request_id=_required_str(msg, "request_id"))
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -2616,6 +2685,7 @@ def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
         allow_session_chunks=(
             _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
         ),
+        progress=_required_bool(msg, "progress") if "progress" in msg else False,
     )
 
 
@@ -2628,6 +2698,7 @@ def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
         allow_session_chunks=(
             _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
         ),
+        progress=_required_bool(msg, "progress") if "progress" in msg else False,
     )
 
 

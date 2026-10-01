@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
+    HostImportLocalProgressFrame,
     HostImportLocalSessionChunkFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
@@ -885,6 +886,11 @@ async def _receive_loop(
             if session is None:
                 continue
             queue.put_nowait(("session", _import_session_queue_payload(frame.total, session)))
+            continue
+        if isinstance(frame, HostImportLocalProgressFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                queue.put_nowait(("progress", {"done": frame.done, "total": frame.total}))
             continue
         if isinstance(frame, HostImportLocalDoneFrame):
             queue = conn.pending_import_local.get(frame.request_id)
