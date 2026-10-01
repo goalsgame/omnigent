@@ -27,6 +27,10 @@ the header menu), and each place is a separate entry point.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
 - `browser-storage`: browser tabs, including the agent browser, share cookies
   within a session; different sessions stay isolated. Navigation stays per-tab.
+- `view-options`: the sidebar filter menu's Grouping (Default / Status /
+  Updated), Display (All / My / Shared / Archived), Ordering (Updated / Status)
+  and Show (Updated / Environment / Branch) submenus, saved per device. Grouped
+  views replace the Projects and Sessions sections with titled groups.
 
 ## How to get to it (user POV)
 
@@ -42,7 +46,13 @@ renames. Sub-agent sessions hide owner-only actions.
 
 **Message actions:** fork from a specific assistant message.
 
-**Archived view:** switch the sidebar to archived sessions and filter by project.
+**Archived view:** choose Display → Archived sessions in the sidebar filter
+menu, then filter by project.
+
+**Sidebar filter menu:** the funnel on the Sessions header (on the first group
+header when grouped) holds Grouping, Display, Ordering and Show. Hovering a row
+opens its tooltip; the repo and PR rows load from the session's GitHub info
+only once the tooltip opens.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
@@ -111,6 +121,9 @@ plain `uv run pytest`, which starts a private server for the test.
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
   tabs; all should be signed out.
+- **`view-options`:**
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_status_grouping_and_show_toggles_persist_across_reload`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`
 
 ## Gotchas
 
@@ -131,3 +144,6 @@ plain `uv run pytest`, which starts a private server for the test.
   shows the command instead.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
   message. That is expected; run them with plain `uv run pytest`.
+- Grouping and ordering apply to the loaded pages only: an older session joins
+  its group once it is paged in. Grouped views hide Projects, so dragging a
+  session onto the list never removes it from its project there.
