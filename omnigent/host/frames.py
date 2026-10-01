@@ -2090,7 +2090,13 @@ def _decode_known_host_frame(
             return HostImportLocalProgressFrame(
                 request_id=_required_str(msg, "request_id"),
                 done=_required_int(msg, "done"),
-                total=total if isinstance(total := msg.get("total"), int) else None,
+                total=(
+                    total
+                    if isinstance(total := msg.get("total"), int)
+                    and not isinstance(total, bool)
+                    and total >= 0
+                    else None
+                ),
                 skipped=_optional_count(msg, "skipped"),
             )
         case HostFrameKind.IMPORT_LOCAL_CANCEL:

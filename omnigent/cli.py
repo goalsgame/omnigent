@@ -6546,13 +6546,6 @@ def _fix_command_lines(value: object) -> tuple[str, ...]:
     return tuple(lines)
 
 
-# Import codes for a failure on the host's tunnel, the only kind the
-# stale-host ``omnigent stop`` hint can help with.
-_HOST_TUNNEL_IMPORT_CODES = frozenset(
-    {"host_offline", "host_unreachable", "host_disconnected", "host_unresponsive"}
-)
-
-
 def _import_cli_error(message: str, *, host_related: bool = False) -> click.ClickException:
     """A ClickException for ``omnigent import`` that names only the real cause.
 
@@ -6569,8 +6562,19 @@ def _import_cli_error(message: str, *, host_related: bool = False) -> click.Clic
 
 
 def _is_host_related_import_failure(code: str | None, status: int | None) -> bool:
-    """Whether a failed import is about the host tunnel (or a 401 rejection)."""
-    return code in _HOST_TUNNEL_IMPORT_CODES or status == 401
+    """Whether a failed import is about the host tunnel (or a 401 rejection).
+
+    Only those failures can be helped by the stale-host ``omnigent stop`` hint.
+    """
+    from omnigent.session_import.errors import ImportErrorCode
+
+    host_tunnel_codes = (
+        ImportErrorCode.HOST_OFFLINE,
+        ImportErrorCode.HOST_UNREACHABLE,
+        ImportErrorCode.HOST_DISCONNECTED,
+        ImportErrorCode.HOST_UNRESPONSIVE,
+    )
+    return code in host_tunnel_codes or status == 401
 
 
 # Older servers name the existing session only in the 409 message.
@@ -6584,7 +6588,7 @@ def _parse_import_error(response: Any) -> _ImportErrorBody:  # type: ignore[expl
     ...}}``; older ones only ``message`` (or FastAPI's ``detail``). Falls back
     to the raw body so nothing is ever reported blank.
     """
-    from omnigent.session_import.errors import import_code_is_retryable
+    from omnigent.session_import.errors import ImportErrorCode, import_code_is_retryable
 
     try:
         body = response.json()
@@ -6621,7 +6625,9 @@ def _parse_import_error(response: Any) -> _ImportErrorBody:  # type: ignore[expl
         readable = _first_validation_message(detail)
         if readable is not None:
             return _ImportErrorBody(
-                message=readable, import_code="invalid_request", retryable=False
+                message=readable,
+                import_code=ImportErrorCode.INVALID_REQUEST,
+                retryable=False,
             )
     return _ImportErrorBody(message=response.text or f"HTTP {response.status_code}")
 
@@ -6644,7 +6650,10 @@ def _first_validation_message(detail: list[object]) -> str | None:
             continue
         msg = msg.removeprefix("Value error, ")
         loc = entry.get("loc")
-        parts = [str(part) for part in loc if part != "body"] if isinstance(loc, list) else []
+        # FastAPI prefixes body fields with "body"; a field named "body" stays.
+        if isinstance(loc, list) and loc[:1] == ["body"]:
+            loc = loc[1:]
+        parts = [str(part) for part in loc] if isinstance(loc, list) else []
         path = ".".join(parts)
         if path and len(path) <= _MAX_VALIDATION_PATH_CHARS:
             return f"{path}: {msg}"
@@ -6732,6 +6741,7 @@ def import_session_command(
         ImportSource,
         SessionImportNotFoundError,
     )
+    from omnigent.session_import.errors import ImportErrorCode
     from omnigent.session_import.local import (
         list_recent_local_session_ids,
         list_recent_sessions_across_harnesses,
@@ -6798,8 +6808,13 @@ def import_session_command(
                 sid, "load_error", message=str(exc), raw_exc=exc, retryable=False
             )
         except (OSError, TypeError, ValueError) as exc:
+            # A read fault may be transient; a parse fault won't change on retry.
             return _SessionImportResult(
-                sid, "load_error", message=str(exc), raw_exc=exc, retryable=False
+                sid,
+                "load_error",
+                message=str(exc),
+                raw_exc=exc,
+                retryable=isinstance(exc, OSError),
             )
 
         payload: dict[str, object] = {
@@ -6843,7 +6858,7 @@ def import_session_command(
             # something else (e.g. the host's Python lacks SQLite).
             duplicate = response.status_code == 409 and error.import_code in (
                 None,
-                "already_imported",
+                ImportErrorCode.ALREADY_IMPORTED,
             )
             status = "already" if duplicate else "failed"
             return _SessionImportResult(
