@@ -889,7 +889,7 @@ def create_imports_router(
                     conversation_store.get_conversation, conversation_id
                 )
                 if existing is None or not await _is_abandoned_import(
-                    existing, source, external_session_id
+                    existing, source, external_session_id, user_id
                 ):
                     raise _already_imported_error(
                         "This source session has already been imported", conversation_id
@@ -942,14 +942,16 @@ def create_imports_router(
         return conversation_id, title
 
     async def _is_abandoned_import(
-        conversation: Any, source: ImportSource, external_session_id: str
+        conversation: Any, source: ImportSource, external_session_id: str, user_id: str | None
     ) -> bool:
-        """Whether an import conversation was left half-written by a dead request.
+        """Whether this importer may replace an import a dead request half-wrote.
 
         Only the deterministic import id qualifies (a native run of the same
         session has its own id). It must be older than any live import could
         be, and either never got its external id (written last) or holds no
-        items (older servers wrote the external id first).
+        items (older servers wrote the external id first). The id derives from
+        the source session alone, so another user importing the same external
+        id lands on the same row: only its owner may discard it.
         """
         if conversation.id != _import_conversation_id(source, external_session_id):
             return False
@@ -958,10 +960,35 @@ def create_imports_router(
             now_epoch() - created_at < _ABANDONED_IMPORT_AGE_S
         ):
             return False
-        if getattr(conversation, "external_session_id", None) != external_session_id:
+        if getattr(conversation, "external_session_id", None) == external_session_id:
+            page = await asyncio.to_thread(conversation_store.list_items, conversation.id, limit=1)
+            if page.data:
+                return False
+        return await _importer_owns_partial(conversation.id, user_id)
+
+    async def _importer_owns_partial(conversation_id: str, user_id: str | None) -> bool:
+        """Whether ``user_id`` may discard a half-written import row.
+
+        The owner check is the one ``--force`` replacement uses. A row that
+        never got its owner grant (the grant is written after the items)
+        belongs to nobody, so the importer may replace it. Auth off (no
+        permission store or user) is single-user, like the host check.
+        """
+        if permission_store is None or user_id is None:
             return True
-        page = await asyncio.to_thread(conversation_store.list_items, conversation.id, limit=1)
-        return not page.data
+        try:
+            await require_access(
+                user_id, conversation_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            return True
+        except OmnigentError:
+            pass
+        try:
+            return not await asyncio.to_thread(permission_store.has_any_grants, conversation_id)
+        except NotImplementedError:
+            # Stores whose ownership is fixed at create time (no grant rows)
+            # can't have an ownerless row; the owner check above is final.
+            return False
 
     @router.post(
         "/imports",
@@ -984,7 +1011,7 @@ def create_imports_router(
             body.external_session_id,
         )
         if existing is not None and await _is_abandoned_import(
-            existing, body.source, body.external_session_id
+            existing, body.source, body.external_session_id, user_id
         ):
             # Half-written by a request that died: replace it, don't report it.
             _logger.warning("Replacing an abandoned partial import %s", existing.id)
@@ -1173,7 +1200,7 @@ def create_imports_router(
                     external_session_id,
                 )
                 if existing is not None and await _is_abandoned_import(
-                    existing, source, external_session_id
+                    existing, source, external_session_id, user_id
                 ):
                     _logger.warning("Replacing an abandoned partial import %s", existing.id)
                     await conversation_store.delete_conversation(existing.id)
