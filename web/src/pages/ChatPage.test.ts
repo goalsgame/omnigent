@@ -9,7 +9,7 @@ import {
   isSlashCommandText,
   slashCommandMatches,
 } from "@/components/SlashCommandMenu";
-import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
+import { isEditorLevel, isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
@@ -52,7 +52,7 @@ import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 // or hide the share button from managers.
 
 function composerState(permissionLevel: number | null) {
-  const isReadOnly = permissionLevel === 1;
+  const isReadOnly = !isEditorLevel(permissionLevel);
   const canType = !isReadOnly;
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
@@ -63,6 +63,13 @@ describe("Composer permission gating", () => {
     const state = composerState(1);
     expect(state.isReadOnly).toBe(true);
     expect(state.canType).toBe(false);
+    expect(state.canSubmit).toBe(false);
+  });
+
+  it("comment (level 5) disables textarea and submit", () => {
+    // Comment-only collaborators may review but never message the agent.
+    const state = composerState(5);
+    expect(state.isReadOnly).toBe(true);
     expect(state.canSubmit).toBe(false);
   });
 
@@ -253,7 +260,8 @@ describe("Warm terminal-surface LRU", () => {
 
 // Share button visibility logic (mirrored from AppShell)
 function shareButtonState(permissionLevel: number | null) {
-  const canManage = permissionLevel === null || permissionLevel >= 3;
+  // Membership, not `>=`: COMMENT (5) is numerically above OWNER but below EDIT.
+  const canManage = permissionLevel === null || permissionLevel === 3 || permissionLevel === 4;
   return { canManage };
 }
 
@@ -272,6 +280,10 @@ describe("Share button permission gating", () => {
 
   it("disabled for read (level 1)", () => {
     expect(shareButtonState(1).canManage).toBe(false);
+  });
+
+  it("disabled for comment (level 5)", () => {
+    expect(shareButtonState(5).canManage).toBe(false);
   });
 
   it("enabled when null (no auth)", () => {
@@ -297,7 +309,7 @@ function activeTurnComposerState({
   disabled = false,
   permissionLevel = null,
 }: ActiveTurnComposerStateInput) {
-  const isReadOnly = permissionLevel === 1;
+  const isReadOnly = !isEditorLevel(permissionLevel);
   const hasDraft = value.trim().length > 0 || fileCount > 0;
   const showInterruptButton = isWorking && !hasDraft;
   const submitDisabled = showInterruptButton ? isReadOnly : !hasDraft || disabled || isReadOnly;
@@ -1832,6 +1844,7 @@ describe("routing eligibility gates", () => {
       enabled_connections: [],
       sharing_mode: "on",
       public_sharing_enabled: true,
+      comment_sharing_enabled: false,
       server_version: null,
       smart_routing_enabled: smartRouting,
       smart_routing_sources: sources ?? { external: smartRouting, oss: smartRouting },

@@ -83,7 +83,7 @@ interface RenderOpts {
     sel: { start_index: number; end_index: number; anchor_content: string } | null,
   ) => void;
   pendingBodyRef?: RefObject<string>;
-  canEdit?: boolean;
+  canComment?: boolean;
 }
 
 function renderPlugin(opts: RenderOpts = {}) {
@@ -98,7 +98,7 @@ function renderPlugin(opts: RenderOpts = {}) {
       activeSelection={opts.activeSelection ?? null}
       onSetActiveSelection={onSetActiveSelection}
       pendingBodyRef={opts.pendingBodyRef}
-      canEdit={opts.canEdit}
+      canComment={opts.canComment}
     />,
   );
   return { ...utils, onSetActiveSelection };
