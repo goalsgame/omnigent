@@ -323,6 +323,7 @@ def write_extension_files(
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
+    system_prompt: str | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -340,6 +341,7 @@ def write_extension_files(
         runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
         centralized server-side policy enforcement. ``None``/empty registers no
         tools (Pi falls back to its own built-in tool surface only).
+    :param system_prompt: Composed instructions appended to Pi’s own system prompt.
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -351,10 +353,26 @@ def write_extension_files(
         "inboxDir": str(bridge_dir / _INBOX_DIR),
         "authHeaders": auth_headers or {},
         "tools": tools or [],
+        "systemPrompt": system_prompt or "",
     }
     _atomic_json(config_path(bridge_dir), payload)
     _atomic_text(extension_path(bridge_dir), _extension_source())
     return extension_path(bridge_dir), config_path(bridge_dir)
+
+
+def refresh_config_system_prompt(bridge_dir: Path, system_prompt: str) -> None:
+    """Refresh composed instructions without changing tools or credentials.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param system_prompt: Current composed instructions; empty clears old text.
+    """
+    path = config_path(bridge_dir)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Pi extension config must be an object")
+    if payload.get("systemPrompt") != system_prompt:
+        payload["systemPrompt"] = system_prompt
+        _atomic_json(path, payload)
 
 
 def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:

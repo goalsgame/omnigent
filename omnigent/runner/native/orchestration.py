@@ -2496,6 +2496,11 @@ async def _auto_create_pi_terminal(
             _logger.warning(
                 "Failed to discover pi-native MCP tools for session %s", session_id, exc_info=True
             )
+    from omnigent.runtime.prompt import build_instructions_nullable
+
+    system_prompt = (
+        build_instructions_nullable(spec_for_mcp, None, []) if spec_for_mcp is not None else None
+    )
     _extension, config = write_extension_files(
         bridge_dir,
         session_id=session_id,
@@ -2503,6 +2508,7 @@ async def _auto_create_pi_terminal(
         conversation_url=conversation_url(launch_config.server_url, session_id),
         auth_headers=auth_headers,
         tools=pi_tools,
+        system_prompt=system_prompt,
     )
     pi_command = resolve_pi_executable()
     # Rebuild the local Pi session JSONL from committed Omnigent items so a

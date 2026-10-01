@@ -370,3 +370,10 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
 def test_kiro_native_is_not_delivered() -> None:
     caps = harness_capabilities()
     assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_native_pi_delivers_composed_instructions_each_turn() -> None:
+    assert (
+        harness_capabilities()["pi-native"].instruction_delivery
+        is InstructionDelivery.COMPOSED_PER_TURN
+    )
