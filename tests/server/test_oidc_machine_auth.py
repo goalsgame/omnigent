@@ -306,3 +306,22 @@ def test_non_https_issuer_rejected(oidc, machine_config):
             machine_config,
             dataclasses.replace(oidc, jwks_uri="http://identity.example.test/certs"),
         )
+
+
+def test_concurrent_first_requests_share_jwks_fetch(verifier, signing_key, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    token = signed_token(signing_key)
+    original = jwt.jwks_client.urllib.request.urlopen
+    calls = []
+
+    def delayed_fetch(*args, **kwargs):
+        calls.append(1)
+        time.sleep(0.02)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("jwt.jwks_client.urllib.request.urlopen", delayed_fetch)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        identities = list(executor.map(verifier.authenticate, [token] * 16))
+    assert identities == [PRINCIPAL] * 16
+    assert calls == [1]
