@@ -458,7 +458,7 @@ describe("ImportSessionsPanel import outcomes", () => {
     },
     {
       name: "old-server 400",
-      error: new ApiError("Wrong replica.", 400, "wrong_replica"),
+      error: new ApiError("Bad request.", 400, "invalid_input"),
       code: null,
       retryable: false,
       refreshesHosts: false,
@@ -570,8 +570,12 @@ describe("ImportSessionsPanel import outcomes", () => {
             "Your machine's Python was built without SQLite (`_sqlite3` is missing), so `omnigent host` can't read local sessions.",
           errorId: "err_sqlite",
           fixCommands: [
-            "brew install sqlite && pyenv install --force 3.12",
-            "sudo apt-get install libsqlite3-dev && pyenv install --force 3.12",
+            { label: "macOS", command: "brew install sqlite && pyenv install --force 3.12" },
+            {
+              label: "Linux",
+              command: "sudo apt-get install libsqlite3-dev && pyenv install --force 3.12",
+            },
+            { label: null, command: "omnigent host" },
           ],
         }),
       }),
@@ -580,6 +584,11 @@ describe("ImportSessionsPanel import outcomes", () => {
     expect(screen.getByTestId("import-fix-0-command")).toHaveTextContent(
       "brew install sqlite && pyenv install --force 3.12",
     );
+    // The label sits outside the code block, so Copy yields a runnable command.
+    expect(screen.getByTestId("import-fix-0-label")).toHaveTextContent("macOS");
+    expect(screen.getByTestId("import-fix-0-command")).not.toHaveTextContent("macOS");
+    expect(screen.getByTestId("import-fix-1-label")).toHaveTextContent("Linux");
+    expect(screen.queryByTestId("import-fix-2-label")).toBeNull();
     expect(screen.getByTestId("import-fix-1-command")).toHaveTextContent(
       "sudo apt-get install libsqlite3-dev && pyenv install --force 3.12",
     );
@@ -594,6 +603,75 @@ describe("ImportSessionsPanel import outcomes", () => {
     expect(details).not.toHaveAttribute("open");
     expect(details).toHaveTextContent("host_python_missing_sqlite");
     expect(details).toHaveTextContent("err_sqlite");
+  });
+
+  it("keeps the tally and banner when the machine goes offline mid-import", async () => {
+    let hostsData = [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }];
+    useHostsMock.mockImplementation(
+      () => ({ data: hostsData }) as unknown as ReturnType<typeof useHosts>,
+    );
+    importLocalSessionsMock.mockImplementation(async (_h, _s, _l, onSession) => {
+      onSession?.({ id: "c1", title: "One" });
+      // The hosts query refetches as the host drops (poll / host_offline refresh).
+      hostsData = [{ ...hostsData[0], status: "offline" }];
+      return result({
+        imported: 1,
+        sessions: [{ id: "c1", title: "One" }],
+        complete: false,
+        error: importError({
+          code: "host_disconnected",
+          message: "mac-laptop disconnected after 1 of 5 sessions.",
+          hostName: "mac-laptop",
+        }),
+      });
+    });
+    const { rerender } = renderPanel();
+    fireEvent.click(screen.getByTestId("import-submit"));
+    await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
+    rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ImportSessionsPanel />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("import-no-hosts")).toBeInTheDocument();
+    expect(screen.getByTestId("import-error-message")).toHaveTextContent(
+      "mac-laptop disconnected after 1 of 5 sessions.",
+    );
+    expect(screen.getByTestId("import-result")).toHaveTextContent("Imported 1");
+    expect(screen.getByTestId("import-result-link-c1")).toHaveTextContent("One");
+    // Nothing to re-run on until a machine is back; the notice says how.
+    expect(screen.queryByTestId("import-retry")).toBeNull();
+    expect(screen.queryByTestId("import-submit")).toBeNull();
+  });
+
+  it("shows only the offline notice when nothing was imported yet", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "offline" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    expect(screen.getByTestId("import-no-hosts")).toBeInTheDocument();
+    expect(screen.queryByTestId("import-outcome")).toBeNull();
+  });
+
+  it("names the machine when a wrong_replica outlives the re-address", async () => {
+    withOnlineHost();
+    importLocalSessionsMock.mockRejectedValue(
+      new ApiError("host is on another replica", 400, "wrong_replica"),
+    );
+    renderPanel();
+    fireEvent.click(screen.getByTestId("import-submit"));
+    await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
+    expect(screen.getByTestId("import-error-message")).toHaveTextContent(
+      "Couldn't reach “mac-laptop”'s connection. Try again in a few seconds.",
+    );
+    expect(screen.getByTestId("import-error")).toHaveAttribute(
+      "data-import-code",
+      "host_unreachable",
+    );
+    expect(screen.getByTestId("import-retry")).toHaveTextContent("Import again");
   });
 
   it("clears the previous error when the import is re-run", async () => {

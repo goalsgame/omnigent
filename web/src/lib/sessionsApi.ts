@@ -639,8 +639,16 @@ export interface ImportErrorInfo {
   retryable: boolean;
   errorId: string | null;
   /** Shell commands that fix the problem (e.g. rebuilding Python with SQLite). */
-  fixCommands: string[];
+  fixCommands: ImportFixCommand[];
   hostName: string | null;
+}
+
+/** One way to fix an import failure: when it applies, and what to paste into a shell. */
+export interface ImportFixCommand {
+  /** e.g. "macOS"; null from a server that sent bare strings. */
+  label: string | null;
+  /** Exactly what the copy button copies. */
+  command: string;
 }
 
 /** One `progress` event: sessions processed so far, out of `total` when known. */
@@ -697,33 +705,66 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
-function fixCommandsFrom(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((c): c is string => typeof c === "string" && c.trim().length > 0)
-    : [];
+/** `fix_commands` entries: `{label, command}` objects, or bare strings from older servers. */
+function fixCommandsFrom(value: unknown): ImportFixCommand[] {
+  if (!Array.isArray(value)) return [];
+  const fixes: ImportFixCommand[] = [];
+  for (const entry of value) {
+    if (typeof entry === "string") {
+      if (entry.trim().length > 0) fixes.push({ label: null, command: entry });
+    } else if (entry !== null && typeof entry === "object") {
+      const { label, command } = entry as Record<string, unknown>;
+      if (typeof command === "string" && command.trim().length > 0) {
+        fixes.push({ label: stringOrNull(label), command });
+      }
+    }
+  }
+  return fixes;
+}
+
+// "… Error ID: err_0123abcd." at the end of a message: older servers put the id
+// inline; the UI shows it under Details instead.
+const INLINE_ERROR_ID_RE = /\s*Error ID: (err_[0-9a-f]+)\.?$/;
+
+/** Split a trailing inline error id off `text`, keeping `errorId` when one was sent. */
+function splitInlineErrorId(
+  text: string,
+  errorId: string | null,
+): { text: string; errorId: string | null } {
+  const match = INLINE_ERROR_ID_RE.exec(text);
+  if (match === null || (errorId !== null && match[1] !== errorId)) return { text, errorId };
+  return { text: text.slice(0, match.index), errorId: match[1] };
 }
 
 /** Map one `failed`/`failures[]` wire record to an {@link ImportFailureRef}. */
 function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
   const code = stringOrNull(evt.code);
+  const { text: reason, errorId } = splitInlineErrorId(
+    typeof evt.reason === "string" ? evt.reason : "This session could not be imported.",
+    stringOrNull(evt.error_id),
+  );
   return {
     externalSessionId: typeof evt.external_session_id === "string" ? evt.external_session_id : null,
     source: typeof evt.source === "string" ? evt.source : null,
-    reason: typeof evt.reason === "string" ? evt.reason : "This session could not be imported.",
+    reason,
     code,
     retryable: typeof evt.retryable === "boolean" ? evt.retryable : importCodeIsRetryable(code),
-    errorId: stringOrNull(evt.error_id),
+    errorId,
   };
 }
 
 /** Map a stream `error` event to an {@link ImportErrorInfo}. */
 function importErrorFromEvent(evt: Record<string, unknown>): ImportErrorInfo {
   const code = stringOrNull(evt.code);
+  const { text: message, errorId } = splitInlineErrorId(
+    stringOrNull(evt.message) ?? "Import failed. Try again.",
+    stringOrNull(evt.error_id),
+  );
   return {
     code,
-    message: stringOrNull(evt.message) ?? "Import failed. Try again.",
+    message,
     retryable: typeof evt.retryable === "boolean" ? evt.retryable : importCodeIsRetryable(code),
-    errorId: stringOrNull(evt.error_id),
+    errorId,
     fixCommands: fixCommandsFrom(evt.fix_commands),
     hostName: stringOrNull(evt.host_name),
   };
@@ -745,30 +786,60 @@ function streamInterruptedError(processed: number): ImportErrorInfo {
   };
 }
 
+// Global error code of a host whose tunnel lives on another replica.
+const WRONG_REPLICA_ERROR_CODE = "wrong_replica";
+
 // HTTP statuses whose request can succeed as-is when re-sent, for an error from
 // a server that predates `import_code`/`retryable` (409 was its "host is offline").
 const LEGACY_RETRYABLE_STATUSES = new Set([408, 409, 429]);
 
+/** The friendly text for a host whose tunnel is on another replica. */
+function wrongReplicaMessage(hostName: string | null): string {
+  const whose = hostName !== null ? `“${hostName}”'s` : "your machine's";
+  return `Couldn't reach ${whose} connection. Try again in a few seconds.`;
+}
+
 /**
  * Describe whatever {@link importLocalSessions} threw (a pre-stream HTTP
  * {@link ApiError}, or an unexpected error) as an {@link ImportErrorInfo}, so
- * callers render every import failure the same way.
+ * callers render every import failure the same way. `hostName` names the
+ * machine for errors from servers that don't.
  */
-export function importErrorFromException(e: unknown): ImportErrorInfo {
+export function importErrorFromException(
+  e: unknown,
+  options: { hostName?: string | null } = {},
+): ImportErrorInfo {
   if (e instanceof ApiError) {
+    const hostName = stringOrNull(e.details.host_name) ?? options.hostName ?? null;
+    // A wrong_replica that survived the keyed/keyless re-address: the tunnel is
+    // moving between replicas. Older servers send only "host is on another replica".
+    if (e.code === WRONG_REPLICA_ERROR_CODE && e.importCode === null) {
+      return {
+        code: "host_unreachable",
+        message: wrongReplicaMessage(hostName),
+        retryable: true,
+        errorId: null,
+        fixCommands: [],
+        hostName,
+      };
+    }
     const code = e.importCode ?? (e.status === 422 ? "invalid_request" : null);
     const retryable =
       e.retryable ??
       (code !== null
         ? importCodeIsRetryable(code)
         : e.status >= 500 || LEGACY_RETRYABLE_STATUSES.has(e.status));
+    const { text: message, errorId } = splitInlineErrorId(
+      e.message,
+      stringOrNull(e.details.error_id),
+    );
     return {
       code,
-      message: e.message,
+      message,
       retryable,
-      errorId: stringOrNull(e.details.error_id),
+      errorId,
       fixCommands: fixCommandsFrom(e.details.fix_commands),
-      hostName: stringOrNull(e.details.host_name),
+      hostName,
     };
   }
   return {

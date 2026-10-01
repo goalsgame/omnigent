@@ -10,7 +10,7 @@ import logging
 import secrets
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 
@@ -24,6 +24,8 @@ from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    CAP_IMPORT_SKIP_KNOWN,
+    MAX_IMPORT_SKIP_IDS,
     HostImportLocalByIdFrame,
     HostImportLocalCancelFrame,
     HostImportLocalFrame,
@@ -262,6 +264,9 @@ class ImportFailureRef(BaseModel):
     # and whether re-running the import can succeed without user action.
     code: str = ImportErrorCode.SESSION_UNREADABLE
     retryable: bool = False
+    # Correlates an ``internal`` failure with the server log line; clients show
+    # it as a detail. ``None`` for every classified failure.
+    error_id: str | None = None
 
 
 class LocalImportResponse(BaseModel):
@@ -348,6 +353,47 @@ class ImportProgress:
 
     done: int
     total: int | None
+    # How many of ``done`` the host skipped unread because the server already
+    # has them (see ``skip_external_session_ids``).
+    skipped: int = 0
+
+
+# External ids an interrupted batch import already has, per (user, host): the
+# re-run that "run it again to continue" asks for passes them to the host so
+# it skips them unread instead of re-reading and re-sending every session (a
+# slow transcript read is what ran out the clock). There is no cheap store
+# query for "this user's imported ids for a source", so this remembers what
+# this server confirmed. Kept only between incomplete runs (dropped once a run
+# completes) and for a short TTL, so a session deleted meanwhile is skipped at
+# most until then; process-local, so another replica or a restart just reads
+# everything again (the server still dedupes).
+_CONTINUE_SKIP_TTL_S = 15 * 60
+_CONTINUE_SKIP_IDS: WorkspaceScopedCache[tuple[str | None, str], tuple[float, tuple[str, ...]]] = (
+    WorkspaceScopedCache()
+)
+
+
+def _continue_skip_ids(user_id: str | None, host_id: str) -> list[str]:
+    """Ids the last interrupted batch import from this host already has."""
+    entry = _CONTINUE_SKIP_IDS.get((user_id, host_id))
+    if entry is None:
+        return []
+    expires_at, ids = entry
+    if expires_at <= time.monotonic():
+        _CONTINUE_SKIP_IDS.pop((user_id, host_id), None)
+        return []
+    return list(ids)
+
+
+def _remember_continue_skip_ids(user_id: str | None, host_id: str, ids: Iterable[str]) -> None:
+    """Remember the newest ids an interrupted batch import has, for its re-run."""
+    now = time.monotonic()
+    for key, (expires_at, _ids) in _CONTINUE_SKIP_IDS.items():
+        if expires_at <= now:
+            _CONTINUE_SKIP_IDS.pop(key, None)
+    newest = list(dict.fromkeys(reversed(list(ids))))[:MAX_IMPORT_SKIP_IDS]
+    if newest:
+        _CONTINUE_SKIP_IDS[(user_id, host_id)] = (now + _CONTINUE_SKIP_TTL_S, tuple(newest))
 
 
 def _host_label(host: object) -> str:
@@ -384,7 +430,8 @@ def _host_offline_error(host: Host) -> LocalImportError:
     if isinstance(updated_at, int):
         last_seen = max(0, now_epoch() - updated_at)
         details["last_seen_seconds"] = last_seen
-        seen = f" (last seen {_ago(last_seen)} ago)"
+        # A host that dropped a moment ago reads better than "0 s ago".
+        seen = " (last seen just now)" if last_seen < 5 else f" (last seen {_ago(last_seen)} ago)"
     else:
         seen = ""
     status = getattr(host, "status", None)
@@ -405,6 +452,25 @@ def _host_offline_error(host: Host) -> LocalImportError:
     )
 
 
+def _host_wrong_replica_error(host: Host, absent: OmnigentError) -> LocalImportError:
+    """The 400 for a live host whose tunnel is on another replica.
+
+    Keeps the global ``wrong_replica`` code the client's keyless re-address
+    matches on; the import code and message are for when that retry also
+    lands elsewhere (the tunnel is moving between replicas).
+    """
+    name = getattr(host, "name", None)
+    has_name = isinstance(name, str) and bool(name.strip())
+    whose = f"“{name}”'s" if has_name else "your machine's"
+    return LocalImportError(
+        f"Couldn't reach {whose} connection. Try again in a few seconds.",
+        import_code=ImportErrorCode.HOST_UNREACHABLE,
+        code=absent.code,
+        http_status=absent.http_status,
+        details={"host_name": name} if has_name else None,
+    )
+
+
 async def _stream_local_sessions_from_host(
     *,
     host_registry: HostRegistry,
@@ -415,6 +481,7 @@ async def _stream_local_sessions_from_host(
     stats: dict[str, Any] | None = None,
     ping_interval_s: float | None = None,
     deadline_s: float | None = None,
+    skip_external_session_ids: Sequence[str] = (),
 ) -> AsyncIterator[dict[str, Any] | ImportProgress]:
     """Yield requested local sessions one at a time as they stream in.
 
@@ -430,6 +497,8 @@ async def _stream_local_sessions_from_host(
         fast with ``host_unreachable`` instead of being waited on.
     :param deadline_s: Whole-stream budget; defaults to
         :data:`_LOCAL_IMPORT_STREAM_DEADLINE_S`.
+    :param skip_external_session_ids: Sessions the server already has; sent to
+        a host that advertises :data:`CAP_IMPORT_SKIP_KNOWN` with a batch request.
     :raises LocalImportError: If the host is unreachable, disconnects, stops
         responding, or the deadline passes.
     :raises OmnigentError: If the host reports a read failure.
@@ -460,6 +529,12 @@ async def _stream_local_sessions_from_host(
             limit=limit,
             allow_session_chunks=True,
             progress=True,
+            skip_external_session_ids=(
+                list(skip_external_session_ids)
+                if CAP_IMPORT_SKIP_KNOWN
+                in getattr(getattr(host_conn, "hello", None), "capabilities", ())
+                else []
+            ),
         )
     )
     frame = encode_host_frame(request_frame)
@@ -481,19 +556,19 @@ async def _stream_local_sessions_from_host(
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise LocalImportError(
-                    "local import reached its time limit",
-                    import_code=ImportErrorCode.TIME_LIMIT_REACHED,
-                    code=ErrorCode.INTERNAL_ERROR,
-                    http_status=503,
-                )
+                raise _time_limit_error()
+            # One wait bounded by whichever ends first. Which bound ended it is
+            # decided here, not by re-reading the clock afterwards: an event
+            # loop with a coarse clock (uvloop's is in ms) can fire the timer a
+            # hair before the deadline, which read as a silent host.
+            deadline_bound = remaining <= frame_timeout
             try:
                 kind, data = await asyncio.wait_for(
-                    queue.get(), timeout=min(frame_timeout, remaining)
+                    queue.get(), timeout=remaining if deadline_bound else frame_timeout
                 )
             except asyncio.TimeoutError as exc:
-                if time.monotonic() >= deadline:
-                    continue  # reported as the time limit at the loop head
+                if deadline_bound:
+                    raise _time_limit_error() from exc
                 raise LocalImportError(
                     f"host '{host_conn.host_id}' stalled mid-import "
                     f"(no session within {frame_timeout:.0f}s)",
@@ -512,8 +587,11 @@ async def _stream_local_sessions_from_host(
                 if isinstance(done, int):
                     frame_timeout = _HOST_IMPORT_HEARTBEAT_TIMEOUT_S
                     total = data.get("total")
+                    skipped = data.get("skipped")
                     yield ImportProgress(
-                        done=done, total=total if isinstance(total, int) else None
+                        done=done,
+                        total=total if isinstance(total, int) else None,
+                        skipped=skipped if isinstance(skipped, int) else 0,
                     )
                 continue
             if kind == "session":
@@ -536,6 +614,7 @@ async def _stream_local_sessions_from_host(
             # explain each failure.
             if stats is not None:
                 stats["host_failed"] = int(data.get("failed") or 0)
+                stats["host_skipped"] = int(data.get("skipped") or 0)
                 raw_failures = data.get("failures")
                 stats["host_failures"] = (
                     [entry for entry in raw_failures if isinstance(entry, dict)]
@@ -554,6 +633,16 @@ async def _stream_local_sessions_from_host(
                 )
 
 
+def _time_limit_error() -> LocalImportError:
+    """The stream deadline passed; the caller restates it with the batch's progress."""
+    return LocalImportError(
+        "local import reached its time limit",
+        import_code=ImportErrorCode.TIME_LIMIT_REACHED,
+        code=ErrorCode.INTERNAL_ERROR,
+        http_status=503,
+    )
+
+
 def _interrupted_import_error(
     exc: LocalImportError,
     *,
@@ -561,6 +650,7 @@ def _interrupted_import_error(
     processed: int,
     imported: int,
     total: int | None,
+    already_imported: int = 0,
 ) -> LocalImportError:
     """Restate a host-liveness failure with the machine's name and the batch's progress.
 
@@ -593,7 +683,9 @@ def _interrupted_import_error(
             "online and `omnigent host` is running, then try again."
         )
     elif code == ImportErrorCode.TIME_LIMIT_REACHED:
-        count = f"{imported}{of_total}" if total is not None else f"{imported} session(s)"
+        # Sessions already there count: the re-run continues from all of them.
+        have = imported + already_imported
+        count = f"{have}{of_total}" if total is not None else f"{have} session(s)"
         message = (
             f"Imported {count} before the time limit — run it again to continue; "
             "already imported sessions are skipped."
@@ -734,9 +826,11 @@ def _rollback_import_in_background(
     task.add_done_callback(_PENDING_ROLLBACKS.discard)
 
 
-_SESSION_SAVE_FAILED_MESSAGE = (
-    "This session couldn't be saved because of an internal error. Try again; if it "
-    "keeps happening, contact an administrator."
+# The ``internal`` text for one session; the error id travels as ``error_id``
+# (clients show it as a detail), never inline.
+_SESSION_INTERNAL_ERROR_MESSAGE = (
+    "Import stopped because of an internal error. Try again; if it keeps happening, "
+    "contact an administrator."
 )
 
 
@@ -760,25 +854,12 @@ def _classify_store_error(
     return classified if isinstance(classified, LocalImportError) else None
 
 
-def _session_failure_for(
-    conversation_store: ConversationStore, exc: BaseException
-) -> tuple[str, str]:
-    """``(import code, user message)`` for an unexpected per-session failure.
+def _internal_session_error(exc: BaseException) -> LocalImportError:
+    """The ``internal`` failure for one session, logged under a fresh error id.
 
-    A store-classified error carries its own actionable message. Anything else
-    is logged with an error id (the traceback may hold paths or payload
-    fragments) and reported generically with that id.
+    The traceback may hold paths or payload fragments, so the client gets the
+    generic message and the id that finds this log line.
     """
-    classified = _classify_store_error(conversation_store, exc)
-    if classified is not None:
-        _logger.warning(
-            "Imported session failed (%s): %s",
-            classified.import_code,
-            classified.message,
-            exc_info=exc,
-            extra={"import_code": classified.import_code},
-        )
-        return classified.import_code, classified.message
     error_id = f"err_{secrets.token_hex(16)}"
     _logger.error(
         "Imported session failed unexpectedly; error_id=%s",
@@ -786,7 +867,33 @@ def _session_failure_for(
         exc_info=exc,
         extra={"error_id": error_id, "import_code": ImportErrorCode.INTERNAL},
     )
-    return ImportErrorCode.INTERNAL, f"{_SESSION_SAVE_FAILED_MESSAGE} Error ID: {error_id}."
+    return LocalImportError(
+        _SESSION_INTERNAL_ERROR_MESSAGE,
+        import_code=ImportErrorCode.INTERNAL,
+        code=ErrorCode.INTERNAL_ERROR,
+        details={"error_id": error_id},
+    )
+
+
+def _session_store_error(
+    conversation_store: ConversationStore, exc: BaseException
+) -> LocalImportError:
+    """The classified failure for a non-Omnigent error persisting one session.
+
+    A store-classified error carries its own actionable message; anything else
+    is :func:`_internal_session_error`.
+    """
+    classified = _classify_store_error(conversation_store, exc)
+    if classified is None:
+        return _internal_session_error(exc)
+    _logger.warning(
+        "Imported session failed (%s): %s",
+        classified.import_code,
+        classified.message,
+        exc_info=exc,
+        extra={"import_code": classified.import_code},
+    )
+    return classified
 
 
 def create_imports_router(
@@ -1049,25 +1156,20 @@ def create_imports_router(
                 host_id=body.host_id,
             )
         except OmnigentError:
+            # Already a deliberate response (e.g. an unknown project).
             raise
         except Exception as exc:
             # A storage failure the backend recognizes (oversized item, save
             # timeout, encryption key unavailable) gets its status and message;
-            # anything else stays the global handler's generic 500.
-            classified = _classify_store_error(conversation_store, exc)
+            # anything else is `internal` with the id of its log line, instead
+            # of a generic 500 nobody can trace.
+            failure = _session_store_error(conversation_store, exc)
+            error_id = failure.details.get("error_id")
             add_audit_attrs(
-                import_code=classified.import_code if classified else ImportErrorCode.INTERNAL
+                import_code=failure.import_code,
+                error_id=error_id if isinstance(error_id, str) else None,
             )
-            if classified is None:
-                raise
-            _logger.warning(
-                "Session import failed (%s): %s",
-                classified.import_code,
-                classified.message,
-                exc_info=exc,
-                extra={"import_code": classified.import_code},
-            )
-            raise classified from exc
+            raise failure from exc
 
         response.status_code = 201
         return ImportSessionResponse(
@@ -1102,6 +1204,8 @@ def create_imports_router(
             absent = host_absent_error(host)
             if absent.code == ErrorCode.CONFLICT:
                 raise _host_offline_error(host)
+            if absent.code == ErrorCode.WRONG_REPLICA:
+                raise _host_wrong_replica_error(host, absent)
             raise absent
         return user_id, host_conn, host
 
@@ -1140,12 +1244,29 @@ def create_imports_router(
         # send no frame) and the batch size, from heartbeats and session frames.
         host_done = 0
         total: int | None = None
+        # Sessions the host skipped unread because an interrupted run already
+        # has them: already imported, folded into the tally as they're reported.
+        host_skipped = 0
+        # Keyed by the registry's canonical id, whatever spelling the client used.
+        skip_ids = (
+            _continue_skip_ids(user_id, host_conn.host_id) if body.session_id is None else []
+        )
+        # External ids this run confirmed are in the store (imported or
+        # already there), remembered if the run stops early.
+        confirmed: list[str] = []
+
+        def _note_skipped(reported: int) -> None:
+            nonlocal host_skipped
+            if reported > host_skipped:
+                counts["already_imported"] += reported - host_skipped
+                host_skipped = reported
 
         def _fail(
             external_session_id: object,
             source: object,
             reason: str,
             code: str = ImportErrorCode.SESSION_UNREADABLE,
+            error_id: str | None = None,
         ) -> None:
             counts["failed"] += 1
             failures.append(
@@ -1157,6 +1278,7 @@ def create_imports_router(
                     reason=reason,
                     code=code,
                     retryable=import_code_is_retryable(code),
+                    error_id=error_id,
                 )
             )
 
@@ -1207,6 +1329,7 @@ def create_imports_router(
                     existing = None
                 if existing is not None:
                     counts["already_imported"] += 1
+                    confirmed.append(external_session_id)
                     return None
                 items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
                 workspace = session.get("workspace")
@@ -1229,6 +1352,7 @@ def create_imports_router(
                     or exc.import_code == ImportErrorCode.ALREADY_IMPORTED
                 ):
                     counts["already_imported"] += 1
+                    confirmed.append(external_session_id)
                     return None
                 if isinstance(exc, LocalImportError):
                     code = exc.import_code
@@ -1245,10 +1369,18 @@ def create_imports_router(
                 # Storage errors (gRPC, DB driver, encryption) are not
                 # OmnigentErrors. Left uncaught they ended the whole stream
                 # mid-body, which the browser saw as a bare "network error".
-                code, reason = _session_failure_for(conversation_store, exc)
-                _fail(external_session_id, source, reason, code)
+                failure = _session_store_error(conversation_store, exc)
+                error_id = failure.details.get("error_id")
+                _fail(
+                    external_session_id,
+                    source,
+                    failure.message,
+                    failure.import_code,
+                    error_id if isinstance(error_id, str) else None,
+                )
                 return None
             counts["imported"] += 1
+            confirmed.append(external_session_id)
             return ImportedSessionRef(session_id=session_id, title=title)
 
         # Set by the stream to the sessions the host couldn't read (no frame
@@ -1264,8 +1396,10 @@ def create_imports_router(
                 session_id=body.session_id,
                 stats=stats,
                 ping_interval_s=ping_interval_s,
+                skip_external_session_ids=skip_ids,
             ):
                 if isinstance(session, ImportProgress):
+                    _note_skipped(session.skipped)
                     host_done = max(host_done, session.done)
                     total = session.total if session.total is not None else total
                     if total is not None:
@@ -1281,9 +1415,20 @@ def create_imports_router(
                     yield ref
                 yield ImportProgress(done=max(_processed(), host_done), total=total)
         except LocalImportError as exc:
+            if body.session_id is None:
+                _remember_continue_skip_ids(user_id, host_conn.host_id, [*skip_ids, *confirmed])
             raise _interrupted_import_error(
-                exc, host=host, processed=_processed(), imported=counts["imported"], total=total
+                exc,
+                host=host,
+                processed=_processed(),
+                imported=counts["imported"],
+                already_imported=counts["already_imported"],
+                total=total,
             ) from exc
+        _note_skipped(int(stats.get("host_skipped", 0)))
+        if body.session_id is None:
+            # Ran to the end: nothing left to continue.
+            _CONTINUE_SKIP_IDS.pop((user_id, host_conn.host_id), None)
         # Fold in sessions the host enumerated but couldn't read. Newer hosts send
         # a per-session reason; older hosts send only a count, so synthesize a
         # generic reason for each so ``failed`` still equals ``len(failures)``.
@@ -1419,6 +1564,7 @@ def create_imports_router(
             failures: list[ImportFailureRef] = []
             error: _ImportFailureReport | None = None
             started_at = time.monotonic()
+            last_progress: tuple[int, int | None] | None = None
             try:
                 async for event in _import_local_core(
                     body,
@@ -1430,9 +1576,12 @@ def create_imports_router(
                     ping_interval_s=PING_INTERVAL_S,
                 ):
                     if isinstance(event, ImportProgress):
-                        yield _import_event_line(
-                            {"event": "progress", "done": event.done, "total": event.total}
-                        )
+                        # Heartbeats and per-session updates often repeat a count.
+                        if (event.done, event.total) != last_progress:
+                            last_progress = (event.done, event.total)
+                            yield _import_event_line(
+                                {"event": "progress", "done": event.done, "total": event.total}
+                            )
                         continue
                     yield _import_event_line(
                         {"event": "session", "session_id": event.session_id, "title": event.title}

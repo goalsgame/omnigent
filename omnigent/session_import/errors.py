@@ -73,10 +73,18 @@ MISSING_SQLITE_MESSAGE = (
     "support and restart `omnigent host`."
 )
 
-# Rendered as code blocks by the UI and indented lines by the CLI.
-MISSING_SQLITE_FIX_COMMANDS: tuple[str, ...] = (
-    "macOS: brew install sqlite && pyenv install --force 3.12  (or use the python.org installer)",
-    "Linux: sudo apt-get install libsqlite3-dev && pyenv install --force 3.12",
+# ``fix_commands`` entries: ``label`` says when it applies, ``command`` is
+# exactly what to paste into a shell (the UI's copy button copies only that; the
+# CLI prints "label: command").
+MISSING_SQLITE_FIX_COMMANDS: tuple[Mapping[str, str], ...] = (
+    {
+        "label": "macOS (or reinstall Python from python.org)",
+        "command": "brew install sqlite && pyenv install --force 3.12",
+    },
+    {
+        "label": "Linux",
+        "command": "sudo apt-get install libsqlite3-dev && pyenv install --force 3.12",
+    },
 )
 
 
@@ -98,7 +106,7 @@ def missing_sqlite_error() -> LocalImportError:
         import_code=ImportErrorCode.HOST_PYTHON_MISSING_SQLITE,
         # 409 like host_offline: the host's state, not the request, is at fault.
         code=ErrorCode.CONFLICT,
-        details={"fix_commands": list(MISSING_SQLITE_FIX_COMMANDS)},
+        details={"fix_commands": [dict(fix) for fix in MISSING_SQLITE_FIX_COMMANDS]},
     )
 
 

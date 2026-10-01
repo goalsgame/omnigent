@@ -62,6 +62,12 @@ class _ClassifyingStore(FakeConversationStore):
         return None
 
 
+_INTERNAL_MESSAGE = (
+    "Import stopped because of an internal error. Try again; if it keeps happening, "
+    "contact an administrator."
+)
+
+
 def _failed(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [e for e in events if e["event"] == "failed"]
 
@@ -101,10 +107,12 @@ async def test_unclassified_storage_error_fails_one_session(
     assert failed["external_session_id"] == "s1"
     assert failed["code"] == ImportErrorCode.INTERNAL
     assert failed["retryable"] is True
-    assert "Error ID: err_" in failed["reason"]
+    assert failed["reason"] == _INTERNAL_MESSAGE
+    # The id is its own field, not part of the reason.
+    error_id = failed["error_id"]
+    assert error_id.startswith("err_")
     assert "/secret/path" not in str(events)
     # The raw text and the error id land in the server log only.
-    error_id = failed["reason"].split("Error ID: ")[1].rstrip(".")
     assert error_id in caplog.text
     assert "/secret/path" in caplog.text
     assert not [e for e in events if e["event"] == "error"]
@@ -316,7 +324,7 @@ async def test_host_missing_sqlite_whole_import_is_actionable(
         assert events[-1]["complete"] is False
     assert error["retryable"] is False
     assert error["message"] == MISSING_SQLITE_MESSAGE
-    assert error["fix_commands"] == list(MISSING_SQLITE_FIX_COMMANDS)
+    assert error["fix_commands"] == [dict(fix) for fix in MISSING_SQLITE_FIX_COMMANDS]
 
 
 @pytest.mark.parametrize(
@@ -346,15 +354,28 @@ async def test_cli_import_returns_classified_status(
     assert store.conversations == {}
 
 
-async def test_cli_import_unclassified_error_stays_a_500() -> None:
-    """An error the store doesn't recognize keeps the generic 500."""
+async def test_cli_import_unclassified_error_is_internal_with_an_error_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An error the store doesn't recognize is a 500 internal whose id is in the server log."""
     store = _ClassifyingStore()
 
     def on_append(_conversation_id: str, _items: list[Any]) -> None:
-        raise RuntimeError("unrecognized")
+        raise RuntimeError("db exploded at /secret/path")
 
     store.on_append = on_append
-    assert (await _post_cli(store)).status_code == 500
+    with caplog.at_level(logging.ERROR, logger=imports_module.__name__):
+        response = await _post_cli(store)
+    assert response.status_code == 500
+    error = response.json()["error"]
+    assert error["code"] == ErrorCode.INTERNAL_ERROR
+    assert (error["import_code"], error["retryable"]) == (ImportErrorCode.INTERNAL, True)
+    assert error["message"] == _INTERNAL_MESSAGE
+    assert error["error_id"].startswith("err_")
+    assert error["error_id"] in caplog.text
+    assert "/secret/path" not in response.text
+    # Rolled back like any failed persist.
+    assert store.conversations == {}
 
 
 def test_classified_error_keeps_the_global_code() -> None:

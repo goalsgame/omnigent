@@ -26,6 +26,7 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import OmnigentError
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     HostHelloFrame,
     HostImportLocalByIdFrame,
     HostImportLocalCancelFrame,
@@ -169,9 +170,11 @@ def host_record(*, name: str = "laptop", age_s: int = 0, status: str = "online")
     )
 
 
-def make_hello(name: str = "laptop") -> HostHelloFrame:
+def make_hello(name: str = "laptop", capabilities: list[str] | None = None) -> HostHelloFrame:
     """A minimal hello frame for registering a host connection."""
-    return HostHelloFrame(version="0", frame_protocol_version=1, name=name)
+    return HostHelloFrame(
+        version="0", frame_protocol_version=1, name=name, capabilities=list(capabilities or [])
+    )
 
 
 def register_host(registry: HostRegistry, name: str = "laptop") -> HostConnection:
@@ -236,8 +239,8 @@ class TunnelPair:
     """A registered host connection whose far end is a real ``HostProcess``.
 
     ``legacy_host=True`` simulates a host build that predates import
-    heartbeats: it ignores the request's ``progress`` flag and drops the
-    cancel frame like any unknown kind.
+    heartbeats and skip lists: it advertises no capabilities, ignores the
+    request's ``progress`` flag and skip list, and drops the cancel frame.
     """
 
     def __init__(self, *, host_name: str = "laptop", legacy_host: bool = False) -> None:
@@ -247,7 +250,7 @@ class TunnelPair:
         self.conn = self.registry.register(
             HOST_ID,
             ws=cast(Any, self.server_ws),
-            hello=make_hello(host_name),
+            hello=make_hello(host_name, [] if legacy_host else HOST_CAPABILITIES),
             owner=None,
             workspace_id=0,
         )
@@ -300,6 +303,8 @@ class TunnelPair:
         if not isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             return  # an older host drops every frame kind it doesn't know
         legacy = dataclasses.replace(frame, progress=False)
+        if isinstance(legacy, HostImportLocalFrame):
+            legacy = dataclasses.replace(legacy, skip_external_session_ids=[])
         task = asyncio.create_task(self.host._handle_import_local(cast(Any, self.host_ws), legacy))
         self.host._frame_tasks.add(cast(Any, task))
         task.add_done_callback(self.host._frame_tasks.discard)

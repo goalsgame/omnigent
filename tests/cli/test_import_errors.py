@@ -14,6 +14,7 @@ import respx
 from click.testing import CliRunner, Result
 
 from omnigent.cli import cli
+from omnigent.cli_diagnostics import suppresses_recovery_hint
 from omnigent.session_import.errors import ImportErrorCode
 
 _BASE = "http://localhost:6767"
@@ -123,8 +124,9 @@ def test_fix_commands_are_printed_indented(home: Path) -> None:
             import_code=ImportErrorCode.HOST_PYTHON_MISSING_SQLITE,
             retryable=False,
             fix_commands=[
-                "macOS: brew install sqlite",
-                "Linux: sudo apt-get install libsqlite3-dev",
+                {"label": "macOS", "command": "brew install sqlite"},
+                {"label": "Linux", "command": "sudo apt-get install libsqlite3-dev"},
+                {"label": "no command"},
             ],
         )
     }
@@ -133,6 +135,42 @@ def test_fix_commands_are_printed_indented(home: Path) -> None:
     assert "Python was built without SQLite" in result.output
     assert "\n    macOS: brew install sqlite\n" in result.output
     assert "\n    Linux: sudo apt-get install libsqlite3-dev" in result.output
+    # An entry without a command has nothing to paste, so it is dropped.
+    assert "no command" not in result.output
+
+
+def test_plain_string_fix_commands_from_older_servers_still_print(home: Path) -> None:
+    """Older servers' plain-string fix commands print as-is."""
+    replies = {
+        _IDS[0]: _error(
+            409,
+            message="No SQLite.",
+            import_code=ImportErrorCode.HOST_PYTHON_MISSING_SQLITE,
+            fix_commands=["macOS: brew install sqlite"],
+        )
+    }
+    result = _run(home, replies, "--session", _IDS[0])
+    assert "\n    macOS: brew install sqlite" in result.output
+
+
+def test_internal_failure_shows_its_error_id(home: Path) -> None:
+    """An internal failure prints the server's error id after its message."""
+    replies = {
+        _IDS[0]: _error(
+            500,
+            code="internal_error",
+            message="Import stopped because of an internal error. Try again.",
+            import_code=ImportErrorCode.INTERNAL,
+            retryable=True,
+            error_id="err_0123",
+        )
+    }
+    result = _run(home, replies, "--session", _IDS[0])
+    assert result.exit_code == 1, result.output
+    assert (
+        "Import failed (500): Import stopped because of an internal error. Try again. "
+        "(error ID: err_0123)"
+    ) in result.output
 
 
 def test_batch_prints_fix_commands_under_the_failure(home: Path) -> None:
@@ -285,3 +323,64 @@ def test_unreadable_detail_falls_back_to_the_body(home: Path) -> None:
     result = _run(home, replies, "--session", _IDS[0])
     assert result.exit_code == 1
     assert 'Import failed (422): {"detail"' in result.output
+
+
+def _raised(home: Path, replies: dict[str, httpx.Response], *args: str) -> BaseException:
+    """The exception ``omnigent import`` raises (not rendered by Click)."""
+    with respx.mock:
+        respx.post(f"{_BASE}/v1/imports").mock(
+            side_effect=lambda request: replies.get(
+                json.loads(request.content)["external_session_id"], _imported()
+            )
+        )
+        with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+            result = CliRunner().invoke(
+                cli,
+                ["import", "--harness", "claude", *args],
+                env={"HOME": str(home)},
+                standalone_mode=False,
+            )
+    assert result.exception is not None, result.output
+    return result.exception
+
+
+_NOT_HOST_FAILURES = [
+    _error(413, message="no", import_code=ImportErrorCode.SESSION_TOO_LARGE),
+    _error(503, message="no", import_code=ImportErrorCode.ENCRYPTION_UNAVAILABLE),
+    _error(500, message="no", import_code=ImportErrorCode.INTERNAL),
+    httpx.Response(422, json={"detail": [{"loc": ["body", "items"], "msg": "too many"}]}),
+]
+
+
+@pytest.mark.parametrize("reply", _NOT_HOST_FAILURES, ids=["413", "503", "500", "422"])
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+def test_non_host_failures_get_no_stale_host_hint(
+    home: Path, reply: httpx.Response, batch: bool
+) -> None:
+    """Storage and validation failures don't get the ``omnigent stop`` hint."""
+    target = _IDS[2] if batch else _IDS[0]
+    args = ("--last", "1") if batch else ("--session", _IDS[0])
+    assert suppresses_recovery_hint(_raised(home, {target: reply}, *args))
+
+
+def test_missing_local_session_gets_no_stale_host_hint(home: Path) -> None:
+    """A session id with no local transcript doesn't get the stale-host hint."""
+    assert suppresses_recovery_hint(_raised(home, {}, "--session", "no-such-session"))
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _error(409, message="no", import_code=ImportErrorCode.HOST_OFFLINE),
+        _error(401, message="no"),
+    ],
+    ids=["host-offline", "401"],
+)
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+def test_host_tunnel_failures_keep_the_stale_host_hint(
+    home: Path, reply: httpx.Response, batch: bool
+) -> None:
+    """Host-tunnel failures and 401s keep the ``omnigent stop`` hint."""
+    target = _IDS[2] if batch else _IDS[0]
+    args = ("--last", "1") if batch else ("--session", _IDS[0])
+    assert not suppresses_recovery_hint(_raised(home, {target: reply}, *args))

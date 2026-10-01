@@ -1960,7 +1960,14 @@ describe("importLocalSessions", () => {
           message: "Your machine's Python was built without SQLite.",
           code: "host_python_missing_sqlite",
           retryable: false,
-          fix_commands: ["brew install sqlite && pyenv install --force 3.12", 7, ""],
+          fix_commands: [
+            { label: "macOS", command: "brew install sqlite && pyenv install --force 3.12" },
+            "sudo apt-get install libsqlite3-dev",
+            { label: "no command" },
+            { label: "blank", command: " " },
+            7,
+            "",
+          ],
         }),
         JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 0 }),
       ]),
@@ -1971,8 +1978,68 @@ describe("importLocalSessions", () => {
     expect(result.error).toMatchObject({
       code: "host_python_missing_sqlite",
       retryable: false,
-      // Non-string / blank entries are dropped rather than rendered.
-      fixCommands: ["brew install sqlite && pyenv install --force 3.12"],
+      // {label, command} entries; an older server's bare strings have no label;
+      // entries without a command are dropped rather than rendered.
+      fixCommands: [
+        { label: "macOS", command: "brew install sqlite && pyenv install --force 3.12" },
+        { label: null, command: "sudo apt-get install libsqlite3-dev" },
+      ],
+    });
+  });
+
+  it("moves an inline error id out of the reason and message", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "failed",
+          external_session_id: "s1",
+          source: "claude",
+          reason:
+            "This session couldn't be saved because of an internal error. Error ID: err_0a1b.",
+          code: "internal",
+          retryable: true,
+        }),
+        JSON.stringify({
+          event: "error",
+          error_id: "err_ffee",
+          message: "The local session import stopped unexpectedly. Error ID: err_ffee.",
+          code: "internal",
+          retryable: true,
+        }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 1 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failures[0]).toMatchObject({
+      reason: "This session couldn't be saved because of an internal error.",
+      errorId: "err_0a1b",
+    });
+    expect(result.error).toMatchObject({
+      message: "The local session import stopped unexpectedly.",
+      errorId: "err_ffee",
+    });
+  });
+
+  it("keeps a reason whose trailing id differs from the error_id field", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "failed",
+          reason: "Failed. Error ID: err_aaaa.",
+          error_id: "err_bbbb",
+          code: "internal",
+        }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 1 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failures[0]).toMatchObject({
+      reason: "Failed. Error ID: err_aaaa.",
+      errorId: "err_bbbb",
     });
   });
 
@@ -2311,7 +2378,7 @@ describe("importErrorFromException", () => {
           import_code: "internal",
           retryable: true,
           error_id: "err_123",
-          fix_commands: ["omnigent host"],
+          fix_commands: [{ label: "Restart the host", command: "omnigent host" }],
         },
       },
       500,
@@ -2320,7 +2387,44 @@ describe("importErrorFromException", () => {
       code: "internal",
       retryable: true,
       errorId: "err_123",
-      fixCommands: ["omnigent host"],
+      fixCommands: [{ label: "Restart the host", command: "omnigent host" }],
+    });
+  });
+
+  it("gives a wrong_replica from an older server a readable message", async () => {
+    const err = await apiError(
+      { error: { code: "wrong_replica", message: "host is on another replica" } },
+      400,
+    );
+    expect(importErrorFromException(err, { hostName: "studio-mac" })).toMatchObject({
+      code: "host_unreachable",
+      retryable: true,
+      message: "Couldn't reach “studio-mac”'s connection. Try again in a few seconds.",
+      hostName: "studio-mac",
+    });
+    expect(importErrorFromException(err).message).toBe(
+      "Couldn't reach your machine's connection. Try again in a few seconds.",
+    );
+  });
+
+  it("uses a newer server's wrong_replica message and import code", async () => {
+    const err = await apiError(
+      {
+        error: {
+          code: "wrong_replica",
+          message: "Couldn't reach “laptop”'s connection. Try again in a few seconds.",
+          import_code: "host_unreachable",
+          retryable: true,
+          host_name: "laptop",
+        },
+      },
+      400,
+    );
+    expect(importErrorFromException(err, { hostName: "other" })).toMatchObject({
+      code: "host_unreachable",
+      retryable: true,
+      message: "Couldn't reach “laptop”'s connection. Try again in a few seconds.",
+      hostName: "laptop",
     });
   });
 

@@ -16,6 +16,9 @@ import pytest
 
 from omnigent.host import connect as host_connect
 from omnigent.host.frames import (
+    CAP_IMPORT_SKIP_KNOWN,
+    HOST_CAPABILITIES,
+    MAX_IMPORT_SKIP_IDS,
     HostImportLocalByIdFrame,
     HostImportLocalCancelFrame,
     HostImportLocalDoneFrame,
@@ -26,6 +29,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.session_import import local as local_import
 from omnigent.session_import.errors import (
     MISSING_SQLITE_FIX_COMMANDS,
     MISSING_SQLITE_MESSAGE,
@@ -261,11 +265,20 @@ async def test_host_logs_start_and_finish_with_counts(
 
 
 def test_missing_sqlite_message_is_actionable_and_short() -> None:
-    """The missing-SQLite message names the module and comes with per-OS fix commands."""
+    """The missing-SQLite message names the module and comes with pasteable per-OS fixes."""
     assert len(MISSING_SQLITE_MESSAGE) < 450
     assert "_sqlite3" in MISSING_SQLITE_MESSAGE
     assert "omnigent host" in MISSING_SQLITE_MESSAGE
-    assert [cmd.split(":")[0] for cmd in MISSING_SQLITE_FIX_COMMANDS] == ["macOS", "Linux"]
+    labels = [fix["label"] for fix in MISSING_SQLITE_FIX_COMMANDS]
+    assert labels[0].startswith("macOS")
+    assert labels[1] == "Linux"
+    # Each command is pasteable as-is: no label or prose inside it.
+    for fix in MISSING_SQLITE_FIX_COMMANDS:
+        assert ":" not in fix["command"]
+        assert "(" not in fix["command"]
+    assert MISSING_SQLITE_FIX_COMMANDS[0]["command"] == (
+        "brew install sqlite && pyenv install --force 3.12"
+    )
 
 
 @pytest.mark.parametrize(
@@ -308,3 +321,88 @@ def test_host_import_modules_load_without_sqlite(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr[-4000:]
     assert result.stdout.strip().endswith("ok")
+
+
+def test_skip_fields_round_trip_and_stay_off_the_wire_when_empty() -> None:
+    """Skip lists and skipped counts survive encode/decode and are omitted when empty."""
+    request = HostImportLocalFrame(request_id="r", source="all", skip_external_session_ids=["a"])
+    assert decode_host_frame(encode_host_frame(request)) == request
+    plain = json.loads(encode_host_frame(HostImportLocalFrame(request_id="r", source="all")))
+    assert "skip_external_session_ids" not in plain
+    done = HostImportLocalDoneFrame(request_id="r", status="ok", skipped=3)
+    assert decode_host_frame(encode_host_frame(done)) == done
+    assert "skipped" not in json.loads(
+        encode_host_frame(HostImportLocalDoneFrame(request_id="r", status="ok"))
+    )
+    progress = HostImportLocalProgressFrame(request_id="r", done=4, total=9, skipped=2)
+    assert decode_host_frame(encode_host_frame(progress)) == progress
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("s0", []),
+        (["a", 1, ""], ["a"]),
+        (
+            [f"s{i}" for i in range(MAX_IMPORT_SKIP_IDS + 5)],
+            [f"s{i}" for i in range(MAX_IMPORT_SKIP_IDS)],
+        ),
+    ],
+    ids=["not-a-list", "mixed", "oversized"],
+)
+def test_malformed_or_oversized_skip_list_is_tolerated(raw: object, expected: list[str]) -> None:
+    """A bad skip list reads as its valid ids (capped), never a decode failure."""
+    msg = {"kind": "host.import_local", "request_id": "r", "source": "all", "limit": 5}
+    frame = decode_host_frame(json.dumps({**msg, "skip_external_session_ids": raw}))
+    assert isinstance(frame, HostImportLocalFrame)
+    assert frame.skip_external_session_ids == expected
+
+
+def test_encoder_caps_the_skip_list() -> None:
+    """A server never puts more than the cap on the wire."""
+    ids = [f"s{i}" for i in range(MAX_IMPORT_SKIP_IDS + 5)]
+    frame = HostImportLocalFrame(request_id="r", source="all", skip_external_session_ids=ids)
+    sent = json.loads(encode_host_frame(frame))["skip_external_session_ids"]
+    assert sent == ids[:MAX_IMPORT_SKIP_IDS]
+
+
+def test_host_advertises_skip_known() -> None:
+    """This host build tells the server it honors skip lists."""
+    assert CAP_IMPORT_SKIP_KNOWN in HOST_CAPABILITIES
+
+
+async def test_host_skips_listed_sessions_unread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Listed sessions are counted as skipped without being read or sent."""
+    loaded: list[str] = []
+    sessions = {f"s{i}": local_session(f"s{i}") for i in range(3)}
+    serve_local_sessions(monkeypatch, sessions)
+    served = local_import.load_local_session
+
+    def _tracking_load(source: Any, session_id: str) -> Any:
+        loaded.append(session_id)
+        return served(source, session_id)
+
+    monkeypatch.setattr(local_import, "load_local_session", _tracking_load)
+    ws = RecordingWs()
+    request = HostImportLocalFrame(
+        request_id="r",
+        source="all",
+        limit=5,
+        progress=True,
+        skip_external_session_ids=["s0", "s2", "not-on-this-host"],
+    )
+    await make_host()._handle_import_local(ws.as_ws(), request)
+    assert loaded == ["s1"]
+    sent = [
+        f.session.external_session_id
+        for f in ws.frames()
+        if isinstance(f, HostImportLocalSessionFrame)
+    ]
+    assert sent == ["s1"]
+    done = _done(ws)
+    assert (done.status, done.skipped, done.failed) == ("ok", 2, 0)
+    beats = [
+        (f.done, f.skipped) for f in ws.frames() if isinstance(f, HostImportLocalProgressFrame)
+    ]
+    # Before each session: s2 (skipped), s1, s0 (skipped).
+    assert beats == [(0, 0), (0, 0), (1, 1), (2, 1)]

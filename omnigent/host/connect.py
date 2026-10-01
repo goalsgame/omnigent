@@ -2641,6 +2641,15 @@ class HostProcess:
         # Read by the heartbeat closure, so always the latest counts.
         progress_done = 0
         progress_total: int | None = None
+        progress_skipped = 0
+        # Sessions the server already has (a re-run of an interrupted batch):
+        # counted as skipped without reading, so the re-run spends its time on
+        # the rest. Exact-id imports always read their one session.
+        skip_ids = (
+            frozenset(frame.skip_external_session_ids)
+            if isinstance(frame, HostImportLocalFrame)
+            else frozenset()
+        )
 
         async def _send_progress() -> None:
             # Only a server that asked for heartbeats gets them; an older one
@@ -2652,6 +2661,7 @@ class HostProcess:
                             request_id=frame.request_id,
                             done=progress_done,
                             total=progress_total,
+                            skipped=progress_skipped,
                         )
                     )
                 )
@@ -2684,6 +2694,7 @@ class HostProcess:
                 exact=isinstance(frame, HostImportLocalByIdFrame),
                 progress=frame.progress,
                 allow_session_chunks=frame.allow_session_chunks,
+                skip_known=len(skip_ids),
             ),
         )
         try:
@@ -2707,6 +2718,9 @@ class HostProcess:
                 # Before each session so a failed one advances the count too.
                 await _send_progress()
                 try:
+                    if session_id in skip_ids:
+                        progress_skipped += 1
+                        continue
                     session, reason = await asyncio.to_thread(_load, source, session_id)
                     if session is None:
                         # Unreadable/corrupt transcript: no frame to send, but
@@ -2776,6 +2790,7 @@ class HostProcess:
                         status="ok",
                         failed=len(failures),
                         failures=failures,
+                        skipped=progress_skipped,
                     )
                 )
             )
@@ -2815,6 +2830,7 @@ class HostProcess:
                     sent=sent_count,
                     chunked=chunked_count,
                     failed=len(failures),
+                    skipped=progress_skipped,
                     total=progress_total,
                 ),
             )

@@ -6505,8 +6505,10 @@ class _SessionImportResult:
     # Stable import code from the server (``ImportErrorCode``), when it sent one.
     code: str | None = None
     retryable: bool = True
-    # Shell commands that fix the failure, printed indented under the message.
+    # "label: command" lines that fix the failure, printed indented under it.
     fix_commands: tuple[str, ...] = ()
+    # HTTP status of a failed import request, when the server answered.
+    http_status: int | None = None
 
 
 @dataclass(frozen=True)
@@ -6519,6 +6521,56 @@ class _ImportErrorBody:
     fix_commands: tuple[str, ...] = ()
     # The existing session a duplicate (409) import points at.
     session_id: str | None = None
+    # Server log correlation id for an ``internal`` failure.
+    error_id: str | None = None
+
+
+def _fix_command_lines(value: object) -> tuple[str, ...]:
+    """``fix_commands`` as printable lines.
+
+    Newer servers send ``{"label", "command"}`` entries (printed
+    ``label: command``); older ones plain strings (printed as-is).
+    """
+    if not isinstance(value, list):
+        return ()
+    lines: list[str] = []
+    for entry in value:
+        if isinstance(entry, str) and entry.strip():
+            lines.append(entry)
+        elif isinstance(entry, dict):
+            command = entry.get("command")
+            label = entry.get("label")
+            if not isinstance(command, str) or not command.strip():
+                continue
+            lines.append(f"{label}: {command}" if isinstance(label, str) and label else command)
+    return tuple(lines)
+
+
+# Import codes for a failure on the host's tunnel, the only kind the
+# stale-host ``omnigent stop`` hint can help with.
+_HOST_TUNNEL_IMPORT_CODES = frozenset(
+    {"host_offline", "host_unreachable", "host_disconnected", "host_unresponsive"}
+)
+
+
+def _import_cli_error(message: str, *, host_related: bool = False) -> click.ClickException:
+    """A ClickException for ``omnigent import`` that names only the real cause.
+
+    The top-level stale-host hint (``omnigent stop``) is advice for runner
+    tunnel rejections; an import failure (an oversized session, a storage
+    error, a bad transcript) gets it only when the failure is the host's tunnel.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    exc = click.ClickException(message)
+    if not host_related:
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
+def _is_host_related_import_failure(code: str | None, status: int | None) -> bool:
+    """Whether a failed import is about the host tunnel (or a 401 rejection)."""
+    return code in _HOST_TUNNEL_IMPORT_CODES or status == 401
 
 
 # Older servers name the existing session only in the 409 message.
@@ -6545,6 +6597,7 @@ def _parse_import_error(response: Any) -> _ImportErrorBody:  # type: ignore[expl
         code = import_code if isinstance(import_code, str) and import_code else None
         retryable = error.get("retryable")
         fixes = error.get("fix_commands")
+        error_id = error.get("error_id")
         session_id = error.get("session_id")
         if not isinstance(session_id, str) and isinstance(message, str):
             match = _EXISTING_SESSION_RE.search(message)
@@ -6558,11 +6611,8 @@ def _parse_import_error(response: Any) -> _ImportErrorBody:  # type: ignore[expl
                 if isinstance(retryable, bool)
                 else (import_code_is_retryable(code) if code else True)
             ),
-            fix_commands=(
-                tuple(cmd for cmd in fixes if isinstance(cmd, str))
-                if isinstance(fixes, list)
-                else ()
-            ),
+            fix_commands=_fix_command_lines(fixes),
+            error_id=error_id if isinstance(error_id, str) and error_id else None,
         )
     detail = body.get("detail") if isinstance(body, dict) else None
     if isinstance(detail, str) and detail:
@@ -6676,6 +6726,7 @@ def import_session_command(
     import httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
     from omnigent.conversation_browser import conversation_url
     from omnigent.session_import import (
         ImportSource,
@@ -6714,11 +6765,11 @@ def import_session_command(
             try:
                 recent_ids = list_recent_local_session_ids(src, limit=recent_session_count)
             except SessionImportNotFoundError as exc:
-                raise click.ClickException(str(exc)) from exc
+                raise _import_cli_error(str(exc)) from exc
             import_targets = [(src, sid) for sid in reversed(recent_ids)]
         if not import_targets:
             scope = "any harness" if all_harnesses else harness
-            raise click.ClickException(f"No local {scope} parent sessions were found")
+            raise _import_cli_error(f"No local {scope} parent sessions were found")
     else:
         assert source_session_id is not None
         import_targets = [(cast(ImportSource, harness), source_session_id)]
@@ -6786,6 +6837,8 @@ def import_session_command(
         if response.is_error:
             error = _parse_import_error(response)
             message = f"Import failed ({response.status_code}): {error.message}"
+            if error.error_id is not None and error.error_id not in message:
+                message += f" (error ID: {error.error_id})"
             # A 409 is a duplicate unless a newer server classified it as
             # something else (e.g. the host's Python lacks SQLite).
             duplicate = response.status_code == 409 and error.import_code in (
@@ -6805,6 +6858,7 @@ def import_session_command(
                 code=error.import_code,
                 retryable=error.retryable,
                 fix_commands=error.fix_commands,
+                http_status=response.status_code,
             )
 
         try:
@@ -6843,11 +6897,16 @@ def import_session_command(
             # A missing session is a clean CLI error; a corrupt transcript keeps
             # its original exception so the traceback points at the parse fault.
             if isinstance(result.raw_exc, SessionImportNotFoundError):
-                raise click.ClickException(str(result.raw_exc)) from result.raw_exc
+                raise _import_cli_error(str(result.raw_exc)) from result.raw_exc
             assert result.raw_exc is not None
+            # A local parse fault, never a stale host.
+            setattr(result.raw_exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
             raise result.raw_exc
         fixes = "".join(f"\n    {command}" for command in result.fix_commands)
-        raise click.ClickException(f"{result.message or 'Import failed'}{fixes}")
+        raise _import_cli_error(
+            f"{result.message or 'Import failed'}{fixes}",
+            host_related=_is_host_related_import_failure(result.code, result.http_status),
+        )
 
     # Distinct sessions are independent conversations on the server (their own
     # ids, row locks, and position counters), so importing them concurrently
@@ -6870,6 +6929,7 @@ def import_session_command(
     already_imported_count = 0
     failed_count = 0
     retryable_count = 0
+    host_related = False
     # Report in the caller's requested order, not worker completion order.
     for target in import_targets:
         sid = target[1]
@@ -6885,6 +6945,9 @@ def import_session_command(
             failed_count += 1
             if outcome.retryable:
                 retryable_count += 1
+            host_related = host_related or _is_host_related_import_failure(
+                outcome.code, outcome.http_status
+            )
             _echo_import_failure(f"Failed {sid}: ", outcome)
 
     click.echo(f"\nImported: {imported_count}")
@@ -6896,7 +6959,9 @@ def import_session_command(
                 "Run the same command again to retry; sessions already imported are skipped.",
                 err=True,
             )
-        raise click.ClickException(f"{failed_count} session(s) failed to import")
+        raise _import_cli_error(
+            f"{failed_count} session(s) failed to import", host_related=host_related
+        )
 
 
 def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[explicit-any]

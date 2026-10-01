@@ -60,7 +60,12 @@ async def _push_after_request(conn: HostConnection, *events: tuple[str, dict[str
 
 @pytest.mark.parametrize(
     ("age_s", "expected"),
-    [(600, "is offline (last seen 10 min ago)"), (20, "isn't connected right now")],
+    [
+        (600, "is offline (last seen 10 min ago)"),
+        # 30 or 31 s, depending on when the clock ticks.
+        (30, "isn't connected right now (last seen 3"),
+        (1, "isn't connected right now (last seen just now)"),
+    ],
 )
 async def test_offline_host_409_names_machine_and_last_seen(age_s: int, expected: str) -> None:
     """A host with no tunnel here gets a 409 naming it and when it was last seen."""
@@ -86,13 +91,36 @@ async def test_offline_host_409_names_machine_and_last_seen(age_s: int, expected
 async def test_live_host_on_another_replica_stays_wrong_replica(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A live host on another replica of a sharded deployment is wrong_replica, not offline."""
+    """A live host on another replica is wrong_replica with a readable host_unreachable body."""
     monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: True)
-    app = imports_app(FakeConversationStore(), host_registry=HostRegistry(), host=host_record())
+    app = imports_app(
+        FakeConversationStore(),
+        host_registry=HostRegistry(),
+        host=host_record(name="studio-mac", age_s=5),
+    )
     async with client(app) as http:
         response = await http.post("/v1/imports/local/stream", json=local_import_body())
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+    error = response.json()["error"]
+    # The client's keyless re-address keys on this code.
+    assert error["code"] == ErrorCode.WRONG_REPLICA
+    assert (error["import_code"], error["retryable"]) == (ImportErrorCode.HOST_UNREACHABLE, True)
+    assert error["message"] == (
+        "Couldn't reach “studio-mac”'s connection. Try again in a few seconds."
+    )
+    assert error["host_name"] == "studio-mac"
+
+
+def test_wrong_replica_message_for_an_unnamed_host() -> None:
+    """A host without a name is called "your machine" and carries no host_name."""
+    absent = _host_launch.host_absent_error(host_record(), sharded=True)
+    error = imports_module._host_wrong_replica_error(host_record(name=" "), absent)
+    assert error.code == ErrorCode.WRONG_REPLICA
+    assert error.http_status == 400
+    assert error.message == (
+        "Couldn't reach your machine's connection. Try again in a few seconds."
+    )
+    assert "host_name" not in error.details
 
 
 async def test_host_disconnect_mid_batch_reports_progress_and_stops(
@@ -185,6 +213,29 @@ async def test_progress_events_report_done_of_total(
     assert bool(heartbeats) is (not legacy_host)
 
 
+async def test_repeated_progress_is_sent_once() -> None:
+    """Heartbeats that repeat the last (done, total) don't add progress events."""
+    registry = HostRegistry()
+    conn = register_host(registry)
+    app = imports_app(FakeConversationStore(), host_registry=registry, host=host_record())
+    host = asyncio.create_task(
+        _push_after_request(
+            conn,
+            ("progress", {"done": 0, "total": None}),
+            ("progress", {"done": 0, "total": 3}),
+            ("progress", {"done": 0, "total": 3}),
+            ("progress", {"done": 0, "total": 3}),
+            ("progress", {"done": 2, "total": 3}),
+            ("progress", {"done": 2, "total": 3}),
+            ("done", {"status": "ok", "failed": 2}),
+        )
+    )
+    events = await post_stream(app)
+    await host
+    progress = [(e["done"], e["total"]) for e in events if e["event"] == "progress"]
+    assert progress == [(0, None), (0, 3), (2, 3)]
+
+
 async def test_stall_after_heartbeat_uses_the_short_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -260,6 +311,54 @@ async def test_deadline_stops_host_and_says_how_to_continue(
     assert 0 < imported < 20
     assert f"Imported {imported} of 20 before the time limit" in error["message"]
     assert pair.cancel_frames()
+
+
+class _LaggingClock:
+    """A ``time`` module stand-in whose monotonic clock reads behind real time.
+
+    Like an event loop whose timers run on a coarser clock (uvloop's is in
+    ms): a deadline-bound wait returns while this clock still reads just before it.
+    """
+
+    def __init__(self, lag_s: float, after_s: float) -> None:
+        self._start = time.monotonic()
+        self._lag_s = lag_s
+        self._after_s = after_s
+        self.time = time.time
+
+    def monotonic(self) -> float:
+        now = time.monotonic()
+        return now - self._lag_s if now - self._start > self._after_s else now
+
+
+async def test_deadline_bound_wait_is_the_time_limit_not_a_silent_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wait ended by the deadline is time_limit_reached even if the clock fires a hair early."""
+    monkeypatch.setattr(imports_module, "_LOCAL_IMPORT_STREAM_DEADLINE_S", 0.3)
+    monkeypatch.setattr(imports_module, "time", _LaggingClock(lag_s=0.05, after_s=0.1))
+    pair = TunnelPair()
+    app = imports_app(FakeConversationStore(), host_registry=pair.registry, host=host_record())
+    # One slow read and no heartbeat due yet: the deadline ends the wait.
+    serve_local_sessions(monkeypatch, {"s0": local_session("s0")}, load_delay_s=1.0)
+    async with pair:
+        events = await post_stream(app)
+    error = error_event(events)
+    assert error["code"] == ImportErrorCode.TIME_LIMIT_REACHED, error
+    assert "silent_seconds" not in error
+
+
+def test_time_limit_message_counts_sessions_already_there() -> None:
+    """The time-limit message counts already-imported sessions as done."""
+    exc = LocalImportError(
+        "x", import_code=ImportErrorCode.TIME_LIMIT_REACHED, code=ErrorCode.INTERNAL_ERROR
+    )
+    restated = imports_module._interrupted_import_error(
+        exc, host=None, processed=12, imported=2, already_imported=10, total=14
+    )
+    assert restated.message.startswith("Imported 12 of 14 before the time limit")
+    assert restated.details["imported"] == 2
+    assert restated.import_code == ImportErrorCode.TIME_LIMIT_REACHED
 
 
 async def test_buffered_route_reports_time_limit_as_503(monkeypatch: pytest.MonkeyPatch) -> None:

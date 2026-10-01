@@ -2727,6 +2727,17 @@
             "title": "Code",
             "type": "string"
           },
+          "error_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Id"
+          },
           "external_session_id": {
             "anyOf": [
               {
