@@ -77,18 +77,52 @@ def _create_claude_sdk_session(base_url: str, runner_id: str, mock_llm_server_ur
 
 
 def _claude_cli_pids() -> set[int]:
-    """Return live SDK-launched Claude CLI process IDs."""
+    """Return live SDK-launched Claude CLI PIDs owned by the e2e runner.
+
+    Discovery is scoped to descendants of the test runner process
+    (``_server_state["runner_pid"]``, refreshed by ``_ensure_runner_online``)
+    so the fault injection below can only ever signal a CLI this runner
+    launched -- never one belonging to another session or application on
+    the host.
+    """
+    try:
+        descendants = psutil.Process(int(_server_state["runner_pid"])).children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return set()
     pids: set[int] = set()
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+    for proc in descendants:
         try:
-            name = (proc.info["name"] or "").lower()
-            cmd = " ".join(proc.info["cmdline"] or [])
+            name = (proc.name() or "").lower()
+            cmd = " ".join(proc.cmdline() or [])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         if "stream-json" not in cmd:
             continue
         if name == "claude" or "/claude" in cmd.lower():
-            pids.add(proc.info["pid"])
+            pids.add(proc.pid)
+    return pids
+
+
+def _single_cli_launch(pids: set[int]) -> set[int]:
+    """Return *pids* once they are confirmed to be exactly one CLI launch.
+
+    A launch may surface as a short parent->child chain (e.g. a wrapper that
+    execs ``claude``), so the PIDs are grouped by their root ancestor within
+    the set. Exactly one root is required; anything else is ambiguous
+    ownership, and the caller must fail without signaling.
+    """
+    roots: set[int] = set()
+    for pid in pids:
+        try:
+            parent = psutil.Process(pid).ppid()
+        except psutil.NoSuchProcess:
+            continue
+        if parent not in pids:
+            roots.add(pid)
+    assert len(roots) == 1, (
+        "expected exactly one new claude-sdk CLI launch under the runner; refusing to signal "
+        f"an ambiguous set pids={sorted(pids)} roots={sorted(roots)}"
+    )
     return pids
 
 
@@ -151,6 +185,7 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
                 "expected a claude-sdk CLI child process to be running after turn 1; "
                 f"baseline={baseline_pids}, now={_claude_cli_pids()}"
             )
+            new_pids = _single_cli_launch(new_pids)
             for pid in new_pids:
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGTERM)
@@ -164,6 +199,8 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
                     pass
                 except psutil.TimeoutExpired:
                     proc.kill()
+                    # Confirm the forced exit landed instead of trusting the settle sleep.
+                    proc.wait(timeout=10)
             # Let the runner reap the child before the next transport write.
             time.sleep(2.0)
 
