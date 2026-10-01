@@ -133,11 +133,13 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ),
     ],
 )
+@pytest.mark.parametrize("mcp_status", ["absent", "available", "unavailable", "exception"])
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     env_denylist: str | None,
     expected_env_unset: list[str],
+    mcp_status: str,
 ) -> None:
     """
     Pi-native auto-create must launch a *required* terminal.
@@ -222,6 +224,42 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
                 metadata={"terminal_name": "pi", "session_key": "main", "running": True},
             )
 
+    from omnigent.runner.mcp_manager import McpSchemasResult
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.spec.types import MCPServerConfig
+
+    mcp_spec = AgentSpec(
+        spec_version=1,
+        name="pi-agent",
+        mcp_servers=(
+            []
+            if mcp_status == "absent"
+            else [MCPServerConfig(name="search", transport="http", url="https://example.com/mcp")]
+        ),
+    )
+    discovered: list[str] = []
+
+    async def _mcp_schemas(self: Any, spec: AgentSpec) -> McpSchemasResult:
+        discovered.append(self._session_id)
+        assert spec is mcp_spec
+        if mcp_status == "exception":
+            raise RuntimeError("MCP discovery unavailable")
+        if mcp_status == "unavailable":
+            return McpSchemasResult(schemas=[], tool_names=set(), failures={"search": "offline"})
+        return McpSchemasResult(
+            schemas=[
+                {
+                    "type": "function",
+                    "name": "search__find",
+                    "description": "Find documents",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ],
+            tool_names={"search__find"},
+            failures={},
+        )
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", _mcp_schemas)
     published: list[dict[str, Any]] = []
 
     await _auto_create_pi_terminal(
@@ -229,6 +267,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        agent_spec=mcp_spec,
     )
 
     # Required lifecycle (parity with claude-native), correct terminal identity.
@@ -243,6 +282,11 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     )
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
+    assert ("search__find" in tool_names) == (mcp_status == "available")
+    assert discovered == ([] if mcp_status == "absent" else ["47f049b9d13df4db397c7f46859b825f"])
+    if mcp_status == "available":
+        external = next(tool for tool in config["tools"] if tool["name"] == "search__find")
+        assert external["parameters"]["properties"]["query"] == {"type": "string"}
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
 
