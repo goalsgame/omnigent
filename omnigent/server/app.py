@@ -848,6 +848,9 @@ def _ensure_builtin_agent(
 
     from omnigent.db.utils import builtin_agent_id
 
+    if not agent_store.is_catalog_agent(name):
+        return
+
     bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
     existing = agent_store.get_by_name(name)
     if existing is not None:
@@ -1476,6 +1479,9 @@ def create_app(
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
+    from omnigent.server.agent_catalog import agent_catalog_names
+
+    agent_store.catalog_names = agent_catalog_names(resolved_server_config)
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()

@@ -2477,6 +2477,25 @@ async def _auto_create_pi_terminal(
             session_id,
             exc_info=True,
         )
+    # External tools use the same authenticated, policy-enforcing MCP proxy.
+    spec_for_mcp = _unwrap_resolved_spec(agent_spec)
+    if server_client is not None and spec_for_mcp is not None and spec_for_mcp.mcp_servers:
+        try:
+            from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+
+            mcp_result = await ProxyMcpManager(session_id, server_client).schemas_for(spec_for_mcp)
+            registered_names = {tool["name"] for tool in pi_tools}
+            pi_tools.extend(
+                schema for schema in mcp_result.schemas if schema["name"] not in registered_names
+            )
+            for server, error in mcp_result.failures.items():
+                _logger.warning(
+                    "Pi native MCP %r unavailable for session %s: %s", server, session_id, error
+                )
+        except Exception:  # noqa: BLE001 — MCP availability must not block built-in tools
+            _logger.warning(
+                "Failed to discover pi-native MCP tools for session %s", session_id, exc_info=True
+            )
     _extension, config = write_extension_files(
         bridge_dir,
         session_id=session_id,

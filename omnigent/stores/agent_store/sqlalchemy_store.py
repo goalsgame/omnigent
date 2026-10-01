@@ -236,6 +236,8 @@ class SqlAlchemyAgentStore(AgentStore):
             is_template = SqlAgent.kind == encode_agent_kind("template")
             in_workspace = SqlAgent.workspace_id == current_workspace_id()
             stmt = select(SqlAgent).where(in_workspace, is_template)
+            if self.catalog_names is not None:
+                stmt = stmt.where(SqlAgent.name.in_(self.catalog_names))
             if after:
                 sub = (
                     select(SqlAgent.created_at)
