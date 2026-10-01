@@ -35,6 +35,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
+import mimetypes
 import os
 import re
 import shutil
@@ -44,7 +46,8 @@ import subprocess
 import sys
 import tarfile
 import time
-from collections.abc import Callable, Iterator
+import warnings
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,6 +95,7 @@ from tests.helpers.ui_server_compat import (
 from tests.helpers.ui_url_safety import DEV_PORTS
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_RECORD_DIR_ENV = "OMNIGENT_E2E_RECORD_DIR"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
@@ -392,8 +396,15 @@ def browser_context_args(
     pytest-playwright already creates a fresh context for its function-scoped
     ``context`` and ``page`` fixtures. Keeping this wrapper function-scoped
     makes that contract explicit and prevents accidental mutable option reuse.
+    When ``OMNIGENT_E2E_RECORD_DIR`` is set, those fixtures record their video
+    there unless ``--video`` already chose a directory.
     """
-    return {**browser_context_args}
+    context_args = {**browser_context_args}
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
+    if record_dir:
+        Path(record_dir).mkdir(parents=True, exist_ok=True)
+        context_args.setdefault("record_video_dir", record_dir)
+    return context_args
 
 
 @pytest.hookimpl(trylast=True)
@@ -2294,33 +2305,17 @@ def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
     page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
 
 
-@pytest.fixture(autouse=True)
-def _record_video(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[None]:
-    """Capture a screen recording of the journey when recording is requested.
-
-    Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
-    (``browser.new_page()`` / ``browser.new_context()``), not the
-    pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
-    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
-    methods to inject ``record_video_dir`` into every page/context they open, so
-    the rendered journey lands as a ``.webm`` regardless of how the test opened
-    the browser. A caller that already passes ``record_video_dir`` is left alone.
-    Playwright writes the file (a random hash name) when the context closes;
-    callers/harnesses pick it up from the directory. No-op when the env var is
-    unset, so ordinary runs are unaffected.
-    """
-    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
-    if not record_dir:
-        yield
-        return
-
+def _install_record_video_patches(monkeypatch: pytest.MonkeyPatch, record_dir: str) -> None:
+    """Inject ``record_video_dir`` into every page/context a ``Browser`` opens,
+    on both the async and sync Playwright APIs. A caller that already passes
+    ``record_video_dir`` is left alone."""
     from playwright.async_api import Browser as _AsyncBrowser
+    from playwright.sync_api import Browser as _SyncBrowser
 
-    Path(record_dir).mkdir(parents=True, exist_ok=True)
     _orig_new_page = _AsyncBrowser.new_page
     _orig_new_context = _AsyncBrowser.new_context
+    _orig_sync_new_page = _SyncBrowser.new_page
+    _orig_sync_new_context = _SyncBrowser.new_context
 
     async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("record_video_dir", record_dir)
@@ -2330,9 +2325,199 @@ def _record_video(
         kwargs.setdefault("record_video_dir", record_dir)
         return await _orig_new_context(self, *args, **kwargs)
 
+    def _sync_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_page(self, *args, **kwargs)
+
+    def _sync_new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_context(self, *args, **kwargs)
+
     monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
     monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    monkeypatch.setattr(_SyncBrowser, "new_page", _sync_new_page)
+    monkeypatch.setattr(_SyncBrowser, "new_context", _sync_new_context)
+
+
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Record async and sync browser journeys when OMNIGENT_E2E_RECORD_DIR is set.
+
+    Patch Browser methods for direct calls; browser_context_args covers sync
+    fixtures. Preserve explicit recording paths. Playwright writes the video
+    when the context closes; an unset environment variable leaves recording off."""
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
+    if not record_dir:
+        yield
+        return
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _install_record_video_patches(monkeypatch, record_dir)
     yield
+
+
+def _recording_requested(item: pytest.Item) -> bool:
+    """True when this test films the journey: env var, ``--video``, or a recording context."""
+    if os.environ.get(_RECORD_DIR_ENV):
+        return True
+    if item.config.getoption("--video", default="off") not in (None, "off"):
+        return True
+    # Authored reproductions sometimes hard-code ``record_video_dir`` themselves.
+    context_args = getattr(item, "funcargs", {}).get("browser_context_args") or {}
+    if context_args.get("record_video_dir"):
+        return True
+    marker = item.get_closest_marker("browser_context_args")
+    return marker is not None and bool(marker.kwargs.get("record_video_dir"))
+
+
+def _stop_recorded_context(item: pytest.Item) -> None:
+    """Close the pytest-playwright context so its video ends on the test's final state."""
+    context = getattr(item, "funcargs", {}).get("context")
+    # No open page means the test closed it and the video is already finalized.
+    if context is None or not context.pages:
+        return
+    # pytest-playwright's close wrapper still takes its screenshots and traces.
+    try:
+        context.close()
+    except Error as exc:
+        # A diagnostic from the report hook must not replace the test result,
+        # even when the suite promotes warnings to errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", pytest.PytestWarning)
+            item.warn(
+                pytest.PytestWarning(f"Could not finalize recording for {item.nodeid}: {exc}")
+            )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, None, None]:
+    """Stop the recording when the test body ends, before later fixtures tear down.
+
+    The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
+    yield
+    if call.when == "call" and _recording_requested(item):
+        _stop_recorded_context(item)
+
+
+# Screenshot kwargs that describe the clipped result rather than the
+# full-viewport capture it is cropped from.
+_CLIP_RESULT_KEYS = frozenset({"clip", "path", "type", "quality"})
+
+
+def _recorded_clip_format(kwargs: dict[str, Any]) -> str | None:
+    """Resolve supported output formats without bypassing native path validation."""
+    kind = kwargs.get("type")
+    if kind is None:
+        path = kwargs.get("path")
+        if path is None:
+            return "png"
+        if not isinstance(path, (str, Path)):
+            return None
+        kind = {"image/png": "png", "image/jpeg": "jpeg"}.get(mimetypes.guess_type(path)[0])
+    return kind if kind in ("png", "jpeg") else None
+
+
+def _recorded_clip_capture(page: Any, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    """Full-viewport screenshot kwargs for a clip of a video-recorded page, or
+    ``None`` when Playwright's native clip path is fine (no clip, ``full_page``,
+    or a page whose context is not recording video)."""
+    if kwargs.get("clip") is None or kwargs.get("full_page") or page.video is None:
+        return None
+    browser = page.context.browser
+    if browser is not None and browser.browser_type.name != "chromium":
+        return None
+    # Keep malformed options on Playwright's native path so it owns validation
+    # and raises the same errors before attempting a clipped capture.
+    kind = _recorded_clip_format(kwargs)
+    if kind is None:
+        return None
+    quality = kwargs.get("quality")
+    if quality is not None and (
+        kind != "jpeg"
+        or type(quality) not in (int, float)
+        or not 0 <= quality <= 100
+        or quality != int(quality)
+    ):
+        return None
+    clip = kwargs["clip"]
+    if not isinstance(clip, dict) or any(
+        type(clip.get(key)) not in (int, float) or not math.isfinite(clip[key])
+        for key in ("x", "y", "width", "height")
+    ):
+        return None
+    if clip["width"] <= 0 or clip["height"] <= 0:
+        return None
+    return {**{k: v for k, v in kwargs.items() if k not in _CLIP_RESULT_KEYS}, "type": "png"}
+
+
+def _crop_recorded_clip(png: bytes, page: Any, kwargs: dict[str, Any]) -> bytes:
+    """Cut ``kwargs["clip"]`` out of a full-viewport PNG, encoding and saving it
+    the way the clipped screenshot would have been."""
+    from PIL import Image
+
+    clip = kwargs["clip"]
+    image = Image.open(io.BytesIO(png))
+    viewport = page.viewport_size
+    # CSS pixels to image pixels; covers device_scale_factor and scale="css".
+    factor = image.width / viewport["width"] if viewport else 1.0
+    x = max(0, clip["x"])
+    y = max(0, clip["y"])
+    width = min(image.width / factor, clip["x"] + clip["width"]) - x
+    height = min(image.height / factor, clip["y"] + clip["height"]) - y
+    # Chromium rounds the origin to device pixels and truncates the CSS size.
+    left = math.floor(x * factor + 0.5)
+    top = math.floor(y * factor + 0.5)
+    right = min(image.width, left + math.floor(math.floor(width + 1e-3) * factor + 0.5))
+    bottom = min(image.height, top + math.floor(math.floor(height + 1e-3) * factor + 0.5))
+    if right <= left or bottom <= top:
+        raise Error("Clipped area is either empty or outside the resulting image")
+    cropped = image.crop((left, top, right, bottom))
+
+    path = kwargs.get("path")
+    kind = _recorded_clip_format(kwargs)
+    encoded = io.BytesIO()
+    if kind == "jpeg":
+        quality = kwargs.get("quality")
+        cropped.convert("RGB").save(
+            encoded, "JPEG", quality=80 if quality is None else int(quality)
+        )
+    else:
+        cropped.save(encoded, "PNG")
+    data = encoded.getvalue()
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(data)
+    return data
+
+
+@pytest.fixture(autouse=True)
+def _undistorted_clip_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``page.screenshot(clip=...)`` from distorting a page's video recording:
+    Chromium resizes the view to the clip for the capture and the screencast films
+    that, so a recorded page gets a full-viewport capture cropped to the clip."""
+    from playwright.async_api import Page as _AsyncPage
+
+    orig_sync = Page.screenshot
+    orig_async = _AsyncPage.screenshot
+
+    def sync_screenshot(self: Page, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return orig_sync(self, **kwargs)
+        return _crop_recorded_clip(orig_sync(self, **viewport_kwargs), self, kwargs)
+
+    async def async_screenshot(self: Any, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return await orig_async(self, **kwargs)
+        return _crop_recorded_clip(await orig_async(self, **viewport_kwargs), self, kwargs)
+
+    monkeypatch.setattr(Page, "screenshot", sync_screenshot)
+    monkeypatch.setattr(_AsyncPage, "screenshot", async_screenshot)
 
 
 @pytest.fixture

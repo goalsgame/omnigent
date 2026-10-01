@@ -1,4 +1,5 @@
-"""Exercise Polly's required database reference when composing the review prompt."""
+"""Exercise how Polly composes its review prompt: the required database reference
+and the rules included only for some changes."""
 
 import hashlib
 import json
@@ -207,3 +208,28 @@ def test_bootstrap_failure_does_not_publish_guidance_or_prompt(
     _expect_bootstrap_fetch(prompt_workspace)
     assert not (artifacts / "polly_database_best_practices.md").exists()
     assert not (prompt_workspace / "artifacts/review_prompt.txt").exists()
+
+
+@pytest.mark.parametrize(
+    ("changed_path", "expected"),
+    [
+        ("web/src/shell/Sidebar.tsx", True),
+        ("omnigent/cli.py", True),
+        ("omnigent/harnesses/pi_native/launch.py", True),
+        ("web/src/shell/Sidebar.test.tsx", False),
+        ("docs/guide.md", False),
+    ],
+)
+def test_feature_map_note_is_requested_only_for_user_facing_changes(
+    prompt_workspace: Path, changed_path: str, expected: bool
+) -> None:
+    (prompt_workspace / "docs/DATABASE_BEST_PRACTICES.md").write_text("# Database practices\n")
+    (prompt_workspace / "artifacts/pr_diff.txt").write_text(
+        f"diff --git a/{changed_path} b/{changed_path}\n+change\n"
+    )
+
+    result = _generate_prompt(prompt_workspace, "MEMBER")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
+    assert ("**Feature map**" in prompt) is expected

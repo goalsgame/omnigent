@@ -47,6 +47,7 @@ import {
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
+import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
@@ -352,6 +353,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
+  if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -562,6 +564,9 @@ export const BubbleView = memo(
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "subagent_activity") {
+      return <SubagentActivityMessage data={bubble.data} />;
+    }
     if (bubble.kind === "routing_decision") {
       return (
         <RoutingDecisionCard

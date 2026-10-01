@@ -5895,6 +5895,24 @@ async def _codex_discover_thread_and_forward(
                 except Exception as diagnostics_error:  # noqa: BLE001
                     # Diagnostics must not replace the startup error or prevent cleanup.
                     diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
+                # A timeout after the TUI already died is a symptom: attribute the
+                # exit itself rather than the generic TimeoutError.
+                exit_attribution: dict[str, object] = {}
+                if isinstance(exc, _CodexTerminalExited) or diagnostics.get(
+                    "terminal_exited_undetected"
+                ):
+                    from omnigent.runner.launch_failure import classify_terminal_failure
+
+                    exit_status = diagnostics.get("terminal_exit_status")
+                    last_output = diagnostics.get("terminal_last_output")
+                    diagnosis = classify_terminal_failure(
+                        command="codex",
+                        exit_status=exit_status if isinstance(exit_status, int) else None,
+                        output=last_output if isinstance(last_output, str) else None,
+                    )
+                    exit_attribution["error_category"] = (
+                        diagnosis.category if diagnosis else ErrorCategory.RUNNER
+                    ).value
                 failure_event = debug_event("codex_thread_start_failed", session_id=session_id)
                 failure_event["attributes"] = {
                     "harness": "codex-native",
@@ -5918,6 +5936,9 @@ async def _codex_discover_thread_and_forward(
                     "elapsed_ms": round((time.monotonic() - discovery_started_at) * 1000),
                     "login_required": login_required,
                     **diagnostics,
+                    **exit_attribution,
+                    "error_impact": ErrorImpact.BLOCKING.value,
+                    "error_phase": ErrorPhase.HARNESS_STARTUP.value,
                 }
                 _logger.exception(
                     "Codex TUI never started a thread for %s; chat will not forward%s%s",
@@ -7512,6 +7533,12 @@ def _native_terminal_start_error_payload(
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
+        # The warning below carries no exc_info for a missing agent, so the
+        # sink cannot derive its category.
+        error_category=exc.category.value
+        if isinstance(exc, OmnigentError) and missing_agent
+        else None,
+        error_impact=ErrorImpact.BLOCKING.value,
     )
     if missing_agent:
         # Expected session-lifecycle condition: the session's agent was deleted
@@ -9626,6 +9653,8 @@ async def _launch_native_terminal(
                     session_id=ctx.session_id,
                     harness=harness_name,
                     stage="terminal_start",
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.HARNESS_STARTUP.value,
                 ),
             )
             if reraise:
@@ -9784,6 +9813,7 @@ async def _ensure_native_terminal(
                         session_id=ctx.session_id,
                         terminal_name=terminal_name,
                         stage="terminal_start",
+                        error_impact=ErrorImpact.BLOCKING.value,
                     ),
                 )
             return _native_terminal_start_error_response(

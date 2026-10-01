@@ -7664,6 +7664,73 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    const teamContent = [
+      {
+        type: "input_text" as const,
+        text: '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
+      },
+    ];
+    it.each([
+      {},
+      { createdBy: "alice@example.com" },
+      { userAuthored: true },
+      { clearedPendingId: "xml" },
+    ])("requires human provenance before acknowledging a team-shaped prompt: %j", (authorship) => {
+      const pending = [{ tempId: "xml", content: teamContent }];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_xml",
+        itemType: "message",
+        ...authorship,
+        data: { role: "user", content: teamContent, user_authored: "userAuthored" in authorship },
+      });
+      const human = Object.keys(authorship).length > 0;
+      expect(useChatStore.getState().pendingUserMessages).toEqual(human ? [] : pending);
+      expect(useChatStore.getState().blocks).toMatchObject(
+        human
+          ? [
+              {
+                type: "user_message",
+                ctx: { itemId: "msg_xml" },
+                stableKey: "xml",
+                content: teamContent,
+              },
+            ]
+          : [],
+      );
+    });
+
+    it.each([false, true])(
+      "keeps unrelated input queued with named acknowledgement = %s",
+      (named) => {
+        const unrelated = {
+          tempId: "other",
+          content: [{ type: "input_text" as const, text: "Still queued" }],
+        };
+        useChatStore.setState({
+          blocks: [],
+          pendingUserMessages: [
+            unrelated,
+            ...(named ? [{ tempId: "xml", content: teamContent }] : []),
+          ],
+        });
+        const event: SessionInputConsumedEvent = {
+          type: "session_input_consumed",
+          itemId: "msg_xml",
+          itemType: "message",
+          ...(named ? { clearedPendingId: "xml" } : {}),
+          data: { role: "user", content: teamContent, user_authored: true },
+        };
+        handleSessionEvent(event);
+        handleSessionEvent(event);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([unrelated]);
+        expect(useChatStore.getState().blocks).toMatchObject([
+          { type: "user_message", ctx: { itemId: "msg_xml" }, content: teamContent },
+        ]);
+      },
+    );
+
     it("is a no-op for non-message item types (e.g. function_call_output from other client)", () => {
       const existingBlocks: AnyBlock[] = [];
       useChatStore.setState({ blocks: existingBlocks, pendingUserMessages: [] });
@@ -11435,15 +11502,86 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await vi.advanceTimersByTimeAsync(20);
       seedSessionItems("conv_interrupted_retry", [assistantMessage("resp_1", "canonical answer")]);
       sinks[0]!.error();
+      // The reconnect's first backfill attempt fails (itemAttempts === 1). The
+      // post-reconnect catch-up burst (RECONNECT_STATUS_CATCHUP_DELAYS_MS, first
+      // at 3s) re-reads status, which — with the interrupted preview still
+      // present — retries the failed final-item backfill. So the canonical item
+      // recovers within seconds rather than waiting out the 60s periodic
+      // reconcile.
       await vi.advanceTimersByTimeAsync(6000);
-      expect(sinks).toHaveLength(2);
-      expect(itemAttempts).toBe(1);
-      expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m1")).toBe(true);
-
-      await advanceWithHeartbeats(sinks[1]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
       await drainAsync(2);
-      expect(itemAttempts).toBeGreaterThan(1);
+      expect(sinks).toHaveLength(2);
+      expect(itemAttempts).toBe(2);
       expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["msg_resp_1_asst"]);
+      expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m1")).toBe(false);
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("clears a stale 'running' via the reconnect catch-up burst, before the 60s reconcile", async () => {
+    // Reproduces the mid-turn server-restart bug: the reconnect's immediate
+    // reconcile reads a still-"running" snapshot (the restarted server hasn't
+    // reprocessed the turn's completion yet), so the tab stays on "Working…".
+    // The catch-up burst re-reads status a few seconds later — once the server
+    // has settled to idle — and clears it, instead of stranding the tab until
+    // the 60s periodic reconcile.
+    seedSession("conv_catchup", [assistantMessage("resp_1", "answer")]);
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    let snapshotGets = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_catchup" && (init?.method ?? "GET") === "GET") {
+        snapshotGets += 1;
+        // First read (the reconnect's own reconcile) still sees "running";
+        // later reads (the catch-up burst) see the settled "idle".
+        const status = snapshotGets <= 1 ? "running" : "idle";
+        return Promise.resolve(
+          mockResponse({
+            id: "conv_catchup",
+            agent_id: "agent_xyz",
+            status,
+            created_at: 0,
+            items: sessionSnapshots.get("conv_catchup") ?? [],
+            labels: {},
+            pending_elicitations: [],
+            pending_inputs: [],
+            mcp_startup: null,
+            terminal_pending: false,
+          }),
+        );
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_catchup",
+      abortController: controller,
+      sessionStatus: "running",
+      blocks: [],
+    });
+    const loop = startStreamPump("conv_catchup", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.error();
+      // Reconnect + its immediate reconcile read the still-"running" snapshot.
+      await vi.advanceTimersByTimeAsync(50);
+      await drainAsync(2);
+      expect(useChatStore.getState().sessionStatus).toBe("running");
+      // Catch-up burst (first tick at 3s) re-reads the now-"idle" snapshot —
+      // well before the 60s periodic reconcile — and clears "Working…".
+      await vi.advanceTimersByTimeAsync(3000);
+      await drainAsync(2);
+      expect(useChatStore.getState().sessionStatus).toBe("idle");
     } finally {
       controller.abort();
       const last = sinks[sinks.length - 1];
@@ -14405,22 +14543,28 @@ describe("chatStore — policy deny renders once", () => {
 });
 
 describe("chatStore — client-side message queue", () => {
-  it.each(["foreground", "background", "evicted", "stranded"])(
-    "queues Codex compact and holds the next message until idle (%s)",
-    async (mode) => {
-      const background = mode !== "foreground";
+  it.each([
+    ...["codex-native", "claude-sdk", "pi-native"].flatMap((harness) =>
+      ["foreground", "background", "evicted", "stranded"].map((mode) => [harness, mode]),
+    ),
+    ["claude-sdk", "steered"],
+    ["pi-native", "steered"],
+  ])(
+    "queues %s compact as a control and holds the next message until idle (%s)",
+    async (harness, mode) => {
+      const background = mode !== "foreground" && mode !== "steered";
       const id = "conv_compact";
       seedSession(id, []);
       fetchMock.mockImplementation(async (input, init) => {
         const response = defaultFetchHandler(input as RequestInfo, init as RequestInit);
         if (String(input).split("?")[0] === `/v1/sessions/${id}` && !init?.method) {
-          return mockResponse({ ...(await response.json()), harness: "codex-native" });
+          return mockResponse({ ...(await response.json()), harness });
         }
         return response;
       });
       await useChatStore.getState().switchTo(id);
       useChatStore.setState({
-        sessionHarness: "codex-native",
+        sessionHarness: harness,
         status: "streaming",
         sessionStatus: "running",
       });
@@ -14429,20 +14573,24 @@ describe("chatStore — client-side message queue", () => {
       const queued = useChatStore.getState().queuedMessages;
       const toastError = vi.spyOn(toast, "error").mockReturnValue("compact-busy");
       onTestFinished(() => toastError.mockRestore());
-      useChatStore.getState().steerMessage(queued[0]!.queueId);
-      expect(toastError).toHaveBeenCalledExactlyOnceWith(
-        "Compact is disabled while a chat is in progress",
-        { richColors: true },
-      );
-      toastError.mockClear();
-      useChatStore.getState().steerAllQueuedMessages(id);
-      expect(toastError).toHaveBeenCalledExactlyOnceWith(
-        "Compact is disabled while a chat is in progress",
-        { richColors: true },
-      );
-      expect(useChatStore.getState().queuedMessages).toEqual(queued);
+      if (harness === "codex-native") {
+        useChatStore.getState().steerMessage(queued[0]!.queueId);
+        expect(toastError).toHaveBeenCalledExactlyOnceWith(
+          "Compact is disabled while a chat is in progress",
+          { richColors: true },
+        );
+        toastError.mockClear();
+        useChatStore.getState().steerAllQueuedMessages(id);
+        expect(toastError).toHaveBeenCalledExactlyOnceWith(
+          "Compact is disabled while a chat is in progress",
+          { richColors: true },
+        );
+        expect(useChatStore.getState().queuedMessages).toEqual(queued);
+      }
 
-      handleSessionEvent({ type: "session_status", conversationId: id, status: "idle" });
+      if (mode !== "steered") {
+        handleSessionEvent({ type: "session_status", conversationId: id, status: "idle" });
+      }
       if (background) {
         seedSession("conv_other", []);
         await useChatStore.getState().switchTo("conv_other");
@@ -14474,12 +14622,19 @@ describe("chatStore — client-side message queue", () => {
           sendLatchedAt: beforeFlush - 10 * 60_000,
         });
       }
-      flush();
+      if (mode === "steered") {
+        useChatStore.getState().steerMessage(queued[0]!.queueId);
+      } else {
+        flush();
+      }
       await tick();
       expect(posts()).toEqual([{ type: "compact", data: {} }]);
-      expect(conversationRegistry.peek(id)!.getState().sendLatchedAt).toBeGreaterThanOrEqual(
-        beforeFlush,
-      );
+      if (harness !== "codex-native") expect(toastError).not.toHaveBeenCalled();
+      if (mode !== "steered") {
+        expect(conversationRegistry.peek(id)!.getState().sendLatchedAt).toBeGreaterThanOrEqual(
+          beforeFlush,
+        );
+      }
       expect(conversationRegistry.peek(id)!.getState().pendingUserMessages).toEqual([]);
       flush();
       await tick();
@@ -14508,6 +14663,71 @@ describe("chatStore — client-side message queue", () => {
       expect(posts().map((p) => p.type)).toEqual(["compact", "message"]);
       expect(posts()[1].data.content).toEqual([{ type: "input_text", text: "after compact" }]);
       expect(useChatStore.getState().queuedMessages).toEqual([]);
+    },
+  );
+
+  it.each(
+    ["compaction_completed", "compaction_failed", "pi_compact_unavailable"].flatMap((terminal) =>
+      [false, true].map((background) => [terminal, background] as const),
+    ),
+  )(
+    "settles old Pi %s (background: %s) without ending a real turn",
+    async (terminal, background) => {
+      const id = "conv_legacy_pi";
+      seedSession(id, []);
+      await useChatStore.getState().switchTo(id);
+      useChatStore.setState({ sessionHarness: "pi-native" });
+      await useChatStore.getState().send("/compact", "agent_xyz");
+      useChatStore.getState().enqueueMessage("after compact");
+      const entry = conversationRegistry.peek(id)!;
+      if (background) {
+        seedSession("conv_other", []);
+        await useChatStore.getState().switchTo("conv_other");
+        seedConversationsCache([conv(id, "idle"), conv("conv_other", "idle")]);
+      }
+      const event =
+        terminal === "pi_compact_unavailable"
+          ? {
+              type: "error" as const,
+              source: "execution",
+              toolName: null,
+              error: { code: terminal, message: "Unavailable" },
+            }
+          : terminal === "compaction_completed"
+            ? { type: "compaction_completed" as const, totalTokens: null }
+            : { type: "compaction_failed" as const };
+      const latch = entry.getState().sendLatchedAt;
+      // A real turn or pending prompt must not be settled by this fallback.
+      for (const state of [
+        { sessionStatus: "running" as const, activeResponse: null },
+        {
+          sessionStatus: "idle" as const,
+          activeResponse: { responseId: "real", state: "streaming" as const, error: null },
+        },
+        {
+          sessionStatus: "idle" as const,
+          activeResponse: null,
+          pendingUserMessages: [
+            { tempId: "pending_real", content: [{ type: "input_text" as const, text: "normal" }] },
+          ],
+        },
+      ]) {
+        entry.setState(state);
+        handleSessionEvent(event, id);
+        expect(entry.getState().status).toBe("streaming");
+        expect(entry.getState().sendLatchedAt).toBe(latch);
+      }
+      entry.setState({ sessionStatus: "idle", activeResponse: null, pendingUserMessages: [] });
+      handleSessionEvent(event, id);
+      expect(entry.getState().status).toBe("idle");
+      expect(entry.getState().sendLatchedAt).toBeNull();
+      if (!background) useChatStore.getState().maybeFlushQueuedHead();
+      await tick();
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/v1/sessions/${id}/events`,
+        expect.objectContaining({ body: expect.stringContaining("after compact") }),
+      );
     },
   );
 
@@ -14542,6 +14762,33 @@ describe("chatStore — client-side message queue", () => {
       }),
     );
     expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it.each([false, true])("bulk steers SDK compact while busy (has prefix: %s)", async (prefix) => {
+    const id = "conv_sdk_compact";
+    seedSession(id, []);
+    await useChatStore.getState().switchTo(id);
+    useChatStore.setState({
+      sessionHarness: "claude-sdk",
+      status: "streaming",
+      sessionStatus: "running",
+    });
+    const toastError = vi.spyOn(toast, "error");
+    onTestFinished(() => toastError.mockRestore());
+    if (prefix) useChatStore.getState().enqueueMessage("before compact");
+    useChatStore.getState().enqueueMessage("/compact");
+    useChatStore.getState().enqueueMessage("after compact");
+    useChatStore.getState().steerAllQueuedMessages(id);
+    await tick();
+    const posts = fetchMock.mock.calls
+      .filter(([url, init]) => url === `/v1/sessions/${id}/events` && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init!.body as string));
+    expect(posts.map((p) => p.type)).toEqual(
+      prefix ? ["message", "compact", "message"] : ["compact", "message"],
+    );
+    expect(posts.at(-1).data.content).toEqual([{ type: "input_text", text: "after compact" }]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(toastError).not.toHaveBeenCalled();
   });
 
   it("bulk steer stops at the first compact, retaining it and later messages", () => {

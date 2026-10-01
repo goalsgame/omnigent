@@ -1261,6 +1261,151 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
     }
 
 
+_TEAMMATE_MESSAGE = '<teammate-message teammate_id="reviewer">Done</teammate-message>'
+_TASK_COMPLETION = (
+    "<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>"
+)
+
+
+def _read_native_user(
+    tmp_path: Path, content: Any, *, queued: str | None = None, **metadata: Any
+) -> tuple[int, str | None, list[Any]]:
+    entry = (
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": queued,
+                "prompt": content,
+                **metadata,
+            },
+        }
+        if queued
+        else {"type": "user", "message": {"role": "user", "content": content}, **metadata}
+    )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+    return read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    "text,candidate",
+    [
+        (_TEAMMATE_MESSAGE, True),
+        ('<agent-message from="reviewer">Done</agent-message>', True),
+        (_TEAMMATE_MESSAGE + _TEAMMATE_MESSAGE, True),
+        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, True),
+        ("A peer session sent a message while you were working:\n" + _TEAMMATE_MESSAGE, True),
+        (
+            "Another Claude session sent a message while you were working:\n" + _TEAMMATE_MESSAGE,
+            True,
+        ),
+        (
+            "Another Claude session sent a message:\n"
+            + _TEAMMATE_MESSAGE
+            + "\nThis came from another Claude session — not typed by your user, "
+            "but working on their behalf.",
+            True,
+        ),
+        ("Explain this: " + _TEAMMATE_MESSAGE, False),
+        (_TEAMMATE_MESSAGE + "\nWhat does this mean?", False),
+        ("```xml\n" + _TEAMMATE_MESSAGE + "\n```", False),
+    ],
+)
+def test_team_markup_needs_provenance(
+    tmp_path: Path, text: str, candidate: bool, as_blocks: bool
+) -> None:
+    content = [{"type": "text", "text": text}] if as_blocks else text
+    _, _, items = _read_native_user(tmp_path, content)
+    [item] = items
+    assert item.agent_message_candidate is candidate
+    assert item.data == {"role": "user", "content": [{"type": "input_text", "text": text}]}
+
+    _, response_id, peers = _read_native_user(tmp_path, content, origin={"kind": "peer"})
+    assert all(peer.data.get("is_meta") for peer in peers)
+    assert response_id == "active"
+
+
+@pytest.mark.parametrize(
+    "queued,text,metadata",
+    [
+        ("prompt", _TEAMMATE_MESSAGE, {"isMeta": True}),
+        ("prompt", _TEAMMATE_MESSAGE, {"origin": {"kind": "peer"}}),
+        ("prompt", "<task-notification><task-id>task-1</task-id></task-notification>", {}),
+        (
+            None,
+            "<task-notification><status>completed</status></task-notification>",
+            {"isMeta": True},
+        ),
+        (
+            None,
+            "<task-notification><task-id>agent-1</task-id><status>completed</status>",
+            {"isMeta": True},
+        ),
+    ],
+)
+def test_internal_scaffolding_does_not_split_parent_response(
+    tmp_path: Path, queued: str | None, text: str, metadata: dict[str, Any]
+) -> None:
+    _, response_id, items = _read_native_user(tmp_path, text, queued=queued, **metadata)
+    assert items == []
+    assert response_id == "active"
+
+
+@pytest.mark.parametrize("queued", [None, "prompt", "task-notification"])
+@pytest.mark.parametrize("handback", [False, True])
+def test_completion_preserves_hidden_provenance(
+    tmp_path: Path, queued: str | None, handback: bool
+) -> None:
+    origin = {"kind": "peer", "handback": True, "senderTaskId": "agent-1"} if handback else None
+    text = _TEAMMATE_MESSAGE if handback else _TASK_COMPLETION
+    _, response_id, items = _read_native_user(
+        tmp_path, text, queued=queued, isMeta=True, origin=origin
+    )
+    [item] = items
+    assert item.data["is_meta"] is True
+    assert item.subagent_return_id == ("agent-1" if handback else None)
+    if queued or handback:
+        assert response_id == "active"
+
+
+@pytest.mark.parametrize("internal", [False, True])
+def test_mixed_native_blocks_keep_human_text_and_hide_completion_guidance(
+    tmp_path: Path, internal: bool
+) -> None:
+    text = "Internal guidance" if internal else "Explain the message format"
+    content = [
+        {"type": "text", "text": _TASK_COMPLETION if internal else _TEAMMATE_MESSAGE},
+        {"type": "text", "text": text},
+    ]
+    _, _, items = _read_native_user(tmp_path, content, isMeta=internal)
+    if internal:
+        assert len(items) == 2
+        assert all(item.data.get("is_meta") for item in items)
+    else:
+        [item] = items
+        assert not item.agent_message_candidate
+        assert [block["text"] for block in item.data["content"]] == [_TEAMMATE_MESSAGE, text]
+
+
+@pytest.mark.parametrize("status", ["completed", "async_launched"])
+def test_native_agent_tool_result_carries_only_completion_provenance(
+    tmp_path: Path, status: str
+) -> None:
+    _, response_id, items = _read_native_user(
+        tmp_path,
+        [{"type": "tool_result", "tool_use_id": "tool-1", "content": "Result text"}],
+        toolUseResult={"agentId": "agent-1", "status": status},
+    )
+    [item] = items
+    assert item.subagent_return_id == ("agent-1" if status == "completed" else None)
+    assert item.data == {"call_id": "tool-1", "output": "Result text"}
+    assert response_id == "active"
+
+
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
     """
     An ``isCompactSummary`` user record is flagged, not rendered as a bubble.
@@ -7840,6 +7985,48 @@ def test_stop_hook_seen_since_ignores_subagent_stop(
     assert not stop_hook_seen_since(bridge_dir, cursor)
 
     # Parent Stop — must be detected.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    assert stop_hook_seen_since(bridge_dir, cursor)
+
+
+def test_stop_hook_seen_since_skips_in_process_subagent_stop(tmp_path: Path) -> None:
+    """
+    ``stop_hook_seen_since`` must skip a stop carrying ``agent_id``.
+
+    In-process subagents fire ``Stop`` / ``StopFailure`` with the parent's
+    session id and transcript path; only ``agent_id`` identifies them.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    cursor = 1
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+            "agent_id": "a4892977eed616593",
+        },
+    )
+    assert not stop_hook_seen_since(bridge_dir, cursor)
+
     record_hook_event(
         bridge_dir,
         {
