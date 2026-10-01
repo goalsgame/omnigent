@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 
+import cachetools
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -329,11 +330,9 @@ async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[
 # this bounds the gap between frames — one transcript's read — not the whole
 # batch. A batch of any size can take arbitrarily long without tripping it, so
 # this can be tight: it's how fast a stalled or silently-dropped host is caught.
+# Heartbeats don't shorten it: one can't overtake a multi-MiB session frame
+# still in transit on the same socket.
 _HOST_IMPORT_TIMEOUT_S: float = 60.0
-# Once a host has sent a progress heartbeat (every ~10 s) it has proven it
-# keeps the channel warm, so three missed beats is enough to call it stuck.
-# Hosts that predate heartbeats never trigger this and keep the 60 s window.
-_HOST_IMPORT_HEARTBEAT_TIMEOUT_S: float = 30.0
 # Whole-request budget, kept under the ~300 s route timeout of typical ingress
 # proxies so the import ends with an explicit "run it again to continue" rather
 # than the proxy cutting the response mid-stream.
@@ -358,42 +357,34 @@ class ImportProgress:
     skipped: int = 0
 
 
-# External ids an interrupted batch import already has, per (user, host): the
-# re-run that "run it again to continue" asks for passes them to the host so
-# it skips them unread instead of re-reading and re-sending every session (a
-# slow transcript read is what ran out the clock). There is no cheap store
-# query for "this user's imported ids for a source", so this remembers what
-# this server confirmed. Kept only between incomplete runs (dropped once a run
-# completes) and for a short TTL, so a session deleted meanwhile is skipped at
-# most until then; process-local, so another replica or a restart just reads
-# everything again (the server still dedupes).
+# Process-local cache of the external ids an interrupted batch already stored,
+# per (user, host), so its re-run can tell the host to skip them. Best effort:
+# a restart or another replica just re-reads everything (the server dedupes).
 _CONTINUE_SKIP_TTL_S = 15 * 60
-_CONTINUE_SKIP_IDS: WorkspaceScopedCache[tuple[str | None, str], tuple[float, tuple[str, ...]]] = (
-    WorkspaceScopedCache()
+_CONTINUE_SKIP_MAX_ENTRIES = 1024
+_CONTINUE_SKIP_IDS: WorkspaceScopedCache[tuple[str | None, str], tuple[str, ...]] = (
+    WorkspaceScopedCache(
+        lambda: cachetools.TTLCache(maxsize=_CONTINUE_SKIP_MAX_ENTRIES, ttl=_CONTINUE_SKIP_TTL_S)
+    )
 )
 
 
 def _continue_skip_ids(user_id: str | None, host_id: str) -> list[str]:
     """Ids the last interrupted batch import from this host already has."""
-    entry = _CONTINUE_SKIP_IDS.get((user_id, host_id))
-    if entry is None:
-        return []
-    expires_at, ids = entry
-    if expires_at <= time.monotonic():
-        _CONTINUE_SKIP_IDS.pop((user_id, host_id), None)
-        return []
-    return list(ids)
+    return list(_CONTINUE_SKIP_IDS.get((user_id, host_id), ()))
 
 
 def _remember_continue_skip_ids(user_id: str | None, host_id: str, ids: Iterable[str]) -> None:
     """Remember the newest ids an interrupted batch import has, for its re-run."""
-    now = time.monotonic()
-    for key, (expires_at, _ids) in _CONTINUE_SKIP_IDS.items():
-        if expires_at <= now:
-            _CONTINUE_SKIP_IDS.pop(key, None)
     newest = list(dict.fromkeys(reversed(list(ids))))[:MAX_IMPORT_SKIP_IDS]
     if newest:
-        _CONTINUE_SKIP_IDS[(user_id, host_id)] = (now + _CONTINUE_SKIP_TTL_S, tuple(newest))
+        _CONTINUE_SKIP_IDS[(user_id, host_id)] = tuple(newest)
+
+
+def _host_skips_known(host_conn: object) -> bool:
+    """Whether the host can skip sessions the server already has, unread."""
+    capabilities = getattr(getattr(host_conn, "hello", None), "capabilities", None) or ()
+    return CAP_IMPORT_SKIP_KNOWN in capabilities
 
 
 def _host_label(host: object) -> str:
@@ -530,10 +521,7 @@ async def _stream_local_sessions_from_host(
             allow_session_chunks=True,
             progress=True,
             skip_external_session_ids=(
-                list(skip_external_session_ids)
-                if CAP_IMPORT_SKIP_KNOWN
-                in getattr(getattr(host_conn, "hello", None), "capabilities", ())
-                else []
+                list(skip_external_session_ids) if _host_skips_known(host_conn) else []
             ),
         )
     )
@@ -582,10 +570,9 @@ async def _stream_local_sessions_from_host(
                 )
             if kind == "progress":
                 # A chunk slice ({}) only proves the host is alive; a heartbeat
-                # also carries the host's count and switches to its tighter timeout.
+                # also carries the host's count.
                 done = data.get("done")
                 if isinstance(done, int):
-                    frame_timeout = _HOST_IMPORT_HEARTBEAT_TIMEOUT_S
                     total = data.get("total")
                     skipped = data.get("skipped")
                     yield ImportProgress(
@@ -651,6 +638,7 @@ def _interrupted_import_error(
     imported: int,
     total: int | None,
     already_imported: int = 0,
+    host_skips_known: bool = True,
 ) -> LocalImportError:
     """Restate a host-liveness failure with the machine's name and the batch's progress.
 
@@ -686,10 +674,19 @@ def _interrupted_import_error(
         # Sessions already there count: the re-run continues from all of them.
         have = imported + already_imported
         count = f"{have}{of_total}" if total is not None else f"{have} session(s)"
-        message = (
-            f"Imported {count} before the time limit — run it again to continue; "
-            "already imported sessions are skipped."
-        )
+        if host_skips_known:
+            message = (
+                f"Imported {count} before the time limit — run it again to continue; "
+                "already imported sessions are skipped."
+            )
+        else:
+            # This host re-reads every session on a re-run, so the same slow
+            # reads can hit the limit again at the same point.
+            message = (
+                f"Imported {count} before the time limit. Import fewer sessions at a "
+                "time, or update Omnigent on that machine so a re-run skips the ones "
+                "already imported."
+            )
     else:
         return exc
     details = {
@@ -1424,6 +1421,7 @@ def create_imports_router(
                 imported=counts["imported"],
                 already_imported=counts["already_imported"],
                 total=total,
+                host_skips_known=_host_skips_known(host_conn),
             ) from exc
         _note_skipped(int(stats.get("host_skipped", 0)))
         if body.session_id is None:

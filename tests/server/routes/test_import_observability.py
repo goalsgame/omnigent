@@ -45,12 +45,14 @@ def _silent_tunnel(monkeypatch: pytest.MonkeyPatch) -> TunnelPair:
     return pair
 
 
+@pytest.mark.parametrize("failing", [None, "s1"], ids=["ok", "partial"])
 async def test_stream_records_tally_and_each_failure_code(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failing: str | None
 ) -> None:
-    """A partial stream records its tally, failure codes, and one event per failed session."""
+    """A stream records its outcome and tally, and one event per failed session (none if clean)."""
     store = FakeConversationStore()
-    fail_append_for(store, "s1", RuntimeError("storage blew up"))
+    if failing is not None:
+        fail_append_for(store, failing, RuntimeError("storage blew up"))
     pair = TunnelPair()
     app = imports_app(store, host_registry=pair.registry, host=host_record())
     serve_local_sessions(monkeypatch, {f"s{i}": local_session(f"s{i}") for i in range(3)})
@@ -60,36 +62,24 @@ async def test_stream_records_tally_and_each_failure_code(
 
     (finished,) = _events(caplog, "import_local_finished")
     assert finished["route"] == "imports_local_stream"
+    assert finished["code"] is None
+    assert isinstance(finished["duration_ms"], int)
+    failed_events = _events(caplog, "import_session_failed")
+    if failing is None:
+        assert finished["outcome"] == "ok"
+        assert (finished["imported"], finished["failed"], finished["total"]) == (3, 0, 3)
+        assert finished["failure_codes"] is None
+        assert failed_events == []
+        return
     assert finished["outcome"] == "partial"
     assert (finished["imported"], finished["failed"], finished["total"]) == (2, 1, 3)
     assert finished["failure_codes"] == f"{ImportErrorCode.INTERNAL}:1"
-    assert finished["code"] is None
-    assert isinstance(finished["duration_ms"], int)
-    (failed,) = _events(caplog, "import_session_failed")
+    (failed,) = failed_events
     assert (failed["code"], failed["external_session_id"], failed["retryable"]) == (
         ImportErrorCode.INTERNAL,
         "s1",
         True,
     )
-
-
-async def test_clean_stream_records_ok(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A stream with no failures records outcome ok and no failure events."""
-    pair = TunnelPair()
-    app = imports_app(FakeConversationStore(), host_registry=pair.registry, host=host_record())
-    serve_local_sessions(monkeypatch, {"s0": local_session("s0")})
-    with caplog.at_level(logging.INFO, logger=imports_module.__name__):
-        async with pair, client(app) as http:
-            await http.post("/v1/imports/local/stream", json=local_import_body())
-    (finished,) = _events(caplog, "import_local_finished")
-    assert (finished["outcome"], finished["imported"], finished["failure_codes"]) == (
-        "ok",
-        1,
-        None,
-    )
-    assert _events(caplog, "import_session_failed") == []
 
 
 async def test_whole_import_error_is_recorded_with_its_code(

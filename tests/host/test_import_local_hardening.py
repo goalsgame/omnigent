@@ -406,3 +406,14 @@ async def test_host_skips_listed_sessions_unread(monkeypatch: pytest.MonkeyPatch
     ]
     # Before each session: s2 (skipped), s1, s0 (skipped).
     assert beats == [(0, 0), (0, 0), (1, 1), (2, 1)]
+
+
+@pytest.mark.parametrize("total", [True, -1, "3"], ids=["bool", "negative", "string"])
+def test_progress_total_that_is_not_a_count_decodes_as_unknown(total: object) -> None:
+    """A heartbeat whose total isn't a non-negative int reads as an unknown total."""
+    raw = json.dumps(
+        {"kind": "host.import_local_progress", "request_id": "r", "done": 1, "total": total}
+    )
+    frame = decode_host_frame(raw)
+    assert isinstance(frame, HostImportLocalProgressFrame)
+    assert (frame.done, frame.total) == (1, None)

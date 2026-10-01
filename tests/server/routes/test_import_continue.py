@@ -3,30 +3,45 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from typing import Any
 
+import cachetools
 import pytest
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.host.frames import (
     MAX_IMPORT_SKIP_IDS,
     HostImportLocalFrame,
     HostImportLocalSessionFrame,
     decode_host_frame,
 )
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes import imports as imports_module
 from omnigent.session_import.errors import ImportErrorCode
 from tests.server.import_tunnel_harness import (
     HOST_ID,
     FakeConversationStore,
     TunnelPair,
+    cli_import_body,
     error_event,
+    expire_deadline_after_first_append,
     host_record,
     imports_app,
     local_session,
     post_stream,
     register_host,
     serve_local_sessions,
+    wait_until,
 )
+
+
+async def _push_after_request(conn: HostConnection, *events: tuple[str, dict[str, Any]]) -> None:
+    """Act as the tunnel: wait for the request, then queue ``events`` for it."""
+    await conn.outbound_queue.get()
+    (queue,) = conn.pending_import_local.values()
+    for event in events:
+        queue.put_nowait(event)
 
 
 def _requests(pair: TunnelPair) -> list[HostImportLocalFrame]:
@@ -47,36 +62,37 @@ async def test_rerun_after_the_time_limit_skips_what_the_server_has(
 ) -> None:
     """A re-run after the time limit skips stored sessions; a completed run forgets them."""
     store = FakeConversationStore()
+    # The deadline passes once the first session (s5, oldest) is stored, while
+    # the host's next read (s4) is stalled.
+    expire_deadline_after_first_append(monkeypatch, store)
+    release = threading.Event()
     sessions = {f"s{i}": local_session(f"s{i}") for i in range(6)}
     pair = TunnelPair()
     app = imports_app(store, host_registry=pair.registry, host=host_record())
-    serve_local_sessions(monkeypatch, sessions, load_delay_s=0.1)
-    async with pair:
-        monkeypatch.setattr(imports_module, "_LOCAL_IMPORT_STREAM_DEADLINE_S", 0.35)
-        first = await post_stream(app)
-        assert error_event(first)["code"] == ImportErrorCode.TIME_LIMIT_REACHED
-        have = set(store.external)
-        assert 0 < len(have) < 6
-        await asyncio.sleep(0.2)  # the cancelled host task winds down
+    serve_local_sessions(monkeypatch, sessions, held={"s4"}, release=release)
+    try:
+        async with pair:
+            first = await post_stream(app)
+            assert error_event(first)["code"] == ImportErrorCode.TIME_LIMIT_REACHED
+            assert set(store.external) == {"s5"}
+            await wait_until(lambda: not pair.host._import_tasks)
+            release.set()
 
-        monkeypatch.setattr(imports_module, "_LOCAL_IMPORT_STREAM_DEADLINE_S", 270.0)
-        sent_before = len(pair.host_ws.sent)
-        second = await post_stream(app)
-        assert set(_requests(pair)[-1].skip_external_session_ids) == have
-        # The host skipped them unread; only the rest crossed the tunnel.
-        assert set(_sent_session_ids(pair, sent_before)) == set(sessions) - have
-        done = second[-1]
-        assert (done["imported"], done["already_imported"], done["failed"]) == (
-            6 - len(have),
-            len(have),
-            0,
-        )
-        assert done["complete"] is True
+            sent_before = len(pair.host_ws.sent)
+            second = await post_stream(app)
+            assert _requests(pair)[-1].skip_external_session_ids == ["s5"]
+            # The host skipped it unread; only the rest crossed the tunnel.
+            assert set(_sent_session_ids(pair, sent_before)) == set(sessions) - {"s5"}
+            done = second[-1]
+            assert (done["imported"], done["already_imported"], done["failed"]) == (5, 1, 0)
+            assert done["complete"] is True
 
-        # A completed run leaves nothing to continue.
-        third = await post_stream(app)
-        assert _requests(pair)[-1].skip_external_session_ids == []
-        assert third[-1]["already_imported"] == 6
+            # A completed run leaves nothing to continue.
+            third = await post_stream(app)
+            assert _requests(pair)[-1].skip_external_session_ids == []
+            assert third[-1]["already_imported"] == 6
+    finally:
+        release.set()
 
 
 async def test_host_without_the_capability_gets_no_skip_list(
@@ -106,6 +122,34 @@ async def test_exact_session_import_never_skips(monkeypatch: pytest.MonkeyPatch)
     assert imports_module._continue_skip_ids(None, HOST_ID) == ["s0"]
 
 
+@pytest.mark.parametrize(
+    ("body", "remembered"),
+    [({"source": "claude", "session_id": "s0"}, None), ({}, ("s0",))],
+    ids=["exact", "batch"],
+)
+async def test_only_an_interrupted_batch_is_remembered(
+    body: dict[str, str], remembered: tuple[str, ...] | None
+) -> None:
+    """A disconnect after one stored session is remembered for a batch, never an exact import."""
+    registry = HostRegistry()
+    conn = register_host(registry)
+    app = imports_app(FakeConversationStore(), host_registry=registry, host=host_record())
+    session = {
+        "external_session_id": "s0",
+        "source": "claude",
+        "items": cli_import_body()["items"],
+        "total": 1,
+    }
+    host = asyncio.create_task(
+        _push_after_request(conn, ("session", session), ("disconnected", {}))
+    )
+    events = await post_stream(app, **body)
+    await host
+    assert error_event(events)["code"] == ImportErrorCode.HOST_DISCONNECTED
+    assert events[-1]["imported"] == 1
+    assert imports_module._CONTINUE_SKIP_IDS.get((None, HOST_ID)) == remembered
+
+
 async def test_host_reported_skips_count_as_already_imported() -> None:
     """Skips from heartbeats and the done frame are folded into already_imported once each."""
     registry = HostRegistry()
@@ -131,11 +175,44 @@ async def test_host_reported_skips_count_as_already_imported() -> None:
     assert done["total"] == 3
 
 
+def _cache_with_clock(
+    monkeypatch: pytest.MonkeyPatch, *, maxsize: int = 8, ttl: float = 60.0
+) -> list[float]:
+    """Swap in a skip-id cache whose TTL clock the test advances via the returned cell."""
+    now = [0.0]
+    cache: WorkspaceScopedCache[Any, Any] = WorkspaceScopedCache(
+        lambda: cachetools.TTLCache(maxsize=maxsize, ttl=ttl, timer=lambda: now[0])
+    )
+    monkeypatch.setattr(imports_module, "_CONTINUE_SKIP_IDS", cache)
+    return now
+
+
 def test_remembered_ids_expire(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remembered skip ids are dropped once their TTL passes."""
-    monkeypatch.setattr(imports_module, "_CONTINUE_SKIP_TTL_S", 0)
+    now = _cache_with_clock(monkeypatch, ttl=60.0)
     imports_module._remember_continue_skip_ids(None, HOST_ID, ["s0"])
+    now[0] = 59.0
+    assert imports_module._continue_skip_ids(None, HOST_ID) == ["s0"]
+    now[0] = 61.0
     assert imports_module._continue_skip_ids(None, HOST_ID) == []
+
+
+def test_skip_cache_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Past its entry cap the cache drops the oldest (user, host) entries."""
+    _cache_with_clock(monkeypatch, maxsize=2)
+    for host_id in ("h1", "h2", "h3"):
+        imports_module._remember_continue_skip_ids(None, host_id, ["s0"])
+    assert imports_module._continue_skip_ids(None, "h1") == []
+    assert imports_module._continue_skip_ids(None, "h3") == ["s0"]
+    assert len(imports_module._CONTINUE_SKIP_IDS) == 2
+
+
+def test_production_cache_is_a_bounded_ttl_cache() -> None:
+    """The real cache expires entries and caps how many it holds."""
+    backing = imports_module._CONTINUE_SKIP_IDS._backing
+    assert isinstance(backing, cachetools.TTLCache)
+    assert backing.ttl == imports_module._CONTINUE_SKIP_TTL_S
+    assert backing.maxsize == imports_module._CONTINUE_SKIP_MAX_ENTRIES
 
 
 def test_remembered_ids_are_capped_to_the_newest() -> None:

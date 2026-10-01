@@ -12,9 +12,10 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import threading
 import time
 import types
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import Any, cast
 
 import httpx
@@ -323,8 +324,14 @@ def serve_local_sessions(
     sessions: Mapping[str, LocalSessionImport | BaseException],
     *,
     load_delay_s: float = 0.0,
+    held: Collection[str] = (),
+    release: threading.Event | None = None,
 ) -> None:
-    """Make the host's transcript readers serve ``sessions`` (newest first)."""
+    """Make the host's transcript readers serve ``sessions`` (newest first).
+
+    Reading any id in ``held`` blocks until ``release`` is set (callers set it
+    in a ``finally``; the wait gives up after 10 s so a failed test can't hang).
+    """
     order = list(sessions)
 
     def _across(*, limit: int) -> list[tuple[str, str]]:
@@ -336,6 +343,8 @@ def serve_local_sessions(
     def _load(_source: str, session_id: str) -> LocalSessionImport:
         if load_delay_s:
             time.sleep(load_delay_s)
+        if session_id in held and release is not None:
+            release.wait(timeout=10)
         value = sessions[session_id]
         if isinstance(value, BaseException):
             raise value
@@ -345,6 +354,43 @@ def serve_local_sessions(
     monkeypatch.setattr(f"{local}.list_recent_sessions_across_harnesses", _across)
     monkeypatch.setattr(f"{local}.list_recent_local_session_ids", _recent)
     monkeypatch.setattr(f"{local}.load_local_session", _load)
+
+
+class JumpingClock:
+    """A ``time`` module stand-in for the imports route whose monotonic clock can jump.
+
+    Jumping past the stream deadline expires it at the next check, so deadline
+    tests end on an event (e.g. the first persisted session), not wall time.
+    """
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+        self.time = time.time
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.offset
+
+    def expire_deadline(self) -> None:
+        """Move the clock past any stream deadline."""
+        self.offset += 10 * imports_module._LOCAL_IMPORT_STREAM_DEADLINE_S
+
+
+def expire_deadline_after_first_append(
+    monkeypatch: pytest.MonkeyPatch, store: FakeConversationStore
+) -> JumpingClock:
+    """Make the stream deadline pass once the first session's items are written."""
+    clock = JumpingClock()
+    monkeypatch.setattr(imports_module, "time", clock)
+    previous = store.on_append
+
+    def on_append(conversation_id: str, items: list[NewConversationItem]) -> None:
+        if previous is not None:
+            previous(conversation_id, items)
+        if not clock.offset:
+            clock.expire_deadline()
+
+    store.on_append = on_append
+    return clock
 
 
 def imports_app(

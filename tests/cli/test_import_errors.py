@@ -15,6 +15,7 @@ from click.testing import CliRunner, Result
 
 from omnigent.cli import cli
 from omnigent.cli_diagnostics import suppresses_recovery_hint
+from omnigent.session_import import local as local_import
 from omnigent.session_import.errors import ImportErrorCode
 
 _BASE = "http://localhost:6767"
@@ -306,6 +307,38 @@ def test_422_trims_value_error_prefix_and_long_paths(
     replies = {_IDS[0]: httpx.Response(422, json={"detail": [entry]})}
     result = _run(home, replies, "--session", _IDS[0])
     assert expected in result.output
+
+
+def test_422_keeps_a_field_named_body(home: Path) -> None:
+    """Only FastAPI's leading ``body`` is dropped from a field path, not a field named body."""
+    detail = [{"loc": ["body", "body", "text"], "msg": "Input should be a string"}]
+    replies = {_IDS[0]: httpx.Response(422, json={"detail": detail})}
+    result = _run(home, replies, "--session", _IDS[0])
+    assert "Import failed (422): body.text: Input should be a string" in result.output
+
+
+@pytest.mark.parametrize(
+    ("exc", "retry_hint"),
+    [(OSError("disk read failed"), True), (ValueError("bad transcript"), False)],
+    ids=["read-fault", "parse-fault"],
+)
+def test_local_read_fault_is_retryable_but_parse_fault_is_not(
+    home: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception, retry_hint: bool
+) -> None:
+    """A read fault may clear on retry and gets the retry hint; a parse fault does not."""
+    real_load = local_import.load_local_session
+
+    def _load(source: Any, session_id: str) -> Any:
+        if session_id == _IDS[2]:
+            raise exc
+        return real_load(source, session_id)
+
+    monkeypatch.setattr(local_import, "load_local_session", _load)
+    result = _run(home, {}, "--last", "2")
+    assert result.exit_code == 1, result.output
+    assert f"Failed {_IDS[2]}: {exc}" in result.output
+    assert "Imported: 1" in result.output
+    assert ("Run the same command again to retry" in result.output) is retry_hint
 
 
 def test_validation_failures_are_not_retryable(home: Path) -> None:

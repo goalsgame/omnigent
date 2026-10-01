@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any, cast
 
@@ -30,6 +31,7 @@ from tests.server.import_tunnel_harness import (
     TunnelPair,
     client,
     error_event,
+    expire_deadline_after_first_append,
     host_record,
     imports_app,
     local_import_body,
@@ -37,6 +39,7 @@ from tests.server.import_tunnel_harness import (
     post_stream,
     register_host,
     serve_local_sessions,
+    wait_until,
 )
 
 
@@ -126,40 +129,39 @@ def test_wrong_replica_message_for_an_unnamed_host() -> None:
 async def test_host_disconnect_mid_batch_reports_progress_and_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tunnel drop ends the stream at once with host_disconnected and the batch's progress."""
+    """A tunnel drop ends the stream with host_disconnected and the batch's progress."""
     store = FakeConversationStore()
     pair = TunnelPair(host_name="studio-mac")
     app = imports_app(store, host_registry=pair.registry, host=host_record(name="studio-mac"))
-    disconnected_at: list[float] = []
 
     def on_append(_conversation_id: str, _items: list[Any]) -> None:
-        if not disconnected_at:
-            disconnected_at.append(time.monotonic())
-            pair.registry.deregister(HOST_ID, workspace_id=0, conn=pair.conn)
+        pair.registry.deregister(HOST_ID, workspace_id=0, conn=pair.conn)
 
     store.on_append = on_append
+    # Host order is oldest first (s2, s1, s0); the reads after the first wait.
+    release = threading.Event()
     sessions = {f"s{i}": local_session(f"s{i}") for i in range(3)}
-    serve_local_sessions(monkeypatch, sessions, load_delay_s=0.05)
-    async with pair:
-        events = await post_stream(app)
+    serve_local_sessions(monkeypatch, sessions, held={"s1", "s0"}, release=release)
+    try:
+        async with pair:
+            events = await post_stream(app)
+    finally:
+        release.set()
 
-    # Ends right away, not after the per-frame timeout.
-    assert time.monotonic() - disconnected_at[0] < 1.0
+    # Waiting out the per-frame timeout instead would read as host_unresponsive.
     error = error_event(events)
     assert error["code"] == ImportErrorCode.HOST_DISCONNECTED
     assert error["retryable"] is True
-    imported = events[-1]["imported"]
-    assert 1 <= imported < 3
-    assert [e["event"] for e in events].count("session") == imported
+    assert [e["event"] for e in events].count("session") == 1
     assert "studio-mac" in error["message"]
-    assert f"disconnected after {imported} of 3 sessions" in error["message"]
+    assert "disconnected after 1 of 3 sessions" in error["message"]
     assert (error["host_name"], error["processed"], error["imported"], error["total"]) == (
         "studio-mac",
-        imported,
-        imported,
+        1,
+        1,
         3,
     )
-    assert events[-1]["complete"] is False
+    assert (events[-1]["imported"], events[-1]["complete"]) == (1, False)
 
 
 async def test_silent_tunnel_is_unreachable_before_any_request(
@@ -236,12 +238,36 @@ async def test_repeated_progress_is_sent_once() -> None:
     assert progress == [(0, None), (0, 3), (2, 3)]
 
 
-async def test_stall_after_heartbeat_uses_the_short_timeout(
+async def test_heartbeat_does_not_shorten_the_frame_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A host silent after a heartbeat is host_unresponsive after the short timeout."""
-    monkeypatch.setattr(imports_module, "_HOST_IMPORT_HEARTBEAT_TIMEOUT_S", 0.2)
-    monkeypatch.setattr(imports_module, "_HOST_IMPORT_TIMEOUT_S", 30.0)
+    """A session frame landing after a heartbeat, within the per-frame timeout, imports.
+
+    Scaled from 60 s: the frame lands at 70%, past the 50% a heartbeat once shortened it to.
+    """
+    monkeypatch.setattr(imports_module, "_HOST_IMPORT_TIMEOUT_S", 1.0)
+    registry = HostRegistry()
+    conn = register_host(registry)
+    session = {"external_session_id": "s0", "items": [], "total": 1}
+
+    async def host() -> None:
+        await _push_after_request(conn, ("progress", {"done": 0, "total": 1}))
+        await asyncio.sleep(0.7)  # a large session frame still in transit
+        (queue,) = conn.pending_import_local.values()
+        queue.put_nowait(("session", session))
+        queue.put_nowait(("done", {"status": "ok"}))
+
+    task = asyncio.create_task(host())
+    yielded = await _drain(registry, conn)
+    await task
+    assert [item for item in yielded if isinstance(item, dict)] == [session]
+
+
+async def test_silent_host_after_heartbeat_is_unresponsive_after_the_frame_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host quiet after a heartbeat is host_unresponsive once the full timeout passes."""
+    monkeypatch.setattr(imports_module, "_HOST_IMPORT_TIMEOUT_S", 0.3)
     registry = HostRegistry()
     conn = register_host(registry)
     host = asyncio.create_task(_push_after_request(conn, ("progress", {"done": 0, "total": 5})))
@@ -250,25 +276,7 @@ async def test_stall_after_heartbeat_uses_the_short_timeout(
         await _drain(registry, conn)
     await host
     assert raised.value.import_code == ImportErrorCode.HOST_UNRESPONSIVE
-    assert time.monotonic() - started < 5
-
-
-async def test_chunk_progress_keeps_the_long_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A chunk slice proves liveness but does not switch to the heartbeat timeout."""
-    monkeypatch.setattr(imports_module, "_HOST_IMPORT_HEARTBEAT_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(imports_module, "_HOST_IMPORT_TIMEOUT_S", 0.5)
-    registry = HostRegistry()
-    conn = register_host(registry)
-
-    async def host() -> None:
-        await _push_after_request(conn, ("progress", {}))
-        await asyncio.sleep(0.2)  # past the heartbeat timeout, within the long one
-        (queue,) = conn.pending_import_local.values()
-        queue.put_nowait(("done", {"status": "ok"}))
-
-    task = asyncio.create_task(host())
-    assert await _drain(registry, conn) == []
-    await task
+    assert time.monotonic() - started >= 0.25
 
 
 async def test_legacy_host_stall_keeps_the_original_timeout(
@@ -290,27 +298,37 @@ async def test_legacy_host_stall_keeps_the_original_timeout(
     assert "studio-mac" in error["message"]
 
 
+@pytest.mark.parametrize("legacy_host", [False, True], ids=["skips-known", "older-host"])
 async def test_deadline_stops_host_and_says_how_to_continue(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, legacy_host: bool
 ) -> None:
-    """The whole-stream deadline cancels the host's read and reports how far the batch got."""
-    monkeypatch.setattr(imports_module, "_LOCAL_IMPORT_STREAM_DEADLINE_S", 0.5)
-    pair = TunnelPair()
-    app = imports_app(FakeConversationStore(), host_registry=pair.registry, host=host_record())
+    """The deadline cancels the host's read; the advice depends on whether a re-run can skip."""
+    store = FakeConversationStore()
+    expire_deadline_after_first_append(monkeypatch, store)
+    pair = TunnelPair(legacy_host=legacy_host)
+    app = imports_app(store, host_registry=pair.registry, host=host_record())
+    # The read after the first session stalls until the test ends.
+    release = threading.Event()
     sessions = {f"s{i}": local_session(f"s{i}") for i in range(20)}
-    serve_local_sessions(monkeypatch, sessions, load_delay_s=0.1)
-    async with pair:
-        events = await post_stream(app, limit=20)
-        await asyncio.sleep(0.2)
-        # The cancel frame stopped the host's import task.
-        assert not pair.host._import_tasks
+    serve_local_sessions(monkeypatch, sessions, held={"s18"}, release=release)
+    try:
+        async with pair:
+            events = await post_stream(app, limit=20)
+            assert pair.cancel_frames()
+            if not legacy_host:
+                # The cancel frame stopped the stalled host import.
+                await wait_until(lambda: not pair.host._import_tasks)
+    finally:
+        release.set()
     error = error_event(events)
     assert error["code"] == ImportErrorCode.TIME_LIMIT_REACHED
     assert error["retryable"] is True
-    imported = events[-1]["imported"]
-    assert 0 < imported < 20
-    assert f"Imported {imported} of 20 before the time limit" in error["message"]
-    assert pair.cancel_frames()
+    assert events[-1]["imported"] == 1
+    assert error["message"].startswith("Imported 1 of 20 before the time limit")
+    if legacy_host:
+        assert "update Omnigent on that machine" in error["message"]
+    else:
+        assert "run it again to continue" in error["message"]
 
 
 class _LaggingClock:
@@ -361,22 +379,55 @@ def test_time_limit_message_counts_sessions_already_there() -> None:
     assert restated.import_code == ImportErrorCode.TIME_LIMIT_REACHED
 
 
+@pytest.mark.parametrize(
+    ("host_skips_known", "message"),
+    [
+        (
+            True,
+            "Imported 3 of 9 before the time limit — run it again to continue; "
+            "already imported sessions are skipped.",
+        ),
+        (
+            False,
+            "Imported 3 of 9 before the time limit. Import fewer sessions at a time, or "
+            "update Omnigent on that machine so a re-run skips the ones already imported.",
+        ),
+    ],
+    ids=["skips-known", "older-host"],
+)
+def test_time_limit_advice_depends_on_the_hosts_skip_support(
+    host_skips_known: bool, message: str
+) -> None:
+    """A host that re-reads everything on a re-run gets advice that can actually help."""
+    exc = LocalImportError(
+        "x", import_code=ImportErrorCode.TIME_LIMIT_REACHED, code=ErrorCode.INTERNAL_ERROR
+    )
+    restated = imports_module._interrupted_import_error(
+        exc, host=None, processed=3, imported=3, total=9, host_skips_known=host_skips_known
+    )
+    assert restated.message == message
+
+
 async def test_buffered_route_reports_time_limit_as_503(monkeypatch: pytest.MonkeyPatch) -> None:
     """The buffered route turns the deadline into a 503 with the partial tally."""
-    monkeypatch.setattr(imports_module, "_LOCAL_IMPORT_STREAM_DEADLINE_S", 0.3)
+    store = FakeConversationStore()
+    expire_deadline_after_first_append(monkeypatch, store)
     pair = TunnelPair()
-    app = imports_app(FakeConversationStore(), host_registry=pair.registry, host=host_record())
+    app = imports_app(store, host_registry=pair.registry, host=host_record())
+    release = threading.Event()
     sessions = {f"s{i}": local_session(f"s{i}") for i in range(20)}
-    serve_local_sessions(monkeypatch, sessions, load_delay_s=0.1)
-    async with pair, client(app) as http:
-        response = await http.post("/v1/imports/local", json=local_import_body(limit=20))
+    serve_local_sessions(monkeypatch, sessions, held={"s18"}, release=release)
+    try:
+        async with pair, client(app) as http:
+            response = await http.post("/v1/imports/local", json=local_import_body(limit=20))
+    finally:
+        release.set()
     assert response.status_code == 503
     error = response.json()["error"]
     assert error["code"] == ErrorCode.INTERNAL_ERROR
     assert error["import_code"] == ImportErrorCode.TIME_LIMIT_REACHED
     assert error["error_id"].startswith("err_")
-    assert error["imported"] >= 1
-    assert error["total"] == 20
+    assert (error["imported"], error["total"]) == (1, 20)
 
 
 async def test_closing_the_stream_early_cancels_the_host_import() -> None:

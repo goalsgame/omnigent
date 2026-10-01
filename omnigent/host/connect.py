@@ -202,8 +202,8 @@ if TYPE_CHECKING:
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
 
-# Import heartbeat cadence. The server treats three missed beats as a stuck
-# host, so a slow transcript read never looks like a dead tunnel.
+# Import heartbeat cadence: keeps the server's per-frame timeout from firing
+# during a slow transcript read and drives its progress readout.
 _IMPORT_PROGRESS_INTERVAL_S = 10.0
 
 _logger = logging.getLogger(__name__)
