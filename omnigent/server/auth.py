@@ -678,14 +678,12 @@ class UnifiedAuthProvider(AuthProvider):
 
         from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
 
-        if user_id.startswith(MACHINE_PRINCIPAL_PREFIX):
+        is_machine = user_id.startswith(MACHINE_PRINCIPAL_PREFIX)
+        if is_machine:
             if self.machine_verifier is None or not self.machine_verifier.principal_allowed(
                 user_id
             ):
                 return None
-            # Runner callbacks use Omnigent-issued owner JWTs; never cache their admin check.
-            return user_id
-
         # Machine-issued tokens carry ``grant_id`` (store-backed grant),
         # ``scope`` (restricted authority), or both. Each claim gets its own
         # request-scoped check below, and a token carrying either is never
@@ -695,7 +693,11 @@ class UnifiedAuthProvider(AuthProvider):
         scope = payload.get("scope")
         # Only client-credentials tokens (scope without a grant) are machine
         # principals. Every user-backed credential carries the account generation.
-        if self._account_check is not None and not (scope is not None and grant_id is None):
+        if (
+            not is_machine
+            and self._account_check is not None
+            and not (scope is not None and grant_id is None)
+        ):
             generation = payload.get("account_generation")
             if not isinstance(generation, str) or not self._account_check(user_id, generation):
                 return None
@@ -724,7 +726,8 @@ class UnifiedAuthProvider(AuthProvider):
                 return None
             return user_id
 
-        if self._account_check is None:
+        # Machine owner JWTs require live binding/admin checks on every request.
+        if self._account_check is None and not is_machine:
             remaining = payload.get("exp", 0) - time.time()
             if remaining > 0:
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
