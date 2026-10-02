@@ -29,6 +29,8 @@ _POD_UID = "29e56ae8-8948-48b2-91dc-e3cd23b88873"
 
 @pytest.fixture
 def activation_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(bootstrap.tempfile, "tempdir", str(tmp_path))
     directory = tmp_path / "activation"
     monkeypatch.setenv(bootstrap.ACTIVATION_DIR_ENV_VAR, str(directory))
     monkeypatch.setenv(bootstrap.POD_UID_ENV_VAR, _POD_UID)
@@ -284,51 +286,63 @@ def test_preparation_failure_never_starts_host(
     assert worker.poll() is None
 
 
-def test_host_waits_then_execs_existing_host_command_with_assigned_environment(
+def test_host_preloads_then_reuses_zygote_after_preparation(
     activation_dir: Path,
     tmp_path: Path,
     processes: Callable[..., subprocess.Popen[str]],
 ) -> None:
     marker = tmp_path / "host.json"
-    executable = tmp_path / "host.py"
-    executable.write_text(
-        "import hashlib, json, os, pathlib, sys\n"
-        f"pathlib.Path({str(marker)!r}).write_text(json.dumps({{\n"
-        f"    'host_id': os.environ[{HOST_ID_ENV_VAR!r}],\n"
-        f"    'host_name': os.environ[{HOST_NAME_ENV_VAR!r}],\n"
-        f"    'digest': hashlib.sha256(os.environ[{HOST_TOKEN_ENV_VAR!r}].encode()).hexdigest(),\n"
-        "    'server_url': sys.argv[1],\n"
-        "}))\n"
-    )
     host_code = (
-        "import sys\n"
+        "import hashlib, json, os, pathlib, sys\n"
+        "from omnigent.cli import cli\n"
         "from omnigent.host import warm_bootstrap as bootstrap\n"
-        "from omnigent.onboarding.sandboxes import kubernetes\n"
-        "kubernetes._render_host_command = lambda url: "
-        f"[sys.executable, {str(executable)!r}, url]\n"
+        "from omnigent.host.connect import HostProcess\n"
+        "from omnigent.host.identity import HostIdentity\n"
+        "def assigned_host(args, *, prog_name, obj, standalone_mode):\n"
+        "    zygote = obj['warm_runner_zygote']\n"
+        "    identity = HostIdentity(host_id=os.environ['OMNIGENT_HOST_ID'], "
+        "name=os.environ['OMNIGENT_HOST_NAME'])\n"
+        "    host = HostProcess(identity, args[2], runner_zygote=zygote)\n"
+        "    assert host._ensure_zygote_started() is zygote\n"
+        "    child = zygote.fork_runner(env={'OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_EXIT': '0'}, "
+        f"workspace=os.getcwd(), log_path={str(tmp_path / 'runner.log')!r})\n"
+        "    assert child.wait(timeout=10) == 0\n"
+        f"    pathlib.Path({str(marker)!r}).write_text(json.dumps({{\n"
+        "        'zygote_pid': zygote.pid,\n"
+        "        'args': args,\n"
+        "        'host_id': identity.host_id,\n"
+        "        'digest': hashlib.sha256(\n"
+        "            os.environ['OMNIGENT_HOST_TOKEN'].encode()).hexdigest(),\n"
+        "    }))\n"
+        "cli.main = assigned_host\n"
         "sys.exit(bootstrap.main(['host']))\n"
     )
+    worker = processes("host", code=host_code)
+    # Preparation readiness alone cannot advertise a cold host runtime.
+    processes("prepare")
+    _wait_for(bootstrap.runtime_ready, timeout=30)
+    before = json.loads(bootstrap._runtime_ready_path().read_text())
+    assert before["zygote_pid"] is not None
+    assert not marker.exists()
     payload = _payload()
     bootstrap.activate(payload)
-    assignment = bootstrap.Activation.parse(payload)
-    worker = processes("host", code=host_code)
-    time.sleep(0.3)
-    assert not marker.exists()
-    assert worker.poll() is None
-    bootstrap._set_stage(activation_dir, assignment, "prepared")
-    stdout, stderr = worker.communicate(timeout=10)
-    assert worker.returncode == 0
-    assert stdout == stderr == ""
-    assert json.loads(marker.read_text()) == {
-        "host_id": payload["host_id"],
-        "host_name": payload["host_name"],
-        "digest": hashlib.sha256(_TOKEN.encode()).hexdigest(),
-        "server_url": payload["server_url"],
-    }
-
-    restarted = processes("host", code=host_code)
-    restarted.communicate(timeout=10)
-    assert restarted.returncode == 0
+    stdout, stderr = worker.communicate(timeout=30)
+    assert worker.returncode == 0, stderr
+    assert _TOKEN not in stdout + stderr
+    result = json.loads(marker.read_text())
+    assert result["zygote_pid"] == before["zygote_pid"]
+    assert result["args"] == [
+        "host",
+        "--server",
+        payload["server_url"],
+        "--no-open",
+        "--non-interactive",
+    ]
+    assert result["host_id"] == payload["host_id"]
+    assert result["digest"] == hashlib.sha256(_TOKEN.encode()).hexdigest()
+    assert not bootstrap.runtime_ready()
+    with pytest.raises(ProcessLookupError):
+        os.kill(before["zygote_pid"], 0)
 
 
 def test_termination_forwards_to_preparation_and_allows_restart(
@@ -481,3 +495,95 @@ def test_disabled_warm_pool_provider_import_does_not_require_fcntl() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "key,value", [("pod_uid", "stale-pod"), ("host_pid", -1), ("zygote_pid", -1)]
+)
+def test_runtime_readiness_rejects_stale_or_invalid_processes(
+    activation_dir: Path, key: str, value: object
+) -> None:
+    activation_dir.mkdir(parents=True)
+    bootstrap._write_json(activation_dir / "ready.json", {"pod_uid": _POD_UID})
+    marker = {"pod_uid": _POD_UID, "host_pid": os.getpid(), "zygote_pid": os.getpid()}
+    bootstrap._write_json(bootstrap._runtime_ready_path(), marker)
+    assert bootstrap.runtime_ready()
+    marker[key] = value
+    bootstrap._write_json(bootstrap._runtime_ready_path(), marker)
+    assert not bootstrap.runtime_ready()
+
+
+def test_disabled_zygote_still_gates_host_on_preparation(
+    activation_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.cli import cli
+    from omnigent.host.runner_zygote import ZygoteManager
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_ZYGOTE", "0")
+    monkeypatch.setattr(ZygoteManager, "start", lambda self: pytest.fail("zygote disabled"))
+    bootstrap.activate(_payload())
+    bootstrap._set_stage(activation_dir, bootstrap.Activation.parse(_payload()), "prepared")
+    calls = []
+    monkeypatch.setattr(cli, "main", lambda *args, **kwargs: calls.append(kwargs))
+    assert bootstrap.host() == 0
+    assert calls[0]["obj"] == {"warm_runner_zygote": None}
+    assert not bootstrap._runtime_ready_path().exists()
+
+
+def test_failed_preload_never_advertises_ready_or_starts_host(
+    activation_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.cli import cli
+    from omnigent.host.runner_zygote import ZygoteManager, ZygoteUnavailable
+
+    def fail(self: ZygoteManager) -> None:
+        raise ZygoteUnavailable("preload failed")
+
+    monkeypatch.setattr(ZygoteManager, "start", fail)
+    monkeypatch.setattr(cli, "main", lambda *args, **kwargs: pytest.fail("host started"))
+    with pytest.raises(bootstrap.BootstrapError, match="preload failed"):
+        bootstrap.host()
+    assert not bootstrap._runtime_ready_path().exists()
+
+
+def test_assigned_host_readiness_survives_initial_zygote_exit(activation_dir: Path) -> None:
+    bootstrap.activate(_payload())
+    bootstrap._write_json(activation_dir / "ready.json", {"pod_uid": _POD_UID})
+    bootstrap._write_json(
+        bootstrap._runtime_ready_path(),
+        {"pod_uid": _POD_UID, "host_pid": os.getpid(), "zygote_pid": 99999999},
+    )
+    assert not bootstrap.runtime_ready()
+    bootstrap._set_stage(activation_dir, bootstrap.Activation.parse(_payload()), "prepared")
+    assert bootstrap.runtime_ready()
+    bootstrap._write_json(
+        bootstrap._runtime_ready_path(),
+        {"pod_uid": _POD_UID, "host_pid": 99999999, "zygote_pid": os.getpid()},
+    )
+    assert not bootstrap.runtime_ready()
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_embedded_cli_errors_keep_normal_output_and_cleanup(
+    activation_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    abort: bool,
+) -> None:
+    import click
+
+    from omnigent.cli import cli
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_ZYGOTE", "0")
+    bootstrap.activate(_payload())
+    bootstrap._set_stage(activation_dir, bootstrap.Activation.parse(_payload()), "prepared")
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise click.Abort() if abort else click.ClickException("Invalid host configuration")
+
+    monkeypatch.setattr(cli, "main", fail)
+    assert bootstrap.host() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ("Aborted!\n" if abort else "Error: Invalid host configuration\n")
+    assert not bootstrap._runtime_ready_path().exists()

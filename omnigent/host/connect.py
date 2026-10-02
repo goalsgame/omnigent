@@ -1088,6 +1088,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        runner_zygote: ZygoteManager | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1098,6 +1099,7 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param runner_zygote: Optional preloaded forkserver retained from warm activation.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
@@ -1225,7 +1227,9 @@ class HostProcess:
         self._zygote_enabled = IS_POSIX and not (
             _zygote_optout is not None and not env_truthy(_zygote_optout)
         )
-        self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
+        self._zygote: ZygoteManager | None = (
+            runner_zygote or ZygoteManager() if self._zygote_enabled else None
+        )
         self._zygote_disabled = False
         # Warms the zygote at daemon start so the first launch doesn't pay
         # its one-time import; see run().
@@ -4828,6 +4832,7 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
+    runner_zygote: ZygoteManager | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -4847,6 +4852,7 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :param runner_zygote: Optional preloaded forkserver retained from warm activation.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -4935,6 +4941,7 @@ def run_host_process(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        runner_zygote=runner_zygote,
     )
     try:
         asyncio.run(host.run())

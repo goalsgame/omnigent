@@ -1483,3 +1483,26 @@ def test_background_host_web_ui_open_preference(
 
     assert result.exit_code == 0, result.output
     assert opened == expected_opened
+
+
+def test_foreground_host_receives_preloaded_zygote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host.runner_zygote import ZygoteManager
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    zygote = ZygoteManager()
+    captured = []
+    with (
+        patch("omnigent.cli._ensure_databricks_server_auth"),
+        patch("omnigent.host.connect.run_host_process", lambda **kwargs: captured.append(kwargs)),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["host", "--server", "https://test.example", "--no-open", "--non-interactive"],
+            obj={"warm_runner_zygote": zygote},
+        )
+    assert result.exit_code == 0, result.output
+    assert captured[0]["runner_zygote"] is zygote
+    assert captured[0]["daemon_target"] == "https://test.example"

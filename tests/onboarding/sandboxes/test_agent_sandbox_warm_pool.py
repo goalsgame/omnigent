@@ -253,13 +253,18 @@ def test_template_is_unassigned_and_preserves_hardening() -> None:
             "-m",
             "omnigent.host.warm_bootstrap",
             "ready",
-        ]
-        assert container["command"] == [
+        ] + (["--runtime"] if container["name"] != "bootstrap" else [])
+        command = [
             "python3",
             "-m",
             "omnigent.host.warm_bootstrap",
             "prepare" if container["name"] == "bootstrap" else "host",
         ]
+        assert container["command"] == (
+            command
+            if container["name"] == "bootstrap"
+            else ["python3", "-c", warm._REAPER_SRC, *command]
+        )
     assert {item["name"] for item in pod["containers"]} == {"bootstrap", "host"}
     activation = next(item for item in pod["volumes"] if item["name"] == "activation")
     assert activation["emptyDir"]["medium"] == "Memory"
