@@ -325,3 +325,64 @@ def test_concurrent_first_requests_share_jwks_fetch(verifier, signing_key, monke
         identities = list(executor.map(verifier.authenticate, [token] * 16))
     assert identities == [PRINCIPAL] * 16
     assert calls == [1]
+
+
+@pytest.mark.parametrize("websocket", [False, True])
+def test_scoped_machine_owner_token_respects_paths(verifier, oidc, websocket):
+    provider = UnifiedAuthProvider("oidc", oidc_config=oidc, machine_verifier=verifier)
+    now = int(time.time())
+    token = jwt.encode(
+        {"sub": PRINCIPAL, "iat": now, "exp": now + 300, "scope": "sessions"},
+        oidc.cookie_secret,
+        algorithm="HS256",
+    )
+    assert provider.get_user_id(connection(token, websocket=websocket)) == PRINCIPAL
+    assert provider.get_user_id(connection(token, "/v1/me", websocket=websocket)) is None
+    assert provider.get_user_id(connection(token, websocket=websocket)) == PRINCIPAL
+    assert not provider._cookie_cache
+
+
+@pytest.mark.parametrize("scope", [None, "sessions"])
+def test_machine_owner_grant_revocation_is_live(verifier, oidc, scope):
+    provider = UnifiedAuthProvider("oidc", oidc_config=oidc, machine_verifier=verifier)
+    revoked = set()
+    checks = []
+
+    def is_revoked(grant_id):
+        checks.append(grant_id)
+        return grant_id in revoked
+
+    provider.set_grant_revocation_check(is_revoked)
+    now = int(time.time())
+    claims = {"sub": PRINCIPAL, "iat": now, "exp": now + 300, "grant_id": "grant-one"}
+    if scope is not None:
+        claims["scope"] = scope
+    token = jwt.encode(claims, oidc.cookie_secret, algorithm="HS256")
+    assert provider.get_user_id(connection(token)) == PRINCIPAL
+    revoked.add("grant-one")
+    assert provider.get_user_id(connection(token)) is None
+    assert checks == ["grant-one", "grant-one"]
+    assert not provider._cookie_cache
+
+
+def test_machine_owner_token_rejects_malformed_grant(verifier, oidc):
+    provider = UnifiedAuthProvider("oidc", oidc_config=oidc, machine_verifier=verifier)
+    now = int(time.time())
+    token = jwt.encode(
+        {"sub": PRINCIPAL, "iat": now, "exp": now + 300, "grant_id": 42},
+        oidc.cookie_secret,
+        algorithm="HS256",
+    )
+    assert provider.get_user_id(connection(token)) is None
+
+
+def test_unscoped_machine_runner_callbacks_keep_live_identity_checks(verifier, oidc):
+    provider = UnifiedAuthProvider("oidc", oidc_config=oidc, machine_verifier=verifier)
+    token = provider.mint_runner_token(PRINCIPAL, 300)
+    assert token is not None
+    assert provider.get_user_id(connection(token, "/v1/me")) == PRINCIPAL
+    assert not provider._cookie_cache
+    allowed = [True]
+    verifier.set_principal_check(lambda principal: allowed[0])
+    allowed[0] = False
+    assert provider.get_user_id(connection(token, "/v1/me")) is None
