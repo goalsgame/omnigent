@@ -39,6 +39,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     _AGENT_LABEL,
     _HOME_DIR,
     _POD_READY_REQUEST_TIMEOUT_S,
+    _REAPER_SRC,
     _api_reason,
     _ensure_sdk,
     _new_pod_name,
@@ -215,7 +216,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         bootstrap["name"] = BOOTSTRAP_CONTAINER
         bootstrap["command"] = _bootstrap_command("prepare")
         host = pod["containers"][0]
-        host["command"] = _bootstrap_command("host")
+        host["command"] = ["python3", "-c", _REAPER_SRC, *_bootstrap_command("host")]
         host["env"] = [
             item
             for item in host["env"]
@@ -240,7 +241,10 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 }
             )
             container["readinessProbe"] = {
-                "exec": {"command": _bootstrap_command("ready")},
+                "exec": {
+                    "command": _bootstrap_command("ready")
+                    + (["--runtime"] if container is host else [])
+                },
                 "periodSeconds": 1,
             }
         pod["containers"] = [bootstrap, host]

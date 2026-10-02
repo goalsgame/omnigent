@@ -9269,7 +9269,11 @@ def host(
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
-        run_host_process(server_url=server, daemon_target=target)
+        warm_zygote = ctx.obj.get("warm_runner_zygote")
+        if warm_zygote is not None:
+            run_host_process(server_url=server, daemon_target=target, runner_zygote=warm_zygote)
+        else:
+            run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it

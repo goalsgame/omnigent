@@ -1,9 +1,9 @@
 """Bind an already-running sandbox Pod to one managed host.
 
 The preparation container owns a private activation file in a memory-backed
-volume. The host container reads that volume and starts the normal host only
-after workspace preparation succeeds. Credentials never enter command argv
-or bootstrap status output.
+volume. The host container preloads the runner graph without an identity, then
+starts the normal host in the same interpreter after workspace preparation
+succeeds. Credentials never enter command argv or bootstrap status output.
 """
 
 from __future__ import annotations
@@ -281,23 +281,82 @@ def prepare() -> int:
     return 128 + signals.signum if signals.signum is not None else 0
 
 
-def host() -> int:
-    """Start the ordinary managed host only after this assignment is prepared."""
-    with _signals() as signals:
-        while signals.signum is None:
-            activation = _load_activation(_state_dir())
-            if activation is not None:
-                stage = status()["stage"]
-                if stage == "failed":
-                    raise BootstrapError("Sandbox workspace preparation failed.")
-                if stage == "prepared":
-                    from omnigent.onboarding.sandboxes.kubernetes import _render_host_command
+def _runtime_ready_path() -> Path:
+    return Path(tempfile.gettempdir()) / "omnigent-warm-runtime.json"
 
-                    command = _render_host_command(activation.server_url)
-                    if signals.signum is None:
-                        os.execvpe(command[0], command, activation.environment())
-            time.sleep(_POLL_INTERVAL)
-    return 128 + signals.signum if signals.signum is not None else 0
+
+def host() -> int:
+    """Preload without an identity, then reuse the runtime after preparation."""
+    marker = _runtime_ready_path()
+    marker.unlink(missing_ok=True)
+    zygote = None
+    try:
+        with _signals() as signals:
+            from omnigent._platform import IS_POSIX
+            from omnigent.cli import cli
+            from omnigent.host.runner_zygote import ZygoteManager, ZygoteUnavailable
+            from omnigent.process_logging import env_truthy
+
+            optout = os.environ.get("OMNIGENT_RUNNER_ZYGOTE")
+            if IS_POSIX and (optout is None or env_truthy(optout)):
+                zygote = ZygoteManager()
+                try:
+                    zygote.start()
+                except ZygoteUnavailable:
+                    raise BootstrapError("Warm runner preload failed.") from None
+            if signals.signum is not None:
+                return 128 + signals.signum
+            _write_json(
+                marker,
+                {
+                    "pod_uid": _pod_uid(),
+                    "host_pid": os.getpid(),
+                    "zygote_pid": zygote.pid if zygote else None,
+                },
+            )
+            while signals.signum is None:
+                if zygote is not None and not zygote.is_running():
+                    raise BootstrapError("Warm runner preload stopped.")
+                activation = _load_activation(_state_dir())
+                if activation is not None:
+                    stage = status()["stage"]
+                    if stage == "failed":
+                        raise BootstrapError("Sandbox workspace preparation failed.")
+                    if stage == "prepared":
+                        os.environ.update(activation.environment())
+                        break
+                time.sleep(_POLL_INTERVAL)
+            else:
+                return 128 + signals.signum if signals.signum is not None else 0
+        # Restore handlers before the ordinary host installs its own.
+        cli.main(
+            ["host", "--server", activation.server_url, "--no-open", "--non-interactive"],
+            obj={"warm_runner_zygote": zygote},
+            standalone_mode=False,
+        )
+        return 0
+    finally:
+        marker.unlink(missing_ok=True)
+        if zygote is not None:
+            zygote.stop()
+
+
+def runtime_ready() -> bool:
+    """Require this container's preloaded process in addition to preparation readiness."""
+    value = _read_json(_runtime_ready_path())
+    if not isinstance(value, dict) or value.get("pod_uid") != _pod_uid():
+        return False
+    for key in ("host_pid", "zygote_pid"):
+        pid = value.get(key)
+        if pid is None and key == "zygote_pid":
+            continue
+        if type(pid) is not int or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+    return ready()
 
 
 def ready() -> bool:
@@ -312,6 +371,7 @@ def ready() -> bool:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("prepare", "host", "activate", "status", "ready"))
+    parser.add_argument("--runtime", action="store_true", help="Require host runtime preload.")
     args = parser.parse_args(argv)
     try:
         if args.mode == "activate":
@@ -328,7 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(status(), separators=(",", ":")))
             return 0
         if args.mode == "ready":
-            return 0 if ready() else 1
+            return 0 if (runtime_ready() if args.runtime else ready()) else 1
         if args.mode == "prepare":
             return prepare()
         return host()
