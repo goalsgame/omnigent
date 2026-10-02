@@ -126,31 +126,11 @@ class OIDCMachineVerifier:
 
     def authenticate(self, token: str) -> str | None:
         """Verify signature and claims using only the operator-configured JWKS URL."""
-        if len(token) > 16_384:
-            return None
-        try:
-            header = jwt.get_unverified_header(token)
-            kid = header.get("kid")
-            if header.get("alg") != "RS256" or not isinstance(kid, str) or not 0 < len(kid) <= 256:
-                return None
-            key = self._jwks.get_signing_key_from_jwt(token).key
-            claims = jwt.decode(
-                token,
-                key,
-                algorithms=["RS256"],
-                issuer=self._issuer,
-                audience=self.config.audience,
-                options={"require": ["iss", "aud", "sub", "exp", "iat", "azp"]},
-            )
-        except (jwt.PyJWTError, OSError, ValueError):
+        claims = verify_access_token(token, self._jwks, self._issuer, self.config.audience)
+        if claims is None:
             return None
         client = claims.get("azp")
         if not isinstance(client, str) or self.config.clients.get(client) != claims.get("sub"):
-            return None
-        if claims.get("typ") != "Bearer":
-            return None
-        issued, expires = claims["iat"], claims["exp"]
-        if type(issued) is not int or type(expires) is not int or not 0 < expires - issued <= 3600:
             return None
         access = claims.get("resource_access")
         if not isinstance(access, dict):
@@ -161,3 +141,38 @@ class OIDCMachineVerifier:
             return None
         principal = MACHINE_PRINCIPAL_PREFIX + client
         return principal if self.principal_allowed(principal) else None
+
+
+def verify_access_token(
+    token: str, jwks: jwt.PyJWKClient, issuer: str, audience: str
+) -> dict[str, object] | None:
+    """Verify short-lived RS256 access tokens using only the configured issuer keys."""
+    if len(token) > 16_384:
+        return None
+    try:
+        header = jwt.get_unverified_header(token)
+        kid = header.get("kid")
+        if header.get("alg") != "RS256" or not isinstance(kid, str) or not 0 < len(kid) <= 256:
+            return None
+        key = jwks.get_signing_key_from_jwt(token).key
+        claims = jwt.decode(
+            token,
+            key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            audience=audience,
+            options={"require": ["iss", "aud", "sub", "exp", "iat", "azp"]},
+        )
+    except (jwt.PyJWTError, OSError, ValueError):
+        return None
+    issued, expires = claims["iat"], claims["exp"]
+    if (
+        claims.get("typ") != "Bearer"
+        or type(issued) is not int
+        or type(expires) is not int
+        or not 0 < expires - issued <= 3600
+        or not isinstance(claims["sub"], str)
+        or not 0 < len(claims["sub"]) <= 256
+    ):
+        return None
+    return claims

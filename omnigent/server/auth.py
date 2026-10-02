@@ -473,12 +473,19 @@ class UnifiedAuthProvider(AuthProvider):
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
         machine_verifier: OIDCMachineVerifier | None = None,
+        human_verifier: OIDCHumanVerifier | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
         self._accounts_config = accounts_config
         if machine_verifier is not None and source != "oidc":
             raise RuntimeError("OIDC machine authentication requires oidc auth mode")
+        if human_verifier is not None and source != "oidc":
+            raise RuntimeError("OIDC human delegation requires oidc auth mode")
+        if machine_verifier is not None and human_verifier is not None:
+            if human_verifier.config.clients.intersection(machine_verifier.config.clients):
+                raise RuntimeError("OIDC human and machine clients must not overlap")
+        self.human_verifier = human_verifier
         self.machine_verifier = machine_verifier
         self._local_single_user = (
             local_single_user if local_single_user is not None else local_single_user_enabled()
@@ -667,9 +674,10 @@ class UnifiedAuthProvider(AuthProvider):
                 algorithms=["HS256"],
             )
         except jwt.InvalidTokenError:
-            if not from_cookie and self.machine_verifier is not None:
-                if delegated_path_allowed(request.url.path):
-                    return self.machine_verifier.authenticate(token)
+            if not from_cookie and delegated_path_allowed(request.url.path):
+                from omnigent.server.oidc_human_auth import authenticate_oidc_bearer
+
+                return authenticate_oidc_bearer(token, self.machine_verifier, self.human_verifier)
             return None
 
         user_id = payload.get("sub")
@@ -910,12 +918,31 @@ def create_auth_provider() -> AuthProvider:
 
         accounts_config = AccountsConfig.from_env()
 
+    from omnigent.server.oidc_human_auth import OIDCHumanConfig, OIDCHumanVerifier
     from omnigent.server.oidc_machine_auth import OIDCMachineConfig, OIDCMachineVerifier
     from omnigent.server.server_config import load_server_config
 
-    machine_config = OIDCMachineConfig.parse(load_server_config().get("oidc_machine_auth"))
+    server_config = load_server_config()
+    human_config = OIDCHumanConfig.parse(server_config.get("oidc_human_auth"))
+    if human_config is not None and (source != "oidc" or oidc_config is None):
+        raise RuntimeError("oidc_human_auth requires oidc auth mode")
+    machine_config = OIDCMachineConfig.parse(server_config.get("oidc_machine_auth"))
     if machine_config is not None and (source != "oidc" or oidc_config is None):
         raise RuntimeError("oidc_machine_auth requires oidc auth mode")
+    if human_config is not None and machine_config is not None:
+        if human_config.clients.intersection(machine_config.clients):
+            raise RuntimeError("OIDC human and machine clients must not overlap")
+    human_verifier = (
+        OIDCHumanVerifier(
+            human_config,
+            oidc_config,
+            frozenset(machine_config.clients.values())
+            if machine_config is not None
+            else frozenset(),
+        )
+        if human_config is not None and oidc_config is not None
+        else None
+    )
     machine_verifier = (
         OIDCMachineVerifier(machine_config, oidc_config)
         if machine_config is not None and oidc_config is not None
@@ -926,6 +953,7 @@ def create_auth_provider() -> AuthProvider:
         oidc_config=oidc_config,
         accounts_config=accounts_config,
         machine_verifier=machine_verifier,
+        human_verifier=human_verifier,
     )
 
 
@@ -937,4 +965,5 @@ if TYPE_CHECKING:
 
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig
+    from omnigent.server.oidc_human_auth import OIDCHumanVerifier
     from omnigent.server.oidc_machine_auth import OIDCMachineVerifier
