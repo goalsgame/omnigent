@@ -766,3 +766,13 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
         r = client.get(f"/auth/cli-poll?ticket={ticket}")
         assert r.status_code == 200, r.text
         assert "refresh_token" not in r.json()
+
+
+def test_callback_cannot_select_machine_principal(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "oidc-machine:ticket-worker", "email_verified": True})
+    response = _do_callback(client, token)
+    assert response.status_code == 403
+    assert response.cookies.get("ap_session") is None
