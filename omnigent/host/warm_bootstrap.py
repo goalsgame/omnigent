@@ -346,7 +346,11 @@ def runtime_ready() -> bool:
     value = _read_json(_runtime_ready_path())
     if not isinstance(value, dict) or value.get("pod_uid") != _pod_uid():
         return False
-    for key in ("host_pid", "zygote_pid"):
+    if not ready():
+        return False
+    # Once prepared, the ordinary host owns forkserver recovery and fallback.
+    keys = ("host_pid",) if status()["stage"] == "prepared" else ("host_pid", "zygote_pid")
+    for key in keys:
         pid = value.get(key)
         if pid is None and key == "zygote_pid":
             continue
@@ -356,7 +360,7 @@ def runtime_ready() -> bool:
             os.kill(pid, 0)
         except OSError:
             return False
-    return ready()
+    return True
 
 
 def ready() -> bool:

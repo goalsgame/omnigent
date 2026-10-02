@@ -544,3 +544,20 @@ def test_failed_preload_never_advertises_ready_or_starts_host(
     with pytest.raises(bootstrap.BootstrapError, match="preload failed"):
         bootstrap.host()
     assert not bootstrap._runtime_ready_path().exists()
+
+
+def test_assigned_host_readiness_survives_initial_zygote_exit(activation_dir: Path) -> None:
+    bootstrap.activate(_payload())
+    bootstrap._write_json(activation_dir / "ready.json", {"pod_uid": _POD_UID})
+    bootstrap._write_json(
+        bootstrap._runtime_ready_path(),
+        {"pod_uid": _POD_UID, "host_pid": os.getpid(), "zygote_pid": 99999999},
+    )
+    assert not bootstrap.runtime_ready()
+    bootstrap._set_stage(activation_dir, bootstrap.Activation.parse(_payload()), "prepared")
+    assert bootstrap.runtime_ready()
+    bootstrap._write_json(
+        bootstrap._runtime_ready_path(),
+        {"pod_uid": _POD_UID, "host_pid": 99999999, "zygote_pid": os.getpid()},
+    )
+    assert not bootstrap.runtime_ready()
