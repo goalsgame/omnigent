@@ -113,6 +113,48 @@ async def test_initializer_evicts_rejected_result_for_retry() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 403, 409, 500, 503])
+async def test_configured_session_preserves_runner_initialization_errors(status_code: int) -> None:
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    client.status_code = status_code
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+    )
+    conversation = _conversation()
+    conversation.inference_snapshot = {"runtime_config": {"providers": {}, "inference": {}}}
+
+    first = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    second = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+
+    assert first.status_code == second.status_code == status_code
+    assert first.json() == {"status": "initialized"}
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_configured_session_still_requires_inference_acknowledgment() -> None:
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+    )
+    conversation = _conversation()
+    conversation.inference_snapshot = {"runtime_config": {"providers": {}, "inference": {}}}
+
+    response = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "The runner did not accept this session's inference configuration"
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "expected_ready"),
     [
