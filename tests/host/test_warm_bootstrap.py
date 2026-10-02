@@ -298,7 +298,7 @@ def test_host_preloads_then_reuses_zygote_after_preparation(
         "from omnigent.host import warm_bootstrap as bootstrap\n"
         "from omnigent.host.connect import HostProcess\n"
         "from omnigent.host.identity import HostIdentity\n"
-        "def assigned_host(args, *, obj, standalone_mode):\n"
+        "def assigned_host(args, *, prog_name, obj, standalone_mode):\n"
         "    zygote = obj['warm_runner_zygote']\n"
         "    identity = HostIdentity(host_id=os.environ['OMNIGENT_HOST_ID'], "
         "name=os.environ['OMNIGENT_HOST_NAME'])\n"
@@ -561,3 +561,29 @@ def test_assigned_host_readiness_survives_initial_zygote_exit(activation_dir: Pa
         {"pod_uid": _POD_UID, "host_pid": 99999999, "zygote_pid": os.getpid()},
     )
     assert not bootstrap.runtime_ready()
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_embedded_cli_errors_keep_normal_output_and_cleanup(
+    activation_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    abort: bool,
+) -> None:
+    import click
+
+    from omnigent.cli import cli
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_ZYGOTE", "0")
+    bootstrap.activate(_payload())
+    bootstrap._set_stage(activation_dir, bootstrap.Activation.parse(_payload()), "prepared")
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise click.Abort() if abort else click.ClickException("Invalid host configuration")
+
+    monkeypatch.setattr(cli, "main", fail)
+    assert bootstrap.host() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ("Aborted!\n" if abort else "Error: Invalid host configuration\n")
+    assert not bootstrap._runtime_ready_path().exists()

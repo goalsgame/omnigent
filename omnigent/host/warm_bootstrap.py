@@ -292,6 +292,8 @@ def host() -> int:
     zygote = None
     try:
         with _signals() as signals:
+            import click
+
             from omnigent._platform import IS_POSIX
             from omnigent.cli import cli
             from omnigent.host.runner_zygote import ZygoteManager, ZygoteUnavailable
@@ -329,11 +331,19 @@ def host() -> int:
             else:
                 return 128 + signals.signum if signals.signum is not None else 0
         # Restore handlers before the ordinary host installs its own.
-        cli.main(
-            ["host", "--server", activation.server_url, "--no-open", "--non-interactive"],
-            obj={"warm_runner_zygote": zygote},
-            standalone_mode=False,
-        )
+        try:
+            cli.main(
+                ["host", "--server", activation.server_url, "--no-open", "--non-interactive"],
+                prog_name="omnigent",
+                obj={"warm_runner_zygote": zygote},
+                standalone_mode=False,
+            )
+        except click.ClickException as exc:
+            exc.show()
+            return exc.exit_code
+        except click.Abort:
+            click.echo("Aborted!", err=True)
+            return 1
         return 0
     finally:
         marker.unlink(missing_ok=True)
