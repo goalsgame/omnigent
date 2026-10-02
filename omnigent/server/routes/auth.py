@@ -137,6 +137,18 @@ def create_auth_router(
         config_allowed_domains=allowed_domains,
     )
 
+    if auth_provider.human_verifier is not None:
+
+        def admit_human(email: str) -> bool:
+            if not admission.is_admitted(email):
+                return False
+            if permission_store is not None:
+                permission_store.ensure_user(email)
+                promote_if_listed(admin_list, permission_store, email)
+            return True
+
+        auth_provider.human_verifier.set_identity_check(admit_human)
+
     # Cookie names and secure flag depend on HTTP vs HTTPS (derived
     # from redirect_uri). The __Host- prefix requires HTTPS — using
     # it on http://localhost causes browsers to silently drop the
@@ -965,16 +977,24 @@ def _resolve_oidc_email(
     if claims is None:
         return None
 
+    return resolve_verified_oidc_email(claims, config)
+
+
+def resolve_verified_oidc_email(
+    claims: dict[str, object], config: OIDCConfig, *, log_details: bool = True
+) -> str | None:
+    """Apply the same email-claim verification policy to already-verified OIDC tokens."""
     email = claims.get(config.email_claim)
     if not isinstance(email, str) or not email.strip():
-        _logger.warning(
-            "Rejecting id_token: %r claim is missing or not a non-empty string "
-            "(claims present: %s). "
-            "IdPs that use a different claim for the email identity "
-            "can set OMNIGENT_OIDC_EMAIL_CLAIM.",
-            config.email_claim,
-            sorted(claims.keys()),
-        )
+        if log_details:
+            _logger.warning(
+                "Rejecting id_token: %r claim is missing or not a non-empty string "
+                "(claims present: %s). "
+                "IdPs that use a different claim for the email identity "
+                "can set OMNIGENT_OIDC_EMAIL_CLAIM.",
+                config.email_claim,
+                sorted(claims.keys()),
+            )
         return None
     email = email.strip()
 
@@ -985,20 +1005,22 @@ def _resolve_oidc_email(
     # explicit opt-out, regardless of ``email_verified``.
     if config.email_claim != "email":
         if config.skip_email_verification:
-            _logger.info(
-                "Accepting id_token %s %r; the claim has no verified "
-                "marker (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+            if log_details:
+                _logger.info(
+                    "Accepting id_token %s %r; the claim has no verified "
+                    "marker (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                    config.email_claim,
+                    email,
+                )
+            return email
+        if log_details:
+            _logger.warning(
+                "Rejecting id_token: %s %r has no email_verified marker "
+                "(email_verified refers to the email claim); set "
+                "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION to accept it",
                 config.email_claim,
                 email,
             )
-            return email
-        _logger.warning(
-            "Rejecting id_token: %s %r has no email_verified marker "
-            "(email_verified refers to the email claim); set "
-            "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION to accept it",
-            config.email_claim,
-            email,
-        )
         return None
 
     # Reject unless the IdP affirmatively verified the email. A signed
@@ -1008,16 +1030,18 @@ def _resolve_oidc_email(
     # IdPs like Okta that omit the claim for directory-managed users.
     if not _claim_is_verified_true(claims.get("email_verified")):
         if config.skip_email_verification:
-            _logger.info(
-                "Accepting id_token email %r without email_verified "
-                "(OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+            if log_details:
+                _logger.info(
+                    "Accepting id_token email %r without email_verified "
+                    "(OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                    email,
+                )
+            return email
+        if log_details:
+            _logger.warning(
+                "Rejecting id_token: email %r present but email_verified is not true",
                 email,
             )
-            return email
-        _logger.warning(
-            "Rejecting id_token: email %r present but email_verified is not true",
-            email,
-        )
         return None
 
     return email
