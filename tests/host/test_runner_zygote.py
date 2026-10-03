@@ -89,7 +89,8 @@ def _wait_exit(proc: ZygoteRunnerProc, timeout: float = 10.0) -> int:
     raise AssertionError("forked runner did not exit in time")
 
 
-def test_import_graph_is_single_threaded() -> None:
+@pytest.mark.parametrize("preload_metadata", [False, True])
+def test_import_graph_is_single_threaded(preload_metadata: bool) -> None:
     """The runner import graph starts no threads — the fork-safety invariant.
 
     A zygote forks from this state, so any import-time thread would risk child
@@ -99,10 +100,11 @@ def test_import_graph_is_single_threaded() -> None:
     """
     probe = "\n".join(
         [
-            "from omnigent.runner._zygote import _import_runner_graph",
+            "from omnigent.runner._zygote import _import_runner_graph, _preload_public_metadata",
             "import sys",
             "import threading",
             "_import_runner_graph()",
+            "_preload_public_metadata()" if preload_metadata else "pass",
             "print(threading.active_count())",
             "print([t.name for t in threading.enumerate()])",
             "print(all(name in sys.modules for name in (",
@@ -1043,3 +1045,51 @@ def test_polled_harness_pid_is_released_from_its_owner(manager: ZygoteManager, t
     # Re-polling is None (code popped) and the zygote is still healthy.
     assert _control_exchange(manager, {"cmd": "poll", "pid": pid})["returncode"] is None
     assert _control_exchange(manager, {"cmd": "ping"}).get("pong") is True
+
+
+def test_public_catalog_cache_survives_fork_and_workspace_change(tmp_path: Path) -> None:
+    probe = r"""
+import json, os, threading
+from pathlib import Path
+from omnigent.onboarding import providers
+from omnigent.runner._zygote import _preload_public_metadata
+from omnigent.harnesses.pi_native.credentials import _catalog_entry_for_model
+os.environ.pop('OMNIGENT_DISABLE_CATALOG_LOOKUP', None)
+providers._catalog_cache.clear()
+providers._catalog_cache_root = lambda: Path(os.environ['TEST_CACHE_ROOT'])
+def download(provider):
+    return {'schema_version': '1.0', 'models': {
+        'test-model': {'mode': 'chat', 'context_window': {'max_input': 12345}}
+    }}
+providers._download_provider_catalog = download
+_preload_public_metadata()
+assert threading.active_count() == 1
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+    providers._catalog_cache_root = lambda: Path('/not-present/assigned-workspace')
+    def no_download(provider):
+        raise AssertionError('cold catalog fetch in assigned child')
+    providers._download_provider_catalog = no_download
+    try:
+        entry = _catalog_entry_for_model('test-model')
+        assert entry is not None and entry.metadata.context_window == 12345
+        os.write(write_fd, b'cache inherited')
+        os._exit(0)
+    except BaseException:
+        os._exit(1)
+os.close(write_fd)
+assert os.read(read_fd, 100) == b'cache inherited'
+assert os.waitpid(pid, 0)[1] == 0
+print('fork inherited public metadata')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env={**os.environ, "TEST_CACHE_ROOT": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "fork inherited public metadata" in result.stdout

@@ -65,6 +65,7 @@ ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
 # Env var gating zygote use in the daemon (read there, documented here). The
 # zygote is on by default; set this to 0/false/no/off to opt out.
 ZYGOTE_ENABLED_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE"
+ZYGOTE_PRELOAD_METADATA_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_PRELOAD_METADATA"
 # Env var the zygote sets on each forked runner: the fd of that runner's own
 # connected control socket back to the zygote. The runner uses it to ask the
 # zygote to fork its harness children (which then share the harness import
@@ -196,6 +197,25 @@ def _import_runner_graph() -> None:
         sdk,
     )
     from omnigent.runtime.harnesses import _runner as _harness_runner  # noqa: F401
+
+
+def _preload_public_metadata() -> None:
+    """Warm public catalog and binary-version caches before accepting fork requests."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.harnesses.pi_native.credentials import PI_MODEL_CATALOG_PROVIDERS
+    from omnigent.harnesses.pi_native.main import pi_version, resolve_pi_executable
+    from omnigent.models.model_catalog import catalog_model_entries
+
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="warm-model-catalog") as executor:
+        futures = [
+            executor.submit(catalog_model_entries, name) for name in PI_MODEL_CATALOG_PROVIDERS
+        ]
+        for future in futures:
+            with contextlib.suppress(Exception):
+                future.result()
+    with contextlib.suppress(Exception):
+        pi_version(resolve_pi_executable())
 
 
 def _wire_child_stdio(log_path: str | None) -> None:
@@ -765,6 +785,8 @@ def main() -> None:
         sources=_package_source_stamps(),
     )
     _import_runner_graph()
+    if env_truthy(os.environ.get(ZYGOTE_PRELOAD_METADATA_ENV_VAR)):
+        _preload_public_metadata()
     # The import graph is now static; move it out of GC's tracked set so cyclic
     # collections stay cheap and don't dirty shared pages in forked children.
     gc.freeze()

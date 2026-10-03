@@ -149,22 +149,13 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
     :returns: Parsed version tuple, e.g. ``(0, 79, 10)``, or ``None``.
     """
     import re
-    import subprocess
 
-    try:
-        result = subprocess.run(
-            [executable, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-    except Exception:  # noqa: BLE001
+    from omnigent.onboarding.harness_install import cli_binary_version
+
+    version = cli_binary_version(executable, timeout=5.0)
+    if version is None:
         return None
-    # Older Pi (mariozechner package) prints the version to stderr via
-    # console.error; newer Pi (earendil-works) prints to stdout via
-    # console.log. Check both so the probe works across all versions.
-    combined = result.stdout + result.stderr
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", combined)
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version)
     if match is None:
         return None
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))

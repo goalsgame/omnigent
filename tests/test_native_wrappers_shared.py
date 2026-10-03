@@ -1033,3 +1033,23 @@ def test_pi_bridge_dir_is_stable_per_session(pi: ModuleType) -> None:
 
     assert first == pi.pi_bridge_dir_for_session("conv_1")
     assert first != pi.pi_bridge_dir_for_session("conv_2")
+
+
+def test_pi_version_reuses_binary_signature_cache(
+    pi: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "pi"
+    binary.write_text("#!/bin/sh\n")
+    calls: list[list[str]] = []
+
+    def version(argv: list[str], **kwargs: object) -> _Completed:
+        calls.append(argv)
+        return _Completed("pi 0.84.2", "")
+
+    monkeypatch.setattr("subprocess.run", version)
+    assert pi.pi_version(str(binary)) == (0, 84, 2)
+    assert pi.pi_supports_approve(str(binary))
+    assert len(calls) == 1
+    binary.write_text("#!/bin/sh\n# upgraded\n")
+    assert pi.pi_version(str(binary)) == (0, 84, 2)
+    assert len(calls) == 2

@@ -980,6 +980,20 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
 
 
+async def preload_managed_sandbox_sdk(deployment: ManagedSandboxDeployment | None) -> None:
+    """Import the optional Kubernetes SDK before serving configured managed launches."""
+    if deployment is None or not {"kubernetes", "agent_sandbox"}.intersection(
+        deployment.launchable_providers()
+    ):
+        return
+    from omnigent.onboarding.sandboxes.kubernetes import _ensure_sdk
+
+    try:
+        await asyncio.to_thread(_ensure_sdk)
+    except click.ClickException:
+        _logger.warning("Kubernetes SDK preload unavailable; managed launches will retry")
+
+
 def _modal_launcher_factory(
     image: str | None,
     secrets: list[str] | None,
