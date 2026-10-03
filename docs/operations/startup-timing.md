@@ -38,3 +38,16 @@ The host forwards the tracing switch through its runner environment allowlist.
 Wait for `runner.native_input_ready` before deleting a disposable session.
 Runner connection alone does not mean initialization or input readiness finished.
 Compare the first session after server restart with repeated warm allocations.
+
+Warm spares import host connection code and probe installed CLI binary versions
+before advertising runtime readiness. Successful version probes use the existing
+executable-signature cache; replacing a binary causes a new probe. Credential
+availability is checked after assignment against the current configuration.
+Managed hosts with an injected ID, name and launch token skip the Databricks
+browser-auth preflight; server registration still validates their launch token.
+
+Pi terminal preparation includes `pi.*` spans for launch configuration, token
+resolution, built-in tool schemas, MCP schemas, extension files, resume lookup,
+version detection, provider configuration and terminal creation. These are nested
+inside `runner.launch_native_terminal`; MCP connection spans may be emitted by
+the server handling discovery.

@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from omnigent.startup_timing import startup_span
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -2451,18 +2452,20 @@ async def _auto_create_pi_terminal(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory
 
-    launch_config = await _pi_native_launch_config(
-        session_id=session_id,
-        server_client=server_client,
-    )
+    with startup_span("pi.load_launch_config", session_id=session_id):
+        launch_config = await _pi_native_launch_config(
+            session_id=session_id,
+            server_client=server_client,
+        )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
     # Drop stale payloads so a relaunched Pi process can't replay them.
     clear_inbox(bridge_dir)
     pi_extension = pi_extension_path(bridge_dir)
     session_dir = pi_session_dir(bridge_dir)
-    auth_factory = _make_auth_token_factory()
-    auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
+    with startup_span("pi.resolve_auth_token", session_id=session_id):
+        auth_factory = _make_auth_token_factory()
+        auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
     # Route the extension's out-of-process POSTs (/events, /mcp,
     # /policies/evaluate) through the shared header builder so they carry the
     # workspace / deployment routing selectors, not just a bare bearer. A bare
@@ -2489,72 +2492,88 @@ async def _auto_create_pi_terminal(
     # can call Omnigent tools with centralized server-side policy enforcement
     # — parity with the other native harnesses. Best-effort: a schema-build
     # failure must not block the terminal launch, so fall back to no tools.
-    pi_tools: list[_JsonObject] = []
-    try:
-        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
-
-        spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
-    except Exception:  # noqa: BLE001 — tool registration is additive
-        _logger.warning(
-            "Failed to build pi-native tool schemas for session %s; "
-            "Pi will run with its built-in tools only",
-            session_id,
-            exc_info=True,
-        )
-    # External tools use the same authenticated, policy-enforcing MCP proxy.
-    spec_for_mcp = _unwrap_resolved_spec(agent_spec)
-    if server_client is not None and spec_for_mcp is not None and spec_for_mcp.mcp_servers:
+    with startup_span("pi.build_tool_schemas", session_id=session_id):
+        pi_tools: list[_JsonObject] = []
         try:
-            from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+            from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-            mcp_result = await ProxyMcpManager(session_id, server_client).schemas_for(spec_for_mcp)
-            registered_names = {tool["name"] for tool in pi_tools}
-            pi_tools.extend(
-                schema for schema in mcp_result.schemas if schema["name"] not in registered_names
-            )
-            for server, error in mcp_result.failures.items():
-                _logger.warning(
-                    "Pi native MCP %r unavailable for session %s: %s", server, session_id, error
-                )
-        except Exception:  # noqa: BLE001 — MCP availability must not block built-in tools
+            spec_for_tools = _unwrap_resolved_spec(agent_spec)
+            pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        except Exception:  # noqa: BLE001 — tool registration is additive
             _logger.warning(
-                "Failed to discover pi-native MCP tools for session %s", session_id, exc_info=True
+                "Failed to build pi-native tool schemas for session %s; "
+                "Pi will run with its built-in tools only",
+                session_id,
+                exc_info=True,
             )
+    # External tools use the same authenticated, policy-enforcing MCP proxy.
+    with startup_span("pi.discover_mcp_tools", session_id=session_id):
+        spec_for_mcp = _unwrap_resolved_spec(agent_spec)
+        if server_client is not None and spec_for_mcp is not None and spec_for_mcp.mcp_servers:
+            try:
+                from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+
+                mcp_result = await ProxyMcpManager(session_id, server_client).schemas_for(
+                    spec_for_mcp
+                )
+                registered_names = {tool["name"] for tool in pi_tools}
+                pi_tools.extend(
+                    schema
+                    for schema in mcp_result.schemas
+                    if schema["name"] not in registered_names
+                )
+                for server, error in mcp_result.failures.items():
+                    _logger.warning(
+                        "Pi native MCP %r unavailable for session %s: %s",
+                        server,
+                        session_id,
+                        error,
+                    )
+            except Exception:  # noqa: BLE001 — MCP availability must not block built-in tools
+                _logger.warning(
+                    "Failed to discover pi-native MCP tools for session %s",
+                    session_id,
+                    exc_info=True,
+                )
     from omnigent.runtime.prompt import build_instructions_nullable
 
     system_prompt = (
         build_instructions_nullable(spec_for_mcp, None, []) if spec_for_mcp is not None else None
     )
-    _extension, config = write_extension_files(
-        bridge_dir,
-        session_id=session_id,
-        server_url=launch_config.server_url,
-        conversation_url=conversation_url(launch_config.server_url, session_id),
-        auth_headers=auth_headers,
-        tools=pi_tools,
-        system_prompt=system_prompt,
-    )
+    with startup_span("pi.write_extension", session_id=session_id):
+        _extension, config = write_extension_files(
+            bridge_dir,
+            session_id=session_id,
+            server_url=launch_config.server_url,
+            conversation_url=conversation_url(launch_config.server_url, session_id),
+            auth_headers=auth_headers,
+            tools=pi_tools,
+            system_prompt=system_prompt,
+        )
     pi_command = resolve_pi_executable()
     # Rebuild the local Pi session JSONL from committed Omnigent items so a
     # cold-resume or fork opens with prior conversation context (parity with
     # claude-native / codex-native). Returns the id to launch with via
     # ``--session`` (the captured id, a minted fork id, or None for fresh).
-    resume_session_id = await _resolve_pi_resume_session(
-        session_id=session_id,
-        launch_config=launch_config,
-        session_dir=session_dir,
-        workspace=launch_config.workspace,
-        server_client=server_client,
-    )
+    with startup_span("pi.resolve_resume", session_id=session_id):
+        resume_session_id = await _resolve_pi_resume_session(
+            session_id=session_id,
+            launch_config=launch_config,
+            session_dir=session_dir,
+            workspace=launch_config.workspace,
+            server_client=server_client,
+        )
     from omnigent.harnesses.pi_native.main import pi_supports_approve
+
+    with startup_span("pi.probe_version", session_id=session_id):
+        supports_approve = await asyncio.to_thread(pi_supports_approve, pi_command)
 
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,
         session_dir=session_dir,
         external_session_id=resume_session_id,
-        approve=await asyncio.to_thread(pi_supports_approve, pi_command),
+        approve=supports_approve,
     )
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
@@ -2578,90 +2597,94 @@ async def _auto_create_pi_terminal(
             "This session has a configured Pi provider. Select its model in the composer "
             "and remove --provider, --model, and --api-key from terminal arguments."
         )
-    if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
-        from omnigent.harnesses.pi_native.credentials import (
-            pi_native_provider_launch,
-            pi_own_login_model_arg,
-            resolve_pi_native_provider,
-        )
+    with startup_span("pi.configure_provider", session_id=session_id):
+        if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
+            from omnigent.harnesses.pi_native.credentials import (
+                pi_native_provider_launch,
+                pi_own_login_model_arg,
+                resolve_pi_native_provider,
+            )
 
-        # Provider-qualified picker values select one of the models rendered
-        # from the provider configured through ``omni setup``.
-        spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
-        pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-        # Provider discovery does network I/O; keep the runner's stream and
-        # tunnel heartbeats responsive while Pi starts.
-        if pi_binding is not None and pi_spec is not None:
-            provider = await asyncio.to_thread(
-                resolve_pi_native_provider, model=spec_model, auth=pi_spec.executor.auth
-            )
-        else:
-            provider = await asyncio.to_thread(resolve_pi_native_provider, model=spec_model)
-        if provider is not None:
-            launch = pi_native_provider_launch(
-                bridge_dir / "pi-agent",
-                provider,
-                launch_config.reasoning_effort,
-                selection=spec_model,
-            )
-            pi_env.update(launch.env)
-            pi_args.extend(launch.args)
-            # An unroutable model leaves Pi unable to select it, which looks
-            # like a silent hang; prefer that notice over the credential one
-            # since it names the model the user actually picked.
-            credential_warning = provider.unroutable_model_warning() or provider.credential_warning
-            # An ignored effort setting is informational — the session still
-            # works, so it posts as a neutral notice rather than an error banner.
-            effort_notice = launch.effort_warning if not credential_warning else None
-        elif spec_model:
-            # No managed provider: Pi runs on its own login, but the pinned
-            # model must still reach it — without this the pick is silently
-            # dropped and Pi opens its own default model. A managed pick that
-            # cannot be expressed for Pi's own resolver (slash-bearing model
-            # id) is refused rather than mis-routed, so Pi keeps its default.
-            own_login_model = pi_own_login_model_arg(spec_model)
-            if own_login_model is not None:
-                pi_args.extend(["--model", own_login_model])
+            # Provider-qualified picker values select one of the models rendered
+            # from the provider configured through ``omni setup``.
+            spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
+            pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+            # Provider discovery does network I/O; keep the runner's stream and
+            # tunnel heartbeats responsive while Pi starts.
+            if pi_binding is not None and pi_spec is not None:
+                provider = await asyncio.to_thread(
+                    resolve_pi_native_provider, model=spec_model, auth=pi_spec.executor.auth
+                )
+            else:
+                provider = await asyncio.to_thread(resolve_pi_native_provider, model=spec_model)
+            if provider is not None:
+                launch = pi_native_provider_launch(
+                    bridge_dir / "pi-agent",
+                    provider,
+                    launch_config.reasoning_effort,
+                    selection=spec_model,
+                )
+                pi_env.update(launch.env)
+                pi_args.extend(launch.args)
+                # An unroutable model leaves Pi unable to select it, which looks
+                # like a silent hang; prefer that notice over the credential one
+                # since it names the model the user actually picked.
+                credential_warning = (
+                    provider.unroutable_model_warning() or provider.credential_warning
+                )
+                # An ignored effort setting is informational — the session still
+                # works, so it posts as a neutral notice rather than an error banner.
+                effort_notice = launch.effort_warning if not credential_warning else None
+            elif spec_model:
+                # No managed provider: Pi runs on its own login, but the pinned
+                # model must still reach it — without this the pick is silently
+                # dropped and Pi opens its own default model. A managed pick that
+                # cannot be expressed for Pi's own resolver (slash-bearing model
+                # id) is refused rather than mis-routed, so Pi keeps its default.
+                own_login_model = pi_own_login_model_arg(spec_model)
+                if own_login_model is not None:
+                    pi_args.extend(["--model", own_login_model])
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
     # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
     agent_os_env = _agent_os_env_from_spec(agent_spec)
-    terminal_view = await resource_registry.launch_required_terminal(
-        session_id=session_id,
-        terminal_name="pi",
-        session_key="main",
-        resource_role=PI_NATIVE_TERMINAL_ROLE,
-        parent_os_env=agent_os_env,
-        spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(
-                type="caller_process",
-                cwd=workspace,
-                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+    with startup_span("pi.create_terminal", session_id=session_id):
+        terminal_view = await resource_registry.launch_required_terminal(
+            session_id=session_id,
+            terminal_name="pi",
+            session_key="main",
+            resource_role=PI_NATIVE_TERMINAL_ROLE,
+            parent_os_env=agent_os_env,
+            spec=TerminalEnvSpec(
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=workspace,
+                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                ),
+                command=pi_command,
+                args=pi_args,
+                env=pi_env,
+                # Credential vars the operator declared off-limits for Pi
+                # (OMNIGENT_PI_ENV_UNSET): Pi activates a built-in provider's
+                # whole catalog on the mere presence of its credential, flooding
+                # the picker with entries that bypass the managed models.json
+                # provider — and Pi needs no credential env (its auth rides the
+                # managed apiKey). Empty list = no scrubbing.
+                env_unset=pi_native_env_unset(os.environ),
+                scrollback=100_000,
+                tmux_allow_passthrough=True,
+                tmux_start_on_attach=False,
+                # Keep the private tmux server alive if the `pi` CLI exits. Without
+                # this, tmux (exit-empty on, remain-on-exit off) reaps the lone-pane
+                # server the instant pi exits, the idle watcher's probes fail with
+                # "tmux unavailable", and the exit is undiagnosable. With it, the
+                # dead pane persists (last output capturable) and the watcher
+                # reports the exit deterministically via `#{pane_dead}` — parity
+                # with the claude terminal.
+                keep_alive_after_exit=True,
             ),
-            command=pi_command,
-            args=pi_args,
-            env=pi_env,
-            # Credential vars the operator declared off-limits for Pi
-            # (OMNIGENT_PI_ENV_UNSET): Pi activates a built-in provider's
-            # whole catalog on the mere presence of its credential, flooding
-            # the picker with entries that bypass the managed models.json
-            # provider — and Pi needs no credential env (its auth rides the
-            # managed apiKey). Empty list = no scrubbing.
-            env_unset=pi_native_env_unset(os.environ),
-            scrollback=100_000,
-            tmux_allow_passthrough=True,
-            tmux_start_on_attach=False,
-            # Keep the private tmux server alive if the `pi` CLI exits. Without
-            # this, tmux (exit-empty on, remain-on-exit off) reaps the lone-pane
-            # server the instant pi exits, the idle watcher's probes fail with
-            # "tmux unavailable", and the exit is undiagnosable. With it, the
-            # dead pane persists (last output capturable) and the watcher
-            # reports the exit deterministically via `#{pane_dead}` — parity
-            # with the claude terminal.
-            keep_alive_after_exit=True,
-        ),
-    )
+        )
     publish_event(
         session_id,
         {

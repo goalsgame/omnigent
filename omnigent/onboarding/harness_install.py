@@ -922,6 +922,19 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     return _harness_cli_version_satisfies(spec, binary, timeout)
 
 
+def preload_harness_cli_versions() -> None:
+    """Warm binary-signature caches for built-in and plugin CLIs, without login probes."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="warm-cli-version") as executor:
+        futures = [
+            executor.submit(harness_cli_installed, key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+            for key in _all_harness_install()
+        ]
+        for future in futures:
+            future.result()
+
+
 def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     """Return the installed CLI's version string plus the declared range.
 
