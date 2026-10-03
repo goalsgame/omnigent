@@ -297,11 +297,15 @@ def test_preparation_failure_never_starts_host(
     assert worker.poll() is None
 
 
+@pytest.mark.parametrize("tracing", [False, True])
 def test_host_preloads_then_reuses_zygote_after_preparation(
     activation_dir: Path,
     tmp_path: Path,
     processes: Callable[..., subprocess.Popen[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tracing: bool,
 ) -> None:
+    monkeypatch.setenv("OMNIGENT_STARTUP_TIMING", "1" if tracing else "0")
     marker = tmp_path / "host.json"
     host_code = (
         "import hashlib, json, os, pathlib, sys\n"
@@ -309,7 +313,10 @@ def test_host_preloads_then_reuses_zygote_after_preparation(
         "from omnigent.host import warm_bootstrap as bootstrap\n"
         "from omnigent.host.connect import HostProcess\n"
         "from omnigent.host.identity import HostIdentity\n"
+        "from omnigent.startup_timing import startup_span\n"
         "def assigned_host(args, *, prog_name, obj, standalone_mode):\n"
+        "    with startup_span('bootstrap.cli_probe'):\n"
+        "        pass\n"
         "    zygote = obj['warm_runner_zygote']\n"
         "    identity = HostIdentity(host_id=os.environ['OMNIGENT_HOST_ID'], "
         "name=os.environ['OMNIGENT_HOST_NAME'])\n"
@@ -339,6 +346,7 @@ def test_host_preloads_then_reuses_zygote_after_preparation(
     bootstrap.activate(payload)
     stdout, stderr = worker.communicate(timeout=30)
     assert worker.returncode == 0, stderr
+    assert ("bootstrap.cli_probe" in stderr) is tracing
     assert _TOKEN not in stdout + stderr
     result = json.loads(marker.read_text())
     assert result["zygote_pid"] == before["zygote_pid"]

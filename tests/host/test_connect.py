@@ -3717,7 +3717,10 @@ def test_handle_stat_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.canonical_path == os.path.realpath(target)
 
 
-def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path) -> None:
+@pytest.mark.parametrize("startup_timing", ["0", "1"])
+def test_build_runner_env_allowlists_host_env_and_strips_secrets(
+    tmp_path: Path, startup_timing: str
+) -> None:
     """
     A spawned runner inherits only allowlisted host env vars — process
     essentials pass through, the host owner's NON-HARNESS secrets do
@@ -3747,6 +3750,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
+        "OMNIGENT_STARTUP_TIMING": startup_timing,
         "OMNIGENT_LOG_TTY_FD": "9",
         "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND": "credential-helper --format raw",
     }
@@ -3814,6 +3818,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
     assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
     assert env["OMNIGENT_LOG_TTY_FD"] == "9"
+    assert env["OMNIGENT_STARTUP_TIMING"] == startup_timing
+
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
