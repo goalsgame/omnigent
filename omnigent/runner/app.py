@@ -226,6 +226,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.startup_timing import startup_span, startup_timed
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
@@ -2297,6 +2298,7 @@ def create_runner_app(
         _session_init_envelopes.pop(session_id, None)
         return None
 
+    @startup_timed("runner.load_init_context")
     async def _load_session_init_context(
         body: _JsonObject,
         *,
@@ -2519,6 +2521,7 @@ def create_runner_app(
             title=" ".join(title.split()),
         )
 
+    @startup_timed("runner.initialize_session", session_argument="body")
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
         from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
 
@@ -2629,7 +2632,8 @@ def create_runner_app(
         spec_entry: _SpecEntry | None = None
         if spec_resolver is not None:
             try:
-                spec_entry = await spec_resolver(agent_id, session_id)
+                with startup_span("runner.resolve_spec"):
+                    spec_entry = await spec_resolver(agent_id, session_id)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 _logger.error(
                     "Runner session initialization failed",
@@ -2772,11 +2776,12 @@ def create_runner_app(
             spawn_env = None
 
         try:
-            await process_manager.get_client(
-                session_id,
-                harness_name,
-                env=spawn_env,
-            )
+            with startup_span("runner.spawn_harness"):
+                await process_manager.get_client(
+                    session_id,
+                    harness_name,
+                    env=spawn_env,
+                )
         except RuntimeError as exc:
             _logger.error(
                 "Runner session initialization failed",
@@ -3071,14 +3076,15 @@ def create_runner_app(
                     session_id
                 )
 
-            _launch_result = await _launch_native_terminal(
-                harness_name,
-                _launch_ctx,
-                ensure_locks=_launch_locks,
-                pre_launch=_launch_pre,
-                build_context=_launch_build,
-                resolve_agent_spec=_launch_resolve_spec,
-            )
+            with startup_span("runner.launch_native_terminal"):
+                _launch_result = await _launch_native_terminal(
+                    harness_name,
+                    _launch_ctx,
+                    ensure_locks=_launch_locks,
+                    pre_launch=_launch_pre,
+                    build_context=_launch_build,
+                    resolve_agent_spec=_launch_resolve_spec,
+                )
             # Only claude reported terminal_ready in the create-session response.
             if harness_name == "claude-native":
                 terminal_ready = _launch_result
@@ -3146,7 +3152,8 @@ def create_runner_app(
         # Preserve the initialization contract: undrained child results are
         # recovered before POST /sessions returns. The scan no longer delays
         # native terminal registration because it ran concurrently above.
-        await asyncio.shield(_subagent_recovery_task)
+        with startup_span("runner.subagent_recovery"):
+            await asyncio.shield(_subagent_recovery_task)
 
         # Crash recovery (Step 8.5 Scenario A): if the session
         # has existing history, check whether the last item
@@ -3666,6 +3673,7 @@ def create_runner_app(
         if last_id:
             _last_server_item_id[session_id] = last_id
 
+    @startup_timed("runner.load_history")
     async def _load_history_as_input(
         session_id: str,
         drop_item_id: str | None = None,
@@ -10820,7 +10828,8 @@ def create_runner_app(
                     f"session spec resolver: session {session_id!r} has no agent_id",
                     code=ErrorCode.NOT_FOUND,
                 )
-            spec_entry = await spec_resolver(agent_id, session_id)
+            with startup_span("runner.resolve_spec"):
+                spec_entry = await spec_resolver(agent_id, session_id)
             if spec_entry is None:
                 # The session still references agent_id, but its stored bundle
                 # no longer resolves (deleted or rebound out from under the
@@ -12343,7 +12352,8 @@ async def _resolve_harness_config(
         rather than spawning an invalid harness subprocess.
     """
     if agent_id and spec_resolver:
-        spec_entry = await spec_resolver(agent_id, session_id)
+        with startup_span("runner.resolve_spec"):
+            spec_entry = await spec_resolver(agent_id, session_id)
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)
         if spec is not None:

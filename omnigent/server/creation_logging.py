@@ -15,6 +15,7 @@ from omnigent.debug_logging import (
     set_current_runner_id,
     set_current_session_id,
 )
+from omnigent.startup_timing import startup_span
 
 _logger = logging.getLogger("omnigent.server.creation")
 
@@ -38,7 +39,8 @@ def creation_stage(attribute: CreationStageAttribute) -> Iterator[None]:
     """
     started_at = time.perf_counter()
     try:
-        yield
+        with startup_span("server." + attribute.removesuffix("_ms")):
+            yield
     finally:
         elapsed_ms = (time.perf_counter() - started_at) * 1000
         existing = current_request_audit_attrs().get(attribute)

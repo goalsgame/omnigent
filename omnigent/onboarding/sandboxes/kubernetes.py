@@ -70,6 +70,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
+from omnigent.startup_timing import startup_timed
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -303,6 +304,7 @@ _DNS1123_SUBDOMAIN_RE: re.Pattern[str] = re.compile(
 # ── module helpers ─────────────────────────────────────
 
 
+@startup_timed("kubernetes.sdk_import")
 def _ensure_sdk() -> None:
     """
     Verify the Kubernetes client is importable, with an install hint when not.
@@ -1316,6 +1318,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
     # ── config / clients ────────────────────────────────────
 
+    @startup_timed("kubernetes.client_config")
     def _load_clients(self) -> tuple[k8s_client.CoreV1Api, k8s_client.BatchV1Api]:
         """
         Return the (lazily built) ``CoreV1Api`` and ``BatchV1Api``, loading
