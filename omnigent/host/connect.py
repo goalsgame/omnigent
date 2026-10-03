@@ -572,6 +572,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Process logging controls. These are diagnostics knobs, not secrets.
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
+        "OMNIGENT_STARTUP_TIMING",
         LOG_TTY_FD_ENV_VAR,
         # Debug-log sink config. A secret-provider command is preferred because
         # the uploader invokes it asynchronously and keeps its output in memory.
@@ -3713,6 +3714,7 @@ class HostProcess:
             ],
         )
 
+    @startup_timed("host.probe_harnesses")
     async def _probe_configured_harnesses(
         self,
         *,
@@ -3732,6 +3734,7 @@ class HostProcess:
                 )
             return None
 
+    @startup_timed("host.probe_gateway")
     async def _probe_gateway_inference(self, *, startup: bool) -> dict[str, bool] | None:
         """Collect gateway metadata without letting a probe break the channel."""
         try:
@@ -3747,6 +3750,7 @@ class HostProcess:
                 )
             return None
 
+    @startup_timed("host.initialize_capabilities")
     async def _initialize_capabilities(self) -> None:
         """Collect startup metadata before registration, with bounded fallback."""
         if self._capabilities_initialized:
@@ -4408,7 +4412,8 @@ class HostProcess:
         """Wait for bounded startup discovery, register, then service the connection."""
         self._start_capability_discovery()
         if self._capability_init_task is not None:
-            await asyncio.shield(self._capability_init_task)
+            with startup_span("host.wait_capabilities"):
+                await asyncio.shield(self._capability_init_task)
         _tel_opt_out = False
         try:
             from omnigent.telemetry.client import is_disabled as _tel_disabled
@@ -4440,7 +4445,8 @@ class HostProcess:
             encoded_hello = encode_host_frame(hello)
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
-        await ws.send(encoded_hello)
+        with startup_span("host.send_hello"):
+            await ws.send(encoded_hello)
         # A completed failed boot probe gets another best-effort chance only
         # after registration reaches the server. Keeping this out of the outer
         # connection-attempt loop avoids repeatedly spawning native probes while

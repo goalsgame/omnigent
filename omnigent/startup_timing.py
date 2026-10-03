@@ -26,6 +26,24 @@ def startup_timing_enabled() -> bool:
 
 
 @contextmanager
+def startup_stderr_logging() -> Iterator[None]:
+    """Capture only safe timing records before ordinary process logging is configured."""
+    if not startup_timing_enabled():
+        yield
+        return
+    handler = logging.StreamHandler()
+    previous_level = _logger.level
+    _logger.addHandler(handler)
+    _logger.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        _logger.removeHandler(handler)
+        handler.close()
+        _logger.setLevel(previous_level)
+
+
+@contextmanager
 def startup_span(
     phase: str, *, session_id: str | None = None, host_id: str | None = None
 ) -> Iterator[None]:

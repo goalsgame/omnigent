@@ -30,7 +30,7 @@ from omnigent.host.identity_env import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
-from omnigent.startup_timing import startup_span, startup_timing_enabled
+from omnigent.startup_timing import startup_span, startup_stderr_logging, startup_timing_enabled
 
 ACTIVATION_DIR_ENV_VAR = "OMNIGENT_ACTIVATION_DIR"
 POD_UID_ENV_VAR = "OMNIGENT_POD_UID"
@@ -338,12 +338,15 @@ def host() -> int:
                 return 128 + signals.signum if signals.signum is not None else 0
         # Restore handlers before the ordinary host installs its own.
         try:
-            cli.main(
-                ["host", "--server", activation.server_url, "--no-open", "--non-interactive"],
-                prog_name="omnigent",
-                obj={"warm_runner_zygote": zygote},
-                standalone_mode=False,
-            )
+            with startup_stderr_logging():
+                with startup_span("bootstrap.host_handoff", host_id=activation.host_id):
+                    pass
+                cli.main(
+                    ["host", "--server", activation.server_url, "--no-open", "--non-interactive"],
+                    prog_name="omnigent",
+                    obj={"warm_runner_zygote": zygote},
+                    standalone_mode=False,
+                )
         except click.ClickException as exc:
             exc.show()
             return exc.exit_code

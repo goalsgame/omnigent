@@ -33,6 +33,8 @@ when no spare was available.
 
 To measure startup, create an empty-workspace session and collect logs from the
 server, the allocated Pod's preparation and host containers, and its runner log.
+Host container stderr includes early CLI spans before process-file logging starts.
+The host forwards the tracing switch through its runner environment allowlist.
 Wait for `runner.native_input_ready` before deleting a disposable session.
 Runner connection alone does not mean initialization or input readiness finished.
 Compare the first session after server restart with repeated warm allocations.

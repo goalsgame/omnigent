@@ -109,3 +109,21 @@ def test_host_frame_correlation_excludes_other_frame_fields(caplog):
     assert launch(Frame("frame-session", "private-frame-token")) == "frame-session"
     assert all(event["session_id"] == "frame-session" for event in records(caplog))
     assert "private-frame-token" not in caplog.text
+
+
+def test_early_stderr_logging_is_timing_only_and_restores_state_after_failure(capsys):
+    from omnigent.startup_timing import startup_stderr_logging
+
+    logger = logging.getLogger("omnigent.startup_timing")
+    handlers = list(logger.handlers)
+    level = logger.level
+    with pytest.raises(RuntimeError, match="private-error"):
+        with startup_stderr_logging():
+            with startup_span("early_cli", host_id="host-test"):
+                raise RuntimeError("private-error")
+    stderr = capsys.readouterr().err
+    assert "early_cli" in stderr
+    assert '"outcome":"raised"' in stderr
+    assert "private-error" not in stderr
+    assert logger.handlers == handlers
+    assert logger.level == level
