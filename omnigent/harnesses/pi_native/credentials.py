@@ -1458,6 +1458,9 @@ def _gateway_pi_model_entry(
     return entry
 
 
+PI_MODEL_CATALOG_PROVIDERS = ("openai", "anthropic", "databricks", "google")
+
+
 def _catalog_entry_for_model(model_id: str) -> model_catalog.ModelEntry | None:
     """Find the best catalog entry for *model_id* by normalised id fragment.
 
@@ -1473,7 +1476,7 @@ def _catalog_entry_for_model(model_id: str) -> model_catalog.ModelEntry | None:
     normalised = lower.replace(".", "-")
 
     all_entries: list[model_catalog.ModelEntry] = []
-    for provider in ("openai", "anthropic", "databricks", "google"):
+    for provider in PI_MODEL_CATALOG_PROVIDERS:
         with contextlib.suppress(Exception):  # catalog failure must not break launch
             all_entries.extend(model_catalog.catalog_model_entries(provider))
 

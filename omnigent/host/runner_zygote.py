@@ -41,7 +41,7 @@ from typing import BinaryIO
 
 from omnigent.inner import _proc
 from omnigent.process_logging import child_logging_popen_kwargs
-from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
+from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR, ZYGOTE_PRELOAD_METADATA_ENV_VAR
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,7 @@ class ZygoteManager:
     :param python_executable: Interpreter to launch the zygote with; defaults
         to ``sys.executable``.
     :param log_path: Optional file for the zygote's own stdout/stderr.
+    :param preload_metadata: Warm public catalog and Pi version caches before readiness.
     """
 
     def __init__(
@@ -143,9 +144,11 @@ class ZygoteManager:
         *,
         python_executable: str | None = None,
         log_path: Path | None = None,
+        preload_metadata: bool = False,
     ) -> None:
         self._python = python_executable or sys.executable
         self._log_path = log_path
+        self._preload_metadata = preload_metadata
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
@@ -216,7 +219,11 @@ class ZygoteManager:
         :returns: The spawned zygote process.
         :raises OSError: If the interpreter could not be spawned.
         """
-        env = {**os.environ, ZYGOTE_CONTROL_FD_ENV_VAR: str(child_fd)}
+        env = {
+            **os.environ,
+            ZYGOTE_CONTROL_FD_ENV_VAR: str(child_fd),
+            ZYGOTE_PRELOAD_METADATA_ENV_VAR: "1" if self._preload_metadata else "0",
+        }
         # glibc reads these once, when its allocator initializes at exec. This is
         # the only exec on the zygote path — forked runners just replace
         # os.environ, far too late to matter — so the cap must be applied here to

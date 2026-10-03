@@ -987,6 +987,13 @@ def _harness_cli_version_string(
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
+    return cli_binary_version(binary, timeout=timeout)
+
+
+def cli_binary_version(
+    binary: str, *, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S
+) -> str | None:
+    """Probe a CLI version, caching successful parses by executable signature."""
     sig = _binary_signature(binary)
     if sig is not None:
         with _PROBE_CACHE_LOCK:

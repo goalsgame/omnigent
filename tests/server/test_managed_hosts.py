@@ -5672,3 +5672,91 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+@pytest.mark.parametrize("provider", [None, "modal", "kubernetes", "agent_sandbox"])
+async def test_sdk_preload_only_for_offered_kubernetes_backends(
+    provider: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.managed_hosts import preload_managed_sandbox_sdk
+
+    deployment = (
+        None
+        if provider is None
+        else ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://example.com",
+                provider=provider,
+                launcher_factory=lambda: pytest.fail("launcher instantiated"),
+                token_ttl_s=3600,
+            )
+        )
+    )
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.kubernetes._ensure_sdk", lambda: calls.append(True)
+    )
+    await preload_managed_sandbox_sdk(deployment)
+    assert bool(calls) is (provider in ("kubernetes", "agent_sandbox"))
+
+
+async def test_missing_sdk_preload_keeps_server_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.server.managed_hosts import preload_managed_sandbox_sdk
+
+    deployment = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://example.com",
+            provider="kubernetes",
+            launcher_factory=lambda: pytest.fail("launcher instantiated"),
+            token_ttl_s=3600,
+        )
+    )
+
+    def unavailable() -> None:
+        raise click.ClickException("optional SDK unavailable")
+
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes._ensure_sdk", unavailable)
+    await preload_managed_sandbox_sdk(deployment)
+
+
+async def test_lifespan_waits_for_sdk_import_before_ready(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    deployment = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://example.com",
+            provider="agent_sandbox",
+            launcher_factory=lambda: pytest.fail("launcher instantiated"),
+            token_ttl_s=3600,
+        )
+    )
+    app = _capability_probe_app(db_uri, tmp_path, deployment)
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    ready = asyncio.Event()
+
+    def import_sdk() -> None:
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=10), "test did not release SDK import"
+
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.kubernetes._ensure_sdk", import_sdk)
+
+    async def run_lifespan() -> None:
+        async with app.router.lifespan_context(app):
+            ready.set()
+
+    task = asyncio.create_task(run_lifespan())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        assert not ready.is_set()
+        assert not task.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=20)
+    assert ready.is_set()

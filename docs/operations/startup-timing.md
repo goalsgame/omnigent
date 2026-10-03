@@ -46,6 +46,18 @@ availability is checked after assignment against the current configuration.
 Managed hosts with an injected ID, name and launch token skip the Databricks
 browser-auth preflight; server registration still validates their launch token.
 
+When Kubernetes or Agent Sandbox launches are configured, the server imports
+the Kubernetes SDK before completing startup. Missing optional dependencies
+still produce the normal launch-time installation error.
+
+Warm forkservers preload public provider model catalogs and the Pi CLI version
+before advertising readiness. Their runner and harness children inherit these
+caches; owner credentials remain resolved after assignment. Catalogs retain
+the normal one-hour freshness limit and download timeout, so long-idle spares
+can refresh metadata during launch. Ordinary hosts do not enable this preload.
+Pi version detection uses the same executable-signature cache as CLI capability
+checks.
+
 Pi terminal preparation includes `pi.*` spans for launch configuration, token
 resolution, built-in tool schemas, MCP schemas, extension files, resume lookup,
 version detection, provider configuration and terminal creation. These are nested
