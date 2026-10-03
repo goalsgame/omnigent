@@ -364,6 +364,7 @@ from omnigent.spec.types import (
     Phase,
     PolicyAction,
 )
+from omnigent.startup_timing import startup_span, startup_timed
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
@@ -3614,6 +3615,7 @@ async def _wait_for_host_bound_runner_client(
             await asyncio.gather(*outstanding, return_exceptions=True)
 
 
+@startup_timed("server.managed_launch_task", session_argument="session_id")
 async def _run_managed_launch(
     *,
     session_id: str,
@@ -3699,7 +3701,10 @@ async def _run_managed_launch(
         resolve_managed_agent_label,
     )
 
-    saved_conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    with startup_span("server.load_launch_session"):
+        saved_conversation = await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
     if saved_conversation is not None:
         sandbox_config = deployment_with_inference_snapshot(
             sandbox_config,
@@ -3708,12 +3713,13 @@ async def _run_managed_launch(
 
     agent_name: str | None = None
     if agent_store is not None and agent_id is not None:
-        agent_name = await asyncio.to_thread(
-            resolve_managed_agent_label,
-            agent_store,
-            agent_id,
-            session_id=session_id,
-        )
+        with startup_span("server.resolve_agent_profile"):
+            agent_name = await asyncio.to_thread(
+                resolve_managed_agent_label,
+                agent_store,
+                agent_id,
+                session_id=session_id,
+            )
     with runner_log_scope(session_id, None):
         managed = await _provision_managed_sandbox(
             session_id=session_id,
@@ -3741,6 +3747,7 @@ async def _run_managed_launch(
         )
 
 
+@startup_timed("server.bind_and_launch_runner", session_argument="session_id")
 async def _bind_and_launch_managed_runner(
     *,
     session_id: str,
@@ -4720,6 +4727,7 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, "failed", "internal error during managed host wake")
 
 
+@startup_timed("server.initialize_runner_session")
 async def _ensure_runner_session_initialized(
     session_id: str,
     conv: Conversation,
@@ -9574,6 +9582,7 @@ async def _resolve_native_smart_routing(
     return native_agent.agent_name, model, verdict, None
 
 
+@startup_timed("server.create_session")
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,

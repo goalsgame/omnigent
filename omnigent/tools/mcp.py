@@ -57,6 +57,7 @@ from mcp.types import Tool as McpToolDef
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
+from omnigent.startup_timing import startup_timed
 
 _T = TypeVar("_T")
 
@@ -577,6 +578,7 @@ class McpServerConnection:
             cooldown_seconds=_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
         )
 
+    @startup_timed("mcp.connect_and_discover")
     async def connect(self) -> list[McpToolDef]:
         """
         Establish the MCP connection and discover tools.

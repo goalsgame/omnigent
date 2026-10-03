@@ -223,11 +223,15 @@ def test_assigned_identity_overrides_inherited_environment(
     assert env["IS_SANDBOX"] == "1"
 
 
+@pytest.mark.parametrize("tracing", [False, True])
 def test_prepare_environment_output_redaction_and_restart(
     activation_dir: Path,
     tmp_path: Path,
     processes: Callable[..., subprocess.Popen[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tracing: bool,
 ) -> None:
+    monkeypatch.setenv("OMNIGENT_STARTUP_TIMING", "1" if tracing else "0")
     marker = tmp_path / "prepared.json"
     script = tmp_path / "prepare.py"
     script.write_text(
@@ -262,7 +266,14 @@ def test_prepare_environment_output_redaction_and_restart(
     worker.terminate()
     stdout, stderr = worker.communicate(timeout=5)
     assert worker.returncode == 128 + signal.SIGTERM
-    assert stdout == stderr == ""
+    assert stdout == ""
+    if tracing:
+        assert "bootstrap.prepare_wait" in stderr
+        assert "duration_ms" in stderr
+        assert _TOKEN not in stderr
+        assert "prepare_command" not in stderr
+    else:
+        assert stderr == ""
 
     processes("prepare")
     _wait_for(lambda: (activation_dir / "ready.json").stat().st_mtime_ns != previous_ready)

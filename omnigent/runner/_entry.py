@@ -30,6 +30,7 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.startup_timing import startup_timed
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -990,6 +991,7 @@ class _ManagedMintTokenFactory:
         return None
 
 
+@startup_timed("runner.mint_owner_token")
 def _mint_managed_owner_token(
     mint_url: str,
     server_url: str,
@@ -1245,6 +1247,7 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+@startup_timed("runner.fetch_agent_spec")
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -1320,6 +1323,7 @@ async def _resolve_agent_spec_from_server(
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
+@startup_timed("runner.create_app")
 def create_app(
     auth_token_factory: Callable[[], str | None] | None = None,
 ) -> FastAPI:

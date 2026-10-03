@@ -190,6 +190,7 @@ from omnigent.onboarding.sandboxes.base import SandboxGoneError
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.startup_timing import startup_span, startup_timed
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -997,6 +998,7 @@ def _modal_launcher_factory(
     :returns: A factory producing parameterized Modal launchers.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the Modal launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.modal import ModalSandboxLauncher
@@ -1084,6 +1086,7 @@ def _registry_launcher_factory(
     :returns: A factory producing that provider's launcher.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the contributed launcher (lazy import inside)."""
         from omnigent.onboarding.sandboxes import registry as sandbox_registry
@@ -1801,6 +1804,7 @@ def _daytona_launcher_factory(
     :returns: A factory producing parameterized Daytona launchers.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the Daytona launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
@@ -1820,6 +1824,7 @@ def _blaxel_launcher_factory(
 ) -> Callable[[], SandboxHostLauncher]:
     """Build the launcher factory for the YAML ``provider: blaxel`` path."""
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the Blaxel launcher; the optional SDK remains lazy."""
         from omnigent.onboarding.sandboxes.blaxel import BlaxelSandboxLauncher
@@ -1957,6 +1962,7 @@ def _boxlite_launcher_factory(
     :returns: A factory producing parameterized boxlite launchers.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the boxlite launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.boxlite import BoxliteSandboxLauncher
@@ -2175,6 +2181,7 @@ def _cwsandbox_launcher_factory(
 ) -> Callable[[], SandboxHostLauncher]:
     """Build the launcher factory for the YAML ``provider: cwsandbox`` path."""
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         from omnigent.onboarding.sandboxes.cwsandbox import CWSandboxLauncher
 
@@ -2242,6 +2249,7 @@ def _e2b_launcher_factory(
     :returns: A factory producing parameterized E2B launchers.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the E2B launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
@@ -2273,6 +2281,7 @@ def _gensee_launcher_factory(
         GenseeSandboxLauncher,
     )
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         return GenseeSandboxLauncher(
             endpoint=endpoint,
@@ -2389,6 +2398,7 @@ def _islo_launcher_factory(
     :returns: A factory producing parameterized Islo launchers.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the Islo launcher."""
         from omnigent.onboarding.sandboxes.islo import IsloSandboxLauncher
@@ -2434,6 +2444,7 @@ def _openshell_launcher_factory(
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
@@ -2475,6 +2486,7 @@ def _microsandbox_launcher_factory(
     :returns: A factory producing parameterized microsandbox launchers.
     """
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the microsandbox launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.microsandbox import MicrosandboxSandboxLauncher
@@ -3378,6 +3390,7 @@ def _kubernetes_launcher_factory(
         namespace, secret_name, service_account, node_selector, runtime_class
     )
 
+    @startup_timed("server.launcher_factory")
     def _build() -> SandboxHostLauncher:
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
@@ -3436,6 +3449,7 @@ def _select_provider_config(
     return selected
 
 
+@startup_timed("server.managed_host_launch")
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3501,9 +3515,12 @@ async def launch_managed_host(
     # across a user's managed sandboxes.
     host_name = f"managed-{host_id[:8]}"
     try:
-        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
-        await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        with startup_span("server.prepare_agent"):
+            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+        with startup_span("server.prepare_launcher"):
+            await asyncio.to_thread(launcher.prepare)
+        with startup_span("server.provision_worker", host_id=host_id):
+            sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3593,8 +3610,10 @@ async def relaunch_managed_host(
             provider=host.sandbox_provider,
         )
     try:
-        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
-        await asyncio.to_thread(launcher.prepare)
+        with startup_span("server.prepare_agent"):
+            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+        with startup_span("server.prepare_launcher"):
+            await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
         raise HTTPException(
@@ -3723,6 +3742,7 @@ async def _start_sandbox_host(
     )
 
 
+@startup_timed("server.host_registration_and_start", host_argument="host_id")
 async def _register_and_start_host(
     *,
     launcher: SandboxHostLauncher,
@@ -3779,29 +3799,30 @@ async def _register_and_start_host(
     token = secrets.token_urlsafe(32)
     record = None
     try:
-        if keep_host_on_failure:
-            record = await asyncio.to_thread(
-                host_store.replace_managed_host_sandbox,
-                host_id=host_id,
-                user_id=owner,
-                token=token,
-                provider=launcher.provider,
-                sandbox_id=sandbox_id,
-                token_expires_at=now_epoch() + config.token_ttl_s,
-            )
-            if record is None:
-                raise ValueError(f"managed host {host_id!r} no longer exists")
-        else:
-            record = await asyncio.to_thread(
-                host_store.register_managed_host,
-                host_id=host_id,
-                name=host_name,
-                user_id=owner,
-                token=token,
-                provider=launcher.provider,
-                sandbox_id=sandbox_id,
-                token_expires_at=now_epoch() + config.token_ttl_s,
-            )
+        with startup_span("server.persist_host", host_id=host_id):
+            if keep_host_on_failure:
+                record = await asyncio.to_thread(
+                    host_store.replace_managed_host_sandbox,
+                    host_id=host_id,
+                    user_id=owner,
+                    token=token,
+                    provider=launcher.provider,
+                    sandbox_id=sandbox_id,
+                    token_expires_at=now_epoch() + config.token_ttl_s,
+                )
+                if record is None:
+                    raise ValueError(f"managed host {host_id!r} no longer exists")
+            else:
+                record = await asyncio.to_thread(
+                    host_store.register_managed_host,
+                    host_id=host_id,
+                    name=host_name,
+                    user_id=owner,
+                    token=token,
+                    provider=launcher.provider,
+                    sandbox_id=sandbox_id,
+                    token_expires_at=now_epoch() + config.token_ttl_s,
+                )
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
         # a token that already resolves. The exec-model default execs in; the
@@ -3867,6 +3888,7 @@ async def _register_and_start_host(
     return workspace
 
 
+@startup_timed("server.wait_host_online", host_argument="host_id")
 async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
     """
     Poll the hosts table until the sandbox host registers, or time out.
@@ -4073,7 +4095,8 @@ async def resume_managed_host(
             launcher.provider,
         )
         try:
-            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            with startup_span("server.prepare_agent"):
+                await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
             await asyncio.to_thread(launcher.resume, sandbox_id)
             token = secrets.token_urlsafe(32)
             armed = await asyncio.to_thread(

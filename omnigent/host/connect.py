@@ -180,6 +180,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.startup_timing import startup_span, startup_timed
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -1785,6 +1786,7 @@ class HostProcess:
             )
             return await self._handle_launch_impl(frame)
 
+    @startup_timed("host.launch_runner", session_argument="frame")
     async def _handle_launch_impl(
         self,
         frame: HostLaunchRunnerFrame,
@@ -2030,6 +2032,7 @@ class HostProcess:
             return None
         return zygote
 
+    @startup_timed("host.spawn_runner")
     def _spawn_runner_proc(
         self,
         env: dict[str, str],
@@ -4214,7 +4217,8 @@ class HostProcess:
         # default context loads zero roots on uv / python-build-standalone Pythons
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
-        ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        with startup_span("host.tls_context"):
+            ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
@@ -4233,7 +4237,8 @@ class HostProcess:
                 ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
                 ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             )
-            ws = await ws_cm.__aenter__()
+            with startup_span("host.websocket_upgrade"):
+                ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:
             # The upgrade itself was rejected. Fail loud on permanent
             # failures (auth / authorization / outdated server); let the
@@ -4282,6 +4287,7 @@ class HostProcess:
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
 
+    @startup_timed("host.resolve_owner")
     async def _ensure_owner_user_id(self, *, headers: dict[str, str] | None = None) -> None:
         """Resolve this host's owning user once and publish it for attribution.
 
@@ -4318,6 +4324,7 @@ class HostProcess:
             self._owner_user_id = owner
             os.environ[USER_ID_ENV_VAR] = owner
 
+    @startup_timed("host.connect_credentials")
     def _build_connect_headers(self) -> dict[str, str]:
         """Build the WebSocket upgrade headers for the tunnel connection.
 
@@ -4868,13 +4875,15 @@ def run_host_process(
     # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
     from omnigent.runtime import telemetry
 
-    telemetry.init("omni-host")
+    with startup_span("host.telemetry_init"):
+        telemetry.init("omni-host")
 
     from omnigent.host.identity import host_config_path
 
     path = host_config_path(config_path)
     try:
-        identity = load_or_create_host_identity(path)
+        with startup_span("host.identity_load"):
+            identity = load_or_create_host_identity(path)
     except ValueError as exc:
         print(
             f"\n✗ Could not start host.\n{exc}",

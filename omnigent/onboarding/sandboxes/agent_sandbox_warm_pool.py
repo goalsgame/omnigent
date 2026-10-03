@@ -49,6 +49,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     build_job_manifest,
 )
 from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.startup_timing import startup_span, startup_timed
 
 _logger = logging.getLogger(__name__)
 EXTENSION_GROUP = "extensions.agents.x-k8s.io"
@@ -263,18 +264,20 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         return spec
 
     def _get(self, group: str, plural: str, namespace: str, name: str) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self._load_custom().get_namespaced_custom_object(
-                group,
-                API_VERSION,
-                namespace,
-                plural,
-                name,
-                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
-            ),
-        )
+        with startup_span(f"kubernetes.get.{plural}"):
+            return cast(
+                dict[str, Any],
+                self._load_custom().get_namespaced_custom_object(
+                    group,
+                    API_VERSION,
+                    namespace,
+                    plural,
+                    name,
+                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                ),
+            )
 
+    @startup_timed("warm_pool.validate_profile")
     def _validate_profile(
         self,
         spec: dict[str, Any],
@@ -298,6 +301,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 "Generate a new versioned template and pool with this server configuration."
             )
 
+    @startup_timed("warm_pool.validate_pod")
     def _validate_pod(
         self,
         pod: Any,
@@ -340,6 +344,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 "Warm Pod does not match its configured profile; create a new versioned pool."
             )
 
+    @startup_timed("warm_pool.provision")
     def provision(self, name: str) -> str:
         if self._warm_pool is None:
             return super().provision(name)
@@ -367,31 +372,32 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 )
                 return super().provision(name)
             self._validate_profile(template["spec"], agent_name=self._agent_name, shared=shared)
-            claim = cast(
-                dict[str, Any],
-                self._load_custom().create_namespaced_custom_object(
-                    EXTENSION_GROUP,
-                    API_VERSION,
-                    namespace,
-                    CLAIMS,
-                    {
-                        "apiVersion": f"{EXTENSION_GROUP}/{API_VERSION}",
-                        "kind": "SandboxClaim",
-                        "metadata": {
-                            "name": claim_name,
-                            "labels": {"app.kubernetes.io/managed-by": "omnigent"},
-                        },
-                        "spec": {
-                            "warmPoolRef": {"name": self._warm_pool},
-                            "lifecycle": {
-                                "shutdownPolicy": "Delete",
-                                "shutdownTime": _shutdown_time(initial_shutdown_window_s()),
+            with startup_span("kubernetes.claim_create"):
+                claim = cast(
+                    dict[str, Any],
+                    self._load_custom().create_namespaced_custom_object(
+                        EXTENSION_GROUP,
+                        API_VERSION,
+                        namespace,
+                        CLAIMS,
+                        {
+                            "apiVersion": f"{EXTENSION_GROUP}/{API_VERSION}",
+                            "kind": "SandboxClaim",
+                            "metadata": {
+                                "name": claim_name,
+                                "labels": {"app.kubernetes.io/managed-by": "omnigent"},
+                            },
+                            "spec": {
+                                "warmPoolRef": {"name": self._warm_pool},
+                                "lifecycle": {
+                                    "shutdownPolicy": "Delete",
+                                    "shutdownTime": _shutdown_time(initial_shutdown_window_s()),
+                                },
                             },
                         },
-                    },
-                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
-                ),
-            )
+                        _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                    ),
+                )
             claim_uid = claim["metadata"]["uid"]
             deadline = time.monotonic() + _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
             while time.monotonic() < deadline:
@@ -458,6 +464,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 "The assigned warm Sandbox no longer exists; its workspace cannot be resumed."
             )
 
+    @startup_timed("warm_pool.check_assignment")
     def _allocation(self, handle: WarmPoolHandle) -> dict[str, Any]:
         from kubernetes.client.rest import ApiException
 
@@ -471,6 +478,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         self._verify_assignment(handle, claim, sandbox)
         return sandbox
 
+    @startup_timed("kubernetes.pod_get")
     def _pod(self, handle: WarmPoolHandle, sandbox: dict[str, Any]) -> Any:
         from kubernetes.client.rest import ApiException
 
@@ -517,6 +525,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             raise SandboxGoneError("Warm Sandbox Pod ownership changed.")
         return pod
 
+    @startup_timed("warm_pool.patch_deadline")
     def _patch_deadline(self, handle: WarmPoolHandle, *, boot: bool) -> None:
         self._load_custom().patch_namespaced_custom_object(
             API_GROUP,
@@ -537,6 +546,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
         )
 
+    @startup_timed("kubernetes.exec")
     def _exec(
         self,
         handle: WarmPoolHandle,
@@ -552,23 +562,25 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         assert self._api_client is not None
         with client.ApiClient(configuration=self._api_client.configuration) as api:
             core = client.CoreV1Api(api)
-            connection = stream(
-                core.connect_get_namespaced_pod_exec,
-                pod_name,
-                handle.namespace,
-                container=BOOTSTRAP_CONTAINER,
-                command=["python3", "-m", "omnigent.host.warm_bootstrap", mode],
-                stdin=payload is not None,
-                stdout=True,
-                stderr=True,
-                tty=False,
-                _preload_content=False,
-                _request_timeout=_EXEC_TIMEOUT_S,
-            )
+            with startup_span(f"kubernetes.exec.{mode}.open"):
+                connection = stream(
+                    core.connect_get_namespaced_pod_exec,
+                    pod_name,
+                    handle.namespace,
+                    container=BOOTSTRAP_CONTAINER,
+                    command=["python3", "-m", "omnigent.host.warm_bootstrap", mode],
+                    stdin=payload is not None,
+                    stdout=True,
+                    stderr=True,
+                    tty=False,
+                    _preload_content=False,
+                    _request_timeout=_EXEC_TIMEOUT_S,
+                )
             try:
                 if payload is not None:
                     connection.write_stdin(json.dumps(payload) + "\n")
-                connection.run_forever(timeout=_EXEC_TIMEOUT_S)
+                with startup_span(f"kubernetes.exec.{mode}.wait"):
+                    connection.run_forever(timeout=_EXEC_TIMEOUT_S)
                 if connection.is_open() or connection.returncode != 0:
                     raise click.ClickException(
                         f"Warm bootstrap {mode} did not complete successfully."
@@ -580,6 +592,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             finally:
                 connection.close()
 
+    @startup_timed("warm_pool.status")
     def _status(self, handle: WarmPoolHandle, pod_name: str) -> dict[str, Any]:
         try:
             status = json.loads(self._exec(handle, pod_name, "status"))
@@ -600,6 +613,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         except ValueError:
             raise click.ClickException("Invalid warm bootstrap status response.") from None
 
+    @startup_timed("warm_pool.activate_and_prepare", host_argument="host_id")
     def start_host(
         self,
         sandbox_id: str,
@@ -640,15 +654,16 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             )
             self._patch_deadline(handle, boot=True)
             # The registered host now owns cleanup. Remove the unactivated-claim TTL.
-            self._load_custom().patch_namespaced_custom_object(
-                EXTENSION_GROUP,
-                API_VERSION,
-                handle.namespace,
-                CLAIMS,
-                handle.claim_name,
-                {"metadata": {"uid": handle.claim_uid}, "spec": {"lifecycle": None}},
-                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
-            )
+            with startup_span("kubernetes.claim_clear_ttl"):
+                self._load_custom().patch_namespaced_custom_object(
+                    EXTENSION_GROUP,
+                    API_VERSION,
+                    handle.namespace,
+                    CLAIMS,
+                    handle.claim_name,
+                    {"metadata": {"uid": handle.claim_uid}, "spec": {"lifecycle": None}},
+                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                )
             activated_uid: str | None = None
             while time.monotonic() < deadline:
                 sandbox = self._allocation(handle)

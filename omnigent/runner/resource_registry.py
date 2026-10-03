@@ -43,6 +43,7 @@ from omnigent.entities.session_resources import (
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
+from omnigent.startup_timing import startup_span
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -1431,7 +1432,8 @@ class SessionResourceRegistry:
                 # Readiness logging must not stop the lifecycle watcher on failure.
                 with contextlib.suppress(Exception):
                     if input_ready_probe(session_id, instance):
-                        native_input_ready = True
+                        with startup_span("runner.native_input_ready", session_id=session_id):
+                            native_input_ready = True
                         _logger.info(
                             "Native input ready",
                             extra=debug_event(

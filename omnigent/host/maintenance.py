@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 from omnigent.debug_logging import debug_event
+from omnigent.startup_timing import startup_timed
 
 try:
     import fcntl
@@ -221,6 +222,7 @@ class HostMaintenanceJanitor:
             if self._pending_reasons and not self._closing:
                 self._ensure_drain_task()
 
+    @startup_timed("host.maintenance")
     async def _run_once(self, reasons: Sequence[str]) -> _RunOutcome:
         with _maintenance_lock(self._lock_path) as lock_outcome:
             if lock_outcome == "busy":

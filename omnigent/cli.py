@@ -100,6 +100,7 @@ from omnigent.process_logging import (
     env_truthy,
     process_log_dir_reference,
 )
+from omnigent.startup_timing import startup_span
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.server_url import ServerUrl
 from omnigent.util.server_url import org_id_from_url as _org_id_from_url
@@ -9214,11 +9215,13 @@ def host(
     # Kept before the config fallback below: `--background` echoes a `host
     # stop` command that mirrors how this command was invoked.
     explicit_server = server
-    cfg = _load_effective_config()
+    with startup_span("host.cli_load_config"):
+        cfg = _load_effective_config()
     if server is None:
         server = cfg.get("server")
     if server:
-        server = _resolve_server_url(server).api_base
+        with startup_span("host.cli_resolve_server"):
+            server = _resolve_server_url(server).api_base
     # Remote mode is decided here, before the local-mode branch reassigns
     # ``server`` to the spawned loopback URL — only a remote target needs
     # the sign-in pre-flight.
@@ -9249,12 +9252,14 @@ def host(
         startup = ensure_local_omnigent_server()
         server = startup.url
         spawned_local_server = startup.spawned
-    record = _foreground_daemon_record(
-        target=target,
-        server_url=server,
-        host_id=_load_or_create_host_id(),
-    )
-    previous = _claim_foreground_daemon_record(record)
+    with startup_span("host.cli_daemon_record"):
+        record = _foreground_daemon_record(
+            target=target,
+            server_url=server,
+            host_id=_load_or_create_host_id(),
+        )
+    with startup_span("host.cli_claim_daemon"):
+        previous = _claim_foreground_daemon_record(record)
     # Only offer to stop the local server after a clean stop (Ctrl-C / normal
     # exit). A connection failure (SystemExit) leaves this False so we don't
     # prompt over an error.
@@ -9267,7 +9272,8 @@ def host(
         # this runs the browser login and continues; ``--non-interactive``
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
-            _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+            with startup_span("host.cli_auth_preflight"):
+                _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
         warm_zygote = ctx.obj.get("warm_runner_zygote")
         if warm_zygote is not None:

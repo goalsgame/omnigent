@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import re
 import signal
@@ -29,6 +30,7 @@ from omnigent.host.identity_env import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
+from omnigent.startup_timing import startup_span, startup_timing_enabled
 
 ACTIVATION_DIR_ENV_VAR = "OMNIGENT_ACTIVATION_DIR"
 POD_UID_ENV_VAR = "OMNIGENT_POD_UID"
@@ -242,16 +244,18 @@ def _signals() -> Iterator[_Signals]:
 def _prepare_once(directory: Path, activation: Activation, signals: _Signals) -> None:
     _set_stage(directory, activation, "preparing")
     try:
-        signals.child = subprocess.Popen(
-            activation.prepare_command,
-            env=activation.environment(),
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        with startup_span("bootstrap.prepare_spawn", host_id=activation.host_id):
+            signals.child = subprocess.Popen(
+                activation.prepare_command,
+                env=activation.environment(),
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         if signals.signum is not None:
             signals.forward(signals.signum, None)
-        returncode = signals.child.wait()
+        with startup_span("bootstrap.prepare_wait", host_id=activation.host_id):
+            returncode = signals.child.wait()
     except (OSError, subprocess.SubprocessError):
         returncode = 1
     finally:
@@ -262,6 +266,8 @@ def _prepare_once(directory: Path, activation: Activation, signals: _Signals) ->
 
 def prepare() -> int:
     """Wait for assignment, prepare once, then stay alive for status requests."""
+    if startup_timing_enabled():
+        logging.basicConfig(level=logging.INFO)
     directory = _state_dir(create=True)
     with _signals() as signals, _lock(directory / "prepare.lock", nonblocking=True):
         _write_json(directory / "ready.json", {"pod_uid": _pod_uid()})

@@ -288,6 +288,7 @@ from omnigent.spec.types import (
     Phase,
     PolicyAction,
 )
+from omnigent.startup_timing import startup_timed
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
@@ -5746,6 +5747,7 @@ def _spawn_superseded_runner_stop(
     task.add_done_callback(_detached_supersede_stops.discard)
 
 
+@startup_timed("server.launch_runner")
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -5979,6 +5981,7 @@ async def cancel_managed_launch_tasks() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+@startup_timed("server.provision_task", session_argument="session_id")
 async def _provision_managed_sandbox(
     *,
     session_id: str,
@@ -6076,6 +6079,7 @@ async def _provision_managed_sandbox(
         return None
 
 
+@startup_timed("server.wait_runner_tunnel", session_argument="session_id")
 async def _wait_for_managed_runner_tunnel(
     session_id: str,
     runner_id: str,
