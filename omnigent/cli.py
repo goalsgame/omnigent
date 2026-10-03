@@ -9271,7 +9271,17 @@ def host(
         # "redirected to a login page" error after several retries. On a TTY
         # this runs the browser login and continues; ``--non-interactive``
         # (or a headless invocation) fails loud with the command to run.
-        if remote_mode:
+        from omnigent.host.identity_env import (
+            HOST_ID_ENV_VAR,
+            HOST_NAME_ENV_VAR,
+            HOST_TOKEN_ENV_VAR,
+        )
+
+        managed_host = all(
+            os.environ.get(key) for key in (HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR)
+        )
+        # Managed hosts authenticate registration with their injected launch token.
+        if remote_mode and not managed_host:
             with startup_span("host.cli_auth_preflight"):
                 _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)

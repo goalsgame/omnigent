@@ -1506,3 +1506,34 @@ def test_foreground_host_receives_preloaded_zygote(
     assert result.exit_code == 0, result.output
     assert captured[0]["runner_zygote"] is zygote
     assert captured[0]["daemon_target"] == "https://test.example"
+
+
+@pytest.mark.parametrize(
+    "missing", [None, "OMNIGENT_HOST_ID", "OMNIGENT_HOST_NAME", "OMNIGENT_HOST_TOKEN"]
+)
+def test_managed_host_skips_only_browser_auth_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str | None
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    for key, value in {
+        "OMNIGENT_HOST_ID": "978ee4f06941429d955fdfc29712f3aa",
+        "OMNIGENT_HOST_NAME": "managed-test-host",
+        "OMNIGENT_HOST_TOKEN": "test-launch-token",
+    }.items():
+        monkeypatch.setenv(key, value)
+    if missing:
+        monkeypatch.delenv(missing)
+    with (
+        patch("omnigent.cli._ensure_databricks_server_auth") as auth,
+        patch("omnigent.host.connect.run_host_process") as host,
+    ):
+        result = CliRunner().invoke(
+            cli, ["host", "--server", "https://example.com", "--no-open", "--non-interactive"]
+        )
+    assert result.exit_code == 0, result.output
+    host.assert_called_once()
+    if missing is None:
+        auth.assert_not_called()
+    else:
+        auth.assert_called_once_with("https://example.com", non_interactive=True)

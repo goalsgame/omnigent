@@ -606,3 +606,32 @@ def test_embedded_cli_errors_keep_normal_output_and_cleanup(
     assert captured.out == ""
     assert captured.err == ("Aborted!\n" if abort else "Error: Invalid host configuration\n")
     assert not bootstrap._runtime_ready_path().exists()
+
+
+def test_warm_preload_caches_versions_without_reading_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.onboarding import harness_install as install
+    from omnigent.onboarding import harness_readiness as readiness
+
+    binary = tmp_path / "pi"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    calls: list[list[str]] = []
+    spec = install.harness_install_spec(install.PI_KEY)
+    assert spec is not None
+    monkeypatch.setattr(install, "_all_harness_install", lambda: {install.PI_KEY: spec})
+    monkeypatch.setattr(install, "resolve_cli_binary", lambda _: str(binary))
+    monkeypatch.setattr(readiness, "load_config", lambda: pytest.fail("owner config read"))
+
+    def version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="1.0.0", stderr="")
+
+    monkeypatch.setattr(install.subprocess, "run", version)
+    bootstrap._preload_host_runtime()
+    assert "omnigent.host.connect" in sys.modules
+    assert install.harness_cli_installed(install.PI_KEY)
+    assert calls == [[str(binary), "--version"]]
+    binary.write_text("#!/bin/sh\n# replaced\n", encoding="utf-8")
+    assert install.harness_cli_installed(install.PI_KEY)
+    assert len(calls) == 2

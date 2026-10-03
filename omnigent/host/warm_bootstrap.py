@@ -291,6 +291,14 @@ def _runtime_ready_path() -> Path:
     return Path(tempfile.gettempdir()) / "omnigent-warm-runtime.json"
 
 
+def _preload_host_runtime() -> None:
+    """Import host code and cache binary versions without reading owner credentials."""
+    import omnigent.host.connect  # noqa: F401
+    from omnigent.onboarding.harness_install import preload_harness_cli_versions
+
+    preload_harness_cli_versions()
+
+
 def host() -> int:
     """Preload without an identity, then reuse the runtime after preparation."""
     marker = _runtime_ready_path()
@@ -305,6 +313,7 @@ def host() -> int:
             from omnigent.host.runner_zygote import ZygoteManager, ZygoteUnavailable
             from omnigent.process_logging import env_truthy
 
+            _preload_host_runtime()
             optout = os.environ.get("OMNIGENT_RUNNER_ZYGOTE")
             if IS_POSIX and (optout is None or env_truthy(optout)):
                 zygote = ZygoteManager()
