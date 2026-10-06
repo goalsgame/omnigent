@@ -60,13 +60,16 @@ class _BoomStore:
         raise RuntimeError("db down")
 
 
-def _app(host_store: _FakeHostStore, *, github_store) -> TestClient:
+def _app(host_store: _FakeHostStore, *, github_store, github_machine_broker=None) -> TestClient:
     app = FastAPI()
     # The generic route reads app.state.<provider>_{store,client}, populated by
     # the connection-provider wiring in create_app.
     app.state.github_store = github_store
     app.state.github_client = None
-    app.include_router(create_host_credentials_router(host_store), prefix="/v1")  # type: ignore[arg-type]
+    app.include_router(
+        create_host_credentials_router(host_store, github_machine_broker=github_machine_broker),
+        prefix="/v1",
+    )  # type: ignore[arg-type]
     return TestClient(app)
 
 
@@ -132,3 +135,38 @@ def test_resolver_fault_degrades_to_connected_false() -> None:
     resp = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR)
     assert resp.status_code == 200
     assert resp.json() == {"connected": False}
+
+
+def test_machine_never_falls_back_to_a_user_connection(db_uri: str) -> None:
+    principal = "oidc-machine:ticket-bot"
+    hs = _FakeHostStore("host1", "launch-tok", principal)
+    store = GithubConnectionStore(db_uri, SecretBox("enc-secret"))
+    store.upsert(
+        principal,
+        github_login="human",
+        github_user_id=42,
+        tokens=GitHubTokenSet("ghu_human", None, None, None, "repo"),
+    )
+    tc = _app(hs, github_store=store)
+    assert tc.get("/v1/hosts/host1/credentials/github", headers=_HDR).json() == {
+        "connected": False
+    }
+
+
+def test_machine_token_is_bound_to_authenticated_host_owner() -> None:
+    calls = []
+
+    class Broker:
+        async def resolve(self, principal):
+            calls.append(principal)
+            return {"username": "x-access-token", "token": "ghs_bot"}
+
+    hs = _FakeHostStore("host1", "launch-tok", "oidc-machine:ticket-bot")
+    tc = _app(hs, github_store=None, github_machine_broker=Broker())
+    assert tc.get("/v1/hosts/host1/credentials/github").status_code == 401
+    assert not calls
+    response = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR)
+    assert response.json()["token"] == "ghs_bot"
+    assert response.json()["owner"] == "oidc-machine:ticket-bot"
+    assert response.headers["cache-control"] == "no-store"
+    assert calls == ["oidc-machine:ticket-bot"]

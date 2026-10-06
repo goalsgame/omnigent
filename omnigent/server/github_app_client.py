@@ -12,6 +12,8 @@ sink in separate modules is deliberate. See
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import httpx
 
 from omnigent.server.github_app import (
@@ -55,9 +57,50 @@ class GitHubAppClient:
         # the real network.
         self._transport = transport
 
+    @property
+    def bot_login(self) -> str | None:
+        """The installation actor shown by GitHub, when the App slug is configured."""
+        return f"{self._config.slug}[bot]" if self._config.slug else None
+
     def _http_client(self) -> httpx.AsyncClient:
         """Open an AsyncClient, honoring an injected test transport."""
         return httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S, transport=self._transport)
+
+    async def installation_token(
+        self,
+        installation_id: int,
+        *,
+        repository_ids: tuple[int, ...],
+        permissions: dict[str, str],
+    ) -> tuple[str, float]:
+        """Mint an installation token with explicit repository and permission limits."""
+        if not repository_ids:
+            raise GitHubAppError("installation tokens require an explicit repository allowlist")
+        async with self._http_client() as client:
+            response = await client.post(
+                f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+                headers={
+                    "Authorization": f"Bearer {self._config.mint_app_jwt()}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2026-03-10",
+                },
+                json={"repository_ids": list(repository_ids), "permissions": permissions},
+            )
+        if response.status_code != 201:
+            raise GitHubAppError(
+                f"GitHub installation token endpoint returned {response.status_code}"
+            )
+        try:
+            payload = response.json()
+            token = payload["token"]
+            expiry = datetime.fromisoformat(payload["expires_at"])
+            if not isinstance(token, str) or not token or expiry.tzinfo is None:
+                raise ValueError("invalid token response")
+            if expiry <= datetime.now(timezone.utc):
+                raise ValueError("expired token response")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise GitHubAppError("invalid installation token response") from exc
+        return token, expiry.timestamp()
 
     async def exchange_code(self, code: str) -> GitHubTokenSet:
         """Exchange an authorization ``code`` for a user access token.
