@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import google_crc32c
 import pytest
 from google.api_core.exceptions import InvalidArgument, PermissionDenied
+from google.cloud import kms_v1
 
 from omnigent.stores.credential_store.gcp_kms_cipher import (
     CREDENTIAL_GCP_KMS_KEY_ENV_VAR,
@@ -29,8 +28,8 @@ class FakeKms:
         self.calls = 0
         self.forbidden = False
         self.bad_integrity = False
-        self.bad_decrypt_integrity = False
-        self.bad_decrypt_aad_integrity = False
+        self.bad_request_integrity = False
+        self.bad_plaintext_integrity = False
 
     def encrypt(self, *, request):
         assert request["plaintext_crc32c"] == google_crc32c.value(request["plaintext"])
@@ -40,7 +39,7 @@ class FakeKms:
         self.calls += 1
         blob = f"cipher-{self.calls}".encode()
         self.rows[blob] = (request["plaintext"], request["additional_authenticated_data"])
-        return SimpleNamespace(
+        return kms_v1.EncryptResponse(
             name=f"{request['name']}/cryptoKeyVersions/1",
             ciphertext=blob,
             ciphertext_crc32c=google_crc32c.value(blob),
@@ -51,6 +50,8 @@ class FakeKms:
     def decrypt(self, *, request):
         if self.forbidden:
             raise PermissionDenied("KMS permission denied")
+        if self.bad_request_integrity:
+            raise InvalidArgument("The checksum in field ciphertext_crc32c did not match")
         assert request["ciphertext_crc32c"] == google_crc32c.value(request["ciphertext"])
         assert request["additional_authenticated_data_crc32c"] == google_crc32c.value(
             request["additional_authenticated_data"]
@@ -58,11 +59,9 @@ class FakeKms:
         entry = self.rows.get(request["ciphertext"])
         if entry is None or entry[1] != request["additional_authenticated_data"]:
             raise InvalidArgument("Decryption failed")
-        return SimpleNamespace(
+        return kms_v1.DecryptResponse(
             plaintext=entry[0],
-            plaintext_crc32c=google_crc32c.value(entry[0]),
-            verified_ciphertext_crc32c=not self.bad_decrypt_integrity,
-            verified_additional_authenticated_data_crc32c=not self.bad_decrypt_aad_integrity,
+            plaintext_crc32c=google_crc32c.value(entry[0]) + self.bad_plaintext_integrity,
         )
 
 
@@ -89,14 +88,14 @@ def test_operational_and_integrity_failures_propagate():
     with pytest.raises(PermissionDenied):
         cipher.decrypt(ciphertext, context=ALICE)
     api.forbidden = False
-    api.bad_decrypt_integrity = True
+    api.bad_request_integrity = True
+    with pytest.raises(InvalidArgument, match="checksum"):
+        cipher.decrypt(ciphertext, context=ALICE)
+    api.bad_request_integrity = False
+    api.bad_plaintext_integrity = True
     with pytest.raises(RuntimeError, match="integrity"):
         cipher.decrypt(ciphertext, context=ALICE)
-    api.bad_decrypt_integrity = False
-    api.bad_decrypt_aad_integrity = True
-    with pytest.raises(RuntimeError, match="integrity"):
-        cipher.decrypt(ciphertext, context=ALICE)
-    api.bad_decrypt_aad_integrity = False
+    api.bad_plaintext_integrity = False
     api.bad_integrity = True
     with pytest.raises(RuntimeError, match="integrity"):
         cipher.encrypt("other", context=ALICE)

@@ -107,10 +107,6 @@ class GcpKmsSecretCipher:
                 raise
             _logger.warning("GCP KMS could not decrypt a credential under its row identity")
             return None
-        if (
-            not response.verified_ciphertext_crc32c
-            or not response.verified_additional_authenticated_data_crc32c
-            or response.plaintext_crc32c != _crc(response.plaintext)
-        ):
+        if response.plaintext_crc32c != _crc(response.plaintext):
             raise RuntimeError("GCP KMS decrypt response failed integrity verification")
         return response.plaintext.decode()
