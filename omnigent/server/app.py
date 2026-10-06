@@ -1606,6 +1606,10 @@ def create_app(
         _log_level_name = _os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
         logging.getLogger("omnigent").setLevel(getattr(logging, _log_level_name, logging.INFO))
 
+        from omnigent.server.managed_hosts import preload_managed_sandbox_sdk
+
+        await preload_managed_sandbox_sdk(sandbox_config)
+
         harness_pm = HarnessProcessManager()
         await harness_pm.start()
         # Store on both ``app.state`` (canonical, accessible from

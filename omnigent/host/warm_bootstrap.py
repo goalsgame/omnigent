@@ -316,7 +316,7 @@ def host() -> int:
             _preload_host_runtime()
             optout = os.environ.get("OMNIGENT_RUNNER_ZYGOTE")
             if IS_POSIX and (optout is None or env_truthy(optout)):
-                zygote = ZygoteManager()
+                zygote = ZygoteManager(preload_metadata=True)
                 try:
                     zygote.start()
                 except ZygoteUnavailable:
