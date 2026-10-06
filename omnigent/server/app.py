@@ -3732,18 +3732,21 @@ def create_app(
             github_config is None
             or not github_config.app_id
             or not github_config.private_key
-            or app.state.github_client is None
             or machine_verifier is None
         ):
             raise RuntimeError(
                 "github_machine_auth requires configured GitHub App credentials, "
-                "credential store and OIDC machine authentication"
+                "and OIDC machine authentication"
             )
+        from omnigent.server.github_app_client import GitHubAppClient
+
         github_machine_broker = GitHubMachineBroker(
             github_machine_bindings,
-            app.state.github_client,
+            app.state.github_client or GitHubAppClient(github_config),
             machine_verifier.principal_allowed,
         )
+    app.state.github_machine_broker = github_machine_broker
+
     # Host tunnel + REST endpoints (DAEMON_API.md). Mounted only when a
     # host_store is configured: the routers call host_store on every
     # request, so mounting them with host_store=None would fail each

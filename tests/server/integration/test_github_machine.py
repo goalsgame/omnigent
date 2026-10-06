@@ -35,6 +35,7 @@ __all__ = ["machine_config", "oidc", "signing_key", "verifier"]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_user_store", [False, True])
 async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
     runtime_init,
     db_uri,
@@ -42,6 +43,7 @@ async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
     oidc,
     verifier,
     monkeypatch,
+    with_user_store,
 ):
     artifact = LocalArtifactStore(str(tmp_path / "artifacts"))
     hosts = HostStore(db_uri)
@@ -57,7 +59,9 @@ async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
         permission_store=permissions,
         auth_provider=UnifiedAuthProvider("oidc", oidc_config=oidc, machine_verifier=verifier),
         github_config=replace(make_config(), app_id="123", private_key="test-key"),
-        github_store=GithubConnectionStore(db_uri, SecretBox("test-key")),
+        github_store=(
+            GithubConnectionStore(db_uri, SecretBox("test-key")) if with_user_store else None
+        ),
         server_config={
             "github_machine_auth": {
                 PRINCIPAL: {"installation_id": 123, "repository_ids": [456], "access": "write"}
@@ -77,7 +81,8 @@ async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
         )
 
     monkeypatch.setattr(GitHubAppConfig, "mint_app_jwt", lambda self: "app-jwt")
-    app.state.github_client._transport = httpx.MockTransport(handle)
+    assert (app.state.github_client is not None) == with_user_store
+    app.state.github_machine_broker._client._transport = httpx.MockTransport(handle)
     hosts.register_managed_host(
         host_id="00000000000000000000000000000001",
         name="bot",

@@ -45,8 +45,13 @@ short-lived token minted from that user's authorization — never a shared PAT.
 - Your Omnigent server's public origin, e.g.
   `https://omnigent.example.com`. The OAuth callback must be
   reachable from a browser at `…/v1/connections/github/callback`.
-- The credential store configured (`OMNIGENT_CREDENTIAL_*` / KMS) so tokens can
-  be encrypted at rest — the connect store is only wired when it is present.
+- For human GitHub connections, configure a credential cipher such as Google Cloud
+  KMS (`OMNIGENT_CREDENTIAL_CIPHER=gcp_kms` and
+  `OMNIGENT_CREDENTIAL_GCP_KMS_KEY_ID=<full CryptoKey name>`). The server identity
+  needs `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that key. Install the
+  backend with `pip install 'omnigent[gcp-kms]'`, or bake it into the server image
+  with `docker build --build-arg OMNIGENT_EXTRAS=gcp-kms -f deploy/docker/Dockerfile .`.
+  Machine App installation tokens remain in memory and do not require this store.
 
 ---
 
@@ -190,8 +195,8 @@ nor `OMNIGENT_DOMAIN`), the feature logs a warning and **stays disabled**.
 ## Verify
 
 1. Sign in to Omnigent as a real user, open **Settings → Sandbox Integrations**.
-   The **Connect GitHub** control appears (the nav link only shows when the App
-   is configured — driven by `github_app_enabled` in `/v1/info`).
+   The **Connect GitHub** control appears when the App and encrypted connection
+   store are configured (`github` appears in `/v1/info`'s `enabled_connections`).
 2. Click **Connect GitHub** → GitHub's authorize screen → back to Omnigent with
    `?github=connected`. The panel now shows **Connected as `<login>`**.
 3. Start a sandbox session on a **private** repo owned by an account where the
@@ -223,10 +228,10 @@ requests read-only Contents and Pull requests permissions; `write` allows branch
 pushes and PR creation. Metadata is always read-only. GitHub additionally limits
 tokens to the App's installed repositories and granted permissions.
 
-Configure the same App client ID, client secret and callback used by human
-connections, plus `OMNIGENT_GITHUB_APP_ID` and
-`OMNIGENT_GITHUB_APP_PRIVATE_KEY` (or `_PRIVATE_KEY_PATH`). The server's encrypted
-credential store must be enabled. Keep the client secret and private key on the
+Configure the App client ID, client secret and callback, plus `OMNIGENT_GITHUB_APP_ID`
+and `OMNIGENT_GITHUB_APP_PRIVATE_KEY` (or `_PRIVATE_KEY_PATH`). Human GitHub
+connections require an encrypted credential store. Machine-owned installation
+tokens do not. Keep the client secret and private key on the
 server; neither enters a runner. Machine bindings without these prerequisites
 fail server startup.
 

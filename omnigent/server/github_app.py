@@ -85,7 +85,7 @@ class GitHubAppConfig:
 
     Token-at-rest encryption is not configured here: stored tokens are
     encrypted by the shared credential store's cipher
-    (``OMNIGENT_CREDENTIAL_ENC_KEY``), not by any GitHub-specific key.
+    configured with ``OMNIGENT_CREDENTIAL_CIPHER``), not by any GitHub-specific key.
     """
 
     app_id: str | None
@@ -158,8 +158,8 @@ class GitHubAppConfig:
         resolvable redirect URI (explicit, or derived from
         ``OMNIGENT_DOMAIN``). Missing any of these disables it. Token-at-rest
         encryption is the credential store's concern
-        (``OMNIGENT_CREDENTIAL_ENC_KEY``), not GitHub's — the caller only
-        wires a connection store when that key is present.
+        (``OMNIGENT_CREDENTIAL_CIPHER``), not GitHub's — the caller only
+        wires a connection store when a cipher is configured.
 
         :returns: A validated config, or ``None`` when GitHub App
             integration is not configured.
