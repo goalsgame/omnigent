@@ -33,6 +33,7 @@ def bindings(raw=POLICY):
         {**POLICY, "installation_id": True},
         {**POLICY, "installation_id": 0},
         {**POLICY, "access": "admin"},
+        {**POLICY, "ci_read": "true"},
         {**POLICY, "extra": "ignored"},
     ],
 )
@@ -82,6 +83,33 @@ async def test_installation_request_always_limits_repositories_and_permissions(m
     }
     assert await broker.resolve("alice@example.com") is None
     assert await broker.resolve("oidc-machine:unknown") is None
+
+
+@pytest.mark.asyncio
+async def test_ci_read_requests_only_read_permissions(monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(201, json=payload())
+
+    broker = GitHubMachineBroker(
+        bindings({**POLICY, "ci_read": True}), client(handle, monkeypatch), lambda p: True
+    )
+    assert await broker.resolve(PRINCIPAL) is not None
+    assert requests == [
+        {
+            "repository_ids": [456],
+            "permissions": {
+                "contents": "write",
+                "pull_requests": "write",
+                "metadata": "read",
+                "checks": "read",
+                "actions": "read",
+                "statuses": "read",
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio

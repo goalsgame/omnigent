@@ -16,14 +16,18 @@ class GitHubMachineBinding:
     installation_id: int
     repository_ids: tuple[int, ...]
     access: str
+    ci_read: bool = False
 
     @property
     def permissions(self) -> dict[str, str]:
-        return {
+        permissions = {
             "contents": self.access,
             "pull_requests": self.access,
             "metadata": "read",
         }
+        if self.ci_read:
+            permissions.update({"checks": "read", "actions": "read", "statuses": "read"})
+        return permissions
 
 
 def parse_machine_bindings(
@@ -42,17 +46,24 @@ def parse_machine_bindings(
             or principal not in principals
         ):
             raise RuntimeError("github_machine_auth must bind configured OIDC machine principals")
-        if not isinstance(raw, dict) or set(raw) != {
+        required = {
             "installation_id",
             "repository_ids",
             "access",
-        }:
+        }
+        if (
+            not isinstance(raw, dict)
+            or not required <= set(raw)
+            or set(raw) - required - {"ci_read"}
+        ):
             raise RuntimeError(
-                "GitHub machine bindings require installation_id, repository_ids, access"
+                "GitHub machine bindings require installation_id, repository_ids, access "
+                "and optionally ci_read"
             )
         installation = raw["installation_id"]
         repos = raw["repository_ids"]
         access = raw["access"]
+        ci_read = raw.get("ci_read", False)
         if type(installation) is not int or installation <= 0:
             raise RuntimeError("GitHub installation_id must be a positive integer")
         if (
@@ -66,7 +77,11 @@ def parse_machine_bindings(
             )
         if access not in ("read", "write"):
             raise RuntimeError("GitHub machine access must be read or write")
-        result[principal] = GitHubMachineBinding(installation, tuple(sorted(repos)), access)
+        if type(ci_read) is not bool:
+            raise RuntimeError("GitHub machine ci_read must be a boolean")
+        result[principal] = GitHubMachineBinding(
+            installation, tuple(sorted(repos)), access, ci_read
+        )
     return result
 
 
