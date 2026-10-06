@@ -113,8 +113,6 @@ status. Leave everything else **No access**. No **Account** or **Organization**
 permissions are needed. The user-to-server token inherits these permissions,
 so this list is the ceiling on what a connected sandbox can do as the user.
 
-![Repository permissions: Contents, Metadata, Pull requests](images/github-app/04-permissions.png)
-
 ## Step 5 — Where can this App be installed, then Create
 
 - **Where can this GitHub App be installed?** Pick **Only on this account** for a
