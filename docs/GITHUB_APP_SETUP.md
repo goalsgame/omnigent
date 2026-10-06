@@ -106,9 +106,10 @@ Under **Repository permissions**, set only what sandboxes need:
 | **Pull requests** | **Read and write** | Open PRs from the sandbox and surface "PRs opened this session". **Read-only** if you never create PRs. |
 | **Checks** | **Read-only** (optional) | Show CI checks in the PR panel. |
 | **Actions** | **Read-only** (optional) | Read the workflow runs behind GitHub Actions checks. |
+| **Commit statuses** | **Read-only** (optional) | Show status-context CI in the PR panel. |
 
-Grant both Checks and Actions when the PR panel should show CI status. Leave
-everything else **No access**. No **Account** or **Organization**
+Grant Checks, Actions, and Commit statuses when the PR panel should show CI
+status. Leave everything else **No access**. No **Account** or **Organization**
 permissions are needed. The user-to-server token inherits these permissions,
 so this list is the ceiling on what a connected sandbox can do as the user.
 
@@ -231,9 +232,10 @@ installation page or API. An empty repository list is rejected. `access: read`
 requests read-only Contents and Pull requests permissions; `write` allows branch
 pushes and PR creation. Metadata is always read-only. GitHub additionally limits
 tokens to the App's installed repositories and granted permissions.
-Set `ci_read: true` to include read-only Checks and Actions permissions for PR
-status in machine-owned sessions. The App installation must grant both permissions;
-without `ci_read`, machine tokens retain the smaller permission set.
+Set `ci_read: true` to include read-only access to Checks, Actions, and Commit
+statuses for PR status in machine-owned sessions. The App installation must
+grant all three; without `ci_read`, machine tokens retain the smaller permission
+set.
 
 Configure the App client ID, client secret and callback, plus `OMNIGENT_GITHUB_APP_ID`
 and `OMNIGENT_GITHUB_APP_PRIVATE_KEY` (or `_PRIVATE_KEY_PATH`). Human GitHub

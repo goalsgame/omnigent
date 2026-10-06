@@ -106,6 +106,7 @@ async def test_ci_read_requests_only_read_permissions(monkeypatch):
                 "metadata": "read",
                 "checks": "read",
                 "actions": "read",
+                "statuses": "read",
             },
         }
     ]

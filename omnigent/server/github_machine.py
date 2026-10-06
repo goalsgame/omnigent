@@ -26,7 +26,7 @@ class GitHubMachineBinding:
             "metadata": "read",
         }
         if self.ci_read:
-            permissions.update({"checks": "read", "actions": "read"})
+            permissions.update({"checks": "read", "actions": "read", "statuses": "read"})
         return permissions
 
 
