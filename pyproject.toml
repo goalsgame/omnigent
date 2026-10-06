@@ -146,6 +146,7 @@ cockroachdb = [
 # `all` carries dependencies moved out of the default install that internal
 # CI / dev workflows still exercise.
 all = [
+    "omnigent[gcp-kms]",
     "databricks-sdk>=0.56.0,<1",
     "opentelemetry-sdk>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",

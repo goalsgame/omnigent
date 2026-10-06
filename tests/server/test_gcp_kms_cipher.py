@@ -29,6 +29,8 @@ class FakeKms:
         self.calls = 0
         self.forbidden = False
         self.bad_integrity = False
+        self.bad_decrypt_integrity = False
+        self.bad_decrypt_aad_integrity = False
 
     def encrypt(self, *, request):
         assert request["plaintext_crc32c"] == google_crc32c.value(request["plaintext"])
@@ -59,6 +61,8 @@ class FakeKms:
         return SimpleNamespace(
             plaintext=entry[0],
             plaintext_crc32c=google_crc32c.value(entry[0]),
+            verified_ciphertext_crc32c=not self.bad_decrypt_integrity,
+            verified_additional_authenticated_data_crc32c=not self.bad_decrypt_aad_integrity,
         )
 
 
@@ -84,6 +88,15 @@ def test_operational_and_integrity_failures_propagate():
     api.forbidden = True
     with pytest.raises(PermissionDenied):
         cipher.decrypt(ciphertext, context=ALICE)
+    api.forbidden = False
+    api.bad_decrypt_integrity = True
+    with pytest.raises(RuntimeError, match="integrity"):
+        cipher.decrypt(ciphertext, context=ALICE)
+    api.bad_decrypt_integrity = False
+    api.bad_decrypt_aad_integrity = True
+    with pytest.raises(RuntimeError, match="integrity"):
+        cipher.decrypt(ciphertext, context=ALICE)
+    api.bad_decrypt_aad_integrity = False
     api.bad_integrity = True
     with pytest.raises(RuntimeError, match="integrity"):
         cipher.encrypt("other", context=ALICE)

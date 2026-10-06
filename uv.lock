@@ -3306,6 +3306,8 @@ agents-sdk = [
 all = [
     { name = "databricks-sdk", version = "0.67.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
     { name = "databricks-sdk", version = "0.115.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "google-cloud-kms" },
+    { name = "google-crc32c" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-fastapi" },
@@ -3513,6 +3515,7 @@ requires-dist = [
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "nimble-python", marker = "extra == 'nimble'", specifier = ">=1.2.0,<2" },
     { name = "numpy", marker = "extra == 'dictation'", specifier = ">=1.24,<3" },
+    { name = "omnigent", extras = ["gcp-kms"], marker = "extra == 'all'" },
     { name = "omnigent", extras = ["postgres"], marker = "extra == 'databricks'" },
     { name = "omnigent-client", editable = "sdks/python-client" },
     { name = "omnigent-slack", marker = "extra == 'slack'", editable = "integrations/slack" },
