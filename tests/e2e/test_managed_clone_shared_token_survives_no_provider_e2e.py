@@ -100,7 +100,13 @@ def _pythonpath() -> str:
 
 
 def _spawn_server(
-    tmp_path: Path, config_path: Path, port: int, capture_path: Path
+    tmp_path: Path,
+    config_path: Path,
+    port: int,
+    capture_path: Path,
+    *,
+    extra_env: dict[str, str] | None = None,
+    bootstrap: str | None = None,
 ) -> tuple[subprocess.Popen[bytes], Path]:
     """Start a real ``omnigent server`` subprocess wired to the stub SDK."""
     stub_root = _write_stub_sdk(tmp_path)
@@ -113,14 +119,15 @@ def _spawn_server(
             _REPO_ROOT / "tests" / "resources" / "agents" / "sdk-chat-builtin.yaml"
         ),
     }
+    env.update(extra_env or {})
+    entrypoint = ["-m", "omnigent.cli"] if bootstrap is None else ["-c", bootstrap]
     log_path = tmp_path / "server.log"
     # The child keeps its own descriptor; the parent's copy closes right away.
     with open(log_path, "w") as log_handle:
         proc = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "omnigent.cli",
+                *entrypoint,
                 "server",
                 "--port",
                 str(port),
@@ -197,19 +204,18 @@ def _await_capture(capture_path: Path, call: str, log_path: Path) -> dict:
 def _write_image_git_identity(tmp_path: Path) -> Path:
     """Materialize the host image's system-scope git credential helper."""
     system_cfg = tmp_path / "image-system.gitconfig"
-    subprocess.run(
-        [
-            "git",
-            "config",
-            "--file",
-            str(system_cfg),
-            "credential.helper",
-            _IMAGE_CREDENTIAL_HELPER,
-        ],
-        check=True,
-        capture_output=True,
-        timeout=30.0,
-    )
+    # Apple Git can load its built-in osxkeychain helper before GIT_CONFIG_SYSTEM.
+    # Reset that inherited chain before installing the test image's helper.
+    for args in (
+        ["credential.helper", ""],
+        ["--add", "credential.helper", _IMAGE_CREDENTIAL_HELPER],
+    ):
+        subprocess.run(
+            ["git", "config", "--file", str(system_cfg), *args],
+            check=True,
+            capture_output=True,
+            timeout=30.0,
+        )
     return system_cfg
 
 
@@ -245,6 +251,7 @@ def _init_container_env(
             "PATH": os.pathsep.join([str(Path(sys.executable).parent), os.environ["PATH"]]),
             "PYTHONPATH": _pythonpath(),
             "GIT_CONFIG_SYSTEM": str(system_cfg),
+            "GIT_CONFIG_GLOBAL": str(pod_home / ".gitconfig"),
             "GIT_TERMINAL_PROMPT": "0",
             # The github.com stand-in's self-signed certificate.
             "GIT_SSL_NO_VERIFY": "1",

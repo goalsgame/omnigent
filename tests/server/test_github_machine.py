@@ -150,3 +150,33 @@ async def test_invalid_or_denied_token_response_is_not_cached(monkeypatch, statu
     with pytest.raises(GitHubAppError):
         await broker.resolve(PRINCIPAL)
     assert not broker._tokens
+
+
+@pytest.mark.asyncio
+async def test_slow_mint_does_not_block_other_principals(monkeypatch):
+    principals = [f"oidc-machine:bot-{n}" for n in range(3)]
+    policy = parse_machine_bindings(
+        {p: {**POLICY, "installation_id": n + 1} for n, p in enumerate(principals)},
+        principals=frozenset(principals),
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def handle(request):
+        calls.append(request.url.path)
+        if request.url.path.endswith("/1/access_tokens"):
+            started.set()
+            await release.wait()
+        return httpx.Response(201, json=payload())
+
+    broker = GitHubMachineBroker(policy, client(handle, monkeypatch), lambda p: True)
+    cached = await broker.resolve(principals[1])
+    slow = asyncio.create_task(broker.resolve(principals[0]))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert await asyncio.wait_for(broker.resolve(principals[1]), timeout=2) == cached
+        assert await asyncio.wait_for(broker.resolve(principals[2]), timeout=2) is not None
+        assert len(calls) == 3
+    finally:
+        release.set()
+        await asyncio.wait_for(slow, timeout=2)

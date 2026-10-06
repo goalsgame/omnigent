@@ -83,13 +83,13 @@ class GitHubMachineBroker:
         self._client = client
         self._principal_allowed = principal_allowed
         self._tokens: dict[str, tuple[str, float]] = {}
-        self._lock = asyncio.Lock()
+        self._locks = {principal: asyncio.Lock() for principal in bindings}
 
     async def resolve(self, principal: str) -> dict[str, object] | None:
         binding = self._bindings.get(principal)
         if binding is None or not await asyncio.to_thread(self._principal_allowed, principal):
             return None
-        async with self._lock:
+        async with self._locks[principal]:
             if not await asyncio.to_thread(self._principal_allowed, principal):
                 return None
             cached = self._tokens.get(principal)
