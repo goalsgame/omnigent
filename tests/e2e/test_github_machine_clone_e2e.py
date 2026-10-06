@@ -1,8 +1,8 @@
 """OIDC machine session -> launch-token broker -> authenticated private Git clone.
 
 The CLI server, RSA verification, ownership, launcher and generated preparation
-command are real. Kubernetes, OIDC/GitHub endpoints and the credential cipher
-use local stand-ins. No LLM, cloud resources or real credentials are required.
+command are real. Kubernetes and OIDC/GitHub endpoints use local stand-ins.
+No LLM, cloud resources or real credentials are required.
 """
 
 from __future__ import annotations

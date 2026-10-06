@@ -13,11 +13,9 @@ Two forces shape the design:
    GitHub MCP, …) needs the same shape: a per-user secret + some non-secret
    metadata, connected once and re-vended to sandboxes. We do not want one
    bespoke table per provider.
-2. **Managed key material.** The secret material is encrypted with **AWS KMS** —
-   the key lives in KMS, the server only holds an IAM permission to call
-   `Encrypt`/`Decrypt`, and each ciphertext is bound to its row's identity as the
-   KMS *encryption context*. This gives per-user encryption, rotation, audit, and
-   "the app process never holds the raw key" without us managing key material.
+2. **Managed key material.** AWS KMS, Google Cloud KMS and Vault Transit keep
+   encryption keys outside the server process. Each ciphertext is bound to its
+   row identity, and backend key rotation and audit stay with the operator.
 
 Getting the schema generic now is cheap; reshaping a provider-specific table
 after users have connected means migrating encrypted rows. Hence this store
@@ -31,10 +29,10 @@ The design deliberately separates two concerns that are easy to conflate:
 | Axis | What varies | This design |
 | --- | --- | --- |
 | **Data model** | "a credential for *any* provider, per user" | one generic table + typed façades per provider |
-| **Secret backend** | *where* the key lives and *who* encrypts | a `SecretCipher` port; AWS KMS is the implementation |
+| **Secret backend** | *where* the key lives and *who* encrypts | a `SecretCipher` port; AWS KMS, Google Cloud KMS and Vault Transit are implementations |
 
 Keeping them orthogonal means a new provider is a façade (no schema change) and
-a different key backend (GCP/Azure KMS, Vault Transit) is a cipher adapter (no
+a different key backend is a cipher adapter (no
 schema change).
 
 ## Data model
@@ -47,7 +45,7 @@ One table, `connections`:
 | `user_id` | str(128) | omnigent user, part of PK |
 | `provider` | str(64) | e.g. `"github"`, part of PK |
 | `account_id` | str(128) | provider account discriminator, part of PK; `""` = the user's single account for that provider |
-| `secret_enc` | text | KMS ciphertext (base64) of a JSON blob holding *all* secret material (access token, refresh token, …) |
+| `secret_enc` | text | ciphertext of a JSON blob holding *all* secret material (access token, refresh token, …) |
 | `metadata_json` | text | non-secret provider metadata (login, ids, scopes, expiries, …) as JSON |
 | `created_at` / `updated_at` | integer | unix epoch seconds (repo convention; `workspace_id` is the lone `bigint`) |
 
@@ -77,18 +75,14 @@ path. The store depends on this port, not on a concrete backend, so the KMS
 implementation can be swapped for GCP/Azure KMS or Vault Transit without a
 schema change.
 
-`KmsSecretCipher` is the implementation: `encrypt` is one `kms:Encrypt` call
+`KmsSecretCipher` is the AWS implementation: `encrypt` is one `kms:Encrypt` call
 under the configured key with `context` as the KMS encryption context; the
 returned ciphertext blob is stored base64. Blobs are small (a token JSON
 object), well under the 4 KB `Encrypt` limit, so no envelope/data-key layer is
 needed. `decrypt` is `kms:Decrypt` with the same context.
 
-`build_secret_cipher()` is the single seam where a deployment selects the
-backend; it reads the **store-level** key `OMNIGENT_CREDENTIAL_KMS_KEY_ID` (id,
-ARN, or `alias/…`) and returns the cipher, or `None` when unset — the store, and
-every integration on it, is then disabled. **There is no non-KMS fallback:** no
-key configured means the feature is off, not that it silently encrypts with a
-local key.
+`build_secret_cipher()` selects the configured backend. With no backend key
+configured, the store and integrations using it are disabled.
 
 The key belongs to the **credential store**, not to any one provider: every
 provider façade shares the one cipher, so connecting an MCP server or Datadog
@@ -96,7 +90,19 @@ account needs no provider-specific key and does not depend on GitHub being
 configured. Provider config gates that provider's routes, not the store's
 ability to encrypt.
 
-### What the encryption context buys (and what it doesn't)
+### Google Cloud KMS
+
+Set `OMNIGENT_CREDENTIAL_CIPHER=gcp_kms` and provide a full CryptoKey resource
+name in `OMNIGENT_CREDENTIAL_GCP_KMS_KEY_ID`. Install `omnigent[gcp-kms]`.
+The server identity needs `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that
+key. The cipher sends the row identity as Additional Authenticated Data to
+Cloud KMS and checks CRC32C request/response integrity. Ciphertexts include the
+key name so a configured key change fails loudly. A wrong row identity or
+corrupt ciphertext returns `None`; IAM errors and disabled keys propagate.
+Key material stays in Cloud KMS, and normal key-version rotation preserves
+previous ciphertexts.
+
+### AWS KMS encryption context
 
 The *tenancy boundary* is the primary key and the `workspace_id`-scoped queries
 — that is what stops user A reading user B's row, and it holds regardless of the
@@ -203,25 +209,22 @@ a 500, and the token is never persisted in the sandbox.
 A vended GitHub token's blast radius is bounded by the launch token: the broker
 resolves `(host_id, launch_token)` server-side and stops vending the moment the
 launch token expires or the host row is deleted, and the raw token never touches
-sandbox disk. KMS adds its own layer — CloudTrail logs every `Decrypt`, and
-disabling the key stops all decrypts globally — but KMS does not know about
-launch tokens. So "stops vending when the session ends" must remain a
-server-side check on the broker path, independent of KMS; KMS is defence in
-depth on the storage, not the session boundary.
+sandbox disk. The configured cipher adds encryption and audit for stored
+tokens, but it does not know about launch tokens. So "stops vending when the session ends" must remain a
+server-side check on the broker path, independent of the storage cipher.
 
 ## Dependencies
 
 The credential store is backend-agnostic; each `SecretCipher` backend declares its
-own extra, both imported lazily:
+own extra, all imported lazily:
 
 - **AWS KMS** (`KmsSecretCipher`) needs boto3 — `omnigent[kms]`.
+- **Google Cloud KMS** (`GcpKmsSecretCipher`) needs the KMS client and CRC32C — `omnigent[gcp-kms]`.
 - **HashiCorp Vault** (`VaultSecretCipher`, Transit) needs hvac — `omnigent[vault]`.
 
-boto3 / hvac load only when the matching backend is selected
-(`OMNIGENT_CREDENTIAL_KMS_KEY_ID` / `OMNIGENT_CREDENTIAL_VAULT_KEY`), so a deployment
-that doesn't enable the credential store — or uses the other backend — needs neither.
+Backend clients load only when their cipher is selected.
 
-`OMNIGENT_CREDENTIAL_CIPHER` (`kms` | `vault`) selects the backend explicitly per
+`OMNIGENT_CREDENTIAL_CIPHER` (`kms` | `gcp_kms` | `vault`) selects the backend explicitly per
 server; the chosen backend's key env var is then required. Leave it unset to
 auto-detect the single configured backend — configuring more than one without the
 selector is an error (no silent precedence), and configuring none disables the store.

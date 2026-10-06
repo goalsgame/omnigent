@@ -14,7 +14,6 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 
 from omnigent.server.github_app_client import GitHubAppClient
-from tests.server.test_github_store import SecretBox
 from tests.server.test_oidc_machine_auth import ISSUER
 
 TOKEN = "ghs_local_installation_fixture"
@@ -80,7 +79,6 @@ def main() -> None:
                 timeout=15,
             ),
         ),
-        patch("omnigent.stores.credential_store.build_secret_cipher", lambda: SecretBox("test")),
     ):
         from omnigent.cli import main as cli_main
 

@@ -4565,8 +4565,8 @@ def server(
         cipher = build_secret_cipher()
         if cipher is None:
             logging.getLogger(__name__).error(
-                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
-                "(the credential store's encryption key) to enable it."
+                "GitHub user connections are disabled: configure "
+                "OMNIGENT_CREDENTIAL_CIPHER with an encryption backend."
             )
         else:
             from omnigent.connections.github import GithubConnectionStore
