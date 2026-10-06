@@ -4551,10 +4551,8 @@ def server(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # GitHub App integration (per-user "Connect GitHub"). Enabled only
-    # when OMNIGENT_GITHUB_APP_* env supplies a client id/secret + a
-    # resolvable redirect URI; otherwise both stay None and the feature
-    # is inert (see docs/GITHUB_APP_SETUP.md).
+    # GitHub App integration (per-user "Connect GitHub" and machine-owned
+    # installation tokens). The user connection store also needs a cipher.
     from omnigent.server.github_app import GitHubAppConfig
 
     github_config = GitHubAppConfig.from_env()
@@ -4564,9 +4562,9 @@ def server(
 
         cipher = build_secret_cipher()
         if cipher is None:
-            logging.getLogger(__name__).error(
+            logging.getLogger(__name__).warning(
                 "GitHub user connections are disabled: configure "
-                "OMNIGENT_CREDENTIAL_CIPHER with an encryption backend."
+                "a credential encryption backend and its key."
             )
         else:
             from omnigent.connections.github import GithubConnectionStore
@@ -4586,7 +4584,7 @@ def server(
         if dbx_cipher is None:
             logging.getLogger(__name__).error(
                 "Databricks Connect is configured but disabled: set the credential "
-                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+                "store's encryption backend and key to enable it."
             )
         else:
             from omnigent.connections.databricks import DatabricksConnectionStore

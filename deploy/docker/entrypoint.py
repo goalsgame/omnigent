@@ -318,10 +318,11 @@ def log_capabilities(
     sandbox_config: ManagedSandboxDeployment | None,
     github_config: object | None,
     github_store: object | None,
+    *,
+    github_machine_broker: object | None = None,
 ) -> None:
     """
-    Log the same flags ``/v1/info`` exposes, so a missing ``sandbox:``
-    block or GitHub App env shows up in pod logs without curling.
+    Log managed-sandbox and GitHub auth availability at boot.
 
     Reads ``sandbox_config.default.provider``, not ``.provider``:
     :class:`ManagedSandboxDeployment` wraps one config PER PROVIDER and has
@@ -333,13 +334,16 @@ def log_capabilities(
     :param sandbox_config: The resolved sandbox deployment, or ``None``.
     :param github_config: The GitHub App config, or ``None``.
     :param github_store: The GitHub connection store, or ``None``.
+    :param github_machine_broker: The machine-owned installation-token broker.
     """
     managed = sandbox_config is not None and sandbox_config.managed_launch_supported
     logger.info(
-        "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
+        "Capabilities: managed_sandboxes=%s provider=%s "
+        "github_connections=%s github_machine_auth=%s",
         managed,
         sandbox_config.default.provider if managed and sandbox_config else None,
         github_config is not None and github_store is not None,
+        github_machine_broker is not None,
     )
 
 
@@ -460,9 +464,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
         cipher = build_secret_cipher()
         if cipher is None:
-            logger.error(
-                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
-                "(the credential store's encryption key) to enable it."
+            logger.warning(
+                "GitHub user connections are disabled: configure a credential "
+                "encryption backend and its key to enable them."
             )
         else:
             from omnigent.connections.github import GithubConnectionStore
@@ -480,7 +484,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         if dbx_cipher is None:
             logger.error(
                 "Databricks Connect is configured but disabled: set the credential "
-                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+                "store's encryption backend and key to enable it."
             )
         else:
             from omnigent.connections.databricks import DatabricksConnectionStore
@@ -514,7 +518,12 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         databricks_store=databricks_store,
     )
 
-    log_capabilities(sandbox_config, github_config, github_store)
+    log_capabilities(
+        sandbox_config,
+        github_config,
+        github_store,
+        github_machine_broker=app.state.github_machine_broker,
+    )
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
 

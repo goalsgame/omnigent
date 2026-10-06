@@ -86,3 +86,13 @@ def test_capabilities_handles_no_sandbox_block(
         entrypoint.log_capabilities(None, None, None)
 
     assert "managed_sandboxes=False" in caplog.text
+
+
+def test_capabilities_distinguish_machine_github_from_user_connections(
+    entrypoint, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="omnigent-docker"):
+        entrypoint.log_capabilities(None, object(), None, github_machine_broker=object())
+
+    assert "github_connections=False" in caplog.text
+    assert "github_machine_auth=True" in caplog.text

@@ -48,8 +48,10 @@ short-lived token minted from that user's authorization — never a shared PAT.
 - For human GitHub connections, configure a credential cipher such as Google Cloud
   KMS (`OMNIGENT_CREDENTIAL_CIPHER=gcp_kms` and
   `OMNIGENT_CREDENTIAL_GCP_KMS_KEY_ID=<full CryptoKey name>`). The server identity
-  needs `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that key. Machine App
-  installation tokens remain in memory and do not require this store.
+  needs `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that key. Install the
+  backend with `pip install 'omnigent[gcp-kms]'`, or bake it into the server image
+  with `docker build --build-arg OMNIGENT_EXTRAS=gcp-kms -f deploy/docker/Dockerfile .`.
+  Machine App installation tokens remain in memory and do not require this store.
 
 ---
 
@@ -193,8 +195,8 @@ nor `OMNIGENT_DOMAIN`), the feature logs a warning and **stays disabled**.
 ## Verify
 
 1. Sign in to Omnigent as a real user, open **Settings → Sandbox Integrations**.
-   The **Connect GitHub** control appears (the nav link only shows when the App
-   is configured — driven by `github_app_enabled` in `/v1/info`).
+   The **Connect GitHub** control appears when the App and encrypted connection
+   store are configured (`github` appears in `/v1/info`'s `enabled_connections`).
 2. Click **Connect GitHub** → GitHub's authorize screen → back to Omnigent with
    `?github=connected`. The panel now shows **Connected as `<login>`**.
 3. Start a sandbox session on a **private** repo owned by an account where the
