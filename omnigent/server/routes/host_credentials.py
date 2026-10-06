@@ -1,4 +1,4 @@
-"""Host-facing endpoint that vends a session's per-user credential.
+"""Host-facing endpoint that vends a session owner's provider credential.
 
 Generic over the connection providers. A managed sandbox authenticates back to
 the server with its launch token (:data:`~omnigent.host.identity.MANAGED_HOST_TOKEN_HEADER`)
@@ -9,7 +9,8 @@ having each executor inject it into the environment.
 
 One route serves every provider that registers a ``credential_resolver`` on
 :mod:`omnigent.server.connections_registry`; the resolver owns the
-provider-specific secret lookup + attribution metadata. Consumers (all inside
+provider-specific secret lookup + attribution metadata. GitHub machine owners
+use an explicit installation policy instead of a per-user connection. Consumers (all inside
 the sandbox/runner, never the agent's own process) pass ``provider`` in the
 path — e.g. the git credential helper and the GitHub MCP proxy pass ``github``.
 
@@ -20,7 +21,8 @@ token expires or the host row is deleted (session teardown). Responses are
 
 Threat model (unchanged from the original GitHub-only broker): what this vends
 is the owner's provider credential — for GitHub, their **full-scope user
-token**. Teardown stops *future* vends, but a token already handed out stays
+token**, or an explicitly repository-scoped machine installation token.
+Teardown stops *future* vends, but a token already handed out stays
 valid at the provider for its own lifetime; this endpoint cannot revoke it. Any
 in-sandbox process that can reach this endpoint (it authenticates with the
 launch token baked into the sandbox) can obtain that credential for its TTL. So
@@ -36,12 +38,16 @@ import logging
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from omnigent.server.connections_registry import connection_providers
+from omnigent.server.github_machine import GitHubMachineBroker
+from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
 
 
-def create_host_credentials_router(host_store: HostStore) -> APIRouter:
+def create_host_credentials_router(
+    host_store: HostStore, *, github_machine_broker: GitHubMachineBroker | None = None
+) -> APIRouter:
     """Build the host-facing, provider-generic credential router.
 
     :param host_store: Resolves a launch token + host id to the session owner.
@@ -86,10 +92,21 @@ def create_host_credentials_router(host_store: HostStore) -> APIRouter:
         resolver = resolvers.get(provider)
         store = getattr(request.app.state, f"{provider}_store", None)
         client = getattr(request.app.state, f"{provider}_client", None)
-        if resolver is None or store is None:
+        is_github_machine = provider == "github" and managed.user_id.startswith(
+            MACHINE_PRINCIPAL_PREFIX
+        )
+        if not is_github_machine and (resolver is None or store is None):
             raise HTTPException(status_code=404, detail="unknown credential provider")
         try:
-            payload = await resolver(managed.user_id, store=store, client=client)
+            if is_github_machine:
+                payload = (
+                    await github_machine_broker.resolve(managed.user_id)
+                    if github_machine_broker is not None
+                    else None
+                )
+            else:
+                assert resolver is not None
+                payload = await resolver(managed.user_id, store=store, client=client)
         except Exception:  # noqa: BLE001 - a provider resolver fault must degrade, not 500
             _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
             return {"connected": False}

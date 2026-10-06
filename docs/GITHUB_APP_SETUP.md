@@ -200,3 +200,54 @@ nor `OMNIGENT_DOMAIN`), the feature logs a warning and **stays disabled**.
 
 If Step 3 returns `404` on a private repo while Steps 1–2 succeeded, the App is
 connected but **not installed** on that repo's owner — revisit [Step 7](#step-7--install-the-app).
+
+## Machine-owned sessions
+
+Human-owned sessions use the owner's connected GitHub account. OIDC
+machine-owned sessions use installation tokens only when an operator explicitly
+binds that machine to an installation and repository IDs:
+
+```yaml
+github_machine_auth:
+  oidc-machine:ticket-bot:
+    installation_id: 123456
+    repository_ids: [987654321]
+    access: write
+```
+
+Each principal must already be bound by `oidc_machine_auth`. Installation and
+repository IDs are public identifiers, not credentials. Obtain a repository ID
+with `gh api repos/OWNER/REPO --jq .id`; use the installation ID from the App's
+installation page or API. An empty repository list is rejected. `access: read`
+requests read-only Contents and Pull requests permissions; `write` allows branch
+pushes and PR creation. Metadata is always read-only. GitHub additionally limits
+tokens to the App's installed repositories and granted permissions.
+
+Configure the same App client ID, client secret and callback used by human
+connections, plus `OMNIGENT_GITHUB_APP_ID` and
+`OMNIGENT_GITHUB_APP_PRIVATE_KEY` (or `_PRIVATE_KEY_PATH`). The server's encrypted
+credential store must be enabled. Keep the client secret and private key on the
+server; neither enters a runner. Machine bindings without these prerequisites
+fail server startup.
+
+The host credential broker authenticates the sandbox's launch token and selects
+credentials using its registered owner. It never accepts an owner or repository
+policy supplied by the sandbox. Human owners retain their per-user token flow;
+machine owners never fall back to a user connection or another machine's policy.
+Installation tokens are cached only in server memory and refreshed five minutes
+before expiry. The machine's current binding and non-admin eligibility are checked
+on every vend, including cache hits and after an in-flight token request.
+
+The sandbox receives a bearer installation token, so any process inside it can
+use that token on the allowed repositories for its remaining GitHub lifetime.
+Removing a machine binding stops future vends after configuration rollout; host
+teardown also stops future vends. Neither action revokes tokens already issued by
+GitHub. Keep installations and machine policies narrow.
+
+To verify, connect GitHub as a human and create a managed session with a private
+HTTPS repository workspace. Confirm clone, branch push and PR creation use that
+user. Then create a machine-owned session through the authenticated session API
+and confirm it uses the App bot, can access its allowed repository, and cannot
+access a private repository excluded from the token policy. A machine with no
+GitHub binding must receive no GitHub credential, even if a user connection was
+previously stored under that subject.
