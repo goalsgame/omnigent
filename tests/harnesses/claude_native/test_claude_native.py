@@ -8448,6 +8448,7 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim(
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
     assert cfg.api_key_helper == "my-cli print-token"
+    assert "60000" not in cfg.routable_models
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://gw.example/v1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
