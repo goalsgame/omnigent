@@ -56,11 +56,20 @@ class OpenRouterWIFBroker:
         self._lock = asyncio.Lock()
         self._token = ""
         self._expires_at = 0.0
+        self._retry_at = 0.0
 
     async def credential(self) -> dict[str, object]:
         async with self._lock:
+            if time.monotonic() < self._retry_at:
+                raise OpenRouterWIFError("OpenRouter workload identity exchange failed")
             if time.monotonic() >= self._expires_at - 120:
-                await self._refresh()
+                try:
+                    await self._refresh()
+                except OpenRouterWIFError:
+                    # Queued requests share the failure instead of retrying upstream.
+                    self._retry_at = time.monotonic() + 5
+                    raise
+                self._retry_at = 0.0
             return {
                 "token": self._token,
                 "expires_in": max(0, int(self._expires_at - time.monotonic())),

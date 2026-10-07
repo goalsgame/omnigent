@@ -60,7 +60,8 @@ Tokens are cached only in server memory, with concurrent exchanges coalesced
 per replica. Refresh starts when less than two minutes remain; tokens with no
 more than two minutes of validity are rejected. Claude and Codex must refresh
 their helper more frequently than this margin. Pi resolves the command per
-request. Exchange errors fail closed with a sanitized 503; there is no fallback
+request. Exchange errors fail closed with a sanitized 503 and a five-second retry backoff
+shared by concurrent callers; there is no fallback
 to a static key. Source tokens and response bodies are not logged.
 
 Upgrade both server and managed-host images before enabling the provider

@@ -118,6 +118,7 @@ async def test_failed_renewal_does_not_return_cached_token(tmp_path, monkeypatch
     clock[0] += 901
     with pytest.raises(wif.OpenRouterWIFError):
         await broker.credential()
+    clock[0] += 5
     assert (await broker.credential())["token"] == "renewed"
 
 
@@ -143,3 +144,96 @@ def test_disabled_and_default_config():
     assert wif.OpenRouterWIFConfig.parse({"policy_id": "policy"}) == wif.OpenRouterWIFConfig(
         "policy"
     )
+
+
+async def test_outage_is_shared_with_waiters_and_recovers_after_backoff(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(wif, "time", type("Clock", (), {"monotonic": lambda: clock[0]}))
+    calls = []
+    failing = True
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(request):
+        calls.append(request)
+        if failing:
+            entered.set()
+            await release.wait()
+            raise httpx.ReadTimeout("private upstream details")
+        if request.method == "GET":
+            return httpx.Response(200, text="identity")
+        return _token("recovered")
+
+    broker = wif.OpenRouterWIFBroker(
+        wif.OpenRouterWIFConfig("policy"), transport=httpx.MockTransport(handle)
+    )
+    first = asyncio.create_task(broker.credential())
+    await entered.wait()
+    waiters = [asyncio.create_task(broker.credential()) for _ in range(10)]
+    release.set()
+    results = await asyncio.gather(first, *waiters, return_exceptions=True)
+    assert all(isinstance(result, wif.OpenRouterWIFError) for result in results)
+    assert len(calls) == 1
+    clock[0] += 4
+    with pytest.raises(wif.OpenRouterWIFError):
+        await broker.credential()
+    assert len(calls) == 1
+    failing = False
+    clock[0] += 1
+    assert (await broker.credential())["token"] == "recovered"
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("explicit_config", [None, {}])
+def test_app_uses_file_config_unless_explicit_config_supplied(
+    tmp_path, db_uri, monkeypatch, explicit_config
+):
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    config = tmp_path / "server.yaml"
+    config.write_text("openrouter_wif:\n  policy_id: file-policy\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    calls = []
+
+    async def credential(broker):
+        calls.append(broker.config.policy_id)
+        return {"token": "test-inference-token", "expires_in": 800}
+
+    monkeypatch.setattr(wif.OpenRouterWIFBroker, "credential", credential)
+    hosts = HostStore(db_uri)
+    host_id = "a" * 32
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="test",
+        user_id="test@example.com",
+        token="launch-token",
+        provider="test",
+        sandbox_id="test",
+        token_expires_at=int(time.time()) + 600,
+    )
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifacts, tmp_path / "cache"),
+        host_store=hosts,
+        server_config=explicit_config,
+    )
+    response = TestClient(app).get(
+        f"/v1/hosts/{host_id}/credentials/openrouter",
+        headers={"X-Omnigent-Host-Token": "launch-token"},
+    )
+    assert response.status_code == (200 if explicit_config is None else 404)
+    assert calls == (["file-policy"] if explicit_config is None else [])

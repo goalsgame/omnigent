@@ -3749,7 +3749,7 @@ def create_app(
 
     from omnigent.server.openrouter_wif import OpenRouterWIFBroker, OpenRouterWIFConfig
 
-    openrouter_wif_config = OpenRouterWIFConfig.parse((server_config or {}).get("openrouter_wif"))
+    openrouter_wif_config = OpenRouterWIFConfig.parse(resolved_server_config.get("openrouter_wif"))
     openrouter_wif_broker = (
         OpenRouterWIFBroker(openrouter_wif_config) if openrouter_wif_config else None
     )
