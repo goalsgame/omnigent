@@ -62,17 +62,20 @@ class OpenRouterWIFBroker:
         async with self._lock:
             if time.monotonic() < self._retry_at:
                 raise OpenRouterWIFError("OpenRouter workload identity exchange failed")
-            if time.monotonic() >= self._expires_at - 120:
-                try:
+            try:
+                if int(self._expires_at - time.monotonic()) <= 120:
                     await self._refresh()
-                except OpenRouterWIFError:
-                    # Queued requests share the failure instead of retrying upstream.
-                    self._retry_at = time.monotonic() + 5
-                    raise
-                self._retry_at = 0.0
+                remaining = int(self._expires_at - time.monotonic())
+                if remaining <= 120:
+                    raise OpenRouterWIFError("OpenRouter workload identity exchange failed")
+            except OpenRouterWIFError:
+                # Queued requests share the failure instead of retrying upstream.
+                self._retry_at = time.monotonic() + 5
+                raise
+            self._retry_at = 0.0
             return {
                 "token": self._token,
-                "expires_in": max(0, int(self._expires_at - time.monotonic())),
+                "expires_in": remaining,
             }
 
     async def _refresh(self) -> None:
@@ -118,8 +121,11 @@ class OpenRouterWIFBroker:
                     or result.get("token_type", "").lower() != "bearer"
                 ):
                     raise ValueError("invalid token response")
-                self._token = token
-                self._expires_at = started + ttl
+            expires_at = started + ttl
+            if int(expires_at - time.monotonic()) <= 120:
+                raise ValueError("insufficient remaining token lifetime")
+            self._token = token
+            self._expires_at = expires_at
         except (httpx.HTTPError, OSError, ValueError, AttributeError, TypeError):
             # Response bodies and exception messages may contain either bearer.
             raise OpenRouterWIFError("OpenRouter workload identity exchange failed") from None

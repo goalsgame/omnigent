@@ -237,3 +237,60 @@ def test_app_uses_file_config_unless_explicit_config_supplied(
     )
     assert response.status_code == (200 if explicit_config is None else 404)
     assert calls == (["file-policy"] if explicit_config is None else [])
+
+
+@pytest.mark.parametrize(
+    ("ttl", "metadata_delay", "exchange_delay", "expected_remaining"),
+    [
+        (121, 1, 0, None),
+        (121, 0, 1, None),
+        (121, 0.25, 0.25, None),
+        (124, 1, 3, None),
+        (124, 1, 2, 121),
+        (900, 1, 2, 897),
+    ],
+)
+async def test_remaining_lifetime_accounts_for_exchange_latency(
+    monkeypatch, ttl, metadata_delay, exchange_delay, expected_remaining
+):
+    clock = [100.0]
+    monkeypatch.setattr(wif, "time", type("Clock", (), {"monotonic": lambda: clock[0]}))
+
+    def handle(request):
+        if request.method == "GET":
+            clock[0] += metadata_delay
+            return httpx.Response(200, text="identity")
+        clock[0] += exchange_delay
+        return _token(expires_in=ttl)
+
+    broker = wif.OpenRouterWIFBroker(
+        wif.OpenRouterWIFConfig("policy"), transport=httpx.MockTransport(handle)
+    )
+    if expected_remaining is None:
+        with pytest.raises(wif.OpenRouterWIFError):
+            await broker.credential()
+        assert broker._token == ""
+        assert broker._expires_at == 0
+        assert broker._retry_at == clock[0] + 5
+    else:
+        assert (await broker.credential())["expires_in"] == expected_remaining
+
+
+async def test_cached_token_refreshes_before_rounded_lifetime_reaches_margin(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(wif, "time", type("Clock", (), {"monotonic": lambda: clock[0]}))
+    exchanges = []
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, text="identity")
+        exchanges.append(True)
+        return _token(f"access-{len(exchanges)}")
+
+    broker = wif.OpenRouterWIFBroker(
+        wif.OpenRouterWIFConfig("policy"), transport=httpx.MockTransport(handle)
+    )
+    assert (await broker.credential())["token"] == "access-1"
+    clock[0] += 779.5
+    assert (await broker.credential())["token"] == "access-2"
+    assert len(exchanges) == 2
