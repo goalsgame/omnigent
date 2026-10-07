@@ -3075,6 +3075,11 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
             **pin_env,
+            **(
+                {_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(family.auth_refresh_interval_ms)}
+                if family.auth_refresh_interval_ms is not None
+                else {}
+            ),
             # Disable beta flags gateways reject (400 "invalid beta flag");
             # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
             **(

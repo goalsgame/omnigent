@@ -4947,6 +4947,9 @@ def run_host_process(
     from omnigent.host.databricks_credential import configure_host_databricks
 
     configure_host_databricks(server_url, identity.host_id)
+    from omnigent.host.inference_credential import configure_host_inference
+
+    configure_host_inference(server_url, identity.host_id)
     _generate_ucode_configs()
 
     if lifecycle_lock is None and daemon_target is not None:

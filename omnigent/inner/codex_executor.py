@@ -2156,6 +2156,7 @@ def _provider_codex_config_overrides(
     base_url: str,
     auth_command: str,
     wire_api: str,
+    auth_refresh_interval_ms: int | None = None,
 ) -> list[str]:
     """Return Codex config overrides routing through a generic provider.
 
@@ -2204,7 +2205,7 @@ def _provider_codex_config_overrides(
         'auth={command="sh",'
         f'args=["-c",{auth_command_json}],'
         f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
-        f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
+        f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
         "},"
         f'wire_api="{effective_wire_api}"}}'
     )

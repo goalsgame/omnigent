@@ -60,14 +60,24 @@ class _BoomStore:
         raise RuntimeError("db down")
 
 
-def _app(host_store: _FakeHostStore, *, github_store, github_machine_broker=None) -> TestClient:
+def _app(
+    host_store: _FakeHostStore,
+    *,
+    github_store,
+    github_machine_broker=None,
+    openrouter_wif_broker=None,
+) -> TestClient:
     app = FastAPI()
     # The generic route reads app.state.<provider>_{store,client}, populated by
     # the connection-provider wiring in create_app.
     app.state.github_store = github_store
     app.state.github_client = None
     app.include_router(
-        create_host_credentials_router(host_store, github_machine_broker=github_machine_broker),
+        create_host_credentials_router(
+            host_store,
+            github_machine_broker=github_machine_broker,
+            openrouter_wif_broker=openrouter_wif_broker,
+        ),
         prefix="/v1",
     )  # type: ignore[arg-type]
     return TestClient(app)
@@ -170,3 +180,42 @@ def test_machine_token_is_bound_to_authenticated_host_owner() -> None:
     assert response.json()["owner"] == "oidc-machine:ticket-bot"
     assert response.headers["cache-control"] == "no-store"
     assert calls == ["oidc-machine:ticket-bot"]
+
+
+def test_openrouter_broker_authenticates_each_fetch_and_stops_after_revocation():
+    calls = []
+
+    class Broker:
+        async def credential(self):
+            calls.append(True)
+            return {"token": "short-lived", "expires_in": 800}
+
+    hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
+    tc = _app(hs, github_store=None, openrouter_wif_broker=Broker())
+    endpoint = "/v1/hosts/host1/credentials/openrouter"
+    assert tc.get(endpoint).status_code == 401
+    assert tc.get("/v1/hosts/other/credentials/openrouter", headers=_HDR).status_code == 401
+    assert not calls
+    response = tc.get(endpoint, headers=_HDR)
+    assert response.json() == {"connected": True, "token": "short-lived", "expires_in": 800}
+    assert response.headers["cache-control"] == "no-store"
+    hs._token = "revoked"
+    assert tc.get(endpoint, headers=_HDR).status_code == 401
+    assert len(calls) == 1
+
+
+def test_openrouter_exchange_failure_and_disabled_broker():
+    from omnigent.server.openrouter_wif import OpenRouterWIFError
+
+    class Broker:
+        async def credential(self):
+            raise OpenRouterWIFError("exchange failed")
+
+    hs = _FakeHostStore("host1", "launch-tok", "oidc-machine:ticket-bot")
+    endpoint = "/v1/hosts/host1/credentials/openrouter"
+    assert _app(hs, github_store=None).get(endpoint, headers=_HDR).status_code == 404
+    tc = _app(hs, github_store=None, openrouter_wif_broker=Broker())
+    response = tc.get(endpoint, headers=_HDR)
+    assert response.status_code == 503
+    assert response.headers["cache-control"] == "no-store"
+    assert "token" not in response.json()

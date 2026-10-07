@@ -1051,3 +1051,40 @@ def test_resolve_model_tier_without_models_map_is_passthrough() -> None:
     """No ``models:`` map → nothing to resolve."""
     family = FamilyConfig(base_url="http://bifrost.example.com/v1")
     assert family.resolve_model_tier("gpt-5") == "gpt-5"
+
+
+@pytest.mark.parametrize("interval", [0, -1, True, "60000"])
+def test_auth_refresh_interval_rejects_invalid_values(interval):
+    with pytest.raises(OmnigentError, match="auth_refresh_interval_ms"):
+        load_providers(
+            {
+                "providers": {
+                    "gw": {
+                        "kind": "gateway",
+                        "openai": {
+                            "base_url": "https://gateway.example/v1",
+                            "auth_command": "mint-token",
+                            "auth_refresh_interval_ms": interval,
+                        },
+                    }
+                }
+            }
+        )
+
+
+def test_auth_refresh_interval_requires_dynamic_auth():
+    with pytest.raises(OmnigentError, match="auth_refresh_interval_ms"):
+        load_providers(
+            {
+                "providers": {
+                    "gw": {
+                        "kind": "gateway",
+                        "openai": {
+                            "base_url": "https://gateway.example/v1",
+                            "api_key": "static-key",
+                            "auth_refresh_interval_ms": 60000,
+                        },
+                    }
+                }
+            }
+        )

@@ -2115,3 +2115,35 @@ def test_stale_login_cache_cannot_shadow_claude_sdk_fallback(
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+
+
+@pytest.mark.parametrize(
+    ("harness", "family", "builder", "prefix"),
+    [
+        ("claude-sdk", "anthropic", _build_claude_sdk_spawn_env, "HARNESS_CLAUDE_SDK"),
+        ("codex", "openai", _build_codex_spawn_env, "HARNESS_CODEX"),
+    ],
+)
+def test_dynamic_provider_refresh_interval_reaches_spawn_env(
+    config_home, harness, family, builder, prefix
+):
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "gateway": {
+                    "kind": "gateway",
+                    "default": True,
+                    family: {
+                        "base_url": "https://gateway.example/v1",
+                        "auth_command": "mint-token",
+                        "auth_refresh_interval_ms": 60000,
+                        "models": {"default": "test-model"},
+                    },
+                }
+            }
+        },
+    )
+    env = builder(_make_spec(harness=harness), workdir=None)
+    assert env[f"{prefix}_GATEWAY_AUTH_COMMAND"] == "mint-token"
+    assert env[f"{prefix}_GATEWAY_AUTH_REFRESH_INTERVAL_MS"] == "60000"

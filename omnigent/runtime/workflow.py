@@ -835,6 +835,8 @@ def _apply_provider_family(
     env[cfg.host_key] = _origin_of(family.base_url)
     if cfg.auth_key is not None:
         env[cfg.auth_key] = _provider_auth_command(family)
+    if cfg.refresh_key and family.auth_refresh_interval_ms is not None:
+        env[cfg.refresh_key] = str(family.auth_refresh_interval_ms)
     # Model precedence: spec model (already in env via _resolve_spec_model) >
     # provider ``models.default`` > catalog family default > fail loud.
     if cfg.model_key not in env and family.default_model:
