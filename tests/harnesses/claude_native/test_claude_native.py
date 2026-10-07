@@ -8438,6 +8438,7 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim(
                     "anthropic": {
                         "base_url": "https://gw.example/v1",
                         "auth_command": "my-cli print-token",
+                        "auth_refresh_interval_ms": 60000,
                     },
                 }
             }
@@ -8450,6 +8451,7 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim(
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://gw.example/v1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "60000",
     }
 
 

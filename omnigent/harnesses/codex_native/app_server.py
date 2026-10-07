@@ -3463,6 +3463,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         base_url=family.base_url,
         auth_command=auth_command,
         wire_api=family.wire_api or "responses",
+        auth_refresh_interval_ms=family.auth_refresh_interval_ms,
     )
     return NativeCodexLaunch(
         config_overrides=overrides,

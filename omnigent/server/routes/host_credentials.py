@@ -40,13 +40,17 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 from omnigent.server.connections_registry import connection_providers
 from omnigent.server.github_machine import GitHubMachineBroker
 from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
+from omnigent.server.openrouter_wif import OpenRouterWIFBroker, OpenRouterWIFError
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
 
 
 def create_host_credentials_router(
-    host_store: HostStore, *, github_machine_broker: GitHubMachineBroker | None = None
+    host_store: HostStore,
+    *,
+    github_machine_broker: GitHubMachineBroker | None = None,
+    openrouter_wif_broker: OpenRouterWIFBroker | None = None,
 ) -> APIRouter:
     """Build the host-facing, provider-generic credential router.
 
@@ -86,6 +90,16 @@ def create_host_credentials_router(
         )
         if managed is None:
             raise HTTPException(status_code=401, detail="unauthenticated")
+        if provider == "openrouter" and openrouter_wif_broker is not None:
+            try:
+                credential = await openrouter_wif_broker.credential()
+            except OpenRouterWIFError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="OpenRouter workload credential unavailable",
+                    headers={"Cache-Control": "no-store"},
+                ) from None
+            return {"connected": True, **credential}
         # Resolve provider only after auth so the endpoint reveals nothing to an
         # unauthenticated caller. A resolver with no configured store on this
         # server (or an unknown provider) is a 404 — nothing to vend.

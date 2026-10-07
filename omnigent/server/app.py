@@ -3747,6 +3747,13 @@ def create_app(
         )
     app.state.github_machine_broker = github_machine_broker
 
+    from omnigent.server.openrouter_wif import OpenRouterWIFBroker, OpenRouterWIFConfig
+
+    openrouter_wif_config = OpenRouterWIFConfig.parse((server_config or {}).get("openrouter_wif"))
+    openrouter_wif_broker = (
+        OpenRouterWIFBroker(openrouter_wif_config) if openrouter_wif_config else None
+    )
+
     # Host tunnel + REST endpoints (DAEMON_API.md). Mounted only when a
     # host_store is configured: the routers call host_store on every
     # request, so mounting them with host_store=None would fail each
@@ -3823,7 +3830,9 @@ def create_app(
 
         app.include_router(
             create_host_credentials_router(
-                host_store, github_machine_broker=github_machine_broker
+                host_store,
+                github_machine_broker=github_machine_broker,
+                openrouter_wif_broker=openrouter_wif_broker,
             ),
             prefix="/v1",
             tags=["hosts"],

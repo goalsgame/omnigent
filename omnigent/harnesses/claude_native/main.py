@@ -3061,6 +3061,8 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
     # pin their aliases directly; ``models.default`` pins its own family's
     # alias when nothing else declared that family.
     pin_env: dict[str, str] = {}
+    if family.auth_refresh_interval_ms is not None:
+        pin_env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(family.auth_refresh_interval_ms)
     for alias, env_var in ALIAS_MODEL_ENV_VARS.items():
         pinned = family.models.get(alias)
         if isinstance(pinned, str) and pinned.strip():

@@ -28,6 +28,7 @@ def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolate config + ambient so codex routing resolution is deterministic."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
     monkeypatch.setenv("HOME", str(tmp_path))
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "CODEX_HOME"):
         monkeypatch.delenv(var, raising=False)
@@ -916,3 +917,25 @@ def test_global_api_key_routes_without_model_or_cli_login(
     assert "model" not in config
     assert launch.model is None
     assert launch.login_required is False
+
+
+def test_native_codex_dynamic_auth_refresh_interval(_isolated):
+    _seed(
+        _isolated,
+        {
+            "gw": {
+                "kind": "gateway",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "auth_command": "mint-token",
+                    "auth_refresh_interval_ms": 60000,
+                },
+            }
+        },
+    )
+    launch = resolve_native_codex_launch(model="test-model")
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert provider["auth"]["refresh_interval_ms"] == 60000
+    assert provider["auth"]["args"] == ["-c", "mint-token"]

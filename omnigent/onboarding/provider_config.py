@@ -312,6 +312,8 @@ class FamilyConfig:
     :param auth_command: Shell command that prints a bearer token, for
         short-lived / dynamic tokens, e.g. ``"my-cli print-token"``.
         Mutually exclusive with :attr:`api_key` and :attr:`api_key_ref`.
+    :param auth_refresh_interval_ms: Maximum credential cache time for command
+        authentication in Claude and Codex. Must be shorter than the token TTL.
     :param wire_api: Wire protocol for the ``openai`` family —
         ``"responses"`` or ``"chat"``. ``None`` lets the consuming harness
         pick its own default. Ignored for the ``anthropic`` family.
@@ -342,6 +344,7 @@ class FamilyConfig:
     pricing: ModelPricingConfig | None = None
     context_window: int | None = None
     max_output_tokens: int | None = None
+    auth_refresh_interval_ms: int | None = None
 
     @property
     def default_model(self) -> str | None:
@@ -738,6 +741,14 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
     auth_command = (
         auth_command_raw if isinstance(auth_command_raw, str) and auth_command_raw else None
     )
+    refresh_interval = raw.get("auth_refresh_interval_ms")
+    if refresh_interval is not None and (
+        type(refresh_interval) is not int or refresh_interval <= 0 or not auth_command
+    ):
+        raise OmnigentError(
+            f"{prefix}.auth_refresh_interval_ms requires auth_command and a positive integer.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     wire_api_raw = raw.get("wire_api")
     wire_api: str | None = None
@@ -818,6 +829,7 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         api_key=api_key,
         api_key_ref=api_key_ref,
         auth_command=auth_command,
+        auth_refresh_interval_ms=refresh_interval,
         wire_api=wire_api,
         models=models,
         pricing=pricing,
