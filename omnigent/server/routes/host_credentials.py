@@ -79,7 +79,9 @@ def create_host_credentials_router(
         bound to *host_id*), exactly like the host tunnel. ``401`` when the
         token doesn't resolve; ``404`` for a provider with no broker resolver or
         not configured on this server; ``{"connected": false}`` when the owner
-        hasn't linked it, so a caller can fall back cleanly.
+        hasn't linked it, so a caller can fall back cleanly. Human GitHub
+        accounts include ``reason: not_connected`` only for a missing connection;
+        credential-resolution failures return ``503``.
         """
         # Never let a proxy/browser cache a vended credential.
         response.headers["Cache-Control"] = "no-store"
@@ -123,8 +125,14 @@ def create_host_credentials_router(
                 payload = await resolver(managed.user_id, store=store, client=client)
         except Exception:  # noqa: BLE001 - a provider resolver fault must degrade, not 500
             _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
-            return {"connected": False}
+            raise HTTPException(
+                status_code=503,
+                detail="Provider credential unavailable",
+                headers={"Cache-Control": "no-store"},
+            ) from None
         if payload is None:
+            if provider == "github" and not is_github_machine:
+                return {"connected": False, "reason": "not_connected"}
             return {"connected": False}
         return {"connected": True, "owner": managed.user_id, **payload}
 

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from unittest.mock import AsyncMock
 
+import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omnigent.connections.github import GithubConnectionStore
+from omnigent.db.utils import now_epoch
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.server.github_app import GitHubTokenSet
 from omnigent.server.routes.host_credentials import create_host_credentials_router
@@ -64,6 +68,7 @@ def _app(
     host_store: _FakeHostStore,
     *,
     github_store,
+    github_client=None,
     github_machine_broker=None,
     openrouter_wif_broker=None,
 ) -> TestClient:
@@ -71,7 +76,7 @@ def _app(
     # The generic route reads app.state.<provider>_{store,client}, populated by
     # the connection-provider wiring in create_app.
     app.state.github_store = github_store
-    app.state.github_client = None
+    app.state.github_client = github_client
     app.include_router(
         create_host_credentials_router(
             host_store,
@@ -125,7 +130,7 @@ def test_connected_false_when_owner_has_no_github(db_uri: str) -> None:
     tc = _app(hs, github_store=store)
     resp = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR)
     assert resp.status_code == 200
-    assert resp.json() == {"connected": False}
+    assert resp.json() == {"connected": False, "reason": "not_connected"}
 
 
 def test_unknown_provider_is_404_but_only_after_auth(db_uri: str) -> None:
@@ -139,12 +144,13 @@ def test_unknown_provider_is_404_but_only_after_auth(db_uri: str) -> None:
     assert tc.get("/v1/hosts/host1/credentials/gitlab").status_code == 401
 
 
-def test_resolver_fault_degrades_to_connected_false() -> None:
+def test_resolver_fault_reports_unavailable() -> None:
     hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
     tc = _app(hs, github_store=_BoomStore())
     resp = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR)
-    assert resp.status_code == 200
-    assert resp.json() == {"connected": False}
+    assert resp.status_code == 503
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.json() == {"detail": "Provider credential unavailable"}
 
 
 def test_machine_never_falls_back_to_a_user_connection(db_uri: str) -> None:
@@ -219,3 +225,34 @@ def test_openrouter_exchange_failure_and_disabled_broker():
     assert response.status_code == 503
     assert response.headers["cache-control"] == "no-store"
     assert "token" not in response.json()
+
+
+@pytest.mark.parametrize("expired", [True, False])
+def test_linked_account_refresh_failure_does_not_report_missing_connection(
+    db_uri: str, expired: bool
+) -> None:
+    owner = "alice@example.com"
+    store = GithubConnectionStore(db_uri, SecretBox("enc-secret"))
+    store.upsert(
+        owner,
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet(
+            "ghu_existing", "ghr_existing", now_epoch() + (-60 if expired else 120), None, "repo"
+        ),
+    )
+    client = AsyncMock()
+    client.refresh_token.side_effect = httpx.TimeoutException("refresh unavailable")
+    tc = _app(
+        _FakeHostStore("host1", "launch-tok", owner), github_store=store, github_client=client
+    )
+    response = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR)
+    assert response.status_code == (503 if expired else 200)
+    assert response.headers["cache-control"] == "no-store"
+    client.refresh_token.assert_awaited_once_with("ghr_existing")
+    assert "reason" not in response.json()
+    if expired:
+        assert response.json() == {"detail": "Provider credential unavailable"}
+    else:
+        assert response.json()["token"] == "ghu_existing"
+    assert store.get(owner) is not None

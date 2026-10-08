@@ -201,8 +201,12 @@ One route (`routes/host_credentials.py`) serves every provider that registers a
 `credential_resolver` on the `ConnectionProvider` registry; a provider with no
 resolver — connect-only, or on-demand delivery not built yet — returns `404`. A
 new provider is one registry entry, not another hand-copied route + client. The
-resolver is best-effort: a fault degrades to `{"connected": false}` rather than
-a 500, and the token is never persisted in the sandbox.
+resolver reports faults as `503` with a fixed message and `Cache-Control: no-store`.
+A human with no GitHub connection receives `{"connected": false, "reason": "not_connected"}`;
+a linked account whose expired token cannot be refreshed receives `503`. Clone
+preparation only displays connection guidance for the explicit missing-connection
+reason. Unavailable credentials keep the per-user broker authoritative instead
+of falling back to shared credentials. The token is never persisted in the sandbox.
 
 ## Revocation & audit note
 

@@ -394,14 +394,17 @@ def configure_clone_credentials_status(
     """Wire clone credentials and distinguish unlinked users from disabled integration.
 
     Unknown probe results still wire the broker, preserving fail-closed behavior.
-    Both definitive negative states preserve the ambient/shared helper chain.
+    Only an explicit missing-connection reason produces connection guidance.
+    Disabled providers and legacy negative responses keep a generic error;
+    all negative responses preserve the ambient/shared helper chain.
     """
     token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
         return "disabled"
     data = _fetch(server_url, host_id, token)
     if data is not None and not data.get("connected"):
-        return "disabled" if data.get("enabled") is False else "unconnected"
+        # Older brokers do not distinguish missing connections from resolution failures.
+        return "unconnected" if data.get("reason") == "not_connected" else "disabled"
     _install_broker_helper(server_url, host_id, token)
     return "broker"
 
