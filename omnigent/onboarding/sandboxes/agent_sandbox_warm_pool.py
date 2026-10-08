@@ -673,22 +673,36 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                     time.sleep(_POLL_S)
                     continue
                 failure = _terminal_failure(pod)
-                if failure:
-                    raise click.ClickException(f"Warm Sandbox startup failed: {failure[1]}")
                 if activated_uid is not None and pod.metadata.uid != activated_uid:
                     raise click.ClickException(
                         "Warm Sandbox Pod changed during activation; retry the session."
                     )
                 self._validate_pod(pod, handle, agent_name=agent_name, shared=shared)
-                # Failed preparation makes readiness false; still read its error state.
+                # Preparation can fail before the launcher observes the host crash-looping.
                 containers = pod.status.container_statuses or []
-                if not any(
+                bootstrap_running = any(
                     item.name == BOOTSTRAP_CONTAINER and item.state and item.state.running
                     for item in containers
+                )
+                status = None
+                if bootstrap_running:
+                    try:
+                        status = self._status(handle, pod.metadata.name)
+                    except Exception:
+                        if not failure:
+                            raise
+                if (
+                    status is not None
+                    and status.get("generation") == generation
+                    and status.get("stage") == "failed"
+                    and (message := WORKSPACE_ERROR_MESSAGES.get(status.get("error_code") or ""))
                 ):
+                    raise click.ClickException(message)
+                if failure:
+                    raise click.ClickException(f"Warm Sandbox startup failed: {failure[1]}")
+                if status is None:
                     time.sleep(_POLL_S)
                     continue
-                status = self._status(handle, pod.metadata.name)
                 if status.get("stage") == "waiting":
                     if not containers or not all(item.ready for item in containers):
                         time.sleep(_POLL_S)

@@ -189,7 +189,7 @@ if sys.argv[1:2] == ["-c"]:
     if mutation == "renamed_installer":
         prefix += (
             "del g._install_broker_helper; "
-            "g.configure_clone_credentials=lambda *_args:True; "
+            "g.configure_clone_credentials_status=lambda *_args:'broker'; "
         )
     elif mutation == "missing_git_config":
         prefix += "del g._git_config; "
@@ -201,14 +201,19 @@ if sys.argv[1:2] == ["-c"]:
             "g._git_config=lambda *args:None if args[0]=='--replace-all' else orig(*args); "
         )
     elif mutation == "unexpected_none":
-        prefix += "g.configure_clone_credentials=lambda *_args:None; "
+        prefix += "g.configure_clone_credentials_status=lambda *_args:None; "
     elif mutation == "truthy_non_bool":
         prefix += (
-            "configure=g.configure_clone_credentials; "
-            "g.configure_clone_credentials=lambda *args:configure(*args) and 1; "
+            "configure=g.configure_clone_credentials_status; "
+            "g.configure_clone_credentials_status=lambda *args:configure(*args) and 1; "
+        )
+    elif mutation == "disabled_provider":
+        prefix += (
+            "import httpx; g.httpx.get=lambda *a,**k:"
+            "httpx.Response(404,json={'detail':'unknown credential provider'}); "
         )
     elif mutation == "disconnected_broker":
-        prefix += "g.configure_clone_credentials=lambda *_args:False; "
+        prefix += "g.configure_clone_credentials_status=lambda *_args:'unconnected'; "
     os.execv(sys.executable, [sys.executable, "-c", prefix + sys.argv[2]])
 with Path(os.environ["HELPER_ARGV_LOG"]).open("a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -269,7 +274,7 @@ raise SystemExit(128)
     fake_git.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
-    if wire_mutation == "disconnected_broker":
+    if wire_mutation in {"disconnected_broker", "disabled_provider"}:
         fallback_log = tmp_path / "fallback-used"
         (home / ".gitconfig").write_text(
             json.dumps(
@@ -2037,6 +2042,7 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
         ("disconnected_broker", "https://github.com/org/private.git", 81),
         ("disconnected_broker", "https://example.com/org/private.git", 1),
         (None, "https://github.com/org/private.git", 1),
+        ("disabled_provider", "https://github.com/org/private.git", 1),
     ],
 )
 def test_failed_clone_reports_missing_github_connection_only_when_confirmed(

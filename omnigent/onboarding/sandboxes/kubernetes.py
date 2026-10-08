@@ -524,12 +524,13 @@ def _render_workspace_prep_command(
             f"cfg('--replace-all',{helper_key!r},''),"
             f"cfg('--add',{helper_key!r},{helper!r})); "
             f"token=(os.environ.get({HOST_TOKEN_ENV_VAR!r}) or '').strip(); "
-            f"wired=g.configure_clone_credentials({server_url!r},{host_id!r}); "
+            f"wired=g.configure_clone_credentials_status({server_url!r},{host_id!r}); "
             "helpers=(subprocess.run(['git','config','--global','--get-all',"
             f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines() "
-            "if wired is True else []); "
-            f"verified=(bool(token) and wired is True and helpers=={expected_helpers!r}); "
-            "sys.exit(10 if bool(token) and wired is False else 0 if verified else 1)"
+            "if wired == 'broker' else []); "
+            f"verified=(bool(token) and wired == 'broker' and helpers=={expected_helpers!r}); "
+            "sys.exit(11 if bool(token) and wired == 'unconnected' "
+            "else 10 if bool(token) and wired == 'disabled' else 0 if verified else 1)"
         )
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
@@ -557,7 +558,7 @@ def _render_workspace_prep_command(
             f"PYTHONNOUSERSITE=1 PYTHONPATH= python3 -c {shlex.quote(wire)} || wire_rc=$?\n"
             '  if [ "$wire_rc" -eq 0 ]; then\n'
             '    export GIT_CONFIG_GLOBAL="$credential_config"\n'
-            '  elif [ "$wire_rc" -eq 10 ]; then\n'
+            '  elif [ "$wire_rc" -eq 10 ] || [ "$wire_rc" -eq 11 ]; then\n'
             '    rm -f -- "$credential_config"\n'
             "    credential_config=''\n"
             "  else\n"
@@ -646,7 +647,7 @@ def _render_workspace_prep_command(
             ):
                 message = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_UNCONNECTED])
                 clone_failure = (
-                    'if [ "$wire_rc" -eq 10 ]; then '
+                    'if [ "$wire_rc" -eq 11 ]; then '
                     f"printf '%s\\n' {message} >&2; "
                     f"exit {GITHUB_CHECKOUT_UNCONNECTED_EXIT}; fi; exit 1"
                 )

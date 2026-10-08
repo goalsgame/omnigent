@@ -54,7 +54,7 @@ def test_unconnected_checkout_prepares_public_repo_or_returns_safe_hint(
     destination = source if available else tmp_path / "missing"
     rewrite = shlex.quote(f"url.{destination}.insteadOf=https://github.com/example/repo.git")
     script = (
-        'python3() { if [ "$1" = "-c" ]; then return 10; fi; command python3 "$@"; }\n'
+        'python3() { if [ "$1" = "-c" ]; then return 11; fi; command python3 "$@"; }\n'
         f'git() {{ command git -c {rewrite} "$@"; }}\n' + command[2]
     )
     payload = {

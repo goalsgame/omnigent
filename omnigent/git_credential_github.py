@@ -49,6 +49,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import yaml
@@ -113,7 +114,7 @@ def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
     if resp.status_code == 404:
         if data.get("detail") != "unknown credential provider":
             return None
-        return {"connected": False}
+        return {"connected": False, "enabled": False}
     return data
 
 
@@ -383,14 +384,26 @@ def configure_clone_credentials(server_url: str, host_id: str) -> bool:
     :returns: ``True`` when the broker was wired (owner connected, or the probe
         was inconclusive); ``False`` only when the owner is confirmed not linked.
     """
+    return configure_clone_credentials_status(server_url, host_id) == "broker"
+
+
+def configure_clone_credentials_status(
+    server_url: str,
+    host_id: str,
+) -> Literal["broker", "unconnected", "disabled"]:
+    """Wire clone credentials and distinguish unlinked users from disabled integration.
+
+    Unknown probe results still wire the broker, preserving fail-closed behavior.
+    Both definitive negative states preserve the ambient/shared helper chain.
+    """
     token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
-        return False
+        return "disabled"
     data = _fetch(server_url, host_id, token)
     if data is not None and not data.get("connected"):
-        return False
+        return "disabled" if data.get("enabled") is False else "unconnected"
     _install_broker_helper(server_url, host_id, token)
-    return True
+    return "broker"
 
 
 def main(argv: list[str] | None = None) -> int:

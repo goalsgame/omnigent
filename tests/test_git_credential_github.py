@@ -210,7 +210,7 @@ def test_configure_clone_credentials_fails_closed_when_probe_fails(
 @pytest.mark.parametrize(
     ("status", "body", "expected"),
     [
-        (404, '{"detail":"unknown credential provider"}', {"connected": False}),
+        (404, '{"detail":"unknown credential provider"}', {"connected": False, "enabled": False}),
         (404, '{"detail":"Not Found"}', None),
         (404, "<html>Not Found</html>", None),
         (404, "", None),
@@ -410,3 +410,24 @@ def test_start_host_gh_refresh_rewrites_hosts_on_tick(
     assert t is not None
     assert refreshed.wait(timeout=5), "refresher never re-materialized hosts.yml"
     assert calls == [("http://srv", "host1")]
+
+
+@pytest.mark.parametrize(
+    ("http_status", "payload", "expected"),
+    [
+        (404, {"detail": "unknown credential provider"}, "disabled"),
+        (200, {"connected": False}, "unconnected"),
+    ],
+)
+def test_clone_status_distinguishes_disabled_provider_from_unlinked_account(
+    monkeypatch: pytest.MonkeyPatch,
+    http_status: int,
+    payload: dict,
+    expected: str,
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setattr(h.httpx, "get", lambda *a, **k: httpx.Response(http_status, json=payload))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    assert h.configure_clone_credentials_status("http://srv", "host1") == expected
+    assert calls == []
