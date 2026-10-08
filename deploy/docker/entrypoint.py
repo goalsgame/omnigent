@@ -473,6 +473,19 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             github_store = GithubConnectionStore(database_url, cipher)
 
+    from omnigent.server.google_cloud import GoogleCloudConfig
+
+    google_cloud_config = GoogleCloudConfig.from_env()
+    google_cloud_store = None
+    if google_cloud_config is not None:
+        from omnigent.connections.google_cloud import GoogleCloudConnectionStore
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        google_cipher = build_secret_cipher()
+        if google_cipher is None:
+            raise RuntimeError("Google Cloud connections require credential encryption")
+        google_cloud_store = GoogleCloudConnectionStore(database_url, google_cipher)
+
     from omnigent.server.databricks_app import DatabricksConfig
 
     databricks_config = DatabricksConfig.from_env()
@@ -514,6 +527,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         server_config=cfg,
         github_config=github_config,
         github_store=github_store,
+        google_cloud_config=google_cloud_config,
+        google_cloud_store=google_cloud_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
     )
