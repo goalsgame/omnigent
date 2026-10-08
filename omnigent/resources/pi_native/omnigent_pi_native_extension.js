@@ -1024,6 +1024,52 @@ async function postModelChangeError(config, message) {
   });
 }
 
+// Managed gateway aliases must retain the native catalog's thinking restrictions.
+function inheritThinkingMetadata(ctx, model) {
+  if (!model || !inferenceProviderIds.has(model.provider)) return;
+  const registry = ctx && ctx.modelRegistry;
+  if (!registry || typeof registry.getAll !== "function") return;
+  const canonical = (id) => typeof id === "string"
+    ? id.split("/").pop().toLowerCase().replaceAll(".", "-") : "";
+  let models;
+  try {
+    models = registry.getAll();
+  } catch (_error) {
+    return;
+  }
+  if (!Array.isArray(models)) return;
+  const candidates = models.filter((candidate) => candidate &&
+    !inferenceProviderIds.has(candidate.provider) && candidate.api === model.api &&
+    canonical(candidate.id) === canonical(model.id));
+  const native = candidates.find((candidate) => candidate.id === model.id) ||
+    candidates.find((candidate) => model.id.startsWith(`${candidate.provider}/`));
+  if (!native) return;
+  if (native.reasoning === true) model.reasoning = true;
+  if (native.thinkingLevelMap && !model.thinkingLevelMap) {
+    model.thinkingLevelMap = { ...native.thinkingLevelMap };
+  }
+}
+
+async function ensureSupportedThinking(pi, config, ctx, model, requested) {
+  inheritThinkingMetadata(ctx, model);
+  const level = requested ?? (typeof pi.getThinkingLevel === "function"
+    ? pi.getThinkingLevel() : undefined);
+  const map = model && model.thinkingLevelMap;
+  if (!map || map[level] !== null || typeof pi.setThinkingLevel !== "function") {
+    if (requested !== undefined) await pi.setThinkingLevel(requested);
+    return;
+  }
+  const fallback = ["medium", "low", "high", "minimal", "xhigh", "max"].find(
+    (candidate) => map[candidate] !== null,
+  );
+  if (!fallback) return;
+  await pi.setThinkingLevel(fallback);
+  await postEvent(config, {
+    type: "external_reasoning_effort_change",
+    data: { reasoning_effort: fallback },
+  });
+}
+
 function modelReference(model) {
   const modelId = model && typeof model.id === "string" ? model.id : "";
   if (!modelId) return "";
@@ -1844,6 +1890,7 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    await ensureSupportedThinking(pi, config, ctx, ctx && ctx.model);
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
@@ -1872,7 +1919,9 @@ module.exports = function (pi) {
         }
       },
       (model) => applyModelChange(pi, config, latestContext, model),
-      (level) => pi.setThinkingLevel(level),
+      (level) => ensureSupportedThinking(
+        pi, config, latestContext, latestContext && latestContext.model, level,
+      ),
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
         // state on SDK versions that don't expose isIdle() (same fallback
@@ -1914,6 +1963,7 @@ module.exports = function (pi) {
 
   pi.on("model_select", async (event, ctx) => {
     rememberContext(ctx);
+    await ensureSupportedThinking(pi, config, ctx, event && event.model);
     // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
     // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
     // ``restore`` — that is Pi re-applying the session's saved model at
@@ -1933,7 +1983,10 @@ module.exports = function (pi) {
     });
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    await ensureSupportedThinking(
+      pi, config, ctx || latestContext, (ctx || latestContext)?.model,
+    );
     const latest = readConfig() || config;
     const instructions = latest && latest.systemPrompt;
     if (typeof instructions !== "string" || !instructions.trim()) return;
