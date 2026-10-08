@@ -148,7 +148,7 @@ it("lets the owner dismiss a request without polling immediately reopening it", 
     render(<GoogleCloudSessionAccess sessionId="session-one" />);
   });
   expect(screen.getByRole("dialog")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Close", exact: true }));
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
   expect(screen.queryByRole("dialog")).toBeNull();
   await act(async () => {
     vi.advanceTimersByTime(6000);

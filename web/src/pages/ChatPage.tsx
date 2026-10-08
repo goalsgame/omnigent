@@ -1109,48 +1109,46 @@ export function ChatPage() {
   }
 
   const mainAgent = (
-    <>
-      <MainAgentSurface
-        conversationId={urlConvId ?? null}
-        hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
-        status={status}
-        isWorking={isWorking}
-        showsWorking={showsWorking}
-        runnerOnline={runnerOnline}
-        liveness={liveness}
-        agentsError={agentsError}
-        disabled={!agentId || agentsError !== null}
-        onSend={onSend}
-        onSendSlashCommand={onSendSlashCommand}
-        onStop={onStop}
-        onShowReconnectHelp={onShowReconnectHelp}
-        agents={visibleAgents}
-        selectedAgentId={agentId}
-        hasMoreHistory={hasMoreHistory}
-        loadingMoreHistory={loadingMoreHistory}
-        permissionLevel={permissionLevel}
-        readOnlyReason={readOnlyReason}
-        sendDisabledReason={sendDisabledReason}
-        effortLevels={effortLevels}
-        showEffort={showEffort}
-        showModels={modelPickerKind !== null}
-        modelPickerKind={modelPickerKind}
-        codexModelOptions={codexModelOptions}
-        inferenceConfigured={activeSession?.inferenceConfigured}
-        inferenceError={activeSession?.inferenceError}
-        modelLabelOptions={sessionModelOptions}
-        showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-        showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
-        showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
-        showGoalControl={shouldShowGoalControl(capabilitySource)}
-        showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
-        showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
-        costRoutingEligible={costRoutingEligible}
-        subagentRoutingEligible={subagentRoutingEligible}
-        subAgentLabel={subAgentLabel}
-        wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
-      />
-    </>
+    <MainAgentSurface
+      conversationId={urlConvId ?? null}
+      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
+      status={status}
+      isWorking={isWorking}
+      showsWorking={showsWorking}
+      runnerOnline={runnerOnline}
+      liveness={liveness}
+      agentsError={agentsError}
+      disabled={!agentId || agentsError !== null}
+      onSend={onSend}
+      onSendSlashCommand={onSendSlashCommand}
+      onStop={onStop}
+      onShowReconnectHelp={onShowReconnectHelp}
+      agents={visibleAgents}
+      selectedAgentId={agentId}
+      hasMoreHistory={hasMoreHistory}
+      loadingMoreHistory={loadingMoreHistory}
+      permissionLevel={permissionLevel}
+      readOnlyReason={readOnlyReason}
+      sendDisabledReason={sendDisabledReason}
+      effortLevels={effortLevels}
+      showEffort={showEffort}
+      showModels={modelPickerKind !== null}
+      modelPickerKind={modelPickerKind}
+      codexModelOptions={codexModelOptions}
+      inferenceConfigured={activeSession?.inferenceConfigured}
+      inferenceError={activeSession?.inferenceError}
+      modelLabelOptions={sessionModelOptions}
+      showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
+      showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
+      showGoalControl={shouldShowGoalControl(capabilitySource)}
+      showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
+      showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
+      costRoutingEligible={costRoutingEligible}
+      subagentRoutingEligible={subagentRoutingEligible}
+      subAgentLabel={subAgentLabel}
+      wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
+    />
   );
 
   // On `/` (no conversation), the composer would let the user POST a

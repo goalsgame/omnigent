@@ -1033,7 +1033,7 @@ it.each([false, true])("keeps session access controls inside the header (mobile=
   isMobileMock.mockReturnValue(mobile);
   renderHeader({
     sidebarOpen: false,
-    sessionAccessControl: <button aria-label="Google Cloud access" />,
+    sessionAccessControl: <button type="button" aria-label="Google Cloud access" />,
   });
   const control = screen.getByRole("button", { name: "Google Cloud access" });
   expect(control.closest("header")).toBeTruthy();
