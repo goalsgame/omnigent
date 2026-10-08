@@ -1,3 +1,4 @@
+import { RootGoogleCloudSessionAccess } from "@/components/RootGoogleCloudSessionAccess";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import {
   type CSSProperties,
@@ -2459,6 +2460,16 @@ export function AppShell() {
                     hasAgentInfo={hasAgentInfo}
                     onAgentInfo={() => setAgentInfoOpen(true)}
                     hasHeaderMenu={hasHeaderMenu}
+                    sessionAccessControl={
+                      serverConversationId &&
+                      serverInfo !== "loading" &&
+                      serverInfo.enabled_connections?.includes("google_cloud") ? (
+                        <RootGoogleCloudSessionAccess
+                          key={serverConversationId}
+                          sessionId={serverConversationId}
+                        />
+                      ) : undefined
+                    }
                     showFilesPanel={showFilesPanel}
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}

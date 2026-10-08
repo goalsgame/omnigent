@@ -336,7 +336,7 @@ Both server and host must run a version supporting this connection.
 
 Connecting Google Cloud in Settings → Sandbox Integrations does not authorize
 any sandbox. Each new or existing session starts with Google Cloud access off.
-The human owner opens the session's Google Cloud control and selects **Allow
+The human owner selects the Google Cloud icon in the session title bar and chooses **Allow
 for this session** to grant its sandbox the connected account's existing IAM
 permissions. Collaborators, administrators who are not the owner, machine
 identities and scoped agent/delegation tokens cannot approve this grant.

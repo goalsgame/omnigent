@@ -1,4 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { CloudIcon } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { authenticatedFetch } from "@/lib/identity";
 
 interface Access {
@@ -14,6 +25,7 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const revision = useRef(0);
+  const promptedGeneration = useRef<string | null>(null);
   const endpoint = `/v1/connections/google_cloud/sessions/${encodeURIComponent(sessionId)}/access`;
 
   useEffect(() => {
@@ -30,6 +42,7 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
           if (active && observed === revision.current) {
             setAccess(null);
             setError(null);
+            setExpanded(false);
           }
           return;
         }
@@ -38,6 +51,12 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
         if (active && observed === revision.current) {
           setAccess(result);
           setError(null);
+          if (result.state === "pending" && promptedGeneration.current !== result.generation) {
+            promptedGeneration.current = result.generation;
+            setExpanded(true);
+          } else if (result.state !== "pending") {
+            promptedGeneration.current = null;
+          }
         }
       } catch {
         if (active && observed === revision.current)
@@ -68,6 +87,7 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
       });
       if (!response.ok) throw new Error("unavailable");
       setAccess((await response.json()) as Access);
+      setExpanded(false);
     } catch {
       setError("Could not update Google Cloud access. Refresh the session and retry.");
     } finally {
@@ -80,53 +100,76 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
   const pending = access?.state === "pending";
   const allowed = access?.state === "allowed";
   return (
-    <section
-      className="border-b border-border px-4 py-2 text-sm"
-      aria-label="Session Google Cloud access"
-    >
-      <button
-        type="button"
-        onClick={() => setExpanded(!expanded)}
-        aria-expanded={expanded || pending}
-      >
-        {pending ? "Google Cloud access requested" : `Google Cloud: ${allowed ? "allowed" : "off"}`}
-      </button>
-      {(expanded || pending) && access && (
-        <div className="mt-2 space-y-2">
-          {access.state === "not_connected" ? (
+    <Dialog open={expanded} onOpenChange={setExpanded}>
+      <DialogTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="shrink-0 text-muted-foreground hover:text-foreground max-md:size-11"
+          aria-label={`Google Cloud access: ${allowed ? "allowed" : pending ? "requested" : "off"}`}
+          title="Google Cloud access"
+        >
+          <CloudIcon className="size-4 max-md:size-5" />
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>
+            {pending ? "Allow Google Cloud access?" : "Google Cloud access"}
+          </DialogTitle>
+          <DialogDescription>
+            {allowed
+              ? "This session can use your connected Google account."
+              : "Choose whether this session can use your connected Google account."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="min-w-0 space-y-3 text-sm">
+          {access?.state === "not_connected" ? (
             <p>Connect Google Cloud in Settings → Sandbox Integrations, then allow access here.</p>
-          ) : (
+          ) : access ? (
             <>
+              <p className="break-words font-medium">{access.email}</p>
               <p>
-                Allow this session's sandbox, including its agents and subprocesses, to use{" "}
-                {access.email}'s Google Cloud permissions? This includes any read or write access
-                that account already has.
+                The sandbox's agents and subprocesses will have this account's existing Google Cloud
+                read and write permissions. Anyone who can run commands in this session can use
+                those permissions.
               </p>
-              <p>Anyone who can run commands in this session can use those permissions.</p>
-              <p>
+              <p className="text-muted-foreground">
                 Revoking stops new tokens. Tokens already issued may remain valid for up to one
                 hour.
               </p>
               {pending && (
                 <p>The command was blocked. After approval, ask the agent to retry it.</p>
               )}
-              <div className="flex gap-3">
-                {!allowed && (
-                  <button type="button" disabled={busy} onClick={() => void decide("allowed")}>
-                    Allow for this session
-                  </button>
-                )}
-                {(allowed || pending) && (
-                  <button type="button" disabled={busy} onClick={() => void decide("denied")}>
-                    {allowed ? "Revoke access" : "Deny"}
-                  </button>
-                )}
-              </div>
             </>
+          ) : null}
+          {error && (
+            <p role="alert" className="text-destructive">
+              {error}
+            </p>
           )}
         </div>
-      )}
-      {error && <p role="alert">{error}</p>}
-    </section>
+        <DialogFooter>
+          {access && access.state !== "not_connected" && (
+            <>
+              {(allowed || pending) && (
+                <Button variant="outline" disabled={busy} onClick={() => void decide("denied")}>
+                  {allowed ? "Revoke access" : "Deny"}
+                </Button>
+              )}
+              {!allowed && (
+                <Button
+                  disabled={busy || !access.generation}
+                  onClick={() => void decide("allowed")}
+                >
+                  Allow for this session
+                </Button>
+              )}
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

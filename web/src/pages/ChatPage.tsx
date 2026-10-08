@@ -1,4 +1,3 @@
-import { RootGoogleCloudSessionAccess } from "@/components/RootGoogleCloudSessionAccess";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useSkills } from "@/hooks/useSkills";
 import {
@@ -1111,12 +1110,6 @@ export function ChatPage() {
 
   const mainAgent = (
     <>
-      {urlConvId &&
-        !isTempConvId(urlConvId) &&
-        serverInfo !== "loading" &&
-        serverInfo.enabled_connections?.includes("google_cloud") && (
-          <RootGoogleCloudSessionAccess key={urlConvId} sessionId={urlConvId} />
-        )}
       <MainAgentSurface
         conversationId={urlConvId ?? null}
         hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
