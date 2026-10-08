@@ -19,7 +19,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import OmnigentError
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.google_cloud import SCOPES, GoogleCloudConfig
 from omnigent.server.routes.connections_google_cloud import create_connections_google_cloud_router
 from omnigent.server.routes.host_credentials import create_host_credentials_router
@@ -35,14 +35,16 @@ class UserAuth(AuthProvider):
 
 
 @pytest.fixture
-def setup(db_uri):
+def setup(db_uri, request):
+    local = getattr(request, "param", False)
+    owner = RESERVED_USER_LOCAL if local else OWNER
     session_id, host_id = uuid.uuid4().hex, uuid.uuid4().hex
     store = GoogleCloudConnectionStore(db_uri, SecretBox("test-key"))
     with Session(get_or_create_engine(db_uri)) as db:
         db.add(
             SqlHost(
                 host_id=host_id,
-                user_id=OWNER,
+                user_id=owner,
                 name="sandbox",
                 status=1,
                 created_at=1,
@@ -55,12 +57,12 @@ def setup(db_uri):
         db.add(
             SqlConversationMetadata(id=session_id, host_id=host_id, workspace="/workspace", kind=1)
         )
-        db.add(SqlSessionPermission(user_id=OWNER, conversation_id=session_id, level=4))
+        db.add(SqlSessionPermission(user_id=owner, conversation_id=session_id, level=4))
         db.commit()
 
     def connect():
         store.upsert(
-            OWNER,
+            owner,
             tokens={
                 "access_token": "access-one",
                 "refresh_token": "refresh",
@@ -78,7 +80,7 @@ def setup(db_uri):
         create_connections_google_cloud_router(
             GoogleCloudConfig("fixture", "secret", "https://app.example/callback"),
             store,
-            auth_provider=UserAuth(),
+            auth_provider=None if local else UserAuth(),
         ),
         prefix="/v1",
     )
@@ -112,6 +114,7 @@ def approve(s):
     return access(s, "post", json={"decision": "allowed", "generation": status["generation"]})
 
 
+@pytest.mark.parametrize("setup", [False, True], indirect=True, ids=["authenticated", "local"])
 def test_first_use_prompts_then_approval_vends_and_revocation_blocks(setup):
     s = setup
     assert access(s).json()["state"] == "off"

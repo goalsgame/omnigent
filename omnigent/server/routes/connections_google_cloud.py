@@ -14,7 +14,7 @@ from fastapi import HTTPException, Request, Response
 from pydantic import BaseModel
 
 from omnigent.connections.google_cloud import GoogleCloudConnectionStore
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.google_cloud import (
     SCOPES,
     GoogleCloudClient,
@@ -129,7 +129,8 @@ def create_connections_google_cloud_router(
     async def session_access(session_id: str, request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
         user = require_user(request, auth_provider)
-        if not user or user.startswith("oidc-machine:"):
+        user = user if user is not None else RESERVED_USER_LOCAL
+        if user.startswith("oidc-machine:"):
             raise HTTPException(403, "Human session owner required")
         try:
             return await asyncio.to_thread(store.access.session, session_id, user)
@@ -144,7 +145,8 @@ def create_connections_google_cloud_router(
     ):
         response.headers["Cache-Control"] = "no-store"
         user = require_user(request, auth_provider)
-        if not user or user.startswith("oidc-machine:"):
+        user = user if user is not None else RESERVED_USER_LOCAL
+        if user.startswith("oidc-machine:"):
             raise HTTPException(403, "Human session owner required")
         try:
             return await asyncio.to_thread(

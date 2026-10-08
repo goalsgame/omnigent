@@ -37,7 +37,8 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
           setError(null);
         }
       } catch {
-        if (active) setError("Google Cloud access status is unavailable. Retry shortly.");
+        if (active && observed === revision.current)
+          setError("Google Cloud access status is unavailable. Retry shortly.");
       } finally {
         loading = false;
       }

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { GoogleCloudSessionAccess } from "./GoogleCloudSessionAccess";
 import { authenticatedFetch } from "@/lib/identity";
@@ -13,7 +13,10 @@ const status = (state: string) => ({
 const response = (body: unknown, code = 200) =>
   ({ ok: code === 200, status: code, json: async () => body }) as Response;
 beforeEach(() => vi.resetAllMocks());
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 it("defaults to off and sends an explicit session-bound decision", async () => {
   fetchMock
@@ -68,4 +71,39 @@ it("hides controls for a nonowner or an unsupported shared host", async () => {
   render(<GoogleCloudSessionAccess sessionId="session-one" />);
   await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
   expect(screen.queryByRole("button")).toBeNull();
+});
+
+it.each(["allowed", "denied"])("ignores a stale polling failure after %s", async (decision) => {
+  let poll!: () => void;
+  const setInterval = window.setInterval.bind(window);
+  vi.spyOn(window, "setInterval").mockImplementation((callback, delay, ...args) => {
+    if (delay === 3000) {
+      poll = callback as () => void;
+      return 1;
+    }
+    return setInterval(callback, delay, ...args);
+  });
+  let rejectPoll!: (error: Error) => void;
+  const pendingPoll = new Promise<Response>((_resolve, reject) => {
+    rejectPoll = reject;
+  });
+  fetchMock
+    .mockResolvedValueOnce(response(status("pending")))
+    .mockReturnValueOnce(pendingPoll)
+    .mockResolvedValueOnce(response(status(decision)));
+  render(<GoogleCloudSessionAccess sessionId="session-one" />);
+  await screen.findByRole("button", { name: "Allow for this session" });
+  act(() => poll());
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: decision === "allowed" ? "Allow for this session" : "Deny",
+    }),
+  );
+  await screen.findByRole("button", {
+    name: decision === "allowed" ? "Google Cloud: allowed" : "Google Cloud: off",
+  });
+  await act(async () => {
+    rejectPoll(new Error("offline"));
+  });
+  expect(screen.queryByRole("alert")).toBeNull();
 });
