@@ -150,7 +150,7 @@ def test_build_job_manifest_clones_multiple_repos_as_parallel_siblings() -> None
     # Both clones are backgrounded and joined, and the broker is wired ONCE
     # (a single `python3 -c` line configures the helper for every clone).
     assert script.count(" & pids=") == 2
-    assert 'for p in $pids; do wait "$p" || rc=1; done' in script
+    assert 'for p in $pids; do wait "$p"' in script
     assert script.count("python3 -c") == 1
 
 
@@ -161,6 +161,8 @@ def _run_failed_clone_with_credential_probe(
     wire_mutation: str | None = None,
     cwd: Path | None = None,
     host_token: str = "test-launch-token-sentinel",
+    repo_url: str = "https://github.com/org/private.git",
+    clone_succeeds: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str], list[str], Path]:
     """Run workspace prep with a recording git that rejects the clone."""
     fake_bin = tmp_path / "bin"
@@ -188,7 +190,7 @@ if sys.argv[1:2] == ["-c"]:
     if mutation == "renamed_installer":
         prefix += (
             "del g._install_broker_helper; "
-            "g.configure_clone_credentials=lambda *_args:True; "
+            "g.configure_clone_credentials_status=lambda *_args:'broker'; "
         )
     elif mutation == "missing_git_config":
         prefix += "del g._git_config; "
@@ -200,14 +202,38 @@ if sys.argv[1:2] == ["-c"]:
             "g._git_config=lambda *args:None if args[0]=='--replace-all' else orig(*args); "
         )
     elif mutation == "unexpected_none":
-        prefix += "g.configure_clone_credentials=lambda *_args:None; "
+        prefix += "g.configure_clone_credentials_status=lambda *_args:None; "
     elif mutation == "truthy_non_bool":
         prefix += (
-            "configure=g.configure_clone_credentials; "
-            "g.configure_clone_credentials=lambda *args:configure(*args) and 1; "
+            "configure=g.configure_clone_credentials_status; "
+            "g.configure_clone_credentials_status=lambda *args:configure(*args) and 1; "
         )
-    elif mutation == "disconnected_broker":
-        prefix += "g.configure_clone_credentials=lambda *_args:False; "
+    elif mutation.startswith("legacy_"):
+        prefix += "del g.configure_clone_credentials_status; "
+        if mutation == "legacy_true":
+            prefix += (
+                "g.configure_clone_credentials=lambda *a:"
+                "(g._install_broker_helper(*a,'tok'),True)[1]; "
+            )
+        else:
+            value = {
+                "legacy_false": "False", "legacy_none": "None",
+                "legacy_one": "1", "legacy_string": "'broker'",
+            }[mutation]
+            prefix += f"g.configure_clone_credentials=lambda *_args:{value}; "
+    elif mutation == "disabled_provider":
+        prefix += (
+            "import httpx; g.httpx.get=lambda *a,**k:"
+            "httpx.Response(404,json={'detail':'unknown credential provider'}); "
+        )
+    elif mutation in {"disconnected_broker", "unavailable_broker"}:
+        code = 200 if mutation == "disconnected_broker" else 503
+        payload = (
+            {'connected': False, 'reason': 'not_connected'}
+            if code == 200 else {'detail': 'Provider credential unavailable'}
+        )
+        prefix += "import httpx; g.httpx.get=lambda *a,**k:"
+        prefix += f"httpx.Response({code},json={payload!r}); "
     os.execv(sys.executable, [sys.executable, "-c", prefix + sys.argv[2]])
 with Path(os.environ["HELPER_ARGV_LOG"]).open("a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -260,6 +286,9 @@ if args and args[0] == "clone":
         text=True,
         check=True,
     )
+    if os.environ.get("CLONE_SUCCEEDS") == "1":
+        Path(args[-1]).mkdir(parents=True)
+        raise SystemExit(0)
     print("simulated clone failure", file=sys.stderr)
     raise SystemExit(1)
 raise SystemExit(128)
@@ -268,7 +297,7 @@ raise SystemExit(128)
     fake_git.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
-    if wire_mutation == "disconnected_broker":
+    if wire_mutation in {"disconnected_broker", "disabled_provider", "legacy_false"}:
         fallback_log = tmp_path / "fallback-used"
         (home / ".gitconfig").write_text(
             json.dumps(
@@ -285,6 +314,7 @@ raise SystemExit(128)
         monkeypatch.setenv("FALLBACK_LOG", str(fallback_log))
         monkeypatch.setenv("GIT_TOKEN", "shared-token-sentinel")
     workspace = home / "workspace"
+    monkeypatch.setenv("CLONE_SUCCEEDS", "1" if clone_succeeds else "0")
     monkeypatch.setenv("ARGV_LOG", str(argv_log))
     monkeypatch.setenv("HELPER_ARGV_LOG", str(helper_argv_log))
     monkeypatch.setenv("CONFIG_LOG", str(config_log))
@@ -300,11 +330,7 @@ raise SystemExit(128)
         monkeypatch.setenv("WIRE_MUTATION", wire_mutation)
     command = k8s._render_workspace_prep_command(
         str(workspace),
-        [
-            RepoWorkspace(
-                url="https://github.com/org/private.git", branch=None, repo_name="private"
-            )
-        ],
+        [RepoWorkspace(url=repo_url, branch=None, repo_name="private")],
         ":",
         "host-test",
     )
@@ -386,6 +412,9 @@ def test_clone_credential_config_is_private_at_creation(
         "extra_helper",
         "unexpected_none",
         "truthy_non_bool",
+        "legacy_none",
+        "legacy_one",
+        "legacy_string",
     ],
 )
 def test_credential_wiring_drift_aborts_before_clone(
@@ -2032,3 +2061,53 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
     assert not hasattr(launcher, "run")
     assert launcher.capabilities.cli_bootstrap is False
     assert launcher.capabilities.classifies_runner_by_agent is True
+
+
+@pytest.mark.parametrize(
+    ("wire_mutation", "repo_url", "expected_code"),
+    [
+        ("disconnected_broker", "https://github.com/org/private.git", 81),
+        ("disconnected_broker", "https://example.com/org/private.git", 1),
+        (None, "https://github.com/org/private.git", 1),
+        ("disabled_provider", "https://github.com/org/private.git", 1),
+        ("unavailable_broker", "https://github.com/org/private.git", 1),
+    ],
+)
+def test_failed_clone_reports_missing_github_connection_only_when_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_mutation: str | None,
+    repo_url: str,
+    expected_code: int,
+) -> None:
+    result, _argv, _paths, _modes, _config = _run_failed_clone_with_credential_probe(
+        tmp_path,
+        monkeypatch,
+        wire_mutation=wire_mutation,
+        repo_url=repo_url,
+    )
+    assert result.returncode == expected_code
+    assert ("connect GitHub in Settings > Integrations" in result.stderr) == (expected_code == 81)
+    assert not (tmp_path / "home/workspace/private").exists()
+
+
+@pytest.mark.parametrize("wire_mutation", ["legacy_true", "legacy_false"])
+@pytest.mark.parametrize("clone_succeeds", [True, False])
+def test_preparation_supports_boolean_only_runner_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_mutation: str,
+    clone_succeeds: bool,
+) -> None:
+    result, argv, paths, _modes, _config = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, wire_mutation=wire_mutation, clone_succeeds=clone_succeeds
+    )
+    assert result.returncode == (0 if clone_succeeds else 1), result.stderr
+    assert any(call and call[0] == "clone" for call in argv)
+    assert "connect GitHub" not in result.stderr
+    assert "AttributeError" not in result.stderr
+    assert all(not Path(path).exists() for path in paths)
+    if wire_mutation == "legacy_false":
+        assert (tmp_path / "fallback-used").read_text() == "used"
+    else:
+        assert paths  # The broker helper was installed and verified.

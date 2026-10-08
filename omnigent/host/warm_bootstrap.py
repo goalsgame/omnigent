@@ -30,6 +30,11 @@ from omnigent.host.identity_env import (
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
 )
+from omnigent.host.workspace_errors import (
+    GITHUB_CHECKOUT_UNCONNECTED,
+    GITHUB_CHECKOUT_UNCONNECTED_EXIT,
+    WORKSPACE_ERROR_MESSAGES,
+)
 from omnigent.startup_timing import startup_span, startup_stderr_logging, startup_timing_enabled
 
 ACTIVATION_DIR_ENV_VAR = "OMNIGENT_ACTIVATION_DIR"
@@ -204,17 +209,28 @@ def status() -> dict[str, str | None]:
         ):
             raise BootstrapError("Invalid bootstrap status.")
         stage = value["stage"]
-    return {"stage": stage, "generation": activation.generation}
+    result: dict[str, str | None] = {"stage": stage, "generation": activation.generation}
+    if stage == "failed" and isinstance(value, dict):
+        error_code = value.get("error_code")
+        if isinstance(error_code, str) and error_code in WORKSPACE_ERROR_MESSAGES:
+            result["error_code"] = error_code
+    return result
 
 
 def _set_stage(
     directory: Path,
     activation: Activation,
     stage: Literal["preparing", "prepared", "failed"],
+    error_code: str | None = None,
 ) -> None:
     _write_json(
         directory / "status.json",
-        {"pod_uid": activation.pod_uid, "generation": activation.generation, "stage": stage},
+        {
+            "pod_uid": activation.pod_uid,
+            "generation": activation.generation,
+            "stage": stage,
+            "error_code": error_code,
+        },
     )
 
 
@@ -261,7 +277,14 @@ def _prepare_once(directory: Path, activation: Activation, signals: _Signals) ->
     finally:
         signals.child = None
     if signals.signum is None:
-        _set_stage(directory, activation, "prepared" if returncode == 0 else "failed")
+        _set_stage(
+            directory,
+            activation,
+            "prepared" if returncode == 0 else "failed",
+            GITHUB_CHECKOUT_UNCONNECTED
+            if returncode == GITHUB_CHECKOUT_UNCONNECTED_EXIT
+            else None,
+        )
 
 
 def prepare() -> int:
@@ -336,9 +359,15 @@ def host() -> int:
                     raise BootstrapError("Warm runner preload stopped.")
                 activation = _load_activation(_state_dir())
                 if activation is not None:
-                    stage = status()["stage"]
+                    preparation = status()
+                    stage = preparation["stage"]
                     if stage == "failed":
-                        raise BootstrapError("Sandbox workspace preparation failed.")
+                        raise BootstrapError(
+                            WORKSPACE_ERROR_MESSAGES.get(
+                                preparation.get("error_code") or "",
+                                "Sandbox workspace preparation failed.",
+                            )
+                        )
                     if stage == "prepared":
                         os.environ.update(activation.environment())
                         break

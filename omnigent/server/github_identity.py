@@ -39,7 +39,7 @@ async def resolve_access_token(
     it (persisting the new token). Best-effort and **non-raising**: a transient
     refresh failure (network/timeout, a rejected refresh, a malformed response)
     never discards a token that is still valid and never propagates — the broker
-    degrades to ``{"connected": false}`` rather than a 500.
+    reports unavailable credentials rather than a 500.
 
     :param user_id: The user whose token to resolve.
     :param store: The connection store (also used to persist a refresh).
@@ -104,13 +104,16 @@ async def resolve_github_credential(
     The provider adapter the generic credential broker
     (:mod:`omnigent.server.routes.host_credentials`) calls: returns the vended
     token plus the attribution metadata git needs (``username``/``login``), or
-    ``None`` when the owner has not linked GitHub. The ``owner``/``login`` let
-    the host attribute commits to the human, decoupled from the push credential.
+    ``None`` when the owner has not linked GitHub. An existing connection with
+    no usable token raises so the broker reports temporary unavailability.
+    The ``owner``/``login`` let the host attribute commits to the human.
     """
     token = await resolve_access_token(user_id, store=store, client=client)
-    if token is None:
-        return None
     connection = await _run_sync(store.get, user_id)
+    if token is None:
+        if connection is None:
+            return None
+        raise RuntimeError("GitHub credential unavailable")
     return {
         "username": _GIT_TOKEN_USERNAME,
         "token": token,

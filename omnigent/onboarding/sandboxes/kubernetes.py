@@ -56,6 +56,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from urllib.parse import urlsplit
 
 import click
 
@@ -63,6 +64,11 @@ from omnigent.host.identity import (
     HOST_ID_ENV_VAR,
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
+)
+from omnigent.host.workspace_errors import (
+    GITHUB_CHECKOUT_UNCONNECTED,
+    GITHUB_CHECKOUT_UNCONNECTED_EXIT,
+    WORKSPACE_ERROR_MESSAGES,
 )
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
@@ -518,12 +524,17 @@ def _render_workspace_prep_command(
             f"cfg('--replace-all',{helper_key!r},''),"
             f"cfg('--add',{helper_key!r},{helper!r})); "
             f"token=(os.environ.get({HOST_TOKEN_ENV_VAR!r}) or '').strip(); "
-            f"wired=g.configure_clone_credentials({server_url!r},{host_id!r}); "
+            "status=getattr(g,'configure_clone_credentials_status',None); "
+            f"wired=(status({server_url!r},{host_id!r}) if status is not None "
+            f"else g.configure_clone_credentials({server_url!r},{host_id!r})); "
+            "wired=(('broker' if wired is True else 'disabled' if wired is False else None) "
+            "if status is None else wired); "
             "helpers=(subprocess.run(['git','config','--global','--get-all',"
             f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines() "
-            "if wired is True else []); "
-            f"verified=(bool(token) and wired is True and helpers=={expected_helpers!r}); "
-            "sys.exit(10 if bool(token) and wired is False else 0 if verified else 1)"
+            "if wired == 'broker' else []); "
+            f"verified=(bool(token) and wired == 'broker' and helpers=={expected_helpers!r}); "
+            "sys.exit(11 if bool(token) and wired == 'unconnected' "
+            "else 10 if bool(token) and wired == 'disabled' else 0 if verified else 1)"
         )
         # Clone every repo concurrently, then wait on each and fail the init
         # container if ANY clone failed — a half-populated workspace must abort
@@ -551,7 +562,7 @@ def _render_workspace_prep_command(
             f"PYTHONNOUSERSITE=1 PYTHONPATH= python3 -c {shlex.quote(wire)} || wire_rc=$?\n"
             '  if [ "$wire_rc" -eq 0 ]; then\n'
             '    export GIT_CONFIG_GLOBAL="$credential_config"\n'
-            '  elif [ "$wire_rc" -eq 10 ]; then\n'
+            '  elif [ "$wire_rc" -eq 10 ] || [ "$wire_rc" -eq 11 ]; then\n'
             '    rm -f -- "$credential_config"\n'
             "    credential_config=''\n"
             "  else\n"
@@ -633,16 +644,30 @@ def _render_workspace_prep_command(
             script += "      exit 1\n    fi\n  fi\n"
             script += f"  mkdir -- {target}\n  mkdir -- {temporary}\n  touch -- {marker}\n"
             script += '  if [ -z "$wired" ]; then wire_credentials; wired=1; fi\n'
+            clone_failure = "exit 1"
+            if (
+                urlsplit(repo.url).scheme == "https"
+                and urlsplit(repo.url).hostname == "github.com"
+            ):
+                message = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_UNCONNECTED])
+                clone_failure = (
+                    'if [ "$wire_rc" -eq 11 ]; then '
+                    f"printf '%s\\n' {message} >&2; "
+                    f"exit {GITHUB_CHECKOUT_UNCONNECTED_EXIT}; fi; exit 1"
+                )
             script += (
-                f"  ({clone} "
+                f"  ( ( {clone} || {{ {clone_failure}; }} ) "
                 f"&& replace_empty_dir {staged_clone} {target} "
                 f"&& rm -f -- {marker} && rmdir -- {temporary} "
-                f"|| {{ rmdir -- {target} 2>/dev/null || true; exit 1; }}) "
+                f"|| {{ clone_rc=$?; rmdir -- {target} 2>/dev/null || true; "
+                'exit "$clone_rc"; }) '
                 f'& pids="$pids $!"\n'
             )
             script += "fi\n"
-        script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
-        script += '[ "$rc" -eq 0 ]\n'
+        script += 'rc=0\nfor p in $pids; do wait "$p" || { child_rc=$?; '
+        script += f'[ "$rc" -eq {GITHUB_CHECKOUT_UNCONNECTED_EXIT} ] || rc=$child_rc; '
+        script += "} ; done\n"
+        script += '[ "$rc" -eq 0 ] || exit "$rc"\n'
     if host_config is not None:
         script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]

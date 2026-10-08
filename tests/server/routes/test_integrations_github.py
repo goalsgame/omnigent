@@ -7,6 +7,8 @@ status → disconnect flow is exercised end-to-end without the network.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import httpx
 import jwt
 import pytest
@@ -346,3 +348,23 @@ def test_repo_branches_rejects_bad_name(db_uri: str) -> None:
     # A dot-run in a charset-valid segment is also rejected (no traversal).
     resp = tc.get("/v1/connections/github/repos/o..o/app/branches", headers=_USER)
     assert resp.status_code == 400
+
+
+def test_failed_refresh_leaves_connection_status_linked(db_uri: str, monkeypatch) -> None:
+    tc, store, _config, client = _app(db_uri)
+    store.upsert(
+        "alice@example.com",
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet("expired", "refresh", 1, None, "repo"),
+    )
+    refresh = AsyncMock(side_effect=httpx.TimeoutException("refresh unavailable"))
+    monkeypatch.setattr(client, "refresh_token", refresh, raising=False)
+    repos = tc.get("/v1/connections/github/repos", headers=_USER)
+    assert repos.status_code == 200
+    assert repos.json() == {"connected": False, "repos": [], "truncated": False}
+    refresh.assert_awaited_once_with("refresh")
+    status = tc.get("/v1/connections/github/status", headers=_USER)
+    assert status.status_code == 200
+    assert status.json()["connected"] is True
+    assert status.json()["login"] == "octocat"

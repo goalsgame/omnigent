@@ -1116,3 +1116,71 @@ def test_incompatible_claimed_profile_preserves_allocation_before_activation(
     harness.custom.patch_namespaced_custom_object.assert_not_called()
     harness.custom.delete_namespaced_custom_object.assert_not_called()
     harness.core.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+
+@pytest.mark.parametrize("error_code", ["github_checkout_unconnected", "credential-sentinel"])
+def test_preparation_failure_surfaces_only_known_checkout_errors(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    _exec_states(harness, monkeypatch, "waiting", "failed")
+    original = harness.launcher._status
+
+    def status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = original(*args, **kwargs)
+        if result.get("stage") == "failed":
+            result["error_code"] = error_code
+        return result
+
+    monkeypatch.setattr(harness.launcher, "_status", status)
+    expected = (
+        "connect GitHub in Settings > Integrations"
+        if error_code == "github_checkout_unconnected"
+        else "workspace preparation failed"
+    )
+    with pytest.raises(click.ClickException, match=expected) as exc:
+        harness.launcher.start_host(_HANDLE.encode(), **_START_ARGS)
+    assert "credential-sentinel" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "case", ["known", "unavailable", "wrong_generation", "unknown", "stopped_bootstrap"]
+)
+def test_crash_loop_prefers_matching_preparation_error_and_keeps_fallback(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    crashing = copy.deepcopy(harness.pod)
+    for container in crashing.status.container_statuses:
+        if container.name == "host" or case == "stopped_bootstrap":
+            container.ready = False
+            container.state.running = None
+            container.state.waiting = SimpleNamespace(reason="CrashLoopBackOff")
+    harness.core.read_namespaced_pod.side_effect = [harness.pod, crashing]
+    execute = _exec_states(harness, monkeypatch, "waiting", "failed")
+    original = harness.launcher._status
+
+    def status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = original(*args, **kwargs)
+        if result.get("stage") == "failed":
+            if case == "unavailable":
+                raise RuntimeError("status unavailable")
+            result["error_code"] = (
+                "credential-sentinel" if case == "unknown" else "github_checkout_unconnected"
+            )
+            if case == "wrong_generation":
+                result["generation"] = "another-generation"
+        return result
+
+    monkeypatch.setattr(harness.launcher, "_status", status)
+    expected = (
+        "connect GitHub in Settings > Integrations"
+        if case == "known"
+        else "Warm Sandbox startup failed"
+    )
+    with pytest.raises(click.ClickException, match=expected):
+        harness.launcher.start_host(_HANDLE.encode(), **_START_ARGS)
+    if case == "stopped_bootstrap":
+        assert [call.args[2] for call in execute.call_args_list].count("status") == 1
