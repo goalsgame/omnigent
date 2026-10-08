@@ -36,7 +36,11 @@ const menuAgent = {
   id: "a1",
   display_name: "Claude Code",
   description: null,
-  skills: [],
+  skills: [
+    { name: "friendly-skill", description: "Named skill", display_name: "Friendly Skill" },
+    { name: "unnamed-skill", description: "Unnamed skill", display_name: null },
+    { name: "legacy-skill", description: "Legacy cached skill" },
+  ],
 };
 const options: NewChatPickerOptions = {
   agent: menuAgent,
