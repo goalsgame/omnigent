@@ -143,8 +143,10 @@ async def test_incomplete_google_grants_are_not_saved(store, missing):
     api.identity.assert_not_awaited()
 
 
-def test_host_broker_authenticates_owner_and_disconnects(store):
+def test_host_broker_authenticates_owner_and_disconnects(store, monkeypatch):
     connect(store)
+    # This test isolates provider resolution; real consent uses managed rows in its own suite.
+    monkeypatch.setattr(store.access, "host", lambda *args, **kwargs: "allowed")
 
     class Hosts:
         def resolve_launch_token(self, host_id, token):

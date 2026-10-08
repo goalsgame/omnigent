@@ -85,7 +85,7 @@ export function GoogleCloudIntegrationControl() {
             {loading
               ? "Checking connection…"
               : status?.connected
-                ? `Connected as ${status.email}. Sandboxes use your existing Google Cloud permissions.`
+                ? `Connected as ${status.email}. Allow access in each session before its sandbox can use your Google Cloud permissions.`
                 : "Connect your Google account to use gcloud and Terraform in your sandboxes with your existing permissions."}
           </span>
         </div>

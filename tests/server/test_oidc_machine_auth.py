@@ -386,3 +386,20 @@ def test_unscoped_machine_runner_callbacks_keep_live_identity_checks(verifier, o
     verifier.set_principal_check(lambda principal: allowed[0])
     allowed[0] = False
     assert provider.get_user_id(connection(token, "/v1/me")) is None
+
+
+def test_scoped_human_token_cannot_approve_google_cloud_access(oidc):
+    provider = UnifiedAuthProvider("oidc", oidc_config=oidc)
+    now = int(time.time())
+    token = jwt.encode(
+        {"sub": "person@example.com", "iat": now, "exp": now + 300, "scope": "sessions"},
+        oidc.cookie_secret,
+        algorithm="HS256",
+    )
+    assert provider.get_user_id(connection(token, "/v1/sessions")) == "person@example.com"
+    assert (
+        provider.get_user_id(
+            connection(token, "/v1/connections/google_cloud/sessions/session-one/access")
+        )
+        is None
+    )

@@ -141,3 +141,27 @@ def test_enabled_adapter_clears_inherited_named_gcloud_config(monkeypatch, tmp_p
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize("state", ["pending", "off", "denied", "unavailable", "not_connected"])
+def test_metadata_consent_guidance_matches_available_action(metadata, monkeypatch, state):
+    server, client = metadata
+    server.credential = GoogleCloudMetadataServer.credential.__get__(server)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **kwargs: httpx.Response(
+            200,
+            request=httpx.Request("GET", url),
+            json={"connected": False, "reason": f"session_access_{state}"},
+        ),
+    )
+    response = client.get(
+        "/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    assert response.status_code == 403
+    assert response.headers["Cache-Control"] == "no-store"
+    assert ("approve, then retry" in response.text) == (state in ("pending", "off", "denied"))
+    assert ("dedicated managed sandbox" in response.text) == (state == "unavailable")
+    assert ("Connect Google Cloud" in response.text) == (state == "not_connected")

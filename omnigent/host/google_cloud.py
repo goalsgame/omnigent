@@ -21,6 +21,14 @@ class GoogleCloudNotConnected(ValueError):
     """The owner has no Google Cloud connection."""
 
 
+class GoogleCloudAccessRequired(ValueError):
+    """The session owner has not granted sandbox access."""
+
+
+class GoogleCloudAccessUnavailable(ValueError):
+    """The sandbox cannot accept a session-scoped grant."""
+
+
 class GoogleCloudMetadataServer(ThreadingHTTPServer):
     """Vend only short-lived owner tokens; never proxy node metadata or ID tokens."""
 
@@ -44,6 +52,17 @@ class GoogleCloudMetadataServer(ThreadingHTTPServer):
         response.raise_for_status()
         data = response.json()
         if data.get("connected") is False:
+            reason = data.get("reason", "")
+            if reason == "session_access_unavailable":
+                raise GoogleCloudAccessUnavailable("Session-scoped access unavailable")
+            if (
+                isinstance(reason, str)
+                and reason.startswith("session_access_")
+                and reason != "session_access_not_connected"
+            ):
+                raise GoogleCloudAccessRequired(
+                    "Approve Google Cloud access in this Omnigent session, then retry"
+                )
             raise GoogleCloudNotConnected("Google Cloud connection unavailable")
         token, email, expiry = data.get("token"), data.get("email"), data.get("expires_at")
         if (
@@ -107,6 +126,20 @@ class GoogleCloudMetadataHandler(BaseHTTPRequestHandler):
             return
         try:
             credential = cast(GoogleCloudMetadataServer, self.server).credential()
+        except GoogleCloudAccessUnavailable:
+            self.reply(
+                403,
+                "Google Cloud access is unavailable for this sandbox; "
+                "start a new session with its own dedicated managed sandbox",
+            )
+            return
+        except GoogleCloudAccessRequired:
+            self.reply(
+                403,
+                "Google Cloud access requires the session owner's approval in Omnigent; "
+                "approve, then retry",
+            )
+            return
         except GoogleCloudNotConnected:
             self.reply(403, "Connect Google Cloud in Omnigent Sandbox Integrations, then retry")
             return

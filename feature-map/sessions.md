@@ -9,6 +9,10 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `google-cloud-consent`: connected Google accounts require owner approval for
+  each managed session. Credential use prompts in the open session; owners can
+  allow, deny or revoke sandbox access.
+
 - `pin`: pinned sessions move to their own section and back.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
@@ -54,6 +58,12 @@ the header menu), and each place is a separate entry point.
   per-tab.
 
 ## How to get to it (user POV)
+
+- **Google Cloud consent:** after connecting Google Cloud in Settings → Sandbox
+  Integrations, open a managed session you own and expand its Google Cloud
+  control. Alternatively ask its agent to run a command needing Google
+  credentials; the control opens an approval prompt. Allow or deny there, then
+  retry the command after approval. The same control revokes access.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
@@ -322,7 +332,23 @@ plain `uv run pytest`, which starts a private server for the test.
   in. Another session should be signed out. Log out and refresh the same-session
   tabs; all should be signed out.
 
+### Google Cloud consent checks
+
+Use `tests/server/test_google_cloud_session_access.py` for owner-only approval,
+first-use prompting, revocation and reconnect isolation. Use
+`tests/e2e/test_google_cloud_connection.py` for the offline OAuth → blocked
+credential → approval → token flow. Component coverage for the control and
+prompt is `web/src/components/GoogleCloudSessionAccess.test.tsx`.
+Live Google consent requires a configured OAuth client; these tests use fake
+provider replies and do not issue real Google tokens.
+
 ## Gotchas
+
+- Google Cloud approval covers all processes sharing the session's sandbox.
+  Shared top-level hosts fail closed. Connecting or reconnecting an account
+  does not grant session access; already-issued tokens can outlive revocation.
+  A blocked command needs retrying after approval. Prompts appear in the open
+  session, not as an out-of-band notification.
 
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.

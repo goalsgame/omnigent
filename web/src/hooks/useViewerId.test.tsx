@@ -3,17 +3,19 @@ import { beforeEach, expect, it, vi } from "vitest";
 
 const identity = vi.hoisted(() => ({
   resolution: Promise.resolve<string | null>(null),
+  userId: null as string | null,
 }));
 
 vi.mock("@/lib/identity", () => ({
-  getCurrentUserId: () => null,
+  getCurrentUserId: () => identity.userId,
   resolveIdentity: () => identity.resolution,
 }));
 
-import { useIdentityReady } from "./useViewerId";
+import { useIdentityReady, useViewerId } from "./useViewerId";
 
 beforeEach(() => {
   identity.resolution = Promise.resolve(null);
+  identity.userId = null;
 });
 
 it("waits until identity resolves", async () => {
@@ -38,4 +40,18 @@ it("unblocks when identity resolution fails", async () => {
   expect(result.current).toBe(false);
   await act(async () => reject(new Error("offline")));
   expect(result.current).toBe(true);
+});
+
+it("preserves the local owner identity after asynchronous resolution", async () => {
+  let resolve!: (value: string | null) => void;
+  identity.resolution = new Promise((finish) => {
+    resolve = finish;
+  });
+  const { result } = renderHook(useViewerId);
+  expect(result.current).toBeNull();
+  await act(async () => {
+    identity.userId = "local";
+    resolve("local");
+  });
+  expect(result.current).toBe("local");
 });

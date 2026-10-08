@@ -1,3 +1,4 @@
+import { GoogleCloudSessionAccess } from "@/components/GoogleCloudSessionAccess";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useSkills } from "@/hooks/useSkills";
 import {
@@ -83,7 +84,7 @@ import {
   isOwnerLevel,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerId } from "@/hooks/useViewerId";
 import { toast } from "sonner";
 import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
@@ -757,7 +758,7 @@ export function ChatPage() {
   // already implies a share; the owner needs the grant list (manage-only,
   // which the owner can read) to know they granted access to anyone else.
   // Hooks stay above the early-return guards (rules-of-hooks).
-  const viewerId = getCurrentAuthorId();
+  const viewerId = useViewerId();
   const { data: directSessionOwner } = useSessionOwner(
     viewerId !== null && activeConv?.owner == null ? (sessionConvId ?? null) : null,
   );
@@ -1109,46 +1110,55 @@ export function ChatPage() {
   }
 
   const mainAgent = (
-    <MainAgentSurface
-      conversationId={urlConvId ?? null}
-      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
-      status={status}
-      isWorking={isWorking}
-      showsWorking={showsWorking}
-      runnerOnline={runnerOnline}
-      liveness={liveness}
-      agentsError={agentsError}
-      disabled={!agentId || agentsError !== null}
-      onSend={onSend}
-      onSendSlashCommand={onSendSlashCommand}
-      onStop={onStop}
-      onShowReconnectHelp={onShowReconnectHelp}
-      agents={visibleAgents}
-      selectedAgentId={agentId}
-      hasMoreHistory={hasMoreHistory}
-      loadingMoreHistory={loadingMoreHistory}
-      permissionLevel={permissionLevel}
-      readOnlyReason={readOnlyReason}
-      sendDisabledReason={sendDisabledReason}
-      effortLevels={effortLevels}
-      showEffort={showEffort}
-      showModels={modelPickerKind !== null}
-      modelPickerKind={modelPickerKind}
-      codexModelOptions={codexModelOptions}
-      inferenceConfigured={activeSession?.inferenceConfigured}
-      inferenceError={activeSession?.inferenceError}
-      modelLabelOptions={sessionModelOptions}
-      showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
-      showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
-      showGoalControl={shouldShowGoalControl(capabilitySource)}
-      showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
-      showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
-      costRoutingEligible={costRoutingEligible}
-      subagentRoutingEligible={subagentRoutingEligible}
-      subAgentLabel={subAgentLabel}
-      wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
-    />
+    <>
+      {urlConvId &&
+        !isTempConvId(urlConvId) &&
+        viewerOwnsSession &&
+        serverInfo !== "loading" &&
+        serverInfo.enabled_connections?.includes("google_cloud") && (
+          <GoogleCloudSessionAccess key={urlConvId} sessionId={urlConvId} />
+        )}
+      <MainAgentSurface
+        conversationId={urlConvId ?? null}
+        hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
+        status={status}
+        isWorking={isWorking}
+        showsWorking={showsWorking}
+        runnerOnline={runnerOnline}
+        liveness={liveness}
+        agentsError={agentsError}
+        disabled={!agentId || agentsError !== null}
+        onSend={onSend}
+        onSendSlashCommand={onSendSlashCommand}
+        onStop={onStop}
+        onShowReconnectHelp={onShowReconnectHelp}
+        agents={visibleAgents}
+        selectedAgentId={agentId}
+        hasMoreHistory={hasMoreHistory}
+        loadingMoreHistory={loadingMoreHistory}
+        permissionLevel={permissionLevel}
+        readOnlyReason={readOnlyReason}
+        sendDisabledReason={sendDisabledReason}
+        effortLevels={effortLevels}
+        showEffort={showEffort}
+        showModels={modelPickerKind !== null}
+        modelPickerKind={modelPickerKind}
+        codexModelOptions={codexModelOptions}
+        inferenceConfigured={activeSession?.inferenceConfigured}
+        inferenceError={activeSession?.inferenceError}
+        modelLabelOptions={sessionModelOptions}
+        showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
+        showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
+        showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
+        showGoalControl={shouldShowGoalControl(capabilitySource)}
+        showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
+        showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
+        costRoutingEligible={costRoutingEligible}
+        subagentRoutingEligible={subagentRoutingEligible}
+        subAgentLabel={subAgentLabel}
+        wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
+      />
+    </>
   );
 
   // On `/` (no conversation), the composer would let the user POST a

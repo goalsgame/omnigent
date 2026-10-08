@@ -7,24 +7,31 @@ import base64
 import hashlib
 import hmac
 import secrets
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 
-from fastapi import Request
+from fastapi import HTTPException, Request, Response
+from pydantic import BaseModel
 
 from omnigent.connections.google_cloud import GoogleCloudConnectionStore
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.google_cloud import (
     SCOPES,
     GoogleCloudClient,
     GoogleCloudConfig,
     GoogleCloudError,
 )
+from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.connections_base import (
     ConnectionError,
     ConnectStart,
     create_connection_router,
 )
+
+
+class GoogleCloudAccessDecision(BaseModel):
+    decision: Literal["allowed", "denied"]
+    generation: str
 
 
 class GoogleCloudConnectionHooks:
@@ -113,7 +120,45 @@ def create_connections_google_cloud_router(
     auth_provider: AuthProvider | None = None,
     client: GoogleCloudClient | None = None,
 ):
-    return create_connection_router(
+    router = create_connection_router(
         GoogleCloudConnectionHooks(config, store, client or GoogleCloudClient(config)),
         auth_provider=auth_provider,
     )
+
+    @router.get("/connections/google_cloud/sessions/{session_id}/access")
+    async def session_access(session_id: str, request: Request, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        user = require_user(request, auth_provider)
+        user = user if user is not None else RESERVED_USER_LOCAL
+        if user.startswith("oidc-machine:"):
+            raise HTTPException(403, "Human session owner required")
+        try:
+            return await asyncio.to_thread(store.access.session, session_id, user)
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @router.post("/connections/google_cloud/sessions/{session_id}/access")
+    async def decide_access(
+        session_id: str, body: GoogleCloudAccessDecision, request: Request, response: Response
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        user = require_user(request, auth_provider)
+        user = user if user is not None else RESERVED_USER_LOCAL
+        if user.startswith("oidc-machine:"):
+            raise HTTPException(403, "Human session owner required")
+        try:
+            return await asyncio.to_thread(
+                store.access.session,
+                session_id,
+                user,
+                decision=body.decision,
+                generation=body.generation,
+            )
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    return router
