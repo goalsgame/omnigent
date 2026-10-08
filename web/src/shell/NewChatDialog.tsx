@@ -5910,6 +5910,23 @@ export function NewChatLandingScreen() {
                         {maxSandboxRepos === 1 ? "repositories" : "ones"} to continue.
                       </p>
                     )}
+                    {githubReposEnabled && sandboxRepoData?.connected === false && (
+                      <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+                        <p className="text-sm text-muted-foreground">
+                          Connect GitHub to check out private repositories using your account.
+                          Public repositories work without connecting.
+                        </p>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="self-start"
+                          onClick={() => navigate("/settings/integrations")}
+                        >
+                          Connect GitHub
+                        </Button>
+                      </div>
+                    )}
                     {/* Selected repos: each clones into its own sibling dir.
                   A connected repo gets its branch combobox; a pasted URL a
                   free-text branch. The remove button drops it. */}

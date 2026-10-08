@@ -23,6 +23,7 @@ import click
 
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.host.warm_bootstrap import ACTIVATION_DIR_ENV_VAR, POD_UID_ENV_VAR
+from omnigent.host.workspace_errors import WORKSPACE_ERROR_MESSAGES
 from omnigent.onboarding.sandboxes.agent_sandbox import (
     API_GROUP,
     API_VERSION,
@@ -721,7 +722,12 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 elif status.get("stage") == "prepared":
                     return f"{workspace}/{repos[0].repo_name}" if len(repos) == 1 else workspace
                 elif status.get("stage") == "failed":
-                    raise click.ClickException("Warm Sandbox workspace preparation failed.")
+                    raise click.ClickException(
+                        WORKSPACE_ERROR_MESSAGES.get(
+                            status.get("error_code") or "",
+                            "Warm Sandbox workspace preparation failed.",
+                        )
+                    )
                 time.sleep(_POLL_S)
             raise click.ClickException(
                 "Timed out waiting for warm Sandbox activation and workspace preparation."

@@ -150,7 +150,7 @@ def test_build_job_manifest_clones_multiple_repos_as_parallel_siblings() -> None
     # Both clones are backgrounded and joined, and the broker is wired ONCE
     # (a single `python3 -c` line configures the helper for every clone).
     assert script.count(" & pids=") == 2
-    assert 'for p in $pids; do wait "$p" || rc=1; done' in script
+    assert 'for p in $pids; do wait "$p"' in script
     assert script.count("python3 -c") == 1
 
 
@@ -161,6 +161,7 @@ def _run_failed_clone_with_credential_probe(
     wire_mutation: str | None = None,
     cwd: Path | None = None,
     host_token: str = "test-launch-token-sentinel",
+    repo_url: str = "https://github.com/org/private.git",
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str], list[str], Path]:
     """Run workspace prep with a recording git that rejects the clone."""
     fake_bin = tmp_path / "bin"
@@ -300,11 +301,7 @@ raise SystemExit(128)
         monkeypatch.setenv("WIRE_MUTATION", wire_mutation)
     command = k8s._render_workspace_prep_command(
         str(workspace),
-        [
-            RepoWorkspace(
-                url="https://github.com/org/private.git", branch=None, repo_name="private"
-            )
-        ],
+        [RepoWorkspace(url=repo_url, branch=None, repo_name="private")],
         ":",
         "host-test",
     )
@@ -2032,3 +2029,29 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
     assert not hasattr(launcher, "run")
     assert launcher.capabilities.cli_bootstrap is False
     assert launcher.capabilities.classifies_runner_by_agent is True
+
+
+@pytest.mark.parametrize(
+    ("wire_mutation", "repo_url", "expected_code"),
+    [
+        ("disconnected_broker", "https://github.com/org/private.git", 81),
+        ("disconnected_broker", "https://example.com/org/private.git", 1),
+        (None, "https://github.com/org/private.git", 1),
+    ],
+)
+def test_failed_clone_reports_missing_github_connection_only_when_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_mutation: str | None,
+    repo_url: str,
+    expected_code: int,
+) -> None:
+    result, _argv, _paths, _modes, _config = _run_failed_clone_with_credential_probe(
+        tmp_path,
+        monkeypatch,
+        wire_mutation=wire_mutation,
+        repo_url=repo_url,
+    )
+    assert result.returncode == expected_code
+    assert ("connect GitHub in Settings > Integrations" in result.stderr) == (expected_code == 81)
+    assert not (tmp_path / "home/workspace/private").exists()

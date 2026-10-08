@@ -56,6 +56,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from urllib.parse import urlsplit
 
 import click
 
@@ -63,6 +64,11 @@ from omnigent.host.identity import (
     HOST_ID_ENV_VAR,
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,
+)
+from omnigent.host.workspace_errors import (
+    GITHUB_CHECKOUT_UNCONNECTED,
+    GITHUB_CHECKOUT_UNCONNECTED_EXIT,
+    WORKSPACE_ERROR_MESSAGES,
 )
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
@@ -633,16 +639,30 @@ def _render_workspace_prep_command(
             script += "      exit 1\n    fi\n  fi\n"
             script += f"  mkdir -- {target}\n  mkdir -- {temporary}\n  touch -- {marker}\n"
             script += '  if [ -z "$wired" ]; then wire_credentials; wired=1; fi\n'
+            clone_failure = "exit 1"
+            if (
+                urlsplit(repo.url).scheme == "https"
+                and urlsplit(repo.url).hostname == "github.com"
+            ):
+                message = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_UNCONNECTED])
+                clone_failure = (
+                    'if [ "$wire_rc" -eq 10 ]; then '
+                    f"printf '%s\\n' {message} >&2; "
+                    f"exit {GITHUB_CHECKOUT_UNCONNECTED_EXIT}; fi; exit 1"
+                )
             script += (
-                f"  ({clone} "
+                f"  ( ( {clone} || {{ {clone_failure}; }} ) "
                 f"&& replace_empty_dir {staged_clone} {target} "
                 f"&& rm -f -- {marker} && rmdir -- {temporary} "
-                f"|| {{ rmdir -- {target} 2>/dev/null || true; exit 1; }}) "
+                f"|| {{ clone_rc=$?; rmdir -- {target} 2>/dev/null || true; "
+                'exit "$clone_rc"; }) '
                 f'& pids="$pids $!"\n'
             )
             script += "fi\n"
-        script += 'rc=0\nfor p in $pids; do wait "$p" || rc=1; done\n'
-        script += '[ "$rc" -eq 0 ]\n'
+        script += 'rc=0\nfor p in $pids; do wait "$p" || { child_rc=$?; '
+        script += f'[ "$rc" -eq {GITHUB_CHECKOUT_UNCONNECTED_EXIT} ] || rc=$child_rc; '
+        script += "} ; done\n"
+        script += '[ "$rc" -eq 0 ] || exit "$rc"\n'
     if host_config is not None:
         script += render_host_config_write_command(host_config) + "\n"
     return ["bash", "-lc", script]

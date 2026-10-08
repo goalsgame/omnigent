@@ -6620,6 +6620,29 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
   });
 
+  it("offers GitHub connection while allowing an unconnected user to add a public repo", async () => {
+    authenticatedFetchMock.mockImplementation(((url: string) =>
+      Promise.resolve({
+        ok: true,
+        json: async () =>
+          url === "/v1/connections/github/repos" ? { connected: false, repos: [] } : {},
+      } as Response)) as typeof authenticatedFetch);
+    renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "New Sandbox",
+      ),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    expect(await screen.findByRole("button", { name: "Connect GitHub" })).toBeEnabled();
+    expect(screen.getByText(/Public repositories work without connecting/)).toBeVisible();
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/octo/public" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    expect(await screen.findByTestId("new-chat-landing-repo-row")).toHaveTextContent("public");
+  });
+
   it("adds a GitHub repo from the picker with a branch", async () => {
     // enabled_connections has github + a connected /repos response → the picker renders
     // inside the repo chip and drives the same URL/branch state as the
@@ -6660,6 +6683,7 @@ describe("NewChatLandingScreen", () => {
     );
 
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    expect(screen.queryByRole("button", { name: "Connect GitHub" })).toBeNull();
     // Open the "Add repository" combobox, filter by typing, then pick the repo.
     fireEvent.click(await screen.findByTestId("new-chat-landing-repo-select"));
     fireEvent.change(await screen.findByTestId("new-chat-landing-repo-search"), {
@@ -6688,6 +6712,7 @@ describe("NewChatLandingScreen", () => {
       ),
     );
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    expect(screen.queryByRole("button", { name: "Connect GitHub" })).toBeNull();
     // The free-text URL input is present; the connected-account picker is not.
     await screen.findByTestId("new-chat-landing-repo-input");
     expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();

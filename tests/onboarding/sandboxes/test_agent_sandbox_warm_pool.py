@@ -1116,3 +1116,29 @@ def test_incompatible_claimed_profile_preserves_allocation_before_activation(
     harness.custom.patch_namespaced_custom_object.assert_not_called()
     harness.custom.delete_namespaced_custom_object.assert_not_called()
     harness.core.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+
+@pytest.mark.parametrize("error_code", ["github_checkout_unconnected", "credential-sentinel"])
+def test_preparation_failure_surfaces_only_known_checkout_errors(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    _exec_states(harness, monkeypatch, "waiting", "failed")
+    original = harness.launcher._status
+
+    def status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = original(*args, **kwargs)
+        if result.get("stage") == "failed":
+            result["error_code"] = error_code
+        return result
+
+    monkeypatch.setattr(harness.launcher, "_status", status)
+    expected = (
+        "connect GitHub in Settings > Integrations"
+        if error_code == "github_checkout_unconnected"
+        else "workspace preparation failed"
+    )
+    with pytest.raises(click.ClickException, match=expected) as exc:
+        harness.launcher.start_host(_HANDLE.encode(), **_START_ARGS)
+    assert "credential-sentinel" not in str(exc.value)

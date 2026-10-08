@@ -635,3 +635,34 @@ def test_warm_preload_caches_versions_without_reading_credentials(
     binary.write_text("#!/bin/sh\n# replaced\n", encoding="utf-8")
     assert install.harness_cli_installed(install.PI_KEY)
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("exit_code", [81, 42])
+def test_preparation_exposes_only_allowlisted_error_codes(
+    activation_dir: Path,
+    exit_code: int,
+) -> None:
+    bootstrap.activate(
+        _payload(
+            prepare_command=[
+                sys.executable,
+                "-c",
+                f"print('credential-sentinel'); raise SystemExit({exit_code})",
+            ]
+        )
+    )
+    activation = bootstrap.Activation.parse(
+        _payload(
+            prepare_command=[
+                sys.executable,
+                "-c",
+                f"print('credential-sentinel'); raise SystemExit({exit_code})",
+            ]
+        )
+    )
+    bootstrap._prepare_once(activation_dir, activation, bootstrap._Signals())
+    result = bootstrap.status()
+    assert result["stage"] == "failed"
+    assert result.get("error_code") == ("github_checkout_unconnected" if exit_code == 81 else None)
+    assert "credential-sentinel" not in json.dumps(result)
+    assert _TOKEN not in json.dumps(result)
