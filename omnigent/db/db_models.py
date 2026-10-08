@@ -734,6 +734,8 @@ class SqlConversationMetadata(OmnigentBase):
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Owner-only Google consent, bound to this host and OAuth connection generation.
+    google_cloud_access: Mapped[str | None] = mapped_column(Text, nullable=True)
     # JSON-encoded provider binding and model catalog captured at session creation.
     inference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.

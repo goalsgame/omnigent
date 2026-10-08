@@ -334,8 +334,35 @@ include that name in `sandbox.kubernetes.env` and set it in the server's
 environment. Hosts must also have `IS_SANDBOX=1` and their managed launch token.
 Both server and host must run a version supporting this connection.
 
-After connecting Google Cloud in Settings → Sandbox Integrations, the owner's
-sandboxes use that Google account's existing IAM permissions. The host exposes
+Connecting Google Cloud in Settings → Sandbox Integrations does not authorize
+any sandbox. Each new or existing session starts with Google Cloud access off.
+The human owner opens the session's Google Cloud control and selects **Allow
+for this session** to grant its sandbox the connected account's existing IAM
+permissions. Collaborators, administrators who are not the owner, machine
+identities and scoped agent/delegation tokens cannot approve this grant.
+
+When gcloud, Terraform or an SDK first requests credentials without consent,
+the broker blocks the request and the open session displays an approval prompt.
+Approve or deny there; after approval, retry the blocked command. Commands that
+do not request credentials, such as `gcloud version`, do not need approval.
+Denial persists without repeated prompts until the owner explicitly allows it.
+The prompt is visible while the owner has that session open; it is not an
+out-of-band notification or a suspended-command queue.
+
+Approval covers every agent and subprocess in the session's sandbox. A host
+bound to multiple top-level sessions is rejected because host credentials cannot
+isolate those sessions. Reconnecting the Google account or changing the host
+requires fresh approval. Consent persists across ordinary sleep/wake and server
+restarts, and is not copied to a new session.
+
+The server rechecks consent on every credential request, including a second
+check after provider resolution. **Revoke access** stops new tokens; already
+issued tokens can remain usable for up to their one-hour lifetime. The consent
+API is `GET/POST /v1/connections/google_cloud/sessions/{session_id}/access`;
+POST takes `decision` (`allowed` or `denied`) and the `generation` from GET,
+rejecting a stale account generation.
+
+ The host exposes
 a loopback metadata adapter understood by gcloud, Google SDK application default
 credentials, and the Terraform Google provider. Select a resource project
 explicitly, for example `gcloud projects describe PROJECT_ID` or the Terraform
@@ -347,6 +374,5 @@ The server encrypts the offline refresh grant. Sandboxes receive only expiring
 access tokens. The adapter does not expose Google identity tokens or forward
 requests to node metadata. Disconnect prevents subsequent credential requests;
 already issued access tokens can remain usable until their Google expiration.
-A Google connection grants cloud access to code running in that owner's
-sandbox, so connect only accounts whose permissions are appropriate for that
-code. Machine identities cannot use this human connection.
+A session approval grants cloud access to code throughout its sandbox. Use an
+account whose permissions are appropriate for that code. Machine identities cannot use this human connection.

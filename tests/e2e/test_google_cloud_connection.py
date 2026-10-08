@@ -3,6 +3,7 @@
 import socket
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
@@ -10,8 +11,11 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from sqlalchemy.orm import Session
 
 from omnigent.connections.google_cloud import GoogleCloudConnectionStore
+from omnigent.db.db_models import SqlConversationMetadata, SqlHost, SqlSessionPermission
+from omnigent.db.utils import get_or_create_engine
 from omnigent.host.google_cloud import GoogleCloudMetadataServer
 from omnigent.server.auth import AuthProvider
 from omnigent.server.google_cloud import SCOPES, GoogleCloudConfig
@@ -28,6 +32,24 @@ class UserAuth(AuthProvider):
 def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
     user = "person@example.com"
     store = GoogleCloudConnectionStore(db_uri, SecretBox("fixture-key"))
+    host_id, session_id = uuid.uuid4().hex, uuid.uuid4().hex
+    with Session(get_or_create_engine(db_uri)) as db:
+        db.add(
+            SqlHost(
+                host_id=host_id,
+                user_id=user,
+                name="sandbox",
+                status=1,
+                created_at=1,
+                updated_at=1,
+                sandbox_provider="agent_sandbox",
+            )
+        )
+        db.add(
+            SqlConversationMetadata(id=session_id, host_id=host_id, workspace="/workspace", kind=1)
+        )
+        db.add(SqlSessionPermission(user_id=user, conversation_id=session_id, level=4))
+        db.commit()
     config = GoogleCloudConfig("fixture", "fixture-secret", "https://app.example/callback")
     api = SimpleNamespace(
         token=AsyncMock(
@@ -42,7 +64,7 @@ def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
     )
     hosts = SimpleNamespace(
         resolve_launch_token=lambda host, token: (
-            SimpleNamespace(user_id=user) if (host, token) == ("host", "launch") else None
+            SimpleNamespace(user_id=user) if (host, token) == (host_id, "launch") else None
         )
     )
     app = FastAPI()
@@ -65,7 +87,7 @@ def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
                 assert thread.is_alive() and time.monotonic() < deadline
                 time.sleep(0.01)
             address = f"http://127.0.0.1:{sock.getsockname()[1]}"
-            metadata = GoogleCloudMetadataServer(address, "host", "launch")
+            metadata = GoogleCloudMetadataServer(address, host_id, "launch")
             try:
                 with httpx.Client(
                     base_url=address, headers={"X-Test-User": user}, trust_env=False
@@ -84,6 +106,20 @@ def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
                     result = client.get(root + "/callback", params=callback)
                     assert result.headers["location"] == "/settings?google_cloud=connected"
                     assert client.get(root + "/status").json()["email"] == user
+                    import pytest
+
+                    from omnigent.host.google_cloud import GoogleCloudAccessRequired
+
+                    with pytest.raises(GoogleCloudAccessRequired):
+                        metadata.credential()
+                    consent_url = f"/v1/connections/google_cloud/sessions/{session_id}/access"
+                    consent = client.get(consent_url).json()
+                    assert consent["state"] == "pending"
+                    decision = client.post(
+                        consent_url,
+                        json={"decision": "allowed", "generation": consent["generation"]},
+                    )
+                    assert decision.status_code == 200
                     assert metadata.credential()["token"] == "access-one"
                     connection = store.get(user, with_tokens=True)
                     store.refresh(

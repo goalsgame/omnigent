@@ -113,6 +113,15 @@ def create_host_credentials_router(
         )
         if not is_github_machine and (resolver is None or store is None):
             raise HTTPException(status_code=404, detail="unknown credential provider")
+        if provider == "google_cloud":
+            access = getattr(store, "access", None)
+            state = (
+                await asyncio.to_thread(access.host, host_id, managed.user_id, request_access=True)
+                if access
+                else "unavailable"
+            )
+            if state != "allowed":
+                return {"connected": False, "reason": "session_access_" + state}
         try:
             if is_github_machine:
                 payload = (
@@ -134,6 +143,19 @@ def create_host_credentials_router(
             if provider == "github" and not is_github_machine:
                 return {"connected": False, "reason": "not_connected"}
             return {"connected": False}
+        if provider == "google_cloud":
+            # Refresh may wait on the provider; recheck consent before releasing a token.
+            assert store is not None
+            generation = payload.pop("connection_generation", None)
+            state = (
+                await asyncio.to_thread(
+                    store.access.host, host_id, managed.user_id, expected_generation=generation
+                )
+                if isinstance(generation, str) and generation
+                else "off"
+            )
+            if state != "allowed":
+                return {"connected": False, "reason": "session_access_" + state}
         return {"connected": True, "owner": managed.user_id, **payload}
 
     return router

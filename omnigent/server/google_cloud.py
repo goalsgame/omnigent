@@ -149,4 +149,5 @@ async def resolve_google_cloud_credential(
         "expires_at": expiry,
         "email": connection.metadata["email"],
         "scopes": SCOPES.split(),
+        "connection_generation": connection.metadata["generation"],
     }

@@ -6,11 +6,17 @@ import secrets
 from typing import Any, ClassVar
 
 from omnigent.connections import ConnectionStore
+from omnigent.connections.google_cloud.access import GoogleCloudSessionAccess
 from omnigent.entities import ProviderConnection
+from omnigent.stores.credential_store.secret_cipher import SecretCipher
 
 
 class GoogleCloudConnectionStore(ConnectionStore[ProviderConnection]):
     _PROVIDER: ClassVar[str] = "google_cloud"
+
+    def __init__(self, storage_location: str, secret_cipher: SecretCipher) -> None:
+        super().__init__(storage_location, secret_cipher)
+        self.access = GoogleCloudSessionAccess(storage_location)
 
     @staticmethod
     def _to_entity(conn: ProviderConnection) -> ProviderConnection:
