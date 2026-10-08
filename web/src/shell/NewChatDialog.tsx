@@ -89,7 +89,12 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
-import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
+import {
+  fetchGithubBranches,
+  fetchGithubRepos,
+  fetchGithubStatus,
+  type GithubRepo,
+} from "@/lib/githubIntegration";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -2445,16 +2450,22 @@ export function NewChatLandingScreen() {
   }, []);
   // Free-text URL being typed into the "paste a URL" adder (not yet added).
   const [pendingRepoUrl, setPendingRepoUrl] = useState<string>("");
-  // When the server advertises the GitHub App and the caller has connected
-  // their account, offer a picker over their repos instead of only the
-  // free-text URL. The /repos endpoint returns `connected: false` when the
-  // account isn't linked, so gating the query on `enabled_connections` and
-  // reading `connected` off the payload doubles as the connection check.
+  // Repo availability can fail during token refresh; stored connection status
+  // determines whether to offer account linking or report unavailable repos.
   const githubReposEnabled =
     info !== "loading" && (info.enabled_connections ?? []).includes("github");
   const { data: sandboxRepoData, isError: sandboxReposErrored } = useQuery({
     queryKey: ["github-repos"],
-    queryFn: fetchGithubRepos,
+    queryFn: async () => {
+      const repos = await fetchGithubRepos();
+      if (repos.connected) return { ...repos, connectionMissing: false };
+      const status = await fetchGithubStatus();
+      if (status.connected) throw new Error("GitHub credentials unavailable");
+      return {
+        ...repos,
+        connectionMissing: status.enabled === true && status.connected === false,
+      };
+    },
     enabled: githubReposEnabled,
     staleTime: 5 * 60_000,
   });
@@ -5910,23 +5921,25 @@ export function NewChatLandingScreen() {
                         {maxSandboxRepos === 1 ? "repositories" : "ones"} to continue.
                       </p>
                     )}
-                    {githubReposEnabled && sandboxRepoData?.connected === false && (
-                      <div className="flex flex-col gap-2 rounded-md border border-border p-3">
-                        <p className="text-sm text-muted-foreground">
-                          Connect GitHub to check out private repositories using your account.
-                          Public repositories work without connecting.
-                        </p>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="self-start"
-                          onClick={() => navigate("/settings/integrations")}
-                        >
-                          Connect GitHub
-                        </Button>
-                      </div>
-                    )}
+                    {githubReposEnabled &&
+                      !sandboxReposErrored &&
+                      sandboxRepoData?.connectionMissing === true && (
+                        <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+                          <p className="text-sm text-muted-foreground">
+                            Connect GitHub to check out private repositories using your account.
+                            Public repositories work without connecting.
+                          </p>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="self-start"
+                            onClick={() => navigate("/settings/integrations")}
+                          >
+                            Connect GitHub
+                          </Button>
+                        </div>
+                      )}
                     {/* Selected repos: each clones into its own sibling dir.
                   A connected repo gets its branch combobox; a pasted URL a
                   free-text branch. The remove button drops it. */}
