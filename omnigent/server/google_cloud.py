@@ -27,6 +27,8 @@ class GoogleCloudConfig:
 
     @classmethod
     def from_env(cls) -> GoogleCloudConfig | None:
+        if os.environ.get("OMNIGENT_GOOGLE_CLOUD_AUTH") != "1":
+            return None
         values = [
             os.environ.get(f"OMNIGENT_GOOGLE_CLOUD_{key}", "").strip()
             for key in ("CLIENT_ID", "CLIENT_SECRET", "REDIRECT_URI")

@@ -320,7 +320,10 @@ Operators can enable a Google Cloud connection in Sandbox Integrations. Create
 an OAuth Web application client with the callback
 `https://<server>/v1/connections/google_cloud/callback`. Configure the server with
 `OMNIGENT_GOOGLE_CLOUD_CLIENT_ID`, `OMNIGENT_GOOGLE_CLOUD_CLIENT_SECRET`, and
-`OMNIGENT_GOOGLE_CLOUD_REDIRECT_URI`. A configured credential cipher is required.
+`OMNIGENT_GOOGLE_CLOUD_REDIRECT_URI`. Set `OMNIGENT_GOOGLE_CLOUD_AUTH=1`
+on the server as well; without it the connection routes and Settings panel
+stay disabled even when OAuth variables are present. A configured credential
+cipher is required.
 Google consent requests `openid`, `email`, and
 `https://www.googleapis.com/auth/cloud-platform`, including offline access.
 Use an Internal OAuth audience when access should be limited to your Workspace

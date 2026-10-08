@@ -187,3 +187,15 @@ async def test_provider_error_is_sanitized(monkeypatch):
         )
     assert "very-secret" not in str(error.value)
     assert "secret-must-not-leak" not in str(error.value)
+
+
+@pytest.mark.parametrize("flag", [None, "0", "false", "1"])
+def test_oauth_configuration_requires_managed_host_opt_in(monkeypatch, flag):
+    monkeypatch.setenv("OMNIGENT_GOOGLE_CLOUD_CLIENT_ID", CONFIG.client_id)
+    monkeypatch.setenv("OMNIGENT_GOOGLE_CLOUD_CLIENT_SECRET", CONFIG.client_secret)
+    monkeypatch.setenv("OMNIGENT_GOOGLE_CLOUD_REDIRECT_URI", CONFIG.redirect_uri)
+    if flag is None:
+        monkeypatch.delenv("OMNIGENT_GOOGLE_CLOUD_AUTH", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_GOOGLE_CLOUD_AUTH", flag)
+    assert GoogleCloudConfig.from_env() == (CONFIG if flag == "1" else None)

@@ -196,7 +196,7 @@ class CredentialStore:
         refresh, preventing concurrent reconnects from being overwritten.
 
         Returns ``True`` when a row was updated, ``False`` when the connection
-        was removed between read and refresh. The caller must not treat
+        was removed or changed between read and refresh. The caller must not treat
         ``False`` as success: providers that rotate refresh tokens (GitHub does)
         have already spent the old one, so a silently-dropped refresh wedges the
         user until they reconnect — worth surfacing, not swallowing.
@@ -237,8 +237,8 @@ class CredentialStore:
         updated = run_write_transaction(self._session_immediate, "update_secret", write)
         if not updated:
             _logger.warning(
-                "credential_store: update_secret found no %s connection for the user "
-                "(removed mid-refresh); the refreshed secret was discarded",
+                "credential_store: %s connection was removed or changed during refresh; "
+                "the refreshed secret was discarded",
                 provider,
             )
         return updated
