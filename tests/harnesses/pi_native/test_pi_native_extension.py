@@ -3733,3 +3733,67 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
 """
     )
     _run_extension_script(node, _extension_path(), script)
+
+
+def test_managed_alias_inherits_native_thinking_restrictions() -> None:
+    """Startup, model switches and web effort changes cannot disable mandatory thinking."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const native = {
+    provider: "anthropic", id: "claude-opus-5-5", api: "anthropic-messages",
+    reasoning: true,
+    thinkingLevelMap: {off: null, minimal: null, low: "low", medium: "medium", high: "high"},
+  };
+  const managed = {
+    provider: "omnigent", id: "anthropic/claude-opus-5.5", api: "anthropic-messages",
+  };
+  ctx.modelRegistry.getAll = () => [managed, native];
+  ctx.model = managed;
+  let level = "off";
+  pi.getThinkingLevel = () => level;
+  pi.setThinkingLevel = async (next) => { level = next; };
+  await handlers.session_start({}, ctx);
+  assert.equal(level, "medium");
+  assert.equal(managed.reasoning, true);
+  assert.deepEqual(managed.thinkingLevelMap, native.thinkingLevelMap);
+  assert.notEqual(managed.thinkingLevelMap, native.thinkingLevelMap);
+  assert(posted.some((e) => e.type === "external_reasoning_effort_change" &&
+    e.data.reasoning_effort === "medium"));
+
+  level = "high";
+  await handlers.model_select({source: "set", model: managed}, ctx);
+  assert.equal(level, "high");
+  level = "off";
+  await handlers.model_select({source: "restore", model: managed}, ctx);
+  assert.equal(level, "medium");
+  level = "off";
+  await handlers.before_agent_start({systemPrompt: "test"}, ctx);
+  assert.equal(level, "medium");
+
+  fs.writeFileSync(path.join(inboxDir, "thinking.json"),
+    JSON.stringify({id:"thinking", type:"thinking_level_change", thinkingLevel:"off"}));
+  await sleep(150);
+  assert.equal(level, "medium");
+
+  // Unrelated providers, unknown models and other wire protocols remain untouched.
+  for (const model of [
+    {...managed, provider: "custom", reasoning:false, thinkingLevelMap:undefined},
+    {...managed, id: "anthropic/claude-opus-5.50", reasoning:false, thinkingLevelMap:undefined},
+    {...managed, api: "openai-completions", reasoning:false, thinkingLevelMap:undefined},
+  ]) {
+    level = "off";
+    ctx.model = model;
+    await handlers.model_select({source:"set", model}, ctx);
+    assert.equal(level, "off");
+    assert.equal(model.reasoning, false);
+  }
+  finish();
+})().catch((error) => { finish(); console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)

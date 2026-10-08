@@ -1962,8 +1962,8 @@ def pi_native_provider_launch(
     :param provider: The resolved provider config.
     :param reasoning_effort: Canonical omnigent effort for the session, e.g.
         ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
-        (with a warning) on a gateway-routed model, whose thinking must stay
-        off for text to surface.
+        (with a warning) on a Databricks secondary surface whose thinking
+        must stay off for text to surface.
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
@@ -2010,7 +2010,9 @@ def pi_native_provider_launch(
     # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
-    overlay: dict[str, object] = {"defaultThinkingLevel": None}
+    overlay: dict[str, object] = (
+        {"defaultThinkingLevel": None} if provider.databricks_surfaces else {}
+    )
     # Only configured shortlists override the user's picker preferences.
     # Qualified refs distinguish managed models from built-in providers.
     enabled_refs = _enabled_model_refs(rendered)
@@ -2046,7 +2048,7 @@ def pi_native_provider_launch(
     # in settings, causing the agent loop to complete without surfacing the text
     # content to the extension. Explicitly passing --thinking off ensures the
     # completions handler doesn't activate the thinking path.
-    if model_provider_id != provider.provider_id:
+    if provider.databricks_surfaces and model_provider_id != provider.provider_id:
         args.extend(["--thinking", PI_THINKING_OFF])
         if thinking is not None and thinking != PI_THINKING_OFF:
             effort_warning = (
