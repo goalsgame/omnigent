@@ -42,6 +42,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { GoogleCloudIntegrationControl } from "./GoogleCloudIntegrationControl";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
@@ -1112,6 +1113,7 @@ function GithubMark({ className }: { className?: string }) {
  * render each. Adding a provider is one entry here plus one string server-side.
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
+  google_cloud: GoogleCloudIntegrationControl,
   github: GithubIntegrationControl,
   databricks: DatabricksIntegrationControl,
 };

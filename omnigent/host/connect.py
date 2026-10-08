@@ -667,6 +667,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_QUOTA_PROJECT",
+        "GCE_METADATA_HOST",
+        "GCE_METADATA_ROOT",
+        "GCE_METADATA_IP",
         "CLOUDSDK_CONFIG",
         "CLOUDSDK_ACTIVE_CONFIG_NAME",
         # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
@@ -4950,6 +4953,9 @@ def run_host_process(
     from omnigent.host.inference_credential import configure_host_inference
 
     configure_host_inference(server_url, identity.host_id)
+    from omnigent.host.google_cloud import start_host_google_cloud
+
+    start_host_google_cloud(server_url, identity.host_id)
     _generate_ucode_configs()
 
     if lifecycle_lock is None and daemon_target is not None:

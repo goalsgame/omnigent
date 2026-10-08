@@ -1317,6 +1317,8 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    google_cloud_config: Any | None = None,
+    google_cloud_store: Any | None = None,
     github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
@@ -1861,6 +1863,7 @@ def create_app(
     from omnigent.server.connections_registry import connection_providers
 
     _connection_inputs = {
+        "google_cloud": (google_cloud_config, google_cloud_store),
         "github": (github_config, github_store),
         "databricks": (databricks_config, databricks_store),
     }
@@ -2923,7 +2926,7 @@ def create_app(
         # and its connection store are present.
         enabled_connections = [
             provider
-            for provider in ("github", "databricks")
+            for provider in ("github", "databricks", "google_cloud")
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
