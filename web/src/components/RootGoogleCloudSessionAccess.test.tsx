@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { RootGoogleCloudSessionAccess } from "./RootGoogleCloudSessionAccess";
@@ -23,7 +23,16 @@ beforeEach(() => {
     async (id) =>
       ({
         id,
-        parentSessionId: id === "grandchild" ? "child" : id === "child" ? "root" : null,
+        parentSessionId: id.startsWith("depth-")
+          ? Number(id.slice(6)) > 1
+            ? `depth-${Number(id.slice(6)) - 1}`
+            : "root"
+          : id === "grandchild"
+            ? "child"
+            : id === "child"
+              ? "root"
+              : null,
+        rootSessionId: "root",
       }) as Session,
   );
   vi.mocked(getSessionOwner).mockResolvedValue(identity.user);
@@ -48,13 +57,15 @@ function mount(id: string) {
     </QueryClientProvider>,
   );
 }
-it.each(["root", "child", "grandchild"])(
+it.each(["root", "child", "grandchild", "depth-12"])(
   "reads and approves the root while viewing %s",
   async (id) => {
     mount(id);
     fireEvent.click(await screen.findByRole("button", { name: "Allow for this session" }));
     await screen.findByRole("button", { name: "Google Cloud: allowed" });
     expect(getSessionOwner).toHaveBeenCalledWith("root");
+    expect(getSessionSlim).toHaveBeenCalledTimes(1);
+    expect(getSessionSlim).toHaveBeenCalledWith(id, { refreshState: true });
     expect(authenticatedFetch).toHaveBeenCalledTimes(2);
     for (const [url] of vi.mocked(authenticatedFetch).mock.calls) {
       expect(url).toBe("/v1/connections/google_cloud/sessions/root/access");
@@ -65,6 +76,20 @@ it.each(["other@example.com", "local"])("does not expose approval to %s", async 
   identity.user = viewer;
   mount("child");
   await waitFor(() => expect(getSessionOwner).toHaveBeenCalledWith("root"));
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button")).toBeNull();
+});
+
+it("does not guess a root when the snapshot omits it", async () => {
+  vi.mocked(getSessionSlim).mockResolvedValue({
+    id: "child",
+    parentSessionId: "parent",
+  } as Session);
+  await act(async () => {
+    mount("child");
+  });
+  await waitFor(() => expect(getSessionSlim).toHaveBeenCalledOnce());
+  expect(getSessionOwner).not.toHaveBeenCalled();
   expect(authenticatedFetch).not.toHaveBeenCalled();
   expect(screen.queryByRole("button")).toBeNull();
 });
