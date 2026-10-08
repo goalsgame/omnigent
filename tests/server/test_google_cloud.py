@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import time
@@ -199,3 +200,40 @@ def test_oauth_configuration_requires_managed_host_opt_in(monkeypatch, flag):
     else:
         monkeypatch.setenv("OMNIGENT_GOOGLE_CLOUD_AUTH", flag)
     assert GoogleCloudConfig.from_env() == (CONFIG if flag == "1" else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loser_fails", [False, True])
+@pytest.mark.parametrize("lifetime", [60, 3500])
+async def test_concurrent_refresh_returns_winning_credential(store, loser_fails, lifetime):
+    connect(store, expired=True)
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    calls = 0
+
+    async def refresh(_fields):
+        nonlocal calls
+        index = calls
+        calls += 1
+        entered[index].set()
+        await asyncio.wait_for(release[index].wait(), 5)
+        if index == 1 and loser_fails:
+            raise GoogleCloudError("refresh failed")
+        return {"access_token": f"fresh-{index}", "expires_at": time.time() + lifetime}
+
+    client = SimpleNamespace(token=refresh)
+    first = asyncio.create_task(resolve_google_cloud_credential(USER, store=store, client=client))
+    await asyncio.wait_for(entered[0].wait(), 5)
+    second = asyncio.create_task(resolve_google_cloud_credential(USER, store=store, client=client))
+    try:
+        await asyncio.wait_for(entered[1].wait(), 5)
+        release[0].set()
+        winner = await asyncio.wait_for(first, 5)
+        release[1].set()
+        other = await asyncio.wait_for(second, 5)
+        assert winner["token"] == other["token"] == "fresh-0"
+        assert store.get(USER, with_tokens=True).secret["access_token"] == "fresh-0"
+    finally:
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)

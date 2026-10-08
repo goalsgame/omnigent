@@ -17,6 +17,10 @@ from omnigent.host.identity_env import HOST_TOKEN_ENV_VAR
 _METADATA_PREFIX = "/computeMetadata/v1/"
 
 
+class GoogleCloudNotConnected(ValueError):
+    """The owner has no Google Cloud connection."""
+
+
 class GoogleCloudMetadataServer(ThreadingHTTPServer):
     """Vend only short-lived owner tokens; never proxy node metadata or ID tokens."""
 
@@ -39,6 +43,8 @@ class GoogleCloudMetadataServer(ThreadingHTTPServer):
         )
         response.raise_for_status()
         data = response.json()
+        if data.get("connected") is False:
+            raise GoogleCloudNotConnected("Google Cloud connection unavailable")
         token, email, expiry = data.get("token"), data.get("email"), data.get("expires_at")
         if (
             data.get("connected") is not True
@@ -101,8 +107,11 @@ class GoogleCloudMetadataHandler(BaseHTTPRequestHandler):
             return
         try:
             credential = cast(GoogleCloudMetadataServer, self.server).credential()
-        except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+        except GoogleCloudNotConnected:
             self.reply(403, "Connect Google Cloud in Omnigent Sandbox Integrations, then retry")
+            return
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+            self.reply(503, "Google Cloud credentials are temporarily unavailable; retry shortly")
             return
         email = str(credential["email"])
         prefix = "instance/service-accounts"
@@ -155,6 +164,7 @@ def start_host_google_cloud(server_url: str, host_id: str) -> GoogleCloudMetadat
         os.environ[name] = address
     # Separate gcloud's cache from personal CLI credentials copied into a home.
     os.environ["CLOUDSDK_CONFIG"] = os.path.expanduser("~/.omnigent/gcloud")
+    os.environ.pop("CLOUDSDK_ACTIVE_CONFIG_NAME", None)
     threading.Thread(
         target=server.serve_forever, daemon=True, name="google-cloud-metadata"
     ).start()

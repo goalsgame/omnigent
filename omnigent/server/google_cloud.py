@@ -115,16 +115,28 @@ async def resolve_google_cloud_credential(
         refresh = secret.get("refresh_token")
         if not refresh:
             raise GoogleCloudError("Reconnect your Google Cloud account")
-        tokens = await client.token({"grant_type": "refresh_token", "refresh_token": refresh})
+        try:
+            tokens = await client.token({"grant_type": "refresh_token", "refresh_token": refresh})
+        except GoogleCloudError:
+            # Another request may already have refreshed this same grant.
+            updated = False
+        else:
+            updated = await asyncio.to_thread(
+                store.refresh, user_id, tokens=tokens, connection=connection
+            )
         current = await asyncio.to_thread(store.get, user_id, with_tokens=True)
-        if current is None or current.secret != connection.secret:
-            return None
-        if not await asyncio.to_thread(
-            store.refresh, user_id, tokens=tokens, connection=connection
+        if current is None or current.metadata.get("generation") != connection.metadata.get(
+            "generation"
         ):
-            raise GoogleCloudError("Google Cloud connection changed; retry the request")
-        secret = {**secret, "access_token": tokens["access_token"]}
-        expiry = tokens["expires_at"]
+            return None
+        if not updated and (
+            current.metadata == connection.metadata
+            or current.metadata.get("expires_at", 0) <= time.time() + 5
+        ):
+            raise GoogleCloudError("Google Cloud refresh temporarily unavailable; retry")
+        connection = current
+        secret = connection.secret or {}
+        expiry = connection.metadata["expires_at"]
     else:
         expiry = connection.metadata["expires_at"]
     current = await asyncio.to_thread(store.get, user_id)
