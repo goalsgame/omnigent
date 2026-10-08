@@ -779,7 +779,29 @@ function headers(config) {
   };
 }
 
-async function postEvent(config, body) {
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+
+function boundedSourceId(sourceId) {
+  const value = typeof sourceId === "string" ? sourceId.trim() : "";
+  if (!value) throw new Error("assistant conversation item requires source_id");
+  if (value.length <= 256) return value;
+  return `pi:${crypto.createHash("sha256").update(value).digest("hex")}`;
+}
+
+function eventPostError(response) {
+  const status = response && response.status;
+  if (typeof status === "number" && Number.isFinite(status)) {
+    const error = new Error(`Omnigent event POST failed with HTTP ${status}`);
+    error.status = status;
+    return error;
+  }
+  return new Error("Omnigent event POST returned an invalid response");
+}
+
+async function postEventChecked(config, body, signal) {
   if (
     !config ||
     !config.serverUrl ||
@@ -788,15 +810,92 @@ async function postEvent(config, body) {
   )
     return;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
+  const request = {
+    method: "POST",
+    headers: headers(config),
+    body: JSON.stringify(body),
+  };
+  if (signal) request.signal = signal;
+  const response = await fetch(url, request);
+  const status = response && response.status;
+  if (
+    !response ||
+    (typeof status === "number" &&
+      (!Number.isFinite(status) || status < 200 || status >= 300)) ||
+    (typeof status !== "number" && response.ok !== true)
+  ) {
+    throw eventPostError(response);
+  }
+  return response;
+}
+
+async function postEvent(config, body) {
   try {
-    await fetch(url, {
-      method: "POST",
-      headers: headers(config),
-      body: JSON.stringify(body),
-    });
+    await postEventChecked(config, body);
   } catch (_err) {
     // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
+}
+
+function isRetryableAssistantError(error) {
+  const status = error && error.status;
+  if (typeof status !== "number") return true;
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function assistantItemPostTimeoutMs(config) {
+  const configured = config && config.assistantItemPostTimeoutMs;
+  return typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? configured
+    : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
+}
+
+// Only the authoritative assistant message_end uses this checked, bounded
+// path; every other bridge event retains postEvent's best-effort behavior.
+async function postAssistantMessage(config, data, sourceId) {
+  const body = {
+    type: "external_conversation_item",
+    data: { ...data, source_id: boundedSourceId(sourceId) },
+  };
+  let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
+  let lastError;
+  for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      assistantItemPostTimeoutMs(config),
+    );
+    try {
+      return await postEventChecked(config, body, controller.signal);
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (
+      attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
+      !isRetryableAssistantError(lastError)
+    )
+      break;
+    await sleep(backoff);
+    backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
+  }
+  throw lastError || new Error("assistant conversation item POST failed");
+}
+
+function assistantMessageSourceId(message, responseId, text) {
+  const response =
+    message && typeof message.responseId === "string" && message.responseId
+      ? `response:${message.responseId}`
+      : "";
+  const timestamp =
+    message && typeof message.timestamp === "number"
+      ? `timestamp:${message.timestamp}`
+      : "";
+  const identity = response || timestamp || `turn:${responseId}:${fingerprint(text)}`;
+  return boundedSourceId(`pi:assistant:${identity}`);
 }
 
 async function patchExternalSessionId(config, nativeSessionId) {
@@ -1021,6 +1120,52 @@ async function postModelChangeError(config, message) {
         message,
       },
     },
+  });
+}
+
+// Managed gateway aliases must retain the native catalog's thinking restrictions.
+function inheritThinkingMetadata(ctx, model) {
+  if (!model || !inferenceProviderIds.has(model.provider)) return;
+  const registry = ctx && ctx.modelRegistry;
+  if (!registry || typeof registry.getAll !== "function") return;
+  const canonical = (id) => typeof id === "string"
+    ? id.split("/").pop().toLowerCase().replaceAll(".", "-") : "";
+  let models;
+  try {
+    models = registry.getAll();
+  } catch (_error) {
+    return;
+  }
+  if (!Array.isArray(models)) return;
+  const candidates = models.filter((candidate) => candidate &&
+    !inferenceProviderIds.has(candidate.provider) && candidate.api === model.api &&
+    canonical(candidate.id) === canonical(model.id));
+  const native = candidates.find((candidate) => candidate.id === model.id) ||
+    candidates.find((candidate) => model.id.startsWith(`${candidate.provider}/`));
+  if (!native) return;
+  if (native.reasoning === true) model.reasoning = true;
+  if (native.thinkingLevelMap && !model.thinkingLevelMap) {
+    model.thinkingLevelMap = { ...native.thinkingLevelMap };
+  }
+}
+
+async function ensureSupportedThinking(pi, config, ctx, model, requested) {
+  inheritThinkingMetadata(ctx, model);
+  const level = requested ?? (typeof pi.getThinkingLevel === "function"
+    ? pi.getThinkingLevel() : undefined);
+  const map = model && model.thinkingLevelMap;
+  if (!map || map[level] !== null || typeof pi.setThinkingLevel !== "function") {
+    if (requested !== undefined) await pi.setThinkingLevel(requested);
+    return;
+  }
+  const fallback = ["medium", "low", "high", "minimal", "xhigh", "max"].find(
+    (candidate) => map[candidate] !== null,
+  );
+  if (!fallback) return;
+  await pi.setThinkingLevel(fallback);
+  await postEvent(config, {
+    type: "external_reasoning_effort_change",
+    data: { reasoning_effort: fallback },
   });
 }
 
@@ -1298,6 +1443,7 @@ module.exports = function (pi) {
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
+  const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
@@ -1844,6 +1990,7 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    await ensureSupportedThinking(pi, config, ctx, ctx && ctx.model);
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
@@ -1872,7 +2019,9 @@ module.exports = function (pi) {
         }
       },
       (model) => applyModelChange(pi, config, latestContext, model),
-      (level) => pi.setThinkingLevel(level),
+      (level) => ensureSupportedThinking(
+        pi, config, latestContext, latestContext && latestContext.model, level,
+      ),
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
         // state on SDK versions that don't expose isIdle() (same fallback
@@ -1914,6 +2063,7 @@ module.exports = function (pi) {
 
   pi.on("model_select", async (event, ctx) => {
     rememberContext(ctx);
+    await ensureSupportedThinking(pi, config, ctx, event && event.model);
     // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
     // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
     // ``restore`` — that is Pi re-applying the session's saved model at
@@ -1933,7 +2083,10 @@ module.exports = function (pi) {
     });
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    await ensureSupportedThinking(
+      pi, config, ctx || latestContext, (ctx || latestContext)?.model,
+    );
     const latest = readConfig() || config;
     const instructions = latest && latest.systemPrompt;
     if (typeof instructions !== "string" || !instructions.trim()) return;
@@ -1955,6 +2108,7 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
+    postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
@@ -2169,12 +2323,14 @@ module.exports = function (pi) {
     }
     const text = textFromMessage(message);
     if (!text) return;
+    const sourceId = assistantMessageSourceId(message, responseId, text);
+    if (postedAssistantMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postAssistantMessage(
+      config,
+      {
         response_id: responseId,
         item_type: "message",
         item_data: {
@@ -2183,7 +2339,11 @@ module.exports = function (pi) {
           content: [{ type: "output_text", text }],
         },
       },
-    });
+      sourceId,
+    );
+    // Retry a failed callback on its next delivery; only suppress duplicates
+    // after the authoritative POST has been accepted.
+    postedAssistantMessages.add(sourceId);
   });
 
   pi.on("turn_end", async (event, ctx) => {
