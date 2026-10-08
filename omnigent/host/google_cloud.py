@@ -25,6 +25,10 @@ class GoogleCloudAccessRequired(ValueError):
     """The session owner has not granted sandbox access."""
 
 
+class GoogleCloudAccessUnavailable(ValueError):
+    """The sandbox cannot accept a session-scoped grant."""
+
+
 class GoogleCloudMetadataServer(ThreadingHTTPServer):
     """Vend only short-lived owner tokens; never proxy node metadata or ID tokens."""
 
@@ -49,6 +53,8 @@ class GoogleCloudMetadataServer(ThreadingHTTPServer):
         data = response.json()
         if data.get("connected") is False:
             reason = data.get("reason", "")
+            if reason == "session_access_unavailable":
+                raise GoogleCloudAccessUnavailable("Session-scoped access unavailable")
             if (
                 isinstance(reason, str)
                 and reason.startswith("session_access_")
@@ -120,6 +126,13 @@ class GoogleCloudMetadataHandler(BaseHTTPRequestHandler):
             return
         try:
             credential = cast(GoogleCloudMetadataServer, self.server).credential()
+        except GoogleCloudAccessUnavailable:
+            self.reply(
+                403,
+                "Google Cloud access is unavailable for this sandbox; "
+                "start a new session with its own dedicated managed sandbox",
+            )
+            return
         except GoogleCloudAccessRequired:
             self.reply(
                 403,

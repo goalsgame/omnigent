@@ -27,7 +27,10 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
       try {
         const response = await authenticatedFetch(endpoint, { signal: controller.signal });
         if (response.status === 409 || response.status === 403) {
-          if (active && observed === revision.current) setAccess(null);
+          if (active && observed === revision.current) {
+            setAccess(null);
+            setError(null);
+          }
           return;
         }
         if (!response.ok) throw new Error("unavailable");

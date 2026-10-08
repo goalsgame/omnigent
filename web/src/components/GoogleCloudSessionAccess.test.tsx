@@ -105,3 +105,29 @@ it.each(["allowed", "denied"])("ignores a stale polling failure after %s", async
   });
   expect(screen.queryByRole("alert")).toBeNull();
 });
+
+it.each([403, 409])("clears a polling error when access becomes unavailable (%s)", async (code) => {
+  vi.useFakeTimers();
+  fetchMock
+    .mockResolvedValueOnce(response(status("pending")))
+    .mockRejectedValueOnce(new Error("offline"))
+    .mockResolvedValue(response({}, code));
+  await act(async () => {
+    render(<GoogleCloudSessionAccess sessionId="session-one" />);
+  });
+  expect(screen.getByRole("button", { name: "Allow for this session" })).toBeTruthy();
+  await act(async () => {
+    vi.advanceTimersByTime(3000);
+  });
+  expect(screen.getByRole("alert")).toHaveTextContent("status is unavailable");
+  await act(async () => {
+    vi.advanceTimersByTime(3000);
+  });
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByRole("button")).toBeNull();
+  await act(async () => {
+    vi.advanceTimersByTime(3000);
+  });
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByRole("button")).toBeNull();
+});
