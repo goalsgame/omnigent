@@ -961,8 +961,6 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
         "omnigent-openai",
         "--model",
         "gpt-5.6-sol",
-        "--thinking",
-        "off",
     ]
 
 
@@ -3632,7 +3630,7 @@ def test_provider_launch_scopes_picker_via_enabled_models(
         "omnigent/claude-fable-5",
         "omnigent/claude-sonnet-4-6",
     ]
-    assert settings["defaultThinkingLevel"] is None
+    assert "defaultThinkingLevel" not in settings
 
 
 @pytest.mark.parametrize("kind", ["key", "gateway"])
@@ -3694,7 +3692,7 @@ def test_setup_single_model_preserves_picker_scope(
     else:
         assert settings["enabledModels"] == prior_scope
     assert settings["theme"] == "light"
-    assert settings["defaultThinkingLevel"] is None
+    assert "defaultThinkingLevel" not in settings
     assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
 
 
@@ -3740,7 +3738,7 @@ def test_provider_launch_without_curated_set_does_not_scope(
         assert "enabledModels" not in settings
     else:
         assert settings["enabledModels"] == prior_scope
-    assert settings["defaultThinkingLevel"] is None
+    assert "defaultThinkingLevel" not in settings
     assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
 
 
@@ -3810,3 +3808,38 @@ def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
     assert provider is not None
     assert provider.model == "GLM-5.3"
     assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3", "GLM-5.3-Flash"]
+
+
+@pytest.mark.parametrize("effort", [None, "high", "none"])
+def test_generic_gateway_secondary_preserves_thinking(
+    tmp_path: Path, effort: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Databricks workaround must not disable another gateway's reasoning."""
+    from omnigent.inner import pi_settings
+
+    global_dir = tmp_path / "global-pi"
+    global_dir.mkdir()
+    (global_dir / "settings.json").write_text('{"defaultThinkingLevel":"medium"}')
+    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_dir)
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://gateway.example/anthropic",
+        api="anthropic-messages",
+        model="openai/reasoning-model",
+        api_key="test-key",
+        auth_header=False,
+        additional_providers={
+            "omnigent-completions": {
+                "baseUrl": "https://gateway.example/v1",
+                "api": "openai-completions",
+                "apiKey": "test-key",
+                "models": [{"id": "openai/reasoning-model", "reasoning": True}],
+            }
+        },
+    )
+    launch = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, effort)
+    assert launch.effort_warning is None
+    expected = [] if effort is None else ["--thinking", "off" if effort == "none" else effort]
+    assert launch.args[4:] == expected
+    settings = json.loads((tmp_path / "pi-agent/settings.json").read_text())
+    assert settings["defaultThinkingLevel"] == "medium"
