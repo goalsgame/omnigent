@@ -75,7 +75,7 @@ function SubagentStateIndicator({ state, label }: { state: IndicatorState; label
         role="status"
         className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
       >
-        <RunningDot />
+        <RunningDot className="motion-reduce:animate-none" />
         {label}
       </span>
     );
