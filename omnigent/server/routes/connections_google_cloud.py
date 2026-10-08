@@ -129,7 +129,8 @@ def create_connections_google_cloud_router(
     async def session_access(session_id: str, request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
         user = require_user(request, auth_provider)
-        user = user if user is not None else RESERVED_USER_LOCAL
+        if user is None or user == RESERVED_USER_LOCAL:
+            raise HTTPException(403, "Google Cloud sandbox access requires server authentication")
         if user.startswith("oidc-machine:"):
             raise HTTPException(403, "Human session owner required")
         try:
@@ -145,7 +146,8 @@ def create_connections_google_cloud_router(
     ):
         response.headers["Cache-Control"] = "no-store"
         user = require_user(request, auth_provider)
-        user = user if user is not None else RESERVED_USER_LOCAL
+        if user is None or user == RESERVED_USER_LOCAL:
+            raise HTTPException(403, "Google Cloud sandbox access requires server authentication")
         if user.startswith("oidc-machine:"):
             raise HTTPException(403, "Human session owner required")
         try:

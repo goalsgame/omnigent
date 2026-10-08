@@ -1,5 +1,6 @@
 """Session consent gates the real managed-host credential endpoint."""
 
+import json
 import time
 import uuid
 from types import SimpleNamespace
@@ -15,11 +16,12 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
     SqlSessionPermission,
+    current_workspace_id,
     workspace_scope,
 )
 from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, UnifiedAuthProvider
 from omnigent.server.google_cloud import SCOPES, GoogleCloudConfig
 from omnigent.server.routes.connections_google_cloud import create_connections_google_cloud_router
 from omnigent.server.routes.host_credentials import create_host_credentials_router
@@ -80,7 +82,13 @@ def setup(db_uri, request):
         create_connections_google_cloud_router(
             GoogleCloudConfig("fixture", "secret", "https://app.example/callback"),
             store,
-            auth_provider=None if local else UserAuth(),
+            auth_provider=(
+                UnifiedAuthProvider(source="header", local_single_user=True)
+                if local == "header"
+                else None
+                if local
+                else UserAuth()
+            ),
         ),
         prefix="/v1",
     )
@@ -114,7 +122,6 @@ def approve(s):
     return access(s, "post", json={"decision": "allowed", "generation": status["generation"]})
 
 
-@pytest.mark.parametrize("setup", [False, True], indirect=True, ids=["authenticated", "local"])
 def test_first_use_prompts_then_approval_vends_and_revocation_blocks(setup):
     s = setup
     assert access(s).json()["state"] == "off"
@@ -235,3 +242,35 @@ def test_reapproval_of_new_account_cannot_release_old_account_token(setup, monke
 
     monkeypatch.setattr(s.store.access, "host", reconnect_before_final_check)
     assert credential(s).json() == {"connected": False, "reason": "session_access_off"}
+
+
+@pytest.mark.parametrize("setup", [True, "header"], indirect=True)
+@pytest.mark.parametrize("headers", [{}, {"X-Omnigent-Host-Token": "launch"}])
+def test_local_sandbox_cannot_self_approve_or_reuse_a_saved_grant(setup, headers):
+    s = setup
+    connection = s.store.get(RESERVED_USER_LOCAL)
+    generation = connection.metadata["generation"]
+    endpoint = f"/v1/connections/google_cloud/sessions/{s.session}/access"
+    assert s.client.get(endpoint, headers=headers).status_code == 403
+    denied = s.client.post(
+        endpoint, headers=headers, json={"decision": "allowed", "generation": generation}
+    )
+    assert denied.status_code == 403
+    assert "requires server authentication" in denied.json()["detail"]
+    with Session(get_or_create_engine(s.uri)) as db:
+        row = db.get(SqlConversationMetadata, (current_workspace_id(), s.session))
+        assert row is not None
+        row.google_cloud_access = json.dumps(
+            {
+                "user_id": RESERVED_USER_LOCAL,
+                "host_id": s.host,
+                "generation": generation,
+                "state": "allowed",
+            }
+        )
+        db.commit()
+    with pytest.raises(PermissionError, match="requires server authentication"):
+        s.store.access.session(
+            s.session, RESERVED_USER_LOCAL, decision="allowed", generation=generation
+        )
+    assert credential(s).json() == {"connected": False, "reason": "session_access_unavailable"}

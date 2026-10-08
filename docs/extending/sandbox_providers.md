@@ -340,6 +340,9 @@ The human owner opens the session's Google Cloud control and selects **Allow
 for this session** to grant its sandbox the connected account's existing IAM
 permissions. Collaborators, administrators who are not the owner, machine
 identities and scoped agent/delegation tokens cannot approve this grant.
+Server authentication is required: auth-disabled/local deployments cannot grant
+or use Google Cloud sandbox access, including previously saved local grants.
+An unauthenticated server cannot distinguish the owner from sandbox callers.
 
 When gcloud, Terraform or an SDK first requests credentials without consent,
 the broker blocks the request and the open session displays an approval prompt.

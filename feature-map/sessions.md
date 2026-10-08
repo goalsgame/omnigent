@@ -334,6 +334,10 @@ plain `uv run pytest`, which starts a private server for the test.
 
 ### Google Cloud consent checks
 
+Google Cloud sandbox consent requires server authentication; the reserved local
+identity cannot grant or use it. The control resolves the root owner/session
+when viewing sub-agents, so requests appear on every depth of the spawn tree.
+
 Use `tests/server/test_google_cloud_session_access.py` for owner-only approval,
 first-use prompting, revocation and reconnect isolation. Use
 `tests/e2e/test_google_cloud_connection.py` for the offline OAuth → blocked
