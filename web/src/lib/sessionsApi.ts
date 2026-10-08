@@ -234,6 +234,7 @@ interface SessionResponseWire {
    * regular session without an extra request.
    */
   parent_session_id?: string | null;
+  root_conversation_id?: string | null;
   /**
    * For sub-agent (child) sessions, the sub-agent type name within
    * the parent's spec tree, e.g. ``"claude_code"``. ``null`` (or
@@ -360,6 +361,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     })),
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
+    rootSessionId: wire.root_conversation_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],

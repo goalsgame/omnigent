@@ -463,6 +463,8 @@ export interface Session {
    * identity label when the user is inside a child.
    */
   parentSessionId: string | null;
+  /** Authoritative spawn-tree root; absent/null when the server has not supplied it. */
+  rootSessionId?: string | null;
   /**
    * For sub-agent (child) sessions, the sub-agent type name within
    * the parent's spec tree, e.g. ``"claude_code"``. ``null`` for

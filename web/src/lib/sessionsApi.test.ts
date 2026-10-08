@@ -167,6 +167,7 @@ describe("createSession", () => {
       pendingInputs: [],
       permissionLevel: null,
       parentSessionId: null,
+      rootSessionId: null,
       subAgentName: null,
       terminalLaunchArgs: null,
       kind: "default",
@@ -1209,6 +1210,22 @@ describe("getSession", () => {
     expect(session.parentSessionId).toBe("conv_parent");
   });
 
+  it("maps the authoritative root without substituting the immediate parent", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_deep_child",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        parent_session_id: "conv_parent",
+        root_conversation_id: "conv_root",
+      }),
+    );
+    const session = await getSession("conv_deep_child");
+    expect(session.rootSessionId).toBe("conv_root");
+    expect(session.parentSessionId).toBe("conv_parent");
+  });
+
   it("maps title from the wire to the camelCase Session", async () => {
     // The sidebar's nested-child row reads ``session.title`` for the
     // display label. Without this mapping it falls back to a truncated
@@ -1238,6 +1255,7 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_top");
     expect(session.parentSessionId).toBeNull();
+    expect(session.rootSessionId).toBeNull();
   });
 });
 

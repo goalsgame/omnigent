@@ -16,6 +16,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
+from omnigent.server.auth import RESERVED_USER_LOCAL
 
 
 class GoogleCloudSessionAccess:
@@ -27,6 +28,8 @@ class GoogleCloudSessionAccess:
         )
 
     def _context(self, db: Session, row: SqlConversationMetadata, user_id: str) -> dict[str, Any]:
+        if user_id == RESERVED_USER_LOCAL:
+            raise PermissionError("Google Cloud sandbox access requires server authentication")
         workspace = current_workspace_id()
         permission = db.get(SqlSessionPermission, (workspace, user_id, row.id))
         if permission is None or permission.level != 4 or user_id.startswith("oidc-machine:"):
