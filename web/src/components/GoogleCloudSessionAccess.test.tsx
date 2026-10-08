@@ -16,6 +16,7 @@ beforeEach(() => vi.resetAllMocks());
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 it("defaults to off and sends an explicit session-bound decision", async () => {
@@ -74,15 +75,7 @@ it("hides controls for a nonowner or an unsupported shared host", async () => {
 });
 
 it.each(["allowed", "denied"])("ignores a stale polling failure after %s", async (decision) => {
-  let poll!: () => void;
-  const setInterval = window.setInterval.bind(window);
-  vi.spyOn(window, "setInterval").mockImplementation((callback, delay, ...args) => {
-    if (delay === 3000) {
-      poll = callback as () => void;
-      return 1;
-    }
-    return setInterval(callback, delay, ...args);
-  });
+  vi.useFakeTimers();
   let rejectPoll!: (error: Error) => void;
   const pendingPoll = new Promise<Response>((_resolve, reject) => {
     rejectPoll = reject;
@@ -91,17 +84,22 @@ it.each(["allowed", "denied"])("ignores a stale polling failure after %s", async
     .mockResolvedValueOnce(response(status("pending")))
     .mockReturnValueOnce(pendingPoll)
     .mockResolvedValueOnce(response(status(decision)));
-  render(<GoogleCloudSessionAccess sessionId="session-one" />);
-  await screen.findByRole("button", { name: "Allow for this session" });
-  act(() => poll());
-  fireEvent.click(
-    screen.getByRole("button", {
-      name: decision === "allowed" ? "Allow for this session" : "Deny",
-    }),
-  );
-  await screen.findByRole("button", {
-    name: decision === "allowed" ? "Google Cloud: allowed" : "Google Cloud: off",
+  await act(async () => {
+    render(<GoogleCloudSessionAccess sessionId="session-one" />);
   });
+  act(() => vi.advanceTimersByTime(3000));
+  await act(async () => {
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: decision === "allowed" ? "Allow for this session" : "Deny",
+      }),
+    );
+  });
+  expect(
+    screen.getByRole("button", {
+      name: decision === "allowed" ? "Google Cloud: allowed" : "Google Cloud: off",
+    }),
+  ).toBeTruthy();
   await act(async () => {
     rejectPoll(new Error("offline"));
   });
