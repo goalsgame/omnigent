@@ -4572,6 +4572,19 @@ def server(
 
             github_store = GithubConnectionStore(db_uri, cipher)
 
+    from omnigent.server.google_cloud import GoogleCloudConfig
+
+    google_cloud_config = GoogleCloudConfig.from_env()
+    google_cloud_store = None
+    if google_cloud_config is not None:
+        from omnigent.connections.google_cloud import GoogleCloudConnectionStore
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        google_cipher = build_secret_cipher()
+        if google_cipher is None:
+            raise click.ClickException("Google Cloud connections require credential encryption")
+        google_cloud_store = GoogleCloudConnectionStore(db_uri, google_cipher)
+
     # Databricks Connect (per-user OAuth U2M). Shares the credential store's
     # cipher; inert unless OMNIGENT_DATABRICKS_CLIENT_ID/_SECRET are set.
     from omnigent.server.databricks_app import DatabricksConfig
@@ -4659,6 +4672,8 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        google_cloud_config=google_cloud_config,
+        google_cloud_store=google_cloud_store,
         github_config=github_config,
         github_store=github_store,
         databricks_config=databricks_config,

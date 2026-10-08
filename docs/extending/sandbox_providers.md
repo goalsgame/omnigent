@@ -313,3 +313,40 @@ a network policy can allowlist by exact host+port:
 Every endpoint on these servers (other than `GET /health`) requires a
 per-relay bearer token, so allowlisting their coordinates does not expose
 unauthenticated functionality.
+
+## Human Google Cloud connections
+
+Operators can enable a Google Cloud connection in Sandbox Integrations. Create
+an OAuth Web application client with the callback
+`https://<server>/v1/connections/google_cloud/callback`. Configure the server with
+`OMNIGENT_GOOGLE_CLOUD_CLIENT_ID`, `OMNIGENT_GOOGLE_CLOUD_CLIENT_SECRET`, and
+`OMNIGENT_GOOGLE_CLOUD_REDIRECT_URI`. Set `OMNIGENT_GOOGLE_CLOUD_AUTH=1`
+on the server as well; without it the connection routes and Settings panel
+stay disabled even when OAuth variables are present. A configured credential
+cipher is required.
+Google consent requests `openid`, `email`, and
+`https://www.googleapis.com/auth/cloud-platform`, including offline access.
+Use an Internal OAuth audience when access should be limited to your Workspace
+organization; external applications may require Google's verification process.
+
+Set `OMNIGENT_GOOGLE_CLOUD_AUTH=1` in managed sandbox hosts. For Kubernetes,
+include that name in `sandbox.kubernetes.env` and set it in the server's
+environment. Hosts must also have `IS_SANDBOX=1` and their managed launch token.
+Both server and host must run a version supporting this connection.
+
+After connecting Google Cloud in Settings → Sandbox Integrations, the owner's
+sandboxes use that Google account's existing IAM permissions. The host exposes
+a loopback metadata adapter understood by gcloud, Google SDK application default
+credentials, and the Terraform Google provider. Select a resource project
+explicitly, for example `gcloud projects describe PROJECT_ID` or the Terraform
+provider's `project` argument. APIs that require a quota project also require
+its standard client configuration and the user's permission to charge quota.
+No resource project or IAM grants are assigned by this connection.
+
+The server encrypts the offline refresh grant. Sandboxes receive only expiring
+access tokens. The adapter does not expose Google identity tokens or forward
+requests to node metadata. Disconnect prevents subsequent credential requests;
+already issued access tokens can remain usable until their Google expiration.
+A Google connection grants cloud access to code running in that owner's
+sandbox, so connect only accounts whose permissions are appropriate for that
+code. Machine identities cannot use this human connection.

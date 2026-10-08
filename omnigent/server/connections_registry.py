@@ -47,14 +47,24 @@ def connection_providers() -> list[ConnectionProvider]:
     from omnigent.server.databricks_identity import resolve_databricks_credential
     from omnigent.server.github_app_client import GitHubAppClient
     from omnigent.server.github_identity import resolve_github_credential
+    from omnigent.server.google_cloud import GoogleCloudClient, resolve_google_cloud_credential
     from omnigent.server.routes.connections_databricks import (
         create_connections_databricks_router,
     )
     from omnigent.server.routes.connections_github import (
         create_connections_github_router,
     )
+    from omnigent.server.routes.connections_google_cloud import (
+        create_connections_google_cloud_router,
+    )
 
     return [
+        ConnectionProvider(
+            name="google_cloud",
+            client_factory=GoogleCloudClient,
+            router_factory=create_connections_google_cloud_router,
+            credential_resolver=resolve_google_cloud_credential,
+        ),
         ConnectionProvider(
             name="github",
             client_factory=GitHubAppClient,

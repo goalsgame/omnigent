@@ -16,7 +16,7 @@ import json
 import logging
 from typing import Any, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -188,11 +188,15 @@ class CredentialStore:
         secret: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         account_id: str = "",
+        expected_metadata: dict[str, Any] | None = None,
     ) -> bool:
         """Persist a refreshed secret (and optional metadata) for an existing row.
 
+        ``expected_metadata`` conditionally updates the exact grant read before
+        refresh, preventing concurrent reconnects from being overwritten.
+
         Returns ``True`` when a row was updated, ``False`` when the connection
-        was removed between read and refresh. The caller must not treat
+        was removed or changed between read and refresh. The caller must not treat
         ``False`` as success: providers that rotate refresh tokens (GitHub does)
         have already spent the old one, so a silently-dropped refresh wedges the
         user until they reconnect — worth surfacing, not swallowing.
@@ -205,6 +209,22 @@ class CredentialStore:
 
         def write(session: Session) -> bool:
             require_active_account(session, user_id)
+            if expected_metadata is not None:
+                values: dict[str, Any] = {"secret_enc": secret_enc, "updated_at": updated_at}
+                if metadata_json is not None:
+                    values["metadata_json"] = metadata_json
+                result = session.execute(
+                    update(SqlConnection)
+                    .where(
+                        SqlConnection.workspace_id == workspace_id,
+                        SqlConnection.user_id == user_id,
+                        SqlConnection.provider == provider,
+                        SqlConnection.account_id == account_id,
+                        SqlConnection.metadata_json == json.dumps(expected_metadata),
+                    )
+                    .values(**values)
+                )
+                return cast(CursorResult, result).rowcount == 1
             row = session.get(SqlConnection, (workspace_id, user_id, provider, account_id))
             if row is None:
                 return False
@@ -217,8 +237,8 @@ class CredentialStore:
         updated = run_write_transaction(self._session_immediate, "update_secret", write)
         if not updated:
             _logger.warning(
-                "credential_store: update_secret found no %s connection for the user "
-                "(removed mid-refresh); the refreshed secret was discarded",
+                "credential_store: %s connection was removed or changed during refresh; "
+                "the refreshed secret was discarded",
                 provider,
             )
         return updated
