@@ -19,7 +19,7 @@ interface Access {
   authorization?: "operator";
 }
 
-/** Owner-only consent for all processes sharing this session's sandbox. */
+/** Human owner consent and reader-visible machine authorization for the session sandbox. */
 export function GoogleCloudSessionAccess({
   sessionId,
   machine = false,
