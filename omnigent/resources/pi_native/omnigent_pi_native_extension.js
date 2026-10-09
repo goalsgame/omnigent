@@ -2314,20 +2314,27 @@ module.exports = function (pi) {
       !message?.content?.some((block) => block.type === "toolCall");
     if (emptyTruncation) truncatedCompletion = true;
     if ((stopReason === "error" && errorMessage) || emptyTruncation) {
-      await postEvent(config, {
-        type: "external_conversation_item",
-        data: {
+      const errorText = emptyTruncation
+        ? "Pi reached its token limit without an answer. Check the model's context/output limits, or compact the session and retry."
+        : `Pi model error: ${errorMessage}`;
+      const sourceId = boundedSourceId(
+        `pi:error:${assistantMessageSourceId(message, responseId, errorText)}`,
+      );
+      if (postedAssistantMessages.has(sourceId)) return;
+      await postAssistantMessage(
+        config,
+        {
           response_id: responseId,
           item_type: "error",
           item_data: {
             source: "execution",
             code: "RuntimeError",
-            message: emptyTruncation
-              ? "Pi reached its token limit without an answer. Check the model's context/output limits, or compact the session and retry."
-              : `Pi model error: ${errorMessage}`,
+            message: errorText,
           },
         },
-      });
+        sourceId,
+      );
+      postedAssistantMessages.add(sourceId);
       return;
     }
     const text = textFromMessage(message);

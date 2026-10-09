@@ -140,7 +140,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
         limits_raw = value.get("model_limits", {})
         if not isinstance(limits_raw, dict):
             raise ValueError(f"Harness {name!r} model_limits must be a mapping")
-        if limits_raw and key != "pi-native":
+        if "model_limits" in value and key != "pi-native":
             raise ValueError("model_limits is supported only for pi-native")
         limits: dict[str, ModelLimitOverride] = {}
         for model_id, fields in limits_raw.items():

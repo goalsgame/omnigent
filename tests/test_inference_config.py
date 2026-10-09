@@ -463,9 +463,8 @@ def test_invalid_pi_model_limits_are_rejected(limits):
         parse_inference_config(config)
 
 
-def test_model_limits_reject_unsupported_harness():
-    config = _config(
-        codex={"provider": "bifrost", "model_limits": {"model-a": {"context_window": 1000000}}}
-    )
+@pytest.mark.parametrize("limits", [{}, {"model-a": {"context_window": 1000000}}])
+def test_model_limits_reject_unsupported_harness(limits):
+    config = _config(codex={"provider": "bifrost", "model_limits": limits})
     with pytest.raises(ValueError, match="only for pi-native"):
         parse_inference_config(config)
