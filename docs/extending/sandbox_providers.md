@@ -424,7 +424,9 @@ For JSON `POST /v1/sessions`, pass `"host_type": "managed"` and
 owners creating root sessions. Omission leaves access off. For an existing root with a dedicated managed sandbox,
 the machine owner, using a fresh direct OIDC machine bearer, can
 `POST /v1/sessions/{id}/google-cloud` with
-`{"enabled": true}` or `{"enabled": false}`. Readers can GET that endpoint to
+`{"enabled": true}`. The same owner can revoke with `{"enabled": false}`
+even while the host is missing, deleted or shared; a subsequent host replacement
+does not restore revoked access. Readers can GET that endpoint to
 inspect `state`, `authorization: "operator"`, `email`, `owner`, and `generation`;
 it never returns a token. The web session's Cloud control shows the operator
 policy without offering human consent controls. Other clients can use this API.

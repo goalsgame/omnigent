@@ -121,7 +121,7 @@ class GoogleCloudMachineBroker:
             ).all()
             if owners != [principal]:
                 raise PermissionError("Unique machine session owner required")
-            if enabled is not None:
+            if enabled is True:
                 host = (
                     db.get(SqlHost, (current_workspace_id(), row.host_id)) if row.host_id else None
                 )
@@ -142,6 +142,7 @@ class GoogleCloudMachineBroker:
                     ).all()
                     if roots != [session_id]:
                         raise PermissionError("Machine Cloud opt-in requires a dedicated sandbox")
+            if enabled is not None:
                 row.google_cloud_access = json.dumps(
                     {
                         "kind": "machine",

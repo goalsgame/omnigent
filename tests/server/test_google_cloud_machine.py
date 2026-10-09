@@ -334,3 +334,50 @@ def test_explicit_decision_requires_managed_root(setup, host_state):
     )
     assert result.status_code == 403
     assert s.broker.session(s.session, BOT)["state"] == "off"
+
+
+@pytest.mark.parametrize(
+    "host_state", ["hostless", "missing", "external", "deleted", "wrong_owner", "shared"]
+)
+def test_revocation_survives_host_unavailability_and_recovery(setup, host_state):
+    s = setup
+    s.broker.session(s.session, BOT, enabled=True)
+    extra_root = uuid.uuid4().hex
+    with Session(get_or_create_engine(s.uri)) as db:
+        host = db.get(SqlHost, (0, s.host))
+        root = db.get(SqlConversationMetadata, (0, s.session))
+        if host_state == "hostless":
+            root.host_id = None
+        elif host_state == "missing":
+            root.host_id = uuid.uuid4().hex
+        elif host_state == "external":
+            host.sandbox_provider = None
+        elif host_state == "deleted":
+            host.deleted_at = 1
+        elif host_state == "wrong_owner":
+            host.user_id = "oidc-machine:other"
+        elif host_state == "shared":
+            db.add(
+                SqlConversationMetadata(
+                    id=extra_root, host_id=s.host, workspace="/workspace", kind=1
+                )
+            )
+        db.commit()
+    response = s.client.post(
+        f"/v1/sessions/{s.session}/google-cloud",
+        json={"enabled": False},
+        headers={"X-Test-User": BOT},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "off"
+    with Session(get_or_create_engine(s.uri)) as db:
+        host = db.get(SqlHost, (0, s.host))
+        host.sandbox_provider = "agent_sandbox"
+        host.deleted_at = None
+        host.user_id = BOT
+        db.get(SqlConversationMetadata, (0, s.session)).host_id = s.host
+        if host_state == "shared":
+            db.delete(db.get(SqlConversationMetadata, (0, extra_root)))
+        db.commit()
+    assert s.broker.session(s.session, BOT)["state"] == "off"
+    assert vend(s).json()["connected"] is False

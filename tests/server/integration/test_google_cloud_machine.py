@@ -29,11 +29,18 @@ __all__ = ["machine_config", "oidc", "signing_key", "verifier"]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("standard_loader", [False, True])
 async def test_machine_create_opt_in(
-    runtime_init, db_uri, tmp_path, oidc, verifier, signing_key, monkeypatch
+    runtime_init, db_uri, tmp_path, oidc, verifier, signing_key, monkeypatch, standard_loader
 ):
     artifact = LocalArtifactStore(str(tmp_path / "artifacts"))
     permissions = SqlAlchemyPermissionStore(db_uri)
+    config = {
+        "google_cloud_machine_auth": {
+            PRINCIPAL: {"service_account": "test-bot@example-project.iam.gserviceaccount.com"}
+        }
+    }
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: config)
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -50,11 +57,7 @@ async def test_machine_create_opt_in(
                 "modal": {"image": "example/host:latest"},
             }
         ),
-        server_config={
-            "google_cloud_machine_auth": {
-                PRINCIPAL: {"service_account": "test-bot@example-project.iam.gserviceaccount.com"}
-            }
-        },
+        server_config=None if standard_loader else config,
     )
     # Provisioning is external to the API contract; keep this test entirely local.
     from omnigent.server.routes.sessions import routes_core

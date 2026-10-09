@@ -3857,7 +3857,7 @@ def create_app(
     )
 
     cloud_bindings = parse_machine_cloud_bindings(
-        (server_config or {}).get("google_cloud_machine_auth"),
+        resolved_server_config.get("google_cloud_machine_auth"),
         principals=machine_verifier.config.principals if machine_verifier else frozenset(),
     )
     machine_cloud = None
