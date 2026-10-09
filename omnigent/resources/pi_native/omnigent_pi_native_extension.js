@@ -1437,6 +1437,7 @@ module.exports = function (pi) {
   // agent_start, before turn_start) would look idle by activeResponseId yet the
   // loop is genuinely running — agentRunning arms it correctly. See F18.
   let agentRunning = false;
+  let truncatedCompletion = false;
   let compacting = false;
   let latestContext = null;
   let pendingInterruptUntil = 0;
@@ -2102,6 +2103,7 @@ module.exports = function (pi) {
     // completes. See F18.
     clearPendingInterrupt();
     agentRunning = true;
+    truncatedCompletion = false;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
     turnOrdinal = 0;
@@ -2152,7 +2154,7 @@ module.exports = function (pi) {
     if (compacting) return;
     await postEvent(config, {
       type: "external_session_status",
-      data: { status: "idle", response_id: endResponseId },
+      data: { status: truncatedCompletion ? "failed" : "idle", response_id: endResponseId },
     });
   });
 
@@ -2306,7 +2308,12 @@ module.exports = function (pi) {
       message && typeof message.errorMessage === "string"
         ? message.errorMessage
         : "";
-    if (stopReason === "error" && errorMessage) {
+    const emptyTruncation =
+      stopReason === "length" &&
+      !textFromMessage(message) &&
+      !message?.content?.some((block) => block.type === "toolCall");
+    if (emptyTruncation) truncatedCompletion = true;
+    if ((stopReason === "error" && errorMessage) || emptyTruncation) {
       await postEvent(config, {
         type: "external_conversation_item",
         data: {
@@ -2315,7 +2322,9 @@ module.exports = function (pi) {
           item_data: {
             source: "execution",
             code: "RuntimeError",
-            message: `Pi model error: ${errorMessage}`,
+            message: emptyTruncation
+              ? "Pi reached its token limit without an answer. Check the model's context/output limits, or compact the session and retry."
+              : `Pi model error: ${errorMessage}`,
           },
         },
       });
