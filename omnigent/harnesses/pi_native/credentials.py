@@ -1767,6 +1767,29 @@ def resolve_pi_native_provider(
                 curated_models=True,
                 model_allowlist=binding.model_allowlist,
             )
+        if binding.model_limits:
+
+            def apply_limits(models: list[_PiModelEntry]) -> list[_PiModelEntry]:
+                updated: list[_PiModelEntry] = []
+                for row in models:
+                    limits = binding.model_limits.get(row["id"])
+                    enriched: _PiModelEntry = {**row}
+                    if limits is not None:
+                        if limits.context_window is not None:
+                            enriched["contextWindow"] = limits.context_window
+                        if limits.max_output_tokens is not None:
+                            enriched["maxTokens"] = limits.max_output_tokens
+                    updated.append(enriched)
+                return updated
+
+            resolved = replace(
+                resolved,
+                extra_models=apply_limits(resolved.extra_models),
+                additional_providers={
+                    pid: {**payload, "models": apply_limits(payload["models"])}
+                    for pid, payload in resolved.additional_providers.items()
+                },
+            )
         return replace(resolved, inference_bound=True)
 
     selection = _split_pi_native_model_selection(model)

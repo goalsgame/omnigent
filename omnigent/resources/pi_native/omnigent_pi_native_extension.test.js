@@ -559,8 +559,41 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   }
 }
 
+
+async function testEmptyLengthCompletionFailsVisiblyAndRetryResets() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: false });
+  await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({ message: {
+    role: "assistant", content: [], stopReason: "length", timestamp: 123,
+  } }, ctx);
+  await h.handlers.agent_end({ messages: [] }, ctx);
+  const errors = h.postedEvents.filter(e => e.data?.item_type === "error");
+  assert("empty truncation is visible", errors.length === 1);
+  assert("error explains limits and recovery", errors[0].data.item_data.message.includes("compact"));
+  assert("empty truncation ends failed", statusEdges(h.postedEvents).at(-1).status === "failed");
+  await h.handlers.agent_start({}, ctx);
+  await h.handlers.agent_end({ messages: [] }, ctx);
+  assert("new turn clears previous failure", statusEdges(h.postedEvents).at(-1).status === "idle");
+}
+
+async function testLengthCompletionWithToolCallIsNotEmptyFailure() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: false });
+  await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({ message: {
+    role: "assistant", content: [{ type: "toolCall", id: "length-tool", name: "read", arguments: {} }],
+    stopReason: "length", timestamp: 124,
+  } }, ctx);
+  await h.handlers.agent_end({ messages: [] }, ctx);
+  assert("tool call completion is not an empty failure", !h.postedEvents.some(e => e.data?.item_type === "error"));
+  assert("tool call ends idle", statusEdges(h.postedEvents).at(-1).status === "idle");
+}
+
 (async () => {
   try {
+    await testEmptyLengthCompletionFailsVisiblyAndRetryResets();
+    await testLengthCompletionWithToolCallIsNotEmptyFailure();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();

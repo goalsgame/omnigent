@@ -10,7 +10,7 @@ import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -26,12 +26,21 @@ _runtime_config: ContextVar[dict[str, object] | None] = ContextVar(
 
 
 @dataclass(frozen=True)
+class ModelLimitOverride:
+    """Explicit endpoint limits for one exact model ID."""
+
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+
+
+@dataclass(frozen=True)
 class HarnessInferenceBinding:
     """A harness's provider and optional ordered model restriction."""
 
     provider: str
     default_model: str | None = None
     model_allowlist: tuple[str, ...] | None = None
+    model_limits: dict[str, ModelLimitOverride] = field(default_factory=dict)
 
 
 def validate_inference_credentials(
@@ -97,7 +106,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
     for name, value in harnesses.items():
         if not isinstance(name, str) or not name.strip() or not isinstance(value, dict):
             raise ValueError("Each inference harness must name a configuration mapping")
-        if set(value) - {"provider", "default_model", "model_allowlist"}:
+        if set(value) - {"provider", "default_model", "model_allowlist", "model_limits"}:
             raise ValueError(f"Unknown inference setting for harness {name!r}")
         provider = value.get("provider")
         if not isinstance(provider, str) or provider not in providers:
@@ -128,12 +137,39 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             "acp",
         } and not (key.startswith("acp:") and key.removeprefix("acp:").strip()):
             raise ValueError(f"Harness {name!r} does not support inference bindings")
+        limits_raw = value.get("model_limits", {})
+        if not isinstance(limits_raw, dict):
+            raise ValueError(f"Harness {name!r} model_limits must be a mapping")
+        if "model_limits" in value and key != "pi-native":
+            raise ValueError("model_limits is supported only for pi-native")
+        limits: dict[str, ModelLimitOverride] = {}
+        for model_id, fields in limits_raw.items():
+            if (
+                not isinstance(model_id, str)
+                or not model_id.strip()
+                or not isinstance(fields, dict)
+                or not fields
+                or set(fields) - {"context_window", "max_output_tokens"}
+            ):
+                raise ValueError("model_limits entries require a model ID and limit fields")
+            if any(type(limit) is not int or limit <= 0 for limit in fields.values()):
+                raise ValueError("Model limits must be positive integers")
+            if (
+                "context_window" in fields
+                and "max_output_tokens" in fields
+                and fields["max_output_tokens"] > fields["context_window"]
+            ):
+                raise ValueError("max_output_tokens cannot exceed context_window")
+            if allowed is not None and model_id not in allowed:
+                raise ValueError("model_limits IDs must belong to model_allowlist")
+            limits[model_id] = ModelLimitOverride(**fields)
         if key in result:
             raise ValueError(f"Duplicate inference binding for harness {key!r}")
         result[key] = HarnessInferenceBinding(
             provider=provider,
             default_model=default,
             model_allowlist=tuple(dict.fromkeys(allowed)) if allowed is not None else None,
+            model_limits=limits,
         )
     return result
 

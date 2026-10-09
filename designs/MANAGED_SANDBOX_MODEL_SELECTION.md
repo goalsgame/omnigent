@@ -77,6 +77,10 @@ sandbox:
           provider: bifrost
           default_model: gpt-primary
           model_allowlist: [gpt-primary, gpt-fast, claude-primary]
+          model_limits:
+            claude-primary:
+              context_window: 1000000
+              max_output_tokens: 128000
 ```
 
 `BIFROST_CATALOG_KEY` belongs in the server environment.
@@ -295,3 +299,20 @@ validation on this PR used Unity OAuth for Claude native and OpenRouter for Pi
 and OpenCode in an Agent Sandbox lab, across the three catalog modes. Validate
 customer-specific Bifrost entitlements and arbitrary ACP CLI authentication in
 the operator's deployment.
+
+### Pi model limits
+
+The `pi-native` binding accepts `model_limits`, keyed by exact provider model ID.
+Each entry can override `context_window`, `max_output_tokens`, or both. Values
+must be positive integers, and an output limit cannot exceed an explicitly
+configured context window. With a `model_allowlist`, limit keys must belong to
+that list. These overrides take precedence over provider-family and catalog
+limits, without changing the model's ID, routing or allowed model list.
+
+Use endpoint-supported limits for models missing from Omnigent's catalog. Pi's
+fallback context window may be smaller than the actual model's window and can
+leave only one output token once a review grows large. Empty length-terminated
+completions produce a visible error and failed turn; correct the limits or
+compact the session before retrying. Limits are saved in each session's inference snapshot and applied when its native
+Pi terminal launches. New sessions capture updated operator configuration;
+existing snapshots and already-running terminals retain their saved limits.

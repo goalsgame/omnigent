@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -3794,6 +3795,113 @@ def test_managed_alias_inherits_native_thinking_restrictions() -> None:
   }
   finish();
 })().catch((error) => { finish(); console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+@pytest.mark.parametrize("stop_reason", ["length", "error"])
+def test_completion_errors_are_visible_and_idempotent(stop_reason: str) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + "const stopReason = "
+        + json.dumps(stop_reason)
+        + ";"
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  const message = {
+    role: "assistant", content: [], stopReason, responseId: "completion-1",
+    errorMessage: stopReason === "error" ? "provider rejected request" : undefined,
+  };
+  const event = { message };
+  const errors = () => posted.filter(e =>
+    e.type === "external_conversation_item" && e.data.item_type === "error");
+  await handlers.message_end(event, ctx);
+  await handlers.message_end(event, ctx);
+  assert.equal(errors().length, 1, JSON.stringify(posted));
+  assert.match(errors()[0].data.source_id, /^pi:error:/);
+  assert.match(errors()[0].data.item_data.message,
+    stopReason === "length" ? /token limit/ : /provider rejected request/);
+  await handlers.agent_end({}, ctx);
+  const statuses = () => posted.filter(e => e.type === "external_session_status");
+  assert.equal(statuses().at(-1).data.status, stopReason === "length" ? "failed" : "idle");
+
+  await handlers.agent_start({}, ctx);
+  await handlers.message_end({ message: {
+    role: "assistant", content: [{ type: "text", text: "Recovered" }],
+    stopReason: "stop", responseId: "completion-2",
+  } }, ctx);
+  await handlers.agent_end({}, ctx);
+  assert.equal(statuses().at(-1).data.status, "idle");
+  finish();
+})().catch(error => { finish(); console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_empty_truncation_error_retries_after_failed_delivery() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  const event = { message: {
+    role: "assistant", content: [], stopReason: "length", responseId: "completion-1",
+  } };
+  const originalFetch = global.fetch;
+  let attempts = 0;
+  global.fetch = async (url, request) => {
+    const body = JSON.parse(request.body);
+    if (body.type === "external_conversation_item" && body.data.item_type === "error") {
+      attempts++;
+      return { ok: false, status: 503, text: async () => "unavailable" };
+    }
+    return originalFetch(url, request);
+  };
+  await assert.rejects(() => handlers.message_end(event, ctx));
+  assert.equal(attempts, 3);
+  global.fetch = originalFetch;
+  await handlers.message_end(event, ctx);
+  await handlers.message_end(event, ctx);
+  const errors = posted.filter(e =>
+    e.type === "external_conversation_item" && e.data.item_type === "error");
+  assert.equal(errors.length, 1, JSON.stringify(posted));
+  finish();
+})().catch(error => { finish(); console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_length_completion_with_tool_call_is_not_empty_failure() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.message_end({ message: {
+    role: "assistant", stopReason: "length", responseId: "tool-completion",
+    content: [{ type: "toolCall", id: "tool-1", name: "bash", arguments: {} }],
+  } }, ctx);
+  await handlers.agent_end({}, ctx);
+  const errors = posted.filter(e =>
+    e.type === "external_conversation_item" && e.data.item_type === "error");
+  assert.equal(errors.length, 0, JSON.stringify(posted));
+  const statuses = posted.filter(e => e.type === "external_session_status");
+  assert.equal(statuses.at(-1).data.status, "idle");
+  finish();
+})().catch(error => { finish(); console.error(error); process.exit(1); });
 """
     )
     _run_extension_script(node, _extension_path(), script)

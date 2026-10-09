@@ -414,3 +414,57 @@ def test_revision_changes_with_routing_or_discovery_inputs(
         target = target[key]
     target[path[-1]] = replacement
     assert inference_revision(config, discovery) != before
+
+
+def test_pi_model_limits_survive_runtime_snapshot():
+    config = _config(
+        **{
+            "pi-native": {
+                "provider": "bifrost",
+                "default_model": "model-a",
+                "model_allowlist": ["model-a"],
+                "model_limits": {
+                    "model-a": {"context_window": 1_000_000, "max_output_tokens": 128_000}
+                },
+            }
+        }
+    )
+    binding = parse_inference_config(config)["pi-native"]
+    assert binding.model_limits["model-a"].context_window == 1_000_000
+    assert binding.model_limits["model-a"].max_output_tokens == 128_000
+    assert snapshot_runtime_config({"runtime_config": config})["inference"] == config["inference"]
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        [],
+        {"model-a": {}},
+        {"model-a": {"unknown": 1}},
+        {"model-a": {"context_window": True}},
+        {"model-a": {"context_window": 0}},
+        {"model-a": {"max_output_tokens": -1}},
+        {"model-a": {"max_output_tokens": "128000"}},
+        {"model-a": {"context_window": 128000, "max_output_tokens": 128001}},
+        {"other-model": {"context_window": 1_000_000}},
+    ],
+)
+def test_invalid_pi_model_limits_are_rejected(limits):
+    config = _config(
+        **{
+            "pi-native": {
+                "provider": "bifrost",
+                "model_allowlist": ["model-a"],
+                "model_limits": limits,
+            }
+        }
+    )
+    with pytest.raises(ValueError):
+        parse_inference_config(config)
+
+
+@pytest.mark.parametrize("limits", [{}, {"model-a": {"context_window": 1000000}}])
+def test_model_limits_reject_unsupported_harness(limits):
+    config = _config(codex={"provider": "bifrost", "model_limits": limits})
+    with pytest.raises(ValueError, match="only for pi-native"):
+        parse_inference_config(config)
