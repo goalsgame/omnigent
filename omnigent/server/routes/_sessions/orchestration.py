@@ -124,6 +124,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_READ,
+    AuthProvider,
     local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
@@ -2201,6 +2202,9 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    approval_request: Request | None = None,
+    approval_auth: AuthProvider | None = None,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -2252,6 +2256,10 @@ async def _resolve_elicitation(
     # malformed body. A missing id degrades gracefully below (no Future
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
+    from omnigent.server.google_cloud_approval import resolve_google_cloud_access
+
+    if await resolve_google_cloud_access(session_id, data, approval_request, approval_auth):
+        return
     elicitation_id = data.get("elicitation_id", "")
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():

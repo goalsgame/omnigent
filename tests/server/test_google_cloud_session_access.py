@@ -35,6 +35,9 @@ class UserAuth(AuthProvider):
     def get_user_id(self, request):
         return request.headers.get("X-Test-User")
 
+    def get_credential_user_id(self, request):
+        return request.headers.get("X-Test-User")
+
 
 @pytest.fixture
 def setup(db_uri, request):

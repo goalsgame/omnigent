@@ -811,6 +811,15 @@ def register_hooks_routes(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
             )
+        if phase == Phase.TOOL_CALL and not is_read_only:
+            from omnigent.server.google_cloud_approval import preflight_google_cloud
+
+            cloud_denial = await preflight_google_cloud(request, conv.host_id, data)
+            if cloud_denial:
+                return Response(
+                    content=json.dumps({"result": "POLICY_ACTION_DENY", "reason": cloud_denial}),
+                    media_type="application/json",
+                )
         agent = agent_store.get(conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).

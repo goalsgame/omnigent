@@ -1540,3 +1540,28 @@ describe("ApprovalCard — prompt expired", () => {
     expect(screen.queryByTestId("prompt-expired-hint")).toBeNull();
   });
 });
+
+it("answers Google Cloud consent through the existing approval action", () => {
+  const previous = useChatStore.getState().submitApproval;
+  const submit = vi.fn().mockResolvedValue(undefined);
+  useChatStore.setState({ submitApproval: submit });
+  try {
+    render(
+      <ApprovalCard
+        elicitationId="elicit_google_cloud_fixture"
+        message="Allow this sandbox to use Google Cloud as person@example.com? Only the session owner can approve."
+        phase="tool_call"
+        policyName="Google Cloud access"
+        contentPreview=""
+        requestedSchema={{ type: "object", properties: {} }}
+        status="pending"
+        response={null}
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^approve/i }));
+    expect(submit).toHaveBeenCalledWith("elicit_google_cloud_fixture", "accept", undefined);
+  } finally {
+    useChatStore.setState({ submitApproval: previous });
+  }
+});

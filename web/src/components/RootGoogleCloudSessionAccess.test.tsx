@@ -61,7 +61,8 @@ it.each(["root", "child", "grandchild", "depth-12"])(
   "reads and approves the root while viewing %s",
   async (id) => {
     mount(id);
-    fireEvent.click(await screen.findByRole("button", { name: "Allow for this session" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Google Cloud access: requested" }));
+    fireEvent.click(screen.getByRole("button", { name: "Allow for this session" }));
     await screen.findByRole("button", { name: "Google Cloud access: allowed" });
     expect(getSessionOwner).toHaveBeenCalledWith("root");
     expect(getSessionSlim).toHaveBeenCalledTimes(1);

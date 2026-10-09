@@ -128,7 +128,8 @@ def create_connections_google_cloud_router(
     @router.get("/connections/google_cloud/sessions/{session_id}/access")
     async def session_access(session_id: str, request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
-        user = require_user(request, auth_provider)
+        require_user(request, auth_provider)
+        user = auth_provider.get_credential_user_id(request) if auth_provider else None
         if user is None or user == RESERVED_USER_LOCAL:
             raise HTTPException(403, "Google Cloud sandbox access requires server authentication")
         if user.startswith("oidc-machine:"):
@@ -145,19 +146,24 @@ def create_connections_google_cloud_router(
         session_id: str, body: GoogleCloudAccessDecision, request: Request, response: Response
     ):
         response.headers["Cache-Control"] = "no-store"
-        user = require_user(request, auth_provider)
+        require_user(request, auth_provider)
+        user = auth_provider.get_credential_user_id(request) if auth_provider else None
         if user is None or user == RESERVED_USER_LOCAL:
             raise HTTPException(403, "Google Cloud sandbox access requires server authentication")
         if user.startswith("oidc-machine:"):
             raise HTTPException(403, "Human session owner required")
         try:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 store.access.session,
                 session_id,
                 user,
                 decision=body.decision,
                 generation=body.generation,
             )
+            from omnigent.server.google_cloud_approval import settle_google_cloud_access
+
+            settle_google_cloud_access(session_id, user, body.generation, body.decision)
+            return result
         except PermissionError as exc:
             raise HTTPException(403, str(exc)) from None
         except ValueError as exc:
