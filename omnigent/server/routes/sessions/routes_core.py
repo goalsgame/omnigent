@@ -767,6 +767,27 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        machine_cloud = getattr(request.app.state, "google_cloud_machine_broker", None)
+        if body.google_cloud_access:
+            authority = (
+                await asyncio.to_thread(auth_provider.get_machine_credential_user_id, request)
+                if auth_provider
+                else None
+            )
+            if authority is None or authority != user_id:
+                raise HTTPException(403, "Direct machine authentication required for Cloud opt-in")
+            if (
+                machine_cloud is None
+                or body.host_type != "managed"
+                or body.parent_session_id is not None
+            ):
+                raise HTTPException(
+                    403, "Machine Cloud access requires a configured managed root session"
+                )
+            try:
+                await asyncio.to_thread(machine_cloud.binding, user_id)
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from None
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -870,6 +891,12 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
+        if body.google_cloud_access:
+            assert machine_cloud is not None
+            try:
+                await asyncio.to_thread(machine_cloud.session, resp.id, user_id, enabled=True)
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from None
         # Push the new session to this user's other open tabs (see the
         # multipart path above for the rationale).
         _announce_session_added(user_id, resp.id)

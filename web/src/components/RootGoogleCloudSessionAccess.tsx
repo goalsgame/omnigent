@@ -9,6 +9,7 @@ export function RootGoogleCloudSessionAccess({ sessionId }: { sessionId: string 
   const rootId = session?.rootSessionId ?? null;
   const viewerId = useViewerId();
   const { data: owner } = useSessionOwner(rootId);
-  if (!rootId || !viewerId || viewerId === "local" || owner !== viewerId) return null;
-  return <GoogleCloudSessionAccess key={rootId} sessionId={rootId} />;
+  const machine = owner?.startsWith("oidc-machine:") ?? false;
+  if (!rootId || !viewerId || viewerId === "local" || (!machine && owner !== viewerId)) return null;
+  return <GoogleCloudSessionAccess key={rootId} sessionId={rootId} machine={machine} />;
 }

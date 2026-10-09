@@ -3849,6 +3849,32 @@ def create_app(
         )
     app.state.github_machine_broker = github_machine_broker
 
+    from omnigent.server.google_cloud_machine import (
+        GoogleCloudMachineBroker,
+        parse_machine_cloud_bindings,
+    )
+
+    cloud_bindings = parse_machine_cloud_bindings(
+        (server_config or {}).get("google_cloud_machine_auth"),
+        principals=machine_verifier.config.principals if machine_verifier else frozenset(),
+    )
+    machine_cloud = None
+    if cloud_bindings:
+        if permission_store is None or machine_verifier is None or auth_provider is None:
+            raise RuntimeError("Machine Cloud access requires SQL permissions and machine auth")
+        machine_cloud = GoogleCloudMachineBroker(
+            permission_store.storage_location, cloud_bindings, machine_verifier.principal_allowed
+        )
+        from omnigent.server.routes.google_cloud_machine import create_machine_cloud_router
+
+        app.include_router(
+            create_machine_cloud_router(
+                machine_cloud, auth_provider, permission_store, conversation_store
+            ),
+            prefix="/v1",
+        )
+    app.state.google_cloud_machine_broker = machine_cloud
+
     from omnigent.server.openrouter_wif import OpenRouterWIFBroker, OpenRouterWIFConfig
 
     openrouter_wif_config = OpenRouterWIFConfig.parse(resolved_server_config.get("openrouter_wif"))

@@ -165,3 +165,24 @@ it("lets the owner dismiss a request without polling immediately reopening it", 
   fireEvent.click(screen.getByRole("button", { name: "Google Cloud access: requested" }));
   expect(screen.getByRole("dialog")).toBeTruthy();
 });
+
+it("shows operator-authorized machine identity without personal consent controls", async () => {
+  fetchMock.mockResolvedValue(
+    response({
+      state: "allowed",
+      email: "test-bot@example-project.iam.gserviceaccount.com",
+      authorization: "operator",
+      generation: "policy",
+    }),
+  );
+  render(<GoogleCloudSessionAccess sessionId="machine-session" machine />);
+  fireEvent.click(await screen.findByRole("button", { name: "Google Cloud access: allowed" }));
+  expect(screen.getByText("Operator-authorized Google Cloud access")).toBeTruthy();
+  expect(screen.getByText("test-bot@example-project.iam.gserviceaccount.com")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Revoke access" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Allow for this session" })).toBeNull();
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/v1/sessions/machine-session/google-cloud",
+    expect.anything(),
+  );
+});

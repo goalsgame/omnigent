@@ -21,6 +21,10 @@ class GoogleCloudNotConnected(ValueError):
     """The owner has no Google Cloud connection."""
 
 
+class GoogleCloudMachineDenied(ValueError):
+    """Machine policy or session opt-in does not authorize Cloud credentials."""
+
+
 class GoogleCloudAccessRequired(ValueError):
     """The session owner has not granted sandbox access."""
 
@@ -53,6 +57,10 @@ class GoogleCloudMetadataServer(ThreadingHTTPServer):
         data = response.json()
         if data.get("connected") is False:
             reason = data.get("reason", "")
+            if reason == "machine_access_denied":
+                raise GoogleCloudMachineDenied(
+                    "Machine Cloud access requires an operator binding and session opt-in"
+                )
             if reason == "session_access_unavailable":
                 raise GoogleCloudAccessUnavailable("Session-scoped access unavailable")
             if (
@@ -126,6 +134,13 @@ class GoogleCloudMetadataHandler(BaseHTTPRequestHandler):
             return
         try:
             credential = cast(GoogleCloudMetadataServer, self.server).credential()
+        except GoogleCloudMachineDenied:
+            self.reply(
+                403,
+                "Machine Google Cloud access is not authorized; "
+                "configure the operator binding and opt this session in",
+            )
+            return
         except GoogleCloudAccessUnavailable:
             self.reply(
                 403,

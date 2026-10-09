@@ -236,6 +236,18 @@ def _cloud_shell_command(command: str, depth: int = 0) -> bool:
 
 async def preflight_google_cloud(request: Request, host_id: str | None, data: Any) -> str | None:
     """Park cloud tool calls before execution; return a denial reason on refusal."""
+    machine = getattr(request.app.state, "google_cloud_machine_broker", None)
+    if machine is not None and host_id and cloud_command(data):
+        try:
+            context = await asyncio.to_thread(machine.host, host_id)
+        except PermissionError:
+            return "Machine Google Cloud access is not authorized for this sandbox."
+        if context is not None:
+            return (
+                None
+                if context["state"] == "allowed"
+                else "Machine Google Cloud access was not requested for this session."
+            )
     store = getattr(request.app.state, "google_cloud_store", None)
     if store is None or not host_id or not cloud_command(data):
         return None

@@ -399,3 +399,50 @@ requests to node metadata. Disconnect prevents subsequent credential requests;
 already issued access tokens can remain usable until their Google expiration.
 A session approval grants cloud access to code throughout its sandbox. Use an
 account whose permissions are appropriate for that code. Machine identities cannot use this human connection.
+
+## Machine Google Cloud access
+
+Machine sessions use operator-configured service accounts rather than human OAuth
+connections. Configure an exact, already-bound OIDC machine principal:
+
+```yaml
+google_cloud_machine_auth:
+  "oidc-machine:ticket-worker":
+    service_account: "ticket-worker@example-project.iam.gserviceaccount.com"
+```
+
+The server obtains its source credential from Google metadata (for example,
+through Workload Identity Federation for GKE). Grant that server identity
+`iam.serviceAccounts.getAccessToken` on each configured target service account;
+grant each target only the resource permissions that its bot needs. Enable the
+IAM Service Account Credentials API. Neither the sandbox nor the bot needs a
+service-account key. The server is trusted to enforce the machine-to-account
+mapping. No Keycloak token is exchanged with Google or retained for renewal.
+
+For JSON `POST /v1/sessions`, pass `"host_type": "managed"` and
+`"google_cloud_access": true`. The opt-in is available only to configured machine
+owners creating root sessions. Omission leaves access off. For an existing root,
+the machine owner, using a fresh direct OIDC machine bearer, can
+`POST /v1/sessions/{id}/google-cloud` with
+`{"enabled": true}` or `{"enabled": false}`. Readers can GET that endpoint to
+inspect `state`, `authorization: "operator"`, `email`, `owner`, and `generation`;
+it never returns a token. The web session's Cloud control shows the operator
+policy without offering human consent controls. Other clients can use this API.
+
+The existing sandbox metadata adapter supplies credentials to gcloud, Terraform
+and Google SDKs. Select the resource project explicitly (`gcloud --project=...`,
+or the Terraform provider's `project` argument); a service account's home project
+is not its allowed-resource list. Machine credentials are issued for ten minutes
+and refreshed on demand. Session opt-in survives server restarts and workspace
+suspension. A different service-account mapping requires a fresh opt-in.
+
+Removing a machine binding, disabling session access or deleting the host stops
+new credential delivery. Already-issued tokens remain usable until expiry.
+All processes and command-capable collaborators within an authorized sandbox can
+use its service account. A human collaborator cannot enable machine access or
+substitute a personal Google connection. Normal command-safety policies still
+apply independently of the machine credential policy.
+
+Managed-runner and locally minted session tokens cannot change machine Cloud
+opt-in. Custom authentication providers must explicitly implement
+`get_machine_credential_user_id` to verify direct automation authority.

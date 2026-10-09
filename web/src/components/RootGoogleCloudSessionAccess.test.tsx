@@ -94,3 +94,14 @@ it("does not guess a root when the snapshot omits it", async () => {
   expect(authenticatedFetch).not.toHaveBeenCalled();
   expect(screen.queryByRole("button")).toBeNull();
 });
+
+it("shows a shared machine root's operator policy to a human viewer", async () => {
+  vi.mocked(getSessionOwner).mockResolvedValue("oidc-machine:test-bot");
+  mount("child");
+  await waitFor(() =>
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/root/google-cloud",
+      expect.anything(),
+    ),
+  );
+});

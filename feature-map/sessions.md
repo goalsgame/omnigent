@@ -394,3 +394,13 @@ provider replies and do not issue real Google tokens.
   shows the command instead.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
   message. That is expected; run them with plain `uv run pytest`.
+
+### Operator-authorized machine Cloud access
+
+A configured machine owner may opt a managed root session into Cloud access with
+`google_cloud_access: true` on JSON creation. Readers see its service account and
+operator authorization in the root session's Cloud dialog; personal Allow/Revoke
+controls are absent. Use `tests/server/integration/test_google_cloud_machine.py`
+for the authenticated create path and `tests/server/test_google_cloud_machine.py`
+for opt-in, isolation, revocation, refresh and wake behavior. The Cloud component
+and root component suites cover the read-only machine display.
