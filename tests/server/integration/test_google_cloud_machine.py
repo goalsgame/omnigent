@@ -66,6 +66,9 @@ async def test_machine_create_opt_in(
         base_url="https://app.example.test",
         headers=headers,
     ) as client:
+        info = (await client.get("/v1/info")).json()
+        assert info["machine_google_cloud_enabled"] is True
+        assert "google_cloud" not in info["enabled_connections"]
         agent = await create_test_agent(client)
         for enabled in (False, True):
             response = await client.post(

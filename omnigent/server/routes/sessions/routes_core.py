@@ -894,7 +894,9 @@ def register_core_routes(
         if body.google_cloud_access:
             assert machine_cloud is not None
             try:
-                await asyncio.to_thread(machine_cloud.session, resp.id, user_id, enabled=True)
+                await asyncio.to_thread(
+                    machine_cloud.session, resp.id, user_id, enabled=True, provisional=True
+                )
             except PermissionError as exc:
                 raise HTTPException(403, str(exc)) from None
         # Push the new session to this user's other open tabs (see the

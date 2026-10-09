@@ -233,3 +233,21 @@ describe("resolveServerInfo branding", () => {
     expect(malformed.branding).toBeNull();
   });
 });
+
+it("exposes machine-only session Cloud controls without human integrations", async () => {
+  const { hasGoogleCloudSessionAccess } = await import("./capabilities");
+  const machineOnly = info({ machine_google_cloud_enabled: true, enabled_connections: [] });
+  expect(hasGoogleCloudSessionAccess(machineOnly)).toBe(true);
+  expect(machineOnly.enabled_connections).toEqual([]);
+  expect(hasGoogleCloudSessionAccess(info({ enabled_connections: ["google_cloud"] }))).toBe(true);
+  expect(hasGoogleCloudSessionAccess(info({ enabled_connections: [] }))).toBe(false);
+});
+
+it.each([true, false, undefined, "true"])(
+  "parses machine Cloud capability %s independently of OAuth",
+  async (flag) => {
+    const result = await probe({ machine_google_cloud_enabled: flag, enabled_connections: [] });
+    expect(result.machine_google_cloud_enabled).toBe(flag === true);
+    expect(result.enabled_connections).toEqual([]);
+  },
+);

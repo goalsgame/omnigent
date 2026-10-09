@@ -95,6 +95,7 @@ class GoogleCloudMachineBroker:
         *,
         enabled: bool | None = None,
         expected_host: str | None = None,
+        provisional: bool = False,
     ) -> dict[str, Any]:
         binding = self.binding(principal)
         with self._session("session_access") as db:
@@ -121,6 +122,26 @@ class GoogleCloudMachineBroker:
             if owners != [principal]:
                 raise PermissionError("Unique machine session owner required")
             if enabled is not None:
+                host = (
+                    db.get(SqlHost, (current_workspace_id(), row.host_id)) if row.host_id else None
+                )
+                if not (provisional and row.host_id is None):
+                    if (
+                        host is None
+                        or host.deleted_at is not None
+                        or host.user_id != principal
+                        or not host.sandbox_provider
+                    ):
+                        raise PermissionError("Machine Cloud opt-in requires a managed sandbox")
+                    roots = db.scalars(
+                        select(SqlConversationMetadata.id).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.host_id == row.host_id,
+                            SqlConversationMetadata.kind == 1,
+                        )
+                    ).all()
+                    if roots != [session_id]:
+                        raise PermissionError("Machine Cloud opt-in requires a dedicated sandbox")
                 row.google_cloud_access = json.dumps(
                     {
                         "kind": "machine",

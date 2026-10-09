@@ -177,6 +177,7 @@ class ServerInfoResponse(BaseModel):
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
     enabled_connections: list[str]
+    machine_google_cloud_enabled: bool = False
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     server_version: str
@@ -3060,6 +3061,7 @@ def create_app(
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
                 "enabled_connections": enabled_connections,
+                "machine_google_cloud_enabled": app.state.google_cloud_machine_broker is not None,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "server_version": _server_version(),

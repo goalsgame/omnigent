@@ -421,7 +421,7 @@ mapping. No Keycloak token is exchanged with Google or retained for renewal.
 
 For JSON `POST /v1/sessions`, pass `"host_type": "managed"` and
 `"google_cloud_access": true`. The opt-in is available only to configured machine
-owners creating root sessions. Omission leaves access off. For an existing root,
+owners creating root sessions. Omission leaves access off. For an existing root with a dedicated managed sandbox,
 the machine owner, using a fresh direct OIDC machine bearer, can
 `POST /v1/sessions/{id}/google-cloud` with
 `{"enabled": true}` or `{"enabled": false}`. Readers can GET that endpoint to
@@ -446,3 +446,7 @@ apply independently of the machine credential policy.
 Managed-runner and locally minted session tokens cannot change machine Cloud
 opt-in. Custom authentication providers must explicitly implement
 `get_machine_credential_user_id` to verify direct automation authority.
+
+Machine-only deployments advertise `machine_google_cloud_enabled` through
+`/v1/info`; this exposes session authorization status without adding a human
+OAuth connection to Sandbox Integrations.

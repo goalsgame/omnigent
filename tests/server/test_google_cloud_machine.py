@@ -300,3 +300,37 @@ def test_fork_does_not_inherit_machine_opt_in(setup):
     fork = SqlAlchemyConversationStore(s.uri).fork_conversation(s.session)
     SqlAlchemyPermissionStore(s.uri).grant(BOT, fork.id, 4)
     assert s.broker.session(fork.id, BOT)["state"] == "off"
+
+
+@pytest.mark.parametrize(
+    "host_state", ["hostless", "missing", "external", "deleted", "wrong_owner", "shared"]
+)
+def test_explicit_decision_requires_managed_root(setup, host_state):
+    s = setup
+    with Session(get_or_create_engine(s.uri)) as db:
+        host = db.get(SqlHost, (0, s.host))
+        root = db.get(SqlConversationMetadata, (0, s.session))
+        if host_state == "hostless":
+            root.host_id = None
+        elif host_state == "missing":
+            root.host_id = uuid.uuid4().hex
+        elif host_state == "external":
+            host.sandbox_provider = None
+        elif host_state == "deleted":
+            host.deleted_at = 1
+        elif host_state == "wrong_owner":
+            host.user_id = "oidc-machine:other"
+        elif host_state == "shared":
+            db.add(
+                SqlConversationMetadata(
+                    id=uuid.uuid4().hex, host_id=s.host, workspace="/workspace", kind=1
+                )
+            )
+        db.commit()
+    result = s.client.post(
+        f"/v1/sessions/{s.session}/google-cloud",
+        json={"enabled": True},
+        headers={"X-Test-User": BOT},
+    )
+    assert result.status_code == 403
+    assert s.broker.session(s.session, BOT)["state"] == "off"

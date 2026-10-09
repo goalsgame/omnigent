@@ -402,5 +402,7 @@ A configured machine owner may opt a managed root session into Cloud access with
 operator authorization in the root session's Cloud dialog; personal Allow/Revoke
 controls are absent. Use `tests/server/integration/test_google_cloud_machine.py`
 for the authenticated create path and `tests/server/test_google_cloud_machine.py`
-for opt-in, isolation, revocation, refresh and wake behavior. The Cloud component
+for opt-in, isolation, revocation, refresh and wake behavior.
+`tests/e2e/test_google_cloud_machine.py` exercises direct machine authorization
+through the HTTP broker and sandbox metadata endpoint. The Cloud component
 and root component suites cover the read-only machine display.
