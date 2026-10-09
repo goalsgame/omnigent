@@ -446,8 +446,8 @@ substitute a personal Google connection. Normal command-safety policies still
 apply independently of the machine credential policy.
 
 Managed-runner and locally minted session tokens cannot change machine Cloud
-opt-in. Custom authentication providers must explicitly implement
-`get_machine_credential_user_id` to verify direct automation authority.
+opt-in. Machine Cloud configuration requires the built-in `UnifiedAuthProvider`
+with OIDC machine authentication; custom authentication providers are not supported.
 
 Machine-only deployments advertise `machine_google_cloud_enabled` through
 `/v1/info`; this exposes session authorization status without adding a human

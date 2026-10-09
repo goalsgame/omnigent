@@ -7,7 +7,7 @@ import pytest
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -107,3 +107,31 @@ async def test_machine_create_opt_in(
         assert (await client.get(f"/v1/sessions/{sid}/google-cloud")).json()["state"] == "allowed"
         permissions.set_admin(PRINCIPAL, True)
         assert (await client.get(f"/v1/sessions/{sid}/google-cloud")).status_code == 401
+
+
+def test_custom_auth_machine_cloud_configuration_is_rejected(runtime_init, db_uri, tmp_path):
+    class CustomMachineAuth(AuthProvider):
+        def get_user_id(self, request):
+            return PRINCIPAL
+
+        def get_machine_credential_user_id(self, request):
+            return PRINCIPAL
+
+    artifact = LocalArtifactStore(str(tmp_path / "artifacts"))
+    with pytest.raises(RuntimeError, match="requires built-in OIDC machine authentication"):
+        create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact,
+            agent_cache=AgentCache(artifact_store=artifact, cache_dir=tmp_path / "cache"),
+            permission_store=SqlAlchemyPermissionStore(db_uri),
+            auth_provider=CustomMachineAuth(),
+            server_config={
+                "google_cloud_machine_auth": {
+                    PRINCIPAL: {
+                        "service_account": "test-bot@example-project.iam.gserviceaccount.com"
+                    }
+                }
+            },
+        )

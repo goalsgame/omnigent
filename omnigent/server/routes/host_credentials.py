@@ -111,6 +111,7 @@ def create_host_credentials_router(
             except PermissionError:
                 return {"connected": False, "reason": "machine_access_denied"}
             except Exception:  # noqa: BLE001
+                _logger.warning("machine Google Cloud credential resolve failed", exc_info=True)
                 raise HTTPException(
                     503,
                     "Machine Google Cloud credential unavailable",

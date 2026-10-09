@@ -49,11 +49,15 @@ beforeEach(() => {
       }) as Response,
   );
 });
-function mount(id: string) {
+function mount(id: string, humanEnabled = true, machineEnabled = true) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <RootGoogleCloudSessionAccess sessionId={id} />
+      <RootGoogleCloudSessionAccess
+        sessionId={id}
+        humanEnabled={humanEnabled}
+        machineEnabled={machineEnabled}
+      />
     </QueryClientProvider>,
   );
 }
@@ -105,3 +109,35 @@ it("shows a shared machine root's operator policy to a human viewer", async () =
     ),
   );
 });
+
+it.each([
+  ["owner@example.com", false, true],
+  ["oidc-machine:test-bot", true, false],
+  ["owner@example.com", false, false],
+  ["oidc-machine:test-bot", false, false],
+] as const)(
+  "does not poll unsupported Cloud capability for %s",
+  async (owner, humanEnabled, machineEnabled) => {
+    vi.mocked(getSessionOwner).mockResolvedValue(owner);
+    await act(async () => {
+      mount("child", humanEnabled, machineEnabled);
+    });
+    await waitFor(() => expect(getSessionOwner).toHaveBeenCalledWith("root"));
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button")).toBeNull();
+  },
+);
+
+it.each([
+  ["owner@example.com", true, false, "/v1/connections/google_cloud/sessions/root/access"],
+  ["oidc-machine:test-bot", false, true, "/v1/sessions/root/google-cloud"],
+] as const)(
+  "polls the supported Cloud capability for %s",
+  async (owner, humanEnabled, machineEnabled, endpoint) => {
+    vi.mocked(getSessionOwner).mockResolvedValue(owner);
+    mount("child", humanEnabled, machineEnabled);
+    await waitFor(() =>
+      expect(authenticatedFetch).toHaveBeenCalledWith(endpoint, expect.anything()),
+    );
+  },
+);

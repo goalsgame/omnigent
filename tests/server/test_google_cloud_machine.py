@@ -278,7 +278,7 @@ async def test_wake_with_replacement_host_retains_opt_in(setup):
 
 
 @pytest.mark.asyncio
-async def test_expired_cache_refreshes_and_provider_failure_is_sanitized(setup):
+async def test_expired_cache_refreshes_and_provider_failure_is_sanitized(setup, caplog):
     s = setup
     s.broker.session(s.session, BOT, enabled=True)
     await s.broker.credential(s.host, BOT)
@@ -292,6 +292,7 @@ async def test_expired_cache_refreshes_and_provider_failure_is_sanitized(setup):
     assert response.status_code == 503
     assert "sensitive" not in response.text
     assert response.headers["cache-control"] == "no-store"
+    assert "machine Google Cloud credential resolve failed" in caplog.text
 
 
 def test_fork_does_not_inherit_machine_opt_in(setup):

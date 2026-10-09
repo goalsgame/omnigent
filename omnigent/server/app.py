@@ -3856,8 +3856,13 @@ def create_app(
         parse_machine_cloud_bindings,
     )
 
+    cloud_config = resolved_server_config.get("google_cloud_machine_auth")
+    if cloud_config and machine_verifier is None:
+        raise RuntimeError(
+            "google_cloud_machine_auth requires built-in OIDC machine authentication"
+        )
     cloud_bindings = parse_machine_cloud_bindings(
-        resolved_server_config.get("google_cloud_machine_auth"),
+        cloud_config,
         principals=machine_verifier.config.principals if machine_verifier else frozenset(),
     )
     machine_cloud = None

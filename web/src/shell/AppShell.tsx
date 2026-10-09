@@ -2471,6 +2471,8 @@ export function AppShell() {
                         <RootGoogleCloudSessionAccess
                           key={serverConversationId}
                           sessionId={serverConversationId}
+                          humanEnabled={serverInfo.enabled_connections.includes("google_cloud")}
+                          machineEnabled={serverInfo.machine_google_cloud_enabled === true}
                         />
                       ) : undefined
                     }
