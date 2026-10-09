@@ -226,16 +226,13 @@ async def preflight_google_cloud(request: Request, host_id: str | None, data: An
         return None
     pending = await request_google_cloud_access(store, host_id)
     if pending is not None:
-        try:
-            approved = await asyncio.shield(pending.future)
-        except asyncio.CancelledError:
-            _finish(pending, False, "cancel")
-            raise
+        # A disconnected waiter must not cancel consent shared by other commands.
+        approved = await asyncio.shield(pending.future)
         if not approved:
             return "Google Cloud access was not approved; command not started."
     context = await asyncio.to_thread(store.access.host_request, host_id)
     # Unconnected accounts can still use explicitly supplied CLI credentials.
-    if pending is None and (context is None or context["state"] == "not_connected"):
+    if pending is None and context is not None and context["state"] == "not_connected":
         return None
     if context is None or (
         pending is not None

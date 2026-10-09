@@ -33,6 +33,9 @@ class UserAuth(AuthProvider):
     def get_user_id(self, request):
         return request.headers.get("X-Test-User")
 
+    def get_credential_user_id(self, request):
+        return request.headers.get("X-Test-User")
+
 
 def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
     user = "person@example.com"

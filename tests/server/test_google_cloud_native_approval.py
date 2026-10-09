@@ -280,3 +280,123 @@ async def test_actual_timeout_clears_native_prompt(setup, monkeypatch):
     assert await asyncio.wait_for(asyncio.shield(pending.future), 2) is False
     assert pending_elicitations.count_for(setup.session) == 0
     assert setup.store.access.host(setup.host, OWNER) != "allowed"
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_must_explicitly_authorize_credential_grants(setup):
+    from omnigent.server.auth import AuthProvider
+
+    class DelegatingProvider(AuthProvider):
+        def get_user_id(self, request):
+            return OWNER
+
+    provider = DelegatingProvider()
+    request = request_for(setup)
+    assert provider.get_user_id(request) == OWNER
+    assert provider.get_credential_user_id(request) is None
+    pending = await request_google_cloud_access(setup.store, setup.host)
+    with pytest.raises(OmnigentError):
+        await _resolve_elicitation(
+            setup.session,
+            {"elicitation_id": pending.id, "action": "accept"},
+            None,
+            approval_request=request,
+            approval_auth=provider,
+        )
+    assert not pending.future.done()
+    assert setup.store.access.host(setup.host, OWNER) == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("condition", ["shared", "deleted", "missing", "wrong_owner"])
+async def test_unresolvable_sandbox_denies_cloud_command(setup, condition):
+    import uuid
+
+    from omnigent.db.db_models import SqlHost
+
+    host_id = setup.host
+    with Session(get_or_create_engine(setup.uri)) as db:
+        host = db.get(SqlHost, (0, host_id))
+        if condition == "shared":
+            db.add(
+                SqlConversationMetadata(
+                    id=uuid.uuid4().hex, host_id=host_id, workspace="/other", kind=1
+                )
+            )
+        elif condition == "deleted":
+            host.deleted_at = int(time.time())
+        elif condition == "wrong_owner":
+            host.user_id = "other@example.com"
+        else:
+            host_id = uuid.uuid4().hex
+        db.commit()
+    assert (
+        await preflight_google_cloud(
+            request_for(setup), host_id, {"command": "gcloud projects list"}
+        )
+        is not None
+    )
+    assert pending_elicitations.count_for(setup.session) == 0
+
+
+@pytest.mark.asyncio
+async def test_explicitly_unconnected_account_can_use_external_cli_credentials(setup):
+    from omnigent.db.db_models import SqlConnection
+
+    with Session(get_or_create_engine(setup.uri)) as db:
+        db.delete(db.get(SqlConnection, (0, OWNER, "google_cloud", "")))
+        db.commit()
+    assert (
+        await preflight_google_cloud(
+            request_for(setup), setup.host, {"command": "gcloud projects list"}
+        )
+        is None
+    )
+    assert pending_elicitations.count_for(setup.session) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_leaves_shared_approval_available(setup, monkeypatch):
+    pending = await request_google_cloud_access(setup.store, setup.host)
+    attached = asyncio.Event()
+    callers = 0
+
+    async def attach(store, host_id):
+        nonlocal callers
+        callers += 1
+        if callers == 2:
+            attached.set()
+        return pending
+
+    monkeypatch.setattr(
+        "omnigent.server.google_cloud_approval.request_google_cloud_access", attach
+    )
+    tasks = [
+        asyncio.create_task(
+            preflight_google_cloud(
+                request_for(setup), setup.host, {"command": "gcloud projects list"}
+            )
+        )
+        for _ in range(2)
+    ]
+    try:
+        await asyncio.wait_for(attached.wait(), 2)
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]
+        assert not pending.future.done()
+        assert not tasks[1].done()
+        assert pending_elicitations.count_for(setup.session) == 1
+        await _resolve_elicitation(
+            setup.session,
+            {"elicitation_id": pending.id, "action": "accept"},
+            None,
+            approval_request=request_for(setup),
+            approval_auth=UserAuth(),
+        )
+        assert await asyncio.wait_for(tasks[1], 2) is None
+        assert setup.store.access.host(setup.host, OWNER) == "allowed"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

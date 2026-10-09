@@ -392,9 +392,9 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
-    def get_credential_user_id(self, request: HTTPConnection) -> str | None:
-        """Identity allowed to grant access to personal credentials."""
-        return self.get_user_id(request)
+    def get_credential_user_id(self, request: HTTPConnection) -> str | None:  # noqa: ARG002
+        """Deny personal-credential grants unless the provider verifies direct authority."""
+        return None
 
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """

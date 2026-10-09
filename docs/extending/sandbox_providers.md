@@ -363,6 +363,8 @@ Denial persists until the owner explicitly allows access through the cloud icon.
 The icon is a management control and does not auto-open a competing modal.
 
 Only a directly authenticated human owner can resolve this credential approval.
+Custom auth providers must implement `get_credential_user_id` to verify direct
+human authority; the base implementation denies personal-credential grants.
 Collaborator access, delegated/scoped tokens and newly minted managed-runner
 bearers cannot authorize it. Managed-runner bearers carry a credential-delegation
 marker; runners holding older unmarked bearers must refresh them (or let their
