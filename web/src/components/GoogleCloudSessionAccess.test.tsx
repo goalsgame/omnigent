@@ -24,10 +24,10 @@ it("defaults to off and sends an explicit session-bound decision", async () => {
     .mockResolvedValueOnce(response(status("off")))
     .mockResolvedValueOnce(response(status("allowed")));
   render(<GoogleCloudSessionAccess sessionId="session-one" />);
-  fireEvent.click(await screen.findByRole("button", { name: "Google Cloud: off" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Google Cloud access: off" }));
   expect(screen.getByText(/user@example.com/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Allow for this session" }));
-  await screen.findByRole("button", { name: "Google Cloud: allowed" });
+  await screen.findByRole("button", { name: "Google Cloud access: allowed" });
   expect(fetchMock).toHaveBeenLastCalledWith(
     "/v1/connections/google_cloud/sessions/session-one/access",
     {
@@ -51,9 +51,9 @@ it("persists denial and lets the owner revoke an existing grant", async () => {
     .mockResolvedValueOnce(response(status("allowed")))
     .mockResolvedValueOnce(response(status("denied")));
   render(<GoogleCloudSessionAccess sessionId="session-one" />);
-  fireEvent.click(await screen.findByRole("button", { name: "Google Cloud: allowed" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Google Cloud access: allowed" }));
   fireEvent.click(screen.getByRole("button", { name: "Revoke access" }));
-  await screen.findByRole("button", { name: "Google Cloud: off" });
+  await screen.findByRole("button", { name: "Google Cloud access: off" });
   expect(fetchMock.mock.calls[1][1]?.body).toContain('"decision":"denied"');
 });
 
@@ -64,7 +64,7 @@ it("does not treat a failed grant as approval", async () => {
   render(<GoogleCloudSessionAccess sessionId="session-one" />);
   fireEvent.click(await screen.findByRole("button", { name: "Allow for this session" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("Could not update");
-  expect(screen.queryByRole("button", { name: "Google Cloud: allowed" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Google Cloud access: allowed" })).toBeNull();
 });
 
 it("hides controls for a nonowner or an unsupported shared host", async () => {
@@ -97,7 +97,7 @@ it.each(["allowed", "denied"])("ignores a stale polling failure after %s", async
   });
   expect(
     screen.getByRole("button", {
-      name: decision === "allowed" ? "Google Cloud: allowed" : "Google Cloud: off",
+      name: decision === "allowed" ? "Google Cloud access: allowed" : "Google Cloud access: off",
     }),
   ).toBeTruthy();
   await act(async () => {
@@ -130,4 +130,30 @@ it.each([403, 409])("clears a polling error when access becomes unavailable (%s)
   });
   expect(screen.queryByRole("alert")).toBeNull();
   expect(screen.queryByRole("button")).toBeNull();
+});
+
+it("uses a portal dialog and leaves no status text in the chat layout", async () => {
+  fetchMock.mockResolvedValue(response(status("pending")));
+  const { container } = render(<GoogleCloudSessionAccess sessionId="session-one" />);
+  const dialog = await screen.findByRole("dialog", { name: "Allow Google Cloud access?" });
+  expect(container.contains(dialog)).toBe(false);
+  expect(document.querySelector('[data-slot="dialog-overlay"]')).toBeTruthy();
+  expect(container.textContent).toBe("");
+});
+
+it("lets the owner dismiss a request without polling immediately reopening it", async () => {
+  vi.useFakeTimers();
+  fetchMock.mockResolvedValue(response(status("pending")));
+  await act(async () => {
+    render(<GoogleCloudSessionAccess sessionId="session-one" />);
+  });
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  await act(async () => {
+    vi.advanceTimersByTime(6000);
+  });
+  expect(screen.queryByRole("dialog")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Google Cloud access: requested" }));
+  expect(screen.getByRole("dialog")).toBeTruthy();
 });

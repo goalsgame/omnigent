@@ -65,6 +65,7 @@ const mobileMenu = {
 };
 
 function renderHeader(props: {
+  sessionAccessControl?: ComponentProps<typeof ChatHeader>["sessionAccessControl"];
   sidebarOpen: boolean;
   isChildSession?: boolean;
   subAgentName?: string | null;
@@ -122,6 +123,7 @@ function renderHeader(props: {
             hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
             hasHeaderMenu={props.hasHeaderMenu ?? false}
+            sessionAccessControl={props.sessionAccessControl}
             showFilesPanel={props.showFilesPanel ?? false}
             hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={props.rightPanelOpen ?? false}
@@ -1025,4 +1027,15 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
     expect(screen.getByText("reviewer")).toBeInTheDocument();
   });
+});
+
+it.each([false, true])("keeps session access controls inside the header (mobile=%s)", (mobile) => {
+  isMobileMock.mockReturnValue(mobile);
+  renderHeader({
+    sidebarOpen: false,
+    sessionAccessControl: <button type="button" aria-label="Google Cloud access" />,
+  });
+  const control = screen.getByRole("button", { name: "Google Cloud access" });
+  expect(control.closest("header")).toBeTruthy();
+  expect(control.textContent).toBe("");
 });

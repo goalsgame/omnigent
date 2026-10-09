@@ -62,7 +62,7 @@ it.each(["root", "child", "grandchild", "depth-12"])(
   async (id) => {
     mount(id);
     fireEvent.click(await screen.findByRole("button", { name: "Allow for this session" }));
-    await screen.findByRole("button", { name: "Google Cloud: allowed" });
+    await screen.findByRole("button", { name: "Google Cloud access: allowed" });
     expect(getSessionOwner).toHaveBeenCalledWith("root");
     expect(getSessionSlim).toHaveBeenCalledTimes(1);
     expect(getSessionSlim).toHaveBeenCalledWith(id, { refreshState: true });

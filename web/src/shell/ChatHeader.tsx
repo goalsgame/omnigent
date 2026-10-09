@@ -45,7 +45,7 @@ import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
@@ -187,6 +187,8 @@ interface ChatHeaderProps {
   onAgentInfo: () => void;
   /** Whether the mobile three-dot menu has any entry to offer. */
   hasHeaderMenu: boolean;
+  /** Session-scoped access controls mounted inside the title-bar action cluster. */
+  sessionAccessControl?: ReactNode;
   /** Whether the Files tab/right panel is available for this session. */
   showFilesPanel: boolean;
   /**
@@ -342,6 +344,7 @@ export function ChatHeader({
   hasAgentInfo,
   onAgentInfo,
   hasHeaderMenu,
+  sessionAccessControl,
   showFilesPanel,
   hasRailContent,
   rightPanelOpen,
@@ -664,6 +667,7 @@ export function ChatHeader({
       </div>
 
       <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
+        {sessionAccessControl}
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}

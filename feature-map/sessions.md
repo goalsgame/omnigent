@@ -60,9 +60,9 @@ the header menu), and each place is a separate entry point.
 ## How to get to it (user POV)
 
 - **Google Cloud consent:** after connecting Google Cloud in Settings → Sandbox
-  Integrations, open a managed session you own and expand its Google Cloud
-  control. Alternatively ask its agent to run a command needing Google
-  credentials; the control opens an approval prompt. Allow or deny there, then
+  Integrations, open a managed session you own and select the Google Cloud
+  icon in its title bar. Alternatively ask its agent to run a command needing Google
+  credentials; the shared modal dialog opens automatically. Allow or deny there, then
   retry the command after approval. The same control revokes access.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
