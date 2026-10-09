@@ -177,6 +177,7 @@ class ServerInfoResponse(BaseModel):
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
     enabled_connections: list[str]
+    machine_google_cloud_enabled: bool = False
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     server_version: str
@@ -3060,6 +3061,7 @@ def create_app(
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
                 "enabled_connections": enabled_connections,
+                "machine_google_cloud_enabled": app.state.google_cloud_machine_broker is not None,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "server_version": _server_version(),
@@ -3848,6 +3850,37 @@ def create_app(
             machine_verifier.principal_allowed,
         )
     app.state.github_machine_broker = github_machine_broker
+
+    from omnigent.server.google_cloud_machine import (
+        GoogleCloudMachineBroker,
+        parse_machine_cloud_bindings,
+    )
+
+    cloud_config = resolved_server_config.get("google_cloud_machine_auth")
+    if cloud_config and machine_verifier is None:
+        raise RuntimeError(
+            "google_cloud_machine_auth requires built-in OIDC machine authentication"
+        )
+    cloud_bindings = parse_machine_cloud_bindings(
+        cloud_config,
+        principals=machine_verifier.config.principals if machine_verifier else frozenset(),
+    )
+    machine_cloud = None
+    if cloud_bindings:
+        if permission_store is None or machine_verifier is None or auth_provider is None:
+            raise RuntimeError("Machine Cloud access requires SQL permissions and machine auth")
+        machine_cloud = GoogleCloudMachineBroker(
+            permission_store.storage_location, cloud_bindings, machine_verifier.principal_allowed
+        )
+        from omnigent.server.routes.google_cloud_machine import create_machine_cloud_router
+
+        app.include_router(
+            create_machine_cloud_router(
+                machine_cloud, auth_provider, permission_store, conversation_store
+            ),
+            prefix="/v1",
+        )
+    app.state.google_cloud_machine_broker = machine_cloud
 
     from omnigent.server.openrouter_wif import OpenRouterWIFBroker, OpenRouterWIFConfig
 

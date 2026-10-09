@@ -102,6 +102,21 @@ def create_host_credentials_router(
                     headers={"Cache-Control": "no-store"},
                 ) from None
             return {"connected": True, **credential}
+        if provider == "google_cloud" and managed.user_id.startswith(MACHINE_PRINCIPAL_PREFIX):
+            broker = getattr(request.app.state, "google_cloud_machine_broker", None)
+            try:
+                if broker is None:
+                    raise PermissionError("Machine Google Cloud access is not configured")
+                return await broker.credential(host_id, managed.user_id)
+            except PermissionError:
+                return {"connected": False, "reason": "machine_access_denied"}
+            except Exception:  # noqa: BLE001
+                _logger.warning("machine Google Cloud credential resolve failed", exc_info=True)
+                raise HTTPException(
+                    503,
+                    "Machine Google Cloud credential unavailable",
+                    headers={"Cache-Control": "no-store"},
+                ) from None
         # Resolve provider only after auth so the endpoint reveals nothing to an
         # unauthenticated caller. A resolver with no configured store on this
         # server (or an unknown provider) is a 404 — nothing to vend.

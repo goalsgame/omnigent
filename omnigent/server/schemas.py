@@ -1520,6 +1520,11 @@ class _SessionCreateRequestBase(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+    google_cloud_access: bool = Field(
+        default=False,
+        strict=True,
+        description="Request operator-configured Google Cloud access for a machine session",
+    )
 
     # Declared here, in the legacy field position, so validation errors keep
     # main's ordering. Concrete public models narrow the wire type below.

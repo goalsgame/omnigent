@@ -96,7 +96,11 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import {
+  hasGoogleCloudSessionAccess,
+  isFeatureEnabled,
+  isSingleUserMode,
+} from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
@@ -2463,10 +2467,12 @@ export function AppShell() {
                     sessionAccessControl={
                       serverConversationId &&
                       serverInfo !== "loading" &&
-                      serverInfo.enabled_connections?.includes("google_cloud") ? (
+                      hasGoogleCloudSessionAccess(serverInfo) ? (
                         <RootGoogleCloudSessionAccess
                           key={serverConversationId}
                           sessionId={serverConversationId}
+                          humanEnabled={serverInfo.enabled_connections.includes("google_cloud")}
+                          machineEnabled={serverInfo.machine_google_cloud_enabled === true}
                         />
                       ) : undefined
                     }

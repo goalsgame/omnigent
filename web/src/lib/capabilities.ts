@@ -131,6 +131,7 @@ export interface ServerInfo {
    * CONNECTION_PANELS. Adding a provider adds a string here, not a new flag.
    */
   enabled_connections: string[];
+  machine_google_cloud_enabled?: boolean;
   /**
    * Server session-sharing policy. Drives whether the SPA shows the
    * Share control (``"on"``), restricts it to read-only invites
@@ -255,6 +256,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
   enabled_connections: [],
+  machine_google_cloud_enabled: false,
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
   sharing_mode: "on",
@@ -351,6 +353,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
+          machine_google_cloud_enabled: data.machine_google_cloud_enabled === true,
           sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
             ? (data.sharing_mode as SharingMode)
             : "on",
@@ -447,4 +450,12 @@ export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
   const offered = info.sandbox_providers;
   if (Array.isArray(offered) && offered.length > 0) return offered;
   return [info.sandbox_provider];
+}
+
+/** Session Cloud controls also apply to deployments with only machine credentials. */
+export function hasGoogleCloudSessionAccess(info: ServerInfo): boolean {
+  return (
+    info.machine_google_cloud_enabled === true ||
+    info.enabled_connections?.includes("google_cloud") === true
+  );
 }

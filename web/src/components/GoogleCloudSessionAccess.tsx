@@ -16,16 +16,25 @@ interface Access {
   state: "off" | "allowed" | "pending" | "denied" | "not_connected";
   email: string | null;
   generation: string | null;
+  authorization?: "operator";
 }
 
-/** Owner-only consent for all processes sharing this session's sandbox. */
-export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
+/** Human owner consent and reader-visible machine authorization for the session sandbox. */
+export function GoogleCloudSessionAccess({
+  sessionId,
+  machine = false,
+}: {
+  sessionId: string;
+  machine?: boolean;
+}) {
   const [access, setAccess] = useState<Access | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const revision = useRef(0);
-  const endpoint = `/v1/connections/google_cloud/sessions/${encodeURIComponent(sessionId)}/access`;
+  const endpoint = machine
+    ? `/v1/sessions/${encodeURIComponent(sessionId)}/google-cloud`
+    : `/v1/connections/google_cloud/sessions/${encodeURIComponent(sessionId)}/access`;
 
   useEffect(() => {
     let active = true;
@@ -37,7 +46,7 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
       const observed = revision.current;
       try {
         const response = await authenticatedFetch(endpoint, { signal: controller.signal });
-        if (response.status === 409 || response.status === 403) {
+        if (response.status === 409 || response.status === 403 || response.status === 404) {
           if (active && observed === revision.current) {
             setAccess(null);
             setError(null);
@@ -112,13 +121,28 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
             {pending ? "Allow Google Cloud access?" : "Google Cloud access"}
           </DialogTitle>
           <DialogDescription>
-            {allowed
-              ? "This session can use your connected Google account."
-              : "Choose whether this session can use your connected Google account."}
+            {machine
+              ? "This session uses an operator-configured machine identity."
+              : allowed
+                ? "This session can use your connected Google account."
+                : "Choose whether this session can use your connected Google account."}
           </DialogDescription>
         </DialogHeader>
         <div className="min-w-0 space-y-3 text-sm">
-          {access?.state === "not_connected" ? (
+          {machine && access ? (
+            <>
+              <p className="break-words font-medium">{access.email}</p>
+              <p>
+                {allowed
+                  ? "Operator-authorized Google Cloud access"
+                  : "Google Cloud access was not requested for this session"}
+              </p>
+              <p className="text-muted-foreground">
+                Permissions are configured by the operator. Anyone who can run commands in this
+                sandbox can use them. Issued tokens last up to ten minutes.
+              </p>
+            </>
+          ) : access?.state === "not_connected" ? (
             <p>Connect Google Cloud in Settings → Sandbox Integrations, then allow access here.</p>
           ) : access ? (
             <>
@@ -148,7 +172,7 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
           )}
         </div>
         <DialogFooter>
-          {access && access.state !== "not_connected" && (
+          {!machine && access && access.state !== "not_connected" && (
             <>
               {(allowed || pending) && (
                 <Button variant="outline" disabled={busy} onClick={() => void decide("denied")}>

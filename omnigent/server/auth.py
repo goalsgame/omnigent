@@ -396,6 +396,10 @@ class AuthProvider(ABC):
         """Deny personal-credential grants unless the provider verifies direct authority."""
         return None
 
+    def get_machine_credential_user_id(self, request: HTTPConnection) -> str | None:  # noqa: ARG002
+        """Deny machine grants unless the provider verifies direct automation authority."""
+        return None
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -640,6 +644,13 @@ class UnifiedAuthProvider(AuthProvider):
             account_generation=account_generation(user_id),
             credential_delegate=True,
         )
+
+    def get_machine_credential_user_id(self, request: HTTPConnection) -> str | None:
+        """Only a current external machine bearer may change machine Cloud opt-in."""
+        bearer = request.headers.get("Authorization", "")
+        if self.machine_verifier is None or not bearer.startswith("Bearer "):
+            return None
+        return self.machine_verifier.authenticate(bearer[7:])
 
     def get_credential_user_id(self, request: HTTPConnection) -> str | None:
         """Require a direct human login, never delegated or runner authority."""
