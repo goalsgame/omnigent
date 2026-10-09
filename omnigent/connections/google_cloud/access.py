@@ -97,14 +97,16 @@ class GoogleCloudSessionAccess:
             if row is None:
                 raise PermissionError("Session not found")
             context = self._context(db, row, user_id)
+            if expected_host is not None and (
+                context["host_id"] != expected_host or context["generation"] != generation
+            ):
+                raise ValueError("Google Cloud access request is no longer current")
             if decision is not None:
                 if decision not in ("allowed", "denied"):
                     raise ValueError("Unknown consent decision")
                 if not generation or generation != context["generation"]:
                     raise ValueError("Google account changed; refresh before deciding")
-                if expected_host is not None and (
-                    context["host_id"] != expected_host or self._state(row, context) != "pending"
-                ):
+                if expected_host is not None and self._state(row, context) != "pending":
                     raise ValueError("Google Cloud access request is no longer current")
                 row.google_cloud_access = json.dumps({**context, "state": decision})
             return {

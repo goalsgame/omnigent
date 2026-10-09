@@ -150,15 +150,30 @@ async def resolve_google_cloud_access(
             generation=pending.context["generation"],
             expected_host=pending.context["host_id"],
         )
-    except (PermissionError, ValueError):
-        _finish(pending, False, "cancel")
+    except BaseException as exc:
+        # Settings may have committed before its prompt notification runs.
+        committed_allowed = False
+        try:
+            current = await asyncio.to_thread(
+                pending.store.access.session,
+                session_id,
+                user,
+                generation=pending.context["generation"],
+                expected_host=pending.context["host_id"],
+            )
+            committed_allowed = current["state"] == "allowed"
+        except (PermissionError, ValueError):
+            pass
+        finally:
+            _finish(pending, committed_allowed, "accept" if committed_allowed else "cancel")
+        if not isinstance(exc, (PermissionError, ValueError)):
+            raise
+        if committed_allowed:
+            return True
         raise OmnigentError(
             "Google Cloud approval is no longer current; retry the command",
             code=ErrorCode.INVALID_INPUT,
         ) from None
-    except BaseException:
-        _finish(pending, False, "cancel")
-        raise
     _finish(pending, allowed, verdict.action)
     return True
 

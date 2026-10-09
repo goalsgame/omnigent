@@ -400,3 +400,104 @@ async def test_cancelled_waiter_leaves_shared_approval_available(setup, monkeypa
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settings_decision", ["allowed", "denied"])
+async def test_settings_commit_before_native_resolution_matches_saved_consent(
+    setup, settings_decision
+):
+    from omnigent.server.google_cloud_approval import settle_google_cloud_access
+
+    pending = await request_google_cloud_access(setup.store, setup.host)
+    # Commit the settings write, leaving its event-loop notification outstanding.
+    setup.store.access.session(
+        setup.session, OWNER, decision=settings_decision, generation=pending.context["generation"]
+    )
+    args = (setup.session, {"elicitation_id": pending.id, "action": "accept"}, None)
+    if settings_decision == "allowed":
+        await _resolve_elicitation(
+            *args, approval_request=request_for(setup), approval_auth=UserAuth()
+        )
+    else:
+        with pytest.raises(OmnigentError):
+            await _resolve_elicitation(
+                *args, approval_request=request_for(setup), approval_auth=UserAuth()
+            )
+    settle_google_cloud_access(
+        setup.session, OWNER, pending.context["generation"], settings_decision
+    )
+    assert pending.future.result() == (settings_decision == "allowed")
+    assert setup.store.access.host(setup.host, OWNER) == settings_decision
+    assert pending_elicitations.count_for(setup.session) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["account", "host"])
+async def test_reconciliation_never_accepts_another_contexts_grant(setup, changed):
+    import uuid
+
+    from omnigent.db.db_models import SqlHost
+
+    pending = await request_google_cloud_access(setup.store, setup.host)
+    if changed == "account":
+        setup.connect()
+    else:
+        new_host = uuid.uuid4().hex
+        with Session(get_or_create_engine(setup.uri)) as db:
+            db.add(
+                SqlHost(
+                    host_id=new_host,
+                    user_id=OWNER,
+                    name="replacement",
+                    status=1,
+                    created_at=1,
+                    updated_at=1,
+                    sandbox_provider="agent_sandbox",
+                )
+            )
+            db.get(SqlConversationMetadata, (0, setup.session)).host_id = new_host
+            db.commit()
+    current = setup.store.access.session(setup.session, OWNER)
+    setup.store.access.session(
+        setup.session, OWNER, decision="allowed", generation=current["generation"]
+    )
+    with pytest.raises(OmnigentError):
+        await _resolve_elicitation(
+            setup.session,
+            {"elicitation_id": pending.id, "action": "accept"},
+            None,
+            approval_request=request_for(setup),
+            approval_auth=UserAuth(),
+        )
+    assert pending.future.result() is False
+    assert setup.store.access.session(setup.session, OWNER)["state"] == "allowed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_resolution_failure_preserves_concurrent_committed_approval(
+    setup, monkeypatch, failure
+):
+    pending = await request_google_cloud_access(setup.store, setup.host)
+    setup.store.access.session(
+        setup.session, OWNER, decision="allowed", generation=pending.context["generation"]
+    )
+    session = setup.store.access.session
+
+    def fail_write(*args, **kwargs):
+        if kwargs.get("decision") is not None:
+            raise failure()
+        return session(*args, **kwargs)
+
+    monkeypatch.setattr(setup.store.access, "session", fail_write)
+    with pytest.raises(failure):
+        await _resolve_elicitation(
+            setup.session,
+            {"elicitation_id": pending.id, "action": "accept"},
+            None,
+            approval_request=request_for(setup),
+            approval_auth=UserAuth(),
+        )
+    assert pending.future.result() is True
+    assert pending_elicitations.count_for(setup.session) == 0
