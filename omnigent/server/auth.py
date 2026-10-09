@@ -392,6 +392,10 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def get_credential_user_id(self, request: HTTPConnection) -> str | None:
+        """Identity allowed to grant access to personal credentials."""
+        return self.get_user_id(request)
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -634,9 +638,18 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            credential_delegate=True,
         )
 
-    def _check_cookie(self, request: HTTPConnection) -> str | None:
+    def get_credential_user_id(self, request: HTTPConnection) -> str | None:
+        """Require a direct human login, never delegated or runner authority."""
+        if self._source in ("oidc", "accounts"):
+            return self._check_cookie(request, credential_authority=True)
+        return self._check_header(request)
+
+    def _check_cookie(
+        self, request: HTTPConnection, *, credential_authority: bool = False
+    ) -> str | None:
         """Validate the session cookie or Bearer token and return the
         user ID.
 
@@ -677,7 +690,12 @@ class UnifiedAuthProvider(AuthProvider):
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
-        if self._account_check is None and cached is not None and cached[1] > time.monotonic():
+        if (
+            not credential_authority
+            and self._account_check is None
+            and cached is not None
+            and cached[1] > time.monotonic()
+        ):
             return cached[0]
 
         try:
@@ -687,12 +705,20 @@ class UnifiedAuthProvider(AuthProvider):
                 algorithms=["HS256"],
             )
         except jwt.InvalidTokenError:
-            if not from_cookie and delegated_path_allowed(request.url.path):
+            if (
+                not credential_authority
+                and not from_cookie
+                and delegated_path_allowed(request.url.path)
+            ):
                 from omnigent.server.oidc_human_auth import authenticate_oidc_bearer
 
                 return authenticate_oidc_bearer(token, self.machine_verifier, self.human_verifier)
             return None
 
+        if credential_authority and (
+            payload.get("scope") is not None or payload.get("credential_delegate") is True
+        ):
+            return None
         user_id = payload.get("sub")
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None

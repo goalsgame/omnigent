@@ -344,13 +344,31 @@ Server authentication is required: auth-disabled/local deployments cannot grant
 or use Google Cloud sandbox access, including previously saved local grants.
 An unauthenticated server cannot distinguish the owner from sandbox callers.
 
-When gcloud, Terraform or an SDK first requests credentials without consent,
-the broker blocks the request and the open session displays an approval prompt.
-Approve or deny there; after approval, retry the blocked command. Commands that
-do not request credentials, such as `gcloud version`, do not need approval.
-Denial persists without repeated prompts until the owner explicitly allows it.
-The prompt is visible while the owner has that session open; it is not an
-out-of-band notification or a suspended-command queue.
+Recognized `gcloud` commands and Terraform commands that can access cloud state
+(`init`, `plan`, `apply`, `destroy`, `import`, `refresh`, `console`, `test`) pause
+at the existing tool-policy gate. Omnigent publishes a standard
+`response.elicitation_request` on the root session, so approval-capable web,
+mobile/desktop web clients, REPL and API consumers can use their existing flow.
+The owner can answer via an `approval` session event or the elicitation's
+`/resolve` endpoint. Approval persists sandbox consent and resumes the held
+command; denial, cancellation or a five-minute timeout prevents it from starting.
+Existing command-safety policies still apply after credential approval.
+
+The broker remains the enforcement boundary for all token requests. Scripts,
+SDK calls and direct terminal commands that bypass the recognized CLI preflight
+can fail their initial credential request; the broker publishes the same native
+prompt, but those already-failed commands need retrying after approval.
+`gcloud version`, `terraform version`, `fmt` and `validate` do not prompt.
+Denial persists until the owner explicitly allows access through the cloud icon.
+The icon is a management control and does not auto-open a competing modal.
+
+Only a directly authenticated human owner can resolve this credential approval.
+Collaborator access, delegated/scoped tokens and newly minted managed-runner
+bearers cannot authorize it. Managed-runner bearers carry a credential-delegation
+marker; runners holding older unmarked bearers must refresh them (or let their
+short lifetime expire) when upgrading. Native mobile/desktop clients that embed
+the web UI receive its approval card; other integrations must support the standard
+elicitation protocol. This does not add a separate push notification channel.
 
 Approval covers every agent and subprocess in the session's sandbox. A host
 bound to multiple top-level sessions is rejected because host credentials cannot

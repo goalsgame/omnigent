@@ -83,6 +83,7 @@ class GoogleCloudSessionAccess:
         *,
         decision: str | None = None,
         generation: str | None = None,
+        expected_host: str | None = None,
     ) -> dict[str, Any]:
         with self._session("session_access") as db:
             row = db.scalar(
@@ -101,6 +102,10 @@ class GoogleCloudSessionAccess:
                     raise ValueError("Unknown consent decision")
                 if not generation or generation != context["generation"]:
                     raise ValueError("Google account changed; refresh before deciding")
+                if expected_host is not None and (
+                    context["host_id"] != expected_host or self._state(row, context) != "pending"
+                ):
+                    raise ValueError("Google Cloud access request is no longer current")
                 row.google_cloud_access = json.dumps({**context, "state": decision})
             return {
                 "state": self._state(row, context),
@@ -140,3 +145,31 @@ class GoogleCloudSessionAccess:
                 row.google_cloud_access = json.dumps({**context, "state": "pending"})
                 return "pending"
             return state
+
+    def host_request(self, host_id: str) -> dict[str, Any] | None:
+        """Resolve an unambiguous managed sandbox to its human owner's consent."""
+        with self._session("host_request") as db:
+            host = db.get(SqlHost, (current_workspace_id(), host_id))
+            if host is None:
+                return None
+            rows = db.scalars(
+                select(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == host_id,
+                    SqlConversationMetadata.kind == 1,
+                )
+                .with_for_update()
+            ).all()
+            if len(rows) != 1:
+                return None
+            row = rows[0]
+            try:
+                context = self._context(db, row, host.user_id)
+            except (PermissionError, ValueError):
+                return None
+            state = self._state(row, context)
+            if state == "off":
+                state = "pending"
+                row.google_cloud_access = json.dumps({**context, "state": state})
+            return {**context, "session_id": row.id, "state": state}

@@ -61,9 +61,10 @@ the header menu), and each place is a separate entry point.
 
 - **Google Cloud consent:** after connecting Google Cloud in Settings → Sandbox
   Integrations, open a managed session you own and select the Google Cloud
-  icon in its title bar. Alternatively ask its agent to run a command needing Google
-  credentials; the shared modal dialog opens automatically. Allow or deny there, then
-  retry the command after approval. The same control revokes access.
+  icon in its title bar to manage or revoke access. Asking the agent to run a
+  recognized Google Cloud CLI command produces a normal approval card on the root
+  session. Approve as the owner through the web/mobile UI, REPL or standard
+  approval API; the held command then continues.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
@@ -335,13 +336,16 @@ plain `uv run pytest`, which starts a private server for the test.
 ### Google Cloud consent checks
 
 Google Cloud sandbox consent requires server authentication; the reserved local
-identity cannot grant or use it. The control resolves the root owner/session
-when viewing sub-agents, so requests appear on every depth of the spawn tree.
+identity cannot grant or use it. The management control resolves the root
+owner/session when viewing sub-agents. Native approval requests target that root.
 
 Use `tests/server/test_google_cloud_session_access.py` for owner-only approval,
 first-use prompting, revocation and reconnect isolation. Use
 `tests/e2e/test_google_cloud_connection.py` for the offline OAuth → blocked
-credential → approval → token flow. Component coverage for the control and
+credential → native approval → token flow. Use
+`tests/server/integration/test_google_cloud_native_approval.py` for both policy
+gates and both approval transports, including rejecting collaborator approval.
+Component coverage for the control and
 prompt is `web/src/components/GoogleCloudSessionAccess.test.tsx`.
 Live Google consent requires a configured OAuth client; these tests use fake
 provider replies and do not issue real Google tokens.
@@ -351,8 +355,12 @@ provider replies and do not issue real Google tokens.
 - Google Cloud approval covers all processes sharing the session's sandbox.
   Shared top-level hosts fail closed. Connecting or reconnecting an account
   does not grant session access; already-issued tokens can outlive revocation.
-  A blocked command needs retrying after approval. Prompts appear in the open
-  session, not as an out-of-band notification.
+  Recognized cloud CLI calls wait at the normal tool gate for up to five minutes.
+  Arbitrary scripts or direct terminal commands that bypass that gate can fail
+  on credential lookup; their native approval appears on the root session and
+  they need retrying afterward. Approval-capable clients use the standard session
+  elicitation protocol. Delegated integrations cannot approve personal credentials
+  themselves; the owner must use a directly authenticated client.
 
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.

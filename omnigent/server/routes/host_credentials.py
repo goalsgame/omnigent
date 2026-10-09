@@ -120,6 +120,10 @@ def create_host_credentials_router(
                 if access
                 else "unavailable"
             )
+            if state == "pending":
+                from omnigent.server.google_cloud_approval import request_google_cloud_access
+
+                await request_google_cloud_access(store, host_id)
             if state != "allowed":
                 return {"connected": False, "reason": "session_access_" + state}
         try:

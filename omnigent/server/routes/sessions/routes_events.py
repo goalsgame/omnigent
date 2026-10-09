@@ -1260,6 +1260,12 @@ def register_events_routes(
                 else:
                     return _output_verdict
         elif body.type == "function_call" and body.data.get("evaluate_policy"):
+            from omnigent.server.google_cloud_approval import preflight_google_cloud
+
+            if isinstance(request, Request):
+                cloud_denial = await preflight_google_cloud(request, conv.host_id, body.data)
+                if cloud_denial:
+                    return {"verdict": "deny", "reason": cloud_denial}
             _tool_verdict = await _evaluate_tool_call_policy(
                 session_id,
                 conv,
@@ -1402,6 +1408,10 @@ def register_events_routes(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
+        if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
+            from omnigent.server.google_cloud_approval import cancel_google_cloud_access
+
+            cancel_google_cloud_access(session_id)
         stop_codex_side_chat = (
             body.type == _STOP_SESSION_TYPE
             and _is_codex_native_subagent(conv)
@@ -1634,7 +1644,14 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                approval_request=request if isinstance(request, Request) else None,
+                approval_auth=auth_provider,
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(

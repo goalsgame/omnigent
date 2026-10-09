@@ -25,7 +25,6 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const revision = useRef(0);
-  const promptedGeneration = useRef<string | null>(null);
   const endpoint = `/v1/connections/google_cloud/sessions/${encodeURIComponent(sessionId)}/access`;
 
   useEffect(() => {
@@ -51,12 +50,6 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
         if (active && observed === revision.current) {
           setAccess(result);
           setError(null);
-          if (result.state === "pending" && promptedGeneration.current !== result.generation) {
-            promptedGeneration.current = result.generation;
-            setExpanded(true);
-          } else if (result.state !== "pending") {
-            promptedGeneration.current = null;
-          }
         }
       } catch {
         if (active && observed === revision.current)
@@ -140,7 +133,11 @@ export function GoogleCloudSessionAccess({ sessionId }: { sessionId: string }) {
                 hour.
               </p>
               {pending && (
-                <p>The command was blocked. After approval, ask the agent to retry it.</p>
+                <p>
+                  Google Cloud access is awaiting owner approval in the session. Commands held at
+                  the approval gate continue after approval; commands that already failed need
+                  retrying.
+                </p>
               )}
             </>
           ) : null}

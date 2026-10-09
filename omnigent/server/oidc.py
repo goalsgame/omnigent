@@ -58,6 +58,7 @@ def mint_session_token(
     provider: str,
     *,
     account_generation: str | None = None,
+    credential_delegate: bool = False,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -83,6 +84,8 @@ def mint_session_token(
         "exp": now + ttl_seconds,
         "provider": provider,
     }
+    if credential_delegate:
+        payload["credential_delegate"] = True
     if account_generation is not None:
         payload["account_generation"] = account_generation
     return jwt.encode(payload, cookie_secret, algorithm="HS256")

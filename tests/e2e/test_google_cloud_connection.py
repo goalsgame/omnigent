@@ -10,17 +10,22 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from sqlalchemy.orm import Session
 
 from omnigent.connections.google_cloud import GoogleCloudConnectionStore
-from omnigent.db.db_models import SqlConversationMetadata, SqlHost, SqlSessionPermission
+from omnigent.db.db_models import SqlHost, SqlSessionPermission
 from omnigent.db.utils import get_or_create_engine
 from omnigent.host.google_cloud import GoogleCloudMetadataServer
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import AuthProvider
 from omnigent.server.google_cloud import SCOPES, GoogleCloudConfig
 from omnigent.server.routes.connections_google_cloud import create_connections_google_cloud_router
 from omnigent.server.routes.host_credentials import create_host_credentials_router
+from omnigent.server.routes.sessions.routes_elicitations import register_elicitations_routes
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.test_github_store import SecretBox
 
 
@@ -45,11 +50,12 @@ def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
                 sandbox_provider="agent_sandbox",
             )
         )
-        db.add(
-            SqlConversationMetadata(id=session_id, host_id=host_id, workspace="/workspace", kind=1)
-        )
         db.add(SqlSessionPermission(user_id=user, conversation_id=session_id, level=4))
         db.commit()
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.create_conversation(
+        conversation_id=session_id, host_id=host_id, workspace="/workspace"
+    )
     config = GoogleCloudConfig("fixture", "fixture-secret", "https://app.example/callback")
     api = SimpleNamespace(
         token=AsyncMock(
@@ -76,6 +82,15 @@ def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
         prefix="/v1",
     )
     app.include_router(create_host_credentials_router(hosts), prefix="/v1")
+    approvals = APIRouter()
+    register_elicitations_routes(
+        approvals,
+        conversation_store=conversations,
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UserAuth(),
+    )
+    app.include_router(approvals, prefix="/v1")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="off"))
@@ -115,11 +130,14 @@ def test_oauth_to_sandbox_token_refresh_and_disconnect(db_uri):
                     consent_url = f"/v1/connections/google_cloud/sessions/{session_id}/access"
                     consent = client.get(consent_url).json()
                     assert consent["state"] == "pending"
-                    decision = client.post(
-                        consent_url,
-                        json={"decision": "allowed", "generation": consent["generation"]},
+                    prompt = pending_elicitations.snapshot_for(session_id)[0]
+                    approval_url = (
+                        f"/v1/sessions/{session_id}/elicitations/{prompt['elicitation_id']}"
                     )
-                    assert decision.status_code == 200
+                    assert client.get(approval_url).json()["status"] == "pending"
+                    decision = client.post(approval_url + "/resolve", json={"action": "accept"})
+                    assert decision.status_code == 202, decision.text
+                    assert client.get(approval_url).json()["status"] == "resolved"
                     assert metadata.credential()["token"] == "access-one"
                     connection = store.get(user, with_tokens=True)
                     store.refresh(
