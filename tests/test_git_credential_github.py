@@ -418,6 +418,7 @@ def test_start_host_gh_refresh_rewrites_hosts_on_tick(
     [
         (404, {"detail": "unknown credential provider"}, "disabled"),
         (200, {"connected": False, "reason": "not_connected"}, "unconnected"),
+        (200, {"connected": False, "reason": "machine_not_authorized"}, "machine_unavailable"),
         (200, {"connected": False}, "disabled"),
     ],
 )

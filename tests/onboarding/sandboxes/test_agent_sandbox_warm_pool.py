@@ -1118,7 +1118,10 @@ def test_incompatible_claimed_profile_preserves_allocation_before_activation(
     harness.core.delete_namespaced_persistent_volume_claim.assert_not_called()
 
 
-@pytest.mark.parametrize("error_code", ["github_checkout_unconnected", "credential-sentinel"])
+@pytest.mark.parametrize(
+    "error_code",
+    ["github_checkout_unconnected", "github_checkout_machine_unavailable", "credential-sentinel"],
+)
 def test_preparation_failure_surfaces_only_known_checkout_errors(
     harness: _Harness,
     monkeypatch: pytest.MonkeyPatch,
@@ -1137,6 +1140,8 @@ def test_preparation_failure_surfaces_only_known_checkout_errors(
     expected = (
         "connect GitHub in Settings > Integrations"
         if error_code == "github_checkout_unconnected"
+        else "GitHub App access is not authorized"
+        if error_code == "github_checkout_machine_unavailable"
         else "workspace preparation failed"
     )
     with pytest.raises(click.ClickException, match=expected) as exc:

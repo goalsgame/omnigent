@@ -637,7 +637,7 @@ def test_warm_preload_caches_versions_without_reading_credentials(
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("exit_code", [81, 42])
+@pytest.mark.parametrize("exit_code", [81, 85, 42])
 def test_preparation_exposes_only_allowlisted_error_codes(
     activation_dir: Path,
     exit_code: int,
@@ -663,6 +663,9 @@ def test_preparation_exposes_only_allowlisted_error_codes(
     bootstrap._prepare_once(activation_dir, activation, bootstrap._Signals())
     result = bootstrap.status()
     assert result["stage"] == "failed"
-    assert result.get("error_code") == ("github_checkout_unconnected" if exit_code == 81 else None)
+    assert result.get("error_code") == {
+        81: "github_checkout_unconnected",
+        85: "github_checkout_machine_unavailable",
+    }.get(exit_code)
     assert "credential-sentinel" not in json.dumps(result)
     assert _TOKEN not in json.dumps(result)

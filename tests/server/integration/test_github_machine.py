@@ -108,8 +108,17 @@ async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
             }
         ]
         permissions.set_admin(PRINCIPAL, True)
-        assert (await client.get(path, headers=headers)).json() == {"connected": False}
+        assert (await client.get(path, headers=headers)).json() == {
+            "connected": False,
+            "reason": "machine_not_authorized",
+        }
         assert len(calls) == 1
         permissions.set_admin(PRINCIPAL, False)
+        app.state.github_machine_broker._bindings.clear()
+        assert (await client.get(path, headers=headers)).json() == {
+            "connected": False,
+            "reason": "machine_not_authorized",
+        }
+        assert len(calls) == 1
         hosts.revoke_launch_token("00000000000000000000000000000001")
         assert (await client.get(path, headers=headers)).status_code == 401
