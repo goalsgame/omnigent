@@ -206,8 +206,7 @@ def register_permissions_routes(
             )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
-        if body.principal_type == "user":
-            _announce_session_added(target_id, session_id)
+        _announce_session_added(target_id, session_id)
         add_audit_attrs(target_user_id=target_id, level=body.level)
         return PermissionObject(
             user_id=perm.user_id,

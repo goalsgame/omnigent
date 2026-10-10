@@ -13,6 +13,7 @@ import asyncio
 import pytest
 
 from omnigent.db.db_models import workspace_scope
+from omnigent.db.group_authority import group_principal
 from omnigent.runtime import user_session_stream
 
 
@@ -93,3 +94,25 @@ async def test_publish_removes_last_closed_subscriber_only_in_current_workspace(
         assert stale in user_session_stream._subscribers[user]
         user_session_stream.publish(user, {"type": "hosts_changed"})
         assert user not in user_session_stream._subscribers
+
+
+async def test_group_discovery_is_workspace_scoped_and_unregisters_all_keys() -> None:
+    user = "member@example.test"
+    group = group_principal("engineering")
+    with workspace_scope(1):
+        stream = user_session_stream.subscribe(user, additional_keys=(group,))
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        assert user_session_stream._subscribers.get(user)
+        assert user_session_stream._subscribers.get(group)
+    with workspace_scope(2):
+        user_session_stream.publish(group, {"type": "session_added", "session_id": "other"})
+    with workspace_scope(1):
+        user_session_stream.publish(group, {"type": "session_added", "session_id": "shared"})
+        assert await asyncio.wait_for(pending, timeout=2) == {
+            "type": "session_added",
+            "session_id": "shared",
+        }
+        await stream.aclose()
+        assert user not in user_session_stream._subscribers
+        assert group not in user_session_stream._subscribers

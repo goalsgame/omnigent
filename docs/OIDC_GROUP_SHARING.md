@@ -45,6 +45,10 @@ that same deadline; token refresh cannot extend group authority. Sign in again
 to refresh membership. Delegated OIDC human tokens use their own expiry.
 Directory membership changes therefore take effect on renewed authentication
 or expiry; they do not revoke already issued login tokens immediately.
+Membership arrays must contain at most 256 entries and fit within 1536 bytes
+of compact, ASCII-escaped JSON after deduplication. Malformed or oversized
+claims confer no group authority; individual permissions remain available.
+Configure the issuer to emit only the groups needed for session sharing.
 Revoking a session's group grant uses the normal permission-cache invalidation
 and cross-replica cache lifetime.
 
@@ -58,3 +62,5 @@ signed-in member should see it under Shared, read it, and fork it, but should
 not edit or delete the original. A non-member should not see or open it.
 Upgrade to Edit and verify the member can send a message; revoke the group
 grant and verify access disappears. Repeat through delegated human API access.
+Keep the member's session list open while granting access; the shared session
+should appear without a reload.

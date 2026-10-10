@@ -1303,11 +1303,15 @@ def test_resolve_access_cache_refuses_store_racing_a_write(
     original_store = store._resolve_cache_store
 
     def _revoke_then_store(
-        conversation_id: str, user_id: str, access: object, generation: int
+        conversation_id: str,
+        user_id: str,
+        access: object,
+        generation: int,
+        principals: tuple[str, ...],
     ) -> None:
         """Land the revoke between this reader's DB read and its cache store."""
         store.revoke(user_id, conversation_id)
-        original_store(conversation_id, user_id, access, generation)  # type: ignore[arg-type]
+        original_store(conversation_id, user_id, access, generation, principals)  # type: ignore[arg-type]
 
     store._resolve_cache_store = _revoke_then_store  # type: ignore[assignment]
     racing = store.resolve_access("judy@test.com", conv_id)

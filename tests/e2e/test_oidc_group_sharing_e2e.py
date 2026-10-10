@@ -74,6 +74,12 @@ async def test_group_grant_list_access_manage_and_revoke(
         session_id = created.json()["session_id"]
         path = f"/v1/sessions/{session_id}"
         assert (await client.get(path, headers=member)).status_code == 404
+        invalid = await client.put(
+            path + "/permissions",
+            headers={**owner, "Content-Type": "application/json"},
+            content=b'{"principal_type":"group","user_id":"\\ud800","level":1}',
+        )
+        assert invalid.status_code == 400, invalid.text
         shared = await client.put(
             path + "/permissions",
             headers=owner,

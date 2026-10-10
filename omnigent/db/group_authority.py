@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,15 +13,21 @@ from dataclasses import dataclass
 from omnigent.db.db_models import current_workspace_id
 
 GROUP_PRINCIPAL_PREFIX = "oidc-group:"
+# Leave room for the rest of the JWT and cookie within a 4 KiB browser limit.
+MAX_GROUP_CLAIM_BYTES = 1536
 
 
 def group_principal(name: str) -> str:
     """Encode an exact issuer group name into the permission row's 128-byte key."""
-    if not name or name != name.strip() or len(name.encode("utf-8")) > 87:
+    try:
+        encoded = name.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Group names must contain valid Unicode") from exc
+    if not name or name != name.strip() or len(encoded) > 87:
         raise ValueError("Group names must be nonempty, unpadded and at most 87 UTF-8 bytes")
     if any(ord(c) < 32 or ord(c) == 127 for c in name):
         raise ValueError("Group names cannot contain control characters")
-    return GROUP_PRINCIPAL_PREFIX + base64.urlsafe_b64encode(name.encode()).decode().rstrip("=")
+    return GROUP_PRINCIPAL_PREFIX + base64.urlsafe_b64encode(encoded).decode().rstrip("=")
 
 
 def group_name(principal: str) -> str | None:
@@ -41,7 +48,10 @@ def verified_groups(value: object) -> tuple[str, ...]:
     try:
         if any(not isinstance(item, str) for item in value):
             return ()
-        return tuple(sorted({group_principal(item) for item in value}))
+        names = sorted(set(value))
+        if len(json.dumps(names, separators=(",", ":")).encode("ascii")) > MAX_GROUP_CLAIM_BYTES:
+            return ()
+        return tuple(sorted({group_principal(item) for item in names}))
     except ValueError:
         return ()
 

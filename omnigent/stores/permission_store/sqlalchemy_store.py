@@ -151,7 +151,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             immediate=True,
         )
         # resolve_access cache (see _RESOLVE_ACCESS_CACHE_TTL_ENV). An LRU keyed
-        # (conversation_id, user_id, account_generation) -> (expiry, access). IDs are
+        # (conversation_id, user_id, account_generation, principals) -> (expiry, access). IDs are
         # globally unique, so grant/revoke can drop a whole session's entries —
         # including the shared __public__ grant, which affects every user of
         # that session — without depending on the ambient workspace context.
@@ -567,10 +567,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
             )
         )
 
-    def _resolve_cache_lookup(self, conversation_id: str, user_id: str) -> ResolvedAccess | None:
+    def _resolve_cache_lookup(
+        self, conversation_id: str, user_id: str, principals: tuple[str, ...]
+    ) -> ResolvedAccess | None:
         """Return a live cached resolve_access result, or ``None`` on miss/expiry."""
         now = self._resolve_cache_clock()
-        key = (conversation_id, user_id, account_generation(user_id), access_principals(user_id))
+        key = (conversation_id, user_id, account_generation(user_id), principals)
         with self._resolve_cache_lock:
             entry = self._resolve_cache.get(key)
             if entry is None:
@@ -593,6 +595,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         user_id: str,
         access: ResolvedAccess,
         generation: int,
+        principals: tuple[str, ...],
     ) -> None:
         """Cache one *granted* resolve_access result until now + TTL.
 
@@ -601,7 +604,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
         be stored on top of the eviction it already performed. Enforces the LRU
         entry cap so the cache cannot grow without bound on a long-lived replica.
         """
-        key = (conversation_id, user_id, account_generation(user_id), access_principals(user_id))
+        if principals != access_principals(user_id):
+            return
+        key = (conversation_id, user_id, account_generation(user_id), principals)
         expiry = self._resolve_cache_clock() + self._resolve_cache_ttl_s
         with self._resolve_cache_lock:
             if generation != self._resolve_cache_generation:
@@ -640,10 +645,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 public_grant_level=None,
             )
         workspace_id = current_workspace_id()
+        principals = access_principals(user_id)
         cache_enabled = self._resolve_cache_ttl_s > 0
         generation = 0
         if cache_enabled:
-            cached = self._resolve_cache_lookup(conversation_id, user_id)
+            cached = self._resolve_cache_lookup(conversation_id, user_id, principals)
             if cached is not None:
                 return cached
             # Sampled before the read: an invalidation landing while the rows
@@ -662,7 +668,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 select(SqlSessionPermission.level).where(
                     SqlSessionPermission.workspace_id == workspace_id,
                     SqlSessionPermission.conversation_id == conversation_id,
-                    SqlSessionPermission.user_id.in_(access_principals(user_id)),
+                    SqlSessionPermission.user_id.in_(principals),
                 )
             ).all()
             public_grant = session.get(
@@ -684,7 +690,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             or access.user_grant_level is not None
             or access.public_grant_level is not None
         ):
-            self._resolve_cache_store(conversation_id, user_id, access, generation)
+            self._resolve_cache_store(conversation_id, user_id, access, generation, principals)
         return access
 
     def has_any_grants(self, conversation_id: str) -> bool:
