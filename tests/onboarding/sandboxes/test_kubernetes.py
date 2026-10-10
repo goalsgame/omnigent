@@ -162,6 +162,7 @@ def _run_failed_clone_with_credential_probe(
     cwd: Path | None = None,
     host_token: str = "test-launch-token-sentinel",
     repo_url: str = "https://github.com/org/private.git",
+    additional_repo_url: str | None = None,
     clone_succeeds: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str], list[str], Path]:
     """Run workspace prep with a recording git that rejects the clone."""
@@ -338,9 +339,12 @@ raise SystemExit(128)
         monkeypatch.delenv("WIRE_MUTATION", raising=False)
     else:
         monkeypatch.setenv("WIRE_MUTATION", wire_mutation)
+    repos = [RepoWorkspace(url=repo_url, branch=None, repo_name="private")]
+    if additional_repo_url is not None:
+        repos.append(RepoWorkspace(url=additional_repo_url, branch=None, repo_name="other"))
     command = k8s._render_workspace_prep_command(
         str(workspace),
-        [RepoWorkspace(url=repo_url, branch=None, repo_name="private")],
+        repos,
         ":",
         "host-test",
     )
@@ -2124,3 +2128,37 @@ def test_preparation_supports_boolean_only_runner_credentials(
         assert (tmp_path / "fallback-used").read_text() == "used"
     else:
         assert paths  # The broker helper was installed and verified.
+
+
+@pytest.mark.parametrize(
+    ("wire_mutation", "expected_code", "message"),
+    [
+        ("machine_unavailable", 85, "GitHub App access is not authorized"),
+        ("disconnected_broker", 81, "connect GitHub in Settings > Integrations"),
+    ],
+)
+@pytest.mark.parametrize("github_first", [True, False])
+def test_multi_repo_clone_preserves_actionable_github_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_mutation: str,
+    expected_code: int,
+    message: str,
+    github_first: bool,
+) -> None:
+    urls = ["https://github.com/org/private.git", "https://example.com/org/private.git"]
+    if not github_first:
+        urls.reverse()
+    result, argv, paths, _modes, _config = _run_failed_clone_with_credential_probe(
+        tmp_path,
+        monkeypatch,
+        wire_mutation=wire_mutation,
+        repo_url=urls[0],
+        additional_repo_url=urls[1],
+    )
+    assert sum(call[0] == "clone" for call in argv if call) == 2
+    assert result.returncode == expected_code
+    assert message in result.stderr
+    assert all(not Path(path).exists() for path in paths)
+    assert not (tmp_path / "home/workspace/private").exists()
+    assert not (tmp_path / "home/workspace/other").exists()

@@ -675,7 +675,10 @@ def _render_workspace_prep_command(
             )
             script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || { child_rc=$?; '
-        script += f'[ "$rc" -eq {GITHUB_CHECKOUT_UNCONNECTED_EXIT} ] || rc=$child_rc; '
+        script += (
+            f'[ "$rc" -eq {GITHUB_CHECKOUT_UNCONNECTED_EXIT} ] || '
+            f'[ "$rc" -eq {GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT} ] || rc=$child_rc; '
+        )
         script += "} ; done\n"
         script += '[ "$rc" -eq 0 ] || exit "$rc"\n'
     if host_config is not None:
