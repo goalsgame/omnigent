@@ -216,6 +216,25 @@ def test_group_acl_max_level_cache_revocation_and_owner_guard(db_uri):
     assert store.get_user(group) is None
 
 
+def test_case_colliding_encoded_group_keys_never_share_access(db_uri):
+    store = SqlAlchemyPermissionStore(db_uri)
+    session_id = SqlAlchemyConversationStore(db_uri).create_conversation().id
+    first, second = group_principal("aaa"), group_principal("aaG")
+    assert first != second and first.lower() == second.lower()
+    store.ensure_user("member")
+    store.grant(first, session_id, 1)
+    store.grant(second, session_id, 3)
+    bind_group_authority("member", ["aaa"], int(time.time()) + 300)
+    assert store.resolve_access("member", session_id).user_grant_level == 1
+    assert not store.check_access("member", session_id, 2)
+    bind_group_authority("member", ["aaG"], int(time.time()) + 300)
+    assert store.resolve_access("member", session_id).user_grant_level == 3
+    store.revoke(first, session_id)
+    assert store.resolve_access("member", session_id).user_grant_level == 3
+    bind_group_authority("member", ["aaa"], int(time.time()) + 300)
+    assert store.resolve_access("member", session_id).user_grant_level is None
+
+
 def test_refresh_keeps_original_group_membership_deadline(db_uri, oidc):
     store = DeviceGrantStore(db_uri)
     deadline = int(time.time()) + 60

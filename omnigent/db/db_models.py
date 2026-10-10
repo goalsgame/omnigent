@@ -28,6 +28,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
@@ -683,7 +684,9 @@ class SqlSessionPermission(OmnigentBase):
         default=current_workspace_id,
     )
     user_id: Mapped[str] = mapped_column(
-        String(128),
+        String(128).with_variant(
+            MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        ),
         primary_key=True,
     )
     conversation_id: Mapped[str] = mapped_column(
