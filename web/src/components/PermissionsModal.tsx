@@ -129,7 +129,7 @@ export function PermissionsModal({
     setError(null);
     grant.mutate(
       {
-        userId: trimmed,
+        userId: principalType === "group" ? newUserId : trimmed,
         level: parseInt(newLevel, 10),
         ...(principalType === "group" ? { principalType } : {}),
       },

@@ -68,6 +68,14 @@ def test_malformed_claims_fail_closed(value):
     assert verified_groups(value) == ()
 
 
+def test_group_names_reject_all_c0_and_c1_controls():
+    for codepoint in (*range(32), *range(127, 160)):
+        name = "before" + chr(codepoint) + "after"
+        with pytest.raises(ValueError, match="control characters"):
+            group_principal(name)
+        assert verified_groups([name]) == ()
+
+
 def test_exact_names_and_tenant_subject_expiry_boundaries():
     group = group_principal("/engineering")
     assert group_name(group) == "/engineering"

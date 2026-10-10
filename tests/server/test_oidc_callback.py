@@ -790,6 +790,39 @@ def test_callback_preserves_verified_group_claims(callback_client):
     assert payload["group_authority"]["expires_at"] <= payload["exp"]
 
 
+@pytest.mark.parametrize("reauth", [False, True])
+def test_callback_validates_token_once_for_email_auth_time_and_groups(
+    callback_client, monkeypatch, reauth
+):
+    client, keys = callback_client
+    lookups = []
+
+    def signing_key_lookup(self, token):
+        lookups.append(token)
+        return keys.signing_key
+
+    monkeypatch.setattr(jwt.PyJWKClient, "get_signing_key_from_jwt", signing_key_lookup)
+    now = int(time.time())
+    token = keys.sign_id_token(
+        {
+            "email": "Alice@Example.com",
+            "email_verified": True,
+            "groups": ["/engineering"],
+            "auth_time": now,
+        }
+    )
+    response = (
+        _do_callback_reauth(client, token, reauth_at=now)
+        if reauth
+        else _do_callback(client, token)
+    )
+    assert response.status_code == 302, response.text
+    assert lookups == [token]
+    payload = jwt.decode(response.cookies["ap_session"], _TEST_SECRET, algorithms=["HS256"])
+    assert payload["sub"] == "alice@example.com"
+    assert payload["group_authority"]["groups"] == ["/engineering"]
+
+
 def test_native_exchange_preserves_verified_groups(callback_client):
     from urllib.parse import parse_qs, urlsplit
 

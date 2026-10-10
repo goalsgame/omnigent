@@ -182,7 +182,7 @@ describe("PermissionsModal", () => {
     await waitFor(() => expect(listMock).toHaveBeenCalled());
 
     const input = screen.getByPlaceholderText("alice@example.com");
-    fireEvent.change(input, { target: { value: "carol@example.com" } });
+    fireEvent.change(input, { target: { value: " carol@example.com " } });
 
     const grantBtn = screen.getByRole("button", { name: /grant/i });
     fireEvent.click(grantBtn);
@@ -911,6 +911,26 @@ describe("PermissionsModal", () => {
 });
 
 describe("OIDC group sharing", () => {
+  it.each([" /engineering", "/engineering "])(
+    "preserves padding for server rejection: %s",
+    async (name) => {
+      listMock.mockResolvedValue([]);
+      grantMock.mockRejectedValue(new Error("Group names must be unpadded"));
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ group_sharing_enabled: true }),
+      });
+      const type = screen.getByRole("combobox", { name: "Share with" });
+      type.focus();
+      fireEvent.keyDown(type, { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "OIDC group" }));
+      fireEvent.change(screen.getByLabelText("Group name"), { target: { value: name } });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", name, 1, "group"));
+      expect(await screen.findByText("Group names must be unpadded")).toBeInTheDocument();
+      expect(screen.getByLabelText("Group name")).toHaveValue(name);
+    },
+  );
+
   it("submits an explicit group grant using the exact claim name", async () => {
     listMock.mockResolvedValue([]);
     grantMock.mockResolvedValue({

@@ -25,7 +25,7 @@ def group_principal(name: str) -> str:
         raise ValueError("Group names must contain valid Unicode") from exc
     if not name or name != name.strip() or len(encoded) > 87:
         raise ValueError("Group names must be nonempty, unpadded and at most 87 UTF-8 bytes")
-    if any(ord(c) < 32 or ord(c) == 127 for c in name):
+    if any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name):
         raise ValueError("Group names cannot contain control characters")
     return GROUP_PRINCIPAL_PREFIX + base64.urlsafe_b64encode(encoded).decode().rstrip("=")
 
