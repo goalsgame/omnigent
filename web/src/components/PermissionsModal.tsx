@@ -725,16 +725,18 @@ function GrantRow({
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
   const fixedLevel = isOwner || isManage || readOnly;
+  const displayName =
+    permission.principal_type === "group"
+      ? (permission.group_name ?? permission.user_id)
+      : permission.user_id;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
       {/* Tail truncation keeps the local part — the distinguishing half when
           every grantee shares one company domain — and the title tooltip
           carries the full id. */}
-      <span className="flex-1 truncate text-ui" title={permission.group_name ?? permission.user_id}>
-        {permission.principal_type === "group"
-          ? `Group: ${permission.group_name}`
-          : permission.user_id}
+      <span className="flex-1 truncate text-ui" title={displayName}>
+        {permission.principal_type === "group" ? `Group: ${displayName}` : displayName}
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
@@ -748,7 +750,7 @@ function GrantRow({
         >
           <SelectTrigger
             className="h-8 w-28"
-            aria-label={`Permission level for ${permission.user_id}`}
+            aria-label={`Permission level for ${permission.principal_type === "group" ? "group " : ""}${displayName}`}
           >
             <SelectValue />
           </SelectTrigger>

@@ -121,6 +121,23 @@ describe("resolveServerInfo sandbox_providers", () => {
   });
 });
 
+describe("resolveServerInfo group sharing", () => {
+  it("preserves an explicitly advertised true", async () => {
+    expect((await probe({ group_sharing_enabled: true })).group_sharing_enabled).toBe(true);
+  });
+
+  it("defaults a missing capability to false", async () => {
+    expect((await probe({})).group_sharing_enabled).toBe(false);
+  });
+
+  it.each([false, null, "true", "false", 0, 1, [], {}])(
+    "defaults non-true values to false: %j",
+    async (value) => {
+      expect((await probe({ group_sharing_enabled: value })).group_sharing_enabled).toBe(false);
+    },
+  );
+});
+
 describe("resolveServerInfo release features", () => {
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({

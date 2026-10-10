@@ -976,7 +976,7 @@ describe("OIDC group sharing", () => {
       wrapper: createInfoWrapper({ group_sharing_enabled: true }),
     });
     await screen.findByText("Group: /engineering");
-    const level = screen.getByRole("combobox", { name: "Permission level for oidc-group:encoded" });
+    const level = screen.getByRole("combobox", { name: "Permission level for group /engineering" });
     level.focus();
     fireEvent.keyDown(level, { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Edit" }));
