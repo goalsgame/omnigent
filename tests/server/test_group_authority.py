@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import jwt
@@ -160,6 +161,35 @@ def test_cookie_cache_does_not_replay_memberships_and_scope_checks_remain(oidc):
     assert len(access_principals("member")) == 2
 
 
+@pytest.mark.parametrize("provider_type", ["oidc", "github"])
+@pytest.mark.parametrize("cookie", [False, True], ids=["bearer", "cookie"])
+@pytest.mark.parametrize("websocket", [False, True], ids=["http", "websocket"])
+@pytest.mark.parametrize("worker_snapshot", [False, True], ids=["token", "worker"])
+def test_group_restoration_requires_active_oidc_provider(
+    db_uri, oidc, provider_type, cookie, websocket, worker_snapshot
+):
+    from omnigent.server.auth import _CONNECTION_IDENTITY_KEY, _ConnectionIdentity
+
+    snapshot = {"groups": ["engineering"], "expires_at": int(time.time()) + 300}
+    token = mint_session_token("member", oidc.cookie_secret, 300, "oidc", group_authority=snapshot)
+    request = connection(token, cookie=cookie, websocket=websocket)
+    # Reuse the original signing secret across the provider switch.
+    provider = UnifiedAuthProvider("oidc", oidc_config=replace(oidc, provider_type=provider_type))
+    if worker_snapshot:
+        request.scope[_CONNECTION_IDENTITY_KEY] = _ConnectionIdentity(
+            provider, 0, "member", None, snapshot
+        )
+    assert provider.supports_group_sharing == (provider_type == "oidc")
+    assert provider.get_user_id(request) == "member"
+    assert len(access_principals("member")) == (2 if provider_type == "oidc" else 1)
+    store = SqlAlchemyPermissionStore(db_uri)
+    session_id = SqlAlchemyConversationStore(db_uri).create_conversation().id
+    store.grant("member", session_id, 1)
+    store.grant(group_principal("engineering"), session_id, 2, is_group=True)
+    assert store.check_access("member", session_id, 1)
+    assert store.check_access("member", session_id, 2) == (provider_type == "oidc")
+
+
 def test_verified_connector_groups_and_machine_exclusion(human, oidc, verifier, signing_key):
     provider = UnifiedAuthProvider(
         "oidc", oidc_config=oidc, human_verifier=human, machine_verifier=verifier
@@ -314,7 +344,8 @@ def test_account_operations_do_not_mutate_explicit_group_grants(db_uri, operatio
     assert store.get(principal, session_id).level == 2
 
 
-def test_refresh_keeps_original_group_membership_deadline(db_uri, oidc):
+@pytest.mark.parametrize("provider_type", ["oidc", "github"])
+def test_refresh_keeps_original_group_membership_deadline(db_uri, oidc, provider_type):
     store = DeviceGrantStore(db_uri)
     deadline = int(time.time()) + 60
     snapshot = {"groups": ["engineering"], "expires_at": deadline}
@@ -326,7 +357,7 @@ def test_refresh_keeps_original_group_membership_deadline(db_uri, oidc):
         created_at=int(time.time()),
         group_authority=snapshot,
     )
-    provider = UnifiedAuthProvider("oidc", oidc_config=oidc)
+    provider = UnifiedAuthProvider("oidc", oidc_config=replace(oidc, provider_type=provider_type))
     app = FastAPI()
     app.include_router(create_oauth_token_router(provider, store))
     with TestClient(app) as client:
@@ -339,7 +370,7 @@ def test_refresh_keeps_original_group_membership_deadline(db_uri, oidc):
         )
         assert claims["group_authority"] == snapshot
         assert provider.get_user_id(connection(response.json()["access_token"])) == "member"
-        assert len(access_principals("member")) == 2
+        assert len(access_principals("member")) == (2 if provider_type == "oidc" else 1)
         store.revoke("grant")
         provider.set_grant_revocation_check(store.is_revoked)
         assert provider.get_user_id(connection(response.json()["access_token"])) is None

@@ -11,6 +11,9 @@ choose Read or Edit. The dialog identifies existing group grants separately
 from individual users. All clients using this dialog share the same behavior.
 Group support is advertised as `group_sharing_enabled` by `GET /v1/info`.
 Header, accounts, and GitHub login deployments do not enable it.
+Only an active OIDC provider restores group authority. GitHub OAuth ignores
+stored OIDC membership claims, including in existing login and refresh tokens
+when the signing secret is retained across an authentication-provider switch.
 
 The permissions API also supports Manage:
 

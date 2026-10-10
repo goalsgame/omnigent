@@ -616,7 +616,11 @@ class UnifiedAuthProvider(AuthProvider):
         ):
             if identity.user_id is not None and identity.generation is not None:
                 bind_account_authority(identity.user_id, identity.generation)
-            if identity.user_id is not None and identity.group_authority is not None:
+            if (
+                self.supports_group_sharing
+                and identity.user_id is not None
+                and identity.group_authority is not None
+            ):
                 bind_group_authority(
                     identity.user_id,
                     identity.group_authority.get("groups"),
@@ -809,7 +813,7 @@ class UnifiedAuthProvider(AuthProvider):
             if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
         # Machine owner JWTs require live binding/admin checks on every request.
-        if self._source == "oidc" and not is_machine:
+        if self.supports_group_sharing and not is_machine:
             group_claim = payload.get("group_authority")
             if isinstance(group_claim, dict):
                 bind_group_authority(
