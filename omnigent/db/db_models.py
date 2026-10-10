@@ -28,6 +28,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
@@ -607,6 +608,7 @@ class SqlDeviceGrant(OmnigentBase):
     """
 
     __tablename__ = "device_grants"
+    group_authority_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
@@ -673,6 +675,10 @@ class SqlSessionPermission(OmnigentBase):
 
     __tablename__ = "session_permissions"
 
+    is_group: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -682,7 +688,9 @@ class SqlSessionPermission(OmnigentBase):
         default=current_workspace_id,
     )
     user_id: Mapped[str] = mapped_column(
-        String(128),
+        String(128).with_variant(
+            MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        ),
         primary_key=True,
     )
     conversation_id: Mapped[str] = mapped_column(

@@ -14,6 +14,10 @@ wakes and pushes the new session to its browser. The browser then reconciles it
 into the sidebar — so a new session appears within a tick of being created, and
 an idle list still makes zero HTTP polls.
 
+Group-sharing streams also subscribe under their verified group principals.
+The updates route checks current session access before sending any discovery
+event to a client, including when membership expires on an open connection.
+
 Mirrors :mod:`omnigent.runtime.session_stream` (the per-conversation SSE
 broadcaster) but is deliberately minimal: no replay buffer, no end-of-stream
 sentinel, no snapshot hooks, and no side-channels. Events emitted while a user
@@ -72,7 +76,9 @@ def publish(user_key: str, event: dict[str, Any]) -> None:
             _subscribers.pop(user_key, None)
 
 
-async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:
+async def subscribe(
+    user_key: str, *, additional_keys: tuple[str, ...] = ()
+) -> AsyncIterator[dict[str, Any]]:
     """
     Subscribe to discovery events for ``user_key`` until cancelled.
 
@@ -84,20 +90,24 @@ async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:
 
     :param user_key: The user's discovery key to subscribe under (see
         :func:`publish`).
+    :param additional_keys: Verified group principals to watch in the same workspace.
     :returns: An async iterator of event dicts, each yielded verbatim.
     """
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     entry = (queue, loop)
+    keys = (user_key, *additional_keys)
     with _lock:
-        _subscribers.setdefault(user_key, set()).add(entry)
+        for key in keys:
+            _subscribers.setdefault(key, set()).add(entry)
     try:
         while True:
             yield await queue.get()
     finally:
         with _lock:
-            subs = _subscribers.get(user_key)
-            if subs is not None:
-                subs.discard(entry)
-                if not subs:
-                    _subscribers.pop(user_key, None)
+            for key in keys:
+                subs = _subscribers.get(key)
+                if subs is not None:
+                    subs.discard(entry)
+                    if not subs:
+                        _subscribers.pop(key, None)

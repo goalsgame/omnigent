@@ -95,6 +95,13 @@ def test_admission_is_live_and_unwired_fails_closed(human, signing_key):
     assert human.authenticate(token) is None
 
 
+def test_reserved_group_identity_is_rejected_before_account_callback(human, signing_key):
+    check = Mock(side_effect=ValueError("Group principals cannot become users"))
+    human.set_identity_check(check)
+    assert human.authenticate(human_token(signing_key, email="oidc-group:ZW5naW5lZXJpbmc")) is None
+    check.assert_not_called()
+
+
 def test_client_dispatch_never_falls_back(human, verifier, oidc, signing_key, monkeypatch):
     provider = UnifiedAuthProvider(
         "oidc", oidc_config=oidc, human_verifier=human, machine_verifier=verifier

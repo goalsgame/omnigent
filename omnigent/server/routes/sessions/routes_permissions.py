@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from typing import TypedDict
 
 from fastapi import (
@@ -13,6 +14,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.db.account_authority import target_account_scope
+from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX, group_name, group_principal
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
@@ -36,6 +38,7 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
+    UnifiedAuthProvider,
     workspace_sharing_blocked,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -68,7 +71,7 @@ from omnigent.spec.types import (
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import PermissionStore, PrincipalTypeConflict
 
 
 class _PermissionListResponse(TypedDict):
@@ -150,12 +153,31 @@ def register_permissions_routes(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        if body.user_id == user_id:
+        if body.principal_type == "group":
+            if (
+                not isinstance(auth_provider, UnifiedAuthProvider)
+                or not auth_provider.supports_group_sharing
+            ):
+                raise OmnigentError(
+                    "Group sharing requires OIDC authentication", code=ErrorCode.INVALID_INPUT
+                )
+            try:
+                target_id = group_principal(body.user_id)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        else:
+            target_id = body.user_id
+            if target_id.startswith(GROUP_PRINCIPAL_PREFIX):
+                raise OmnigentError(
+                    "Use principal_type=group with the exact group name",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if target_id == user_id:
             raise OmnigentError(
                 "Cannot modify your own permissions",
                 code=ErrorCode.FORBIDDEN,
             )
-        if body.user_id == RESERVED_USER_PUBLIC:
+        if target_id == RESERVED_USER_PUBLIC:
             # Public-access kill switch, independent of the sharing_mode gate
             # above (see app.state.public_sharing). Blocks the anyone-with-the
             # -link grant while leaving user-to-user sharing intact. ``getattr``
@@ -170,26 +192,44 @@ def register_permissions_routes(
                     "Public access is limited to read-only (level 1)",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
-        with target_account_scope(body.user_id, target.account_generation if target else None):
-            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+        target = (
+            await asyncio.to_thread(permission_store.get_user, target_id)
+            if body.principal_type == "user"
+            else None
+        )
+        with (
+            target_account_scope(target_id, target.account_generation if target else None)
+            if body.principal_type == "user"
+            else nullcontext()
+        ):
+            existing = await asyncio.to_thread(permission_store.get, target_id, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
                 raise OmnigentError(
                     "Cannot modify owner permissions",
                     code=ErrorCode.FORBIDDEN,
                 )
-            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
-            perm = await asyncio.to_thread(
-                permission_store.grant, body.user_id, session_id, body.level
-            )
+            if body.principal_type == "user":
+                await asyncio.to_thread(permission_store.ensure_user, target_id)
+            try:
+                perm = await asyncio.to_thread(
+                    permission_store.grant,
+                    target_id,
+                    session_id,
+                    body.level,
+                    is_group=body.principal_type == "group",
+                )
+            except PrincipalTypeConflict as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
-        _announce_session_added(body.user_id, session_id)
-        add_audit_attrs(target_user_id=body.user_id, level=body.level)
+        _announce_session_added(target_id, session_id)
+        add_audit_attrs(target_user_id=target_id, level=body.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
             level=perm.level,
+            principal_type="group" if perm.is_group else "user",
+            group_name=group_name(perm.user_id) if perm.is_group else None,
         )
 
     @router.delete(
@@ -347,6 +387,8 @@ def register_permissions_routes(
                     user_id=g.user_id,
                     conversation_id=g.conversation_id,
                     level=g.level,
+                    principal_type="group" if g.is_group else "user",
+                    group_name=group_name(g.user_id) if g.is_group else None,
                 )
                 for g in grants
             ],

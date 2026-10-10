@@ -30,6 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
+from omnigent.db.group_authority import access_principals
 from omnigent.db.utils import generate_agent_id, generate_file_id
 from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
@@ -2053,7 +2054,9 @@ def register_core_routes(
             re-sends its watch-set including it, after which it is tracked
             like any normal watched row. Idle users with no new sessions
             receive nothing — so the zero-traffic property holds."""
-            async for evt in user_session_stream.subscribe(_discovery_key(user_id)):
+            async for evt in user_session_stream.subscribe(
+                _discovery_key(user_id), additional_keys=access_principals(user_id)[1:]
+            ):
                 if not isinstance(evt, dict):
                     continue
                 evt_type = evt.get("type")

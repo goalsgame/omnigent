@@ -117,6 +117,31 @@ describe("listPermissions", () => {
 });
 
 describe("grantPermission", () => {
+  it.each(["/engineering", " /engineering"])(
+    "serializes the group discriminator and exact name: %s",
+    async (name) => {
+      const permission = {
+        user_id: "oidc-group:encoded",
+        conversation_id: "conv_abc",
+        level: 1,
+        principal_type: "group",
+        group_name: name,
+      };
+      fetchMock.mockResolvedValueOnce(mockResponse(permission));
+      const result = await grantPermission("conv_abc", name, 1, "group");
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/sessions/conv_abc/permissions");
+      expect(init.method).toBe("PUT");
+      expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+      expect(JSON.parse(init.body as string)).toEqual({
+        user_id: name,
+        level: 1,
+        principal_type: "group",
+      });
+      expect(result).toEqual(permission);
+    },
+  );
+
   it("PUTs /v1/sessions/{id}/permissions with user_id and level", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({ user_id: "bob", conversation_id: "conv_abc", level: 2 }),

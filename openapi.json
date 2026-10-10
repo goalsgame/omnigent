@@ -2612,6 +2612,16 @@
             "title": "Level",
             "type": "integer"
           },
+          "principal_type": {
+            "default": "user",
+            "description": "`user` (default), or `group` to interpret `user_id` as an exact group name from verified OIDC claims.",
+            "enum": [
+              "user",
+              "group"
+            ],
+            "title": "Principal Type",
+            "type": "string"
+          },
           "user_id": {
             "description": "The user to grant access to, e.g. `\"alice@example.com\"` or `\"__public__\"` for public read access.",
             "title": "User Id",
@@ -4080,11 +4090,31 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "group_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Name"
+          },
           "level": {
             "description": "Numeric permission level (1=read, 2=edit, 3=manage).",
             "format": "int64",
             "title": "Level",
             "type": "integer"
+          },
+          "principal_type": {
+            "default": "user",
+            "enum": [
+              "user",
+              "group"
+            ],
+            "title": "Principal Type",
+            "type": "string"
           },
           "user_id": {
             "description": "The grantee, e.g. `\"alice@example.com\"`.",
@@ -5232,6 +5262,11 @@
             "title": "Features",
             "type": "object"
           },
+          "group_sharing_enabled": {
+            "default": false,
+            "title": "Group Sharing Enabled",
+            "type": "boolean"
+          },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
             "type": "boolean"
@@ -5253,6 +5288,11 @@
               }
             ],
             "title": "Login Url"
+          },
+          "machine_google_cloud_enabled": {
+            "default": false,
+            "title": "Machine Google Cloud Enabled",
+            "type": "boolean"
           },
           "managed_sandboxes_enabled": {
             "title": "Managed Sandboxes Enabled",
@@ -10165,7 +10205,7 @@
     },
     "/v1/hosts/{host_id}/credentials/{provider}": {
       "get": {
-        "description": "Return the session owner's *provider* credential for *host_id*.\n\nAuthenticated by the launch token (constant-time, expiry-aware, and\nbound to *host_id*), exactly like the host tunnel. `401` when the\ntoken doesn't resolve; `404` for a provider with no broker resolver or\nnot configured on this server; `{\"connected\": false}` when the owner\nhasn't linked it, so a caller can fall back cleanly.",
+        "description": "Return the session owner's *provider* credential for *host_id*.\n\nAuthenticated by the launch token (constant-time, expiry-aware, and\nbound to *host_id*), exactly like the host tunnel. `401` when the\ntoken doesn't resolve; `404` for a provider with no broker resolver or\nnot configured on this server; `{\"connected\": false}` when the owner\nhasn't linked it, so a caller can fall back cleanly. Human GitHub\naccounts include `reason: not_connected` only for a missing connection.\nMachines without authorized App access include `reason: machine_not_authorized`;\ncredential-resolution failures return `503`.",
         "operationId": "host_credential_v1_hosts__host_id__credentials__provider__get",
         "parameters": [
           {

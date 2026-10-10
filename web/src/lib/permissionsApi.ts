@@ -121,6 +121,8 @@ export function isSessionSharedWithOthers(
 }
 
 export interface Permission {
+  principal_type?: "user" | "group";
+  group_name?: string | null;
   user_id: string;
   conversation_id: string;
   level: number;
@@ -161,13 +163,18 @@ export async function grantPermission(
   sessionId: string,
   userId: string,
   level: number,
+  principalType?: "user" | "group",
 ): Promise<Permission> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions`,
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, level }),
+      body: JSON.stringify({
+        user_id: userId,
+        level,
+        ...(principalType ? { principal_type: principalType } : {}),
+      }),
     },
   );
   if (!res.ok) {

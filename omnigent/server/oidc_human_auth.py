@@ -110,10 +110,15 @@ class OIDCHumanVerifier:
         if email is None:
             return None
         email = email.lower()
+        from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX, bind_group_authority
+
         if email in _RESERVED_USERS or email.startswith(MACHINE_PRINCIPAL_PREFIX):
+            return None
+        if email.startswith(GROUP_PRINCIPAL_PREFIX):
             return None
         if self._identity_check is None or not self._identity_check(email):
             return None
+        bind_group_authority(email, claims.get("groups"), claims["exp"])
         return email
 
 

@@ -776,3 +776,84 @@ def test_callback_cannot_select_machine_principal(
     response = _do_callback(client, token)
     assert response.status_code == 403
     assert response.cookies.get("ap_session") is None
+
+
+def test_callback_preserves_verified_group_claims(callback_client):
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "Alice@Example.com", "email_verified": True, "groups": ["/engineering"]}
+    )
+    response = _do_callback(client, token)
+    assert response.status_code == 302
+    payload = jwt.decode(client.cookies.get("ap_session"), _TEST_SECRET, algorithms=["HS256"])
+    assert payload["group_authority"]["groups"] == ["/engineering"]
+    assert payload["group_authority"]["expires_at"] <= payload["exp"]
+
+
+@pytest.mark.parametrize("reauth", [False, True])
+def test_callback_validates_token_once_for_email_auth_time_and_groups(
+    callback_client, monkeypatch, reauth
+):
+    client, keys = callback_client
+    lookups = []
+
+    def signing_key_lookup(self, token):
+        lookups.append(token)
+        return keys.signing_key
+
+    monkeypatch.setattr(jwt.PyJWKClient, "get_signing_key_from_jwt", signing_key_lookup)
+    now = int(time.time())
+    token = keys.sign_id_token(
+        {
+            "email": "Alice@Example.com",
+            "email_verified": True,
+            "groups": ["/engineering"],
+            "auth_time": now,
+        }
+    )
+    response = (
+        _do_callback_reauth(client, token, reauth_at=now)
+        if reauth
+        else _do_callback(client, token)
+    )
+    assert response.status_code == 302, response.text
+    assert lookups == [token]
+    payload = jwt.decode(response.cookies["ap_session"], _TEST_SECRET, algorithms=["HS256"])
+    assert payload["sub"] == "alice@example.com"
+    assert payload["group_authority"]["groups"] == ["/engineering"]
+
+
+def test_native_exchange_preserves_verified_groups(callback_client):
+    from urllib.parse import parse_qs, urlsplit
+
+    from omnigent.server.oidc import derive_code_challenge
+
+    client, keys = callback_client
+    verifier = "v" * 64
+    redirect = "ai.omnigent.ios:/oauth/callback"
+    login = client.get(
+        "/auth/login",
+        params={
+            "native_redirect_uri": redirect,
+            "native_state": "native-state",
+            "code_challenge": derive_code_challenge(verifier),
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(
+        {"email": "Alice@Example.com", "email_verified": True, "groups": ["/engineering"]}
+    )
+    callback = client.get(
+        "/auth/callback", params={"code": "idp-code", "state": state}, follow_redirects=False
+    )
+    assert callback.status_code == 302, callback.text
+    code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
+    exchanged = client.post(
+        "/auth/native-token",
+        data={"code": code, "code_verifier": verifier, "redirect_uri": redirect},
+    )
+    assert exchanged.status_code == 200, exchanged.text
+    payload = jwt.decode(exchanged.json()["token"], _TEST_SECRET, algorithms=["HS256"])
+    assert payload["group_authority"]["groups"] == ["/engineering"]

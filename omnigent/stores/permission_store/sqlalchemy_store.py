@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import cast
 
-from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy import case, delete, exists, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -19,6 +19,12 @@ from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import account_generation, require_active_account
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
+from omnigent.db.group_authority import (
+    GROUP_PRINCIPAL_PREFIX,
+    access_principals,
+    group_name,
+    permission_principal_filter,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -30,7 +36,7 @@ from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
 )
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import PermissionStore, PrincipalTypeConflict
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
@@ -120,6 +126,7 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
         user_id=row.user_id,
         conversation_id=row.conversation_id,
         level=row.level,
+        is_group=row.is_group,
     )
 
 
@@ -150,7 +157,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             immediate=True,
         )
         # resolve_access cache (see _RESOLVE_ACCESS_CACHE_TTL_ENV). An LRU keyed
-        # (conversation_id, user_id, account_generation) -> (expiry, access). IDs are
+        # (conversation_id, user_id, account_generation, principals) -> (expiry, access). IDs are
         # globally unique, so grant/revoke can drop a whole session's entries —
         # including the shared __public__ grant, which affects every user of
         # that session — without depending on the ambient workspace context.
@@ -161,7 +168,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         self._resolve_cache_ttl_s = _resolve_access_cache_ttl_s()
         self._resolve_cache_max_entries = _resolve_access_cache_max_entries()
         self._resolve_cache: collections.OrderedDict[
-            tuple[str, str, str | None], tuple[float, ResolvedAccess]
+            tuple[str, str, str | None, tuple[str, ...]], tuple[float, ResolvedAccess]
         ] = collections.OrderedDict()
         self._resolve_cache_lock = threading.Lock()
         self._resolve_cache_clock: Callable[[], float] = time.monotonic
@@ -176,16 +183,21 @@ class SqlAlchemyPermissionStore(PermissionStore):
         user_id: str,
         conversation_id: str,
         level: int,
+        *,
+        is_group: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
+        if is_group and (group_name(user_id) is None or level >= LEVEL_OWNER):
+            raise ValueError("Groups cannot own sessions and require a valid group principal")
 
         def write(session: Session) -> None:
-            require_active_account(session, user_id)
+            require_active_account(session, None if is_group else user_id)
             dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "level": level,
+                "is_group": is_group,
             }
             stmt: Insert
             if dialect == "sqlite":
@@ -195,13 +207,19 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
                         set_={"level": level},
+                        where=SqlSessionPermission.is_group == is_group,
                     )
                 )
             elif dialect == "mysql":
                 stmt = (
                     mysql_insert(SqlSessionPermission)
                     .values(**values)
-                    .on_duplicate_key_update(level=level)
+                    .on_duplicate_key_update(
+                        level=case(
+                            (SqlSessionPermission.is_group == is_group, level),
+                            else_=SqlSessionPermission.level,
+                        )
+                    )
                 )
             else:
                 stmt = (
@@ -210,10 +228,23 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
                         set_={"level": level},
+                        where=SqlSessionPermission.is_group == is_group,
                     )
                 )
             session.execute(stmt)
             session.flush()
+            stored_type = session.scalar(
+                select(SqlSessionPermission.is_group).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                    SqlSessionPermission.conversation_id == conversation_id,
+                )
+            )
+            if stored_type != is_group:
+                raise PrincipalTypeConflict(
+                    "This grant key belongs to a different principal type. "
+                    "Revoke the conflicting grant before adding this share."
+                )
 
         run_write_transaction(
             self._session_immediate,
@@ -226,6 +257,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             user_id=user_id,
             conversation_id=conversation_id,
             level=level,
+            is_group=is_group,
         )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
@@ -281,6 +313,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
         :returns: The number of grants repointed to *to_user_id*.
         """
 
+        if to_user_id.startswith(GROUP_PRINCIPAL_PREFIX):
+            raise ValueError("Group principals cannot become users")
+
         def write(session: Session) -> tuple[int, bool]:
             require_active_account(session, to_user_id)
             # FK target: ensure the destination users.id row exists. Don't
@@ -293,6 +328,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     select(SqlSessionPermission).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.is_group.is_(False),
                     )
                 )
                 .scalars()
@@ -320,6 +356,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     delete(SqlSessionPermission).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.is_group.is_(False),
                         SqlSessionPermission.conversation_id.in_(duplicate_ids),
                     )
                 )
@@ -331,6 +368,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.is_group.is_(False),
                         SqlSessionPermission.conversation_id.in_(reassign_ids),
                     )
                     .values(user_id=to_user_id)
@@ -410,6 +448,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.is_group.is_(False),
                     )
                     .limit(limit)
                 )
@@ -420,6 +459,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         """Upsert a user row. See base class for contract."""
+        if user_id.startswith(GROUP_PRINCIPAL_PREFIX):
+            raise ValueError("Group principals cannot become user accounts")
 
         def write(session: Session) -> None:
             require_active_account(session, user_id)
@@ -514,15 +555,22 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if user_id is None:
             return False
 
-        grant = self.get(user_id, conversation_id)
-        if grant is not None and grant.level >= required_level:
-            return True
-
-        public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
-            return True
-
-        return False
+        with self._session("check_access") as session:
+            return (
+                session.scalar(
+                    select(
+                        exists().where(
+                            SqlSessionPermission.workspace_id == current_workspace_id(),
+                            SqlSessionPermission.conversation_id == conversation_id,
+                            permission_principal_filter(
+                                access_principals(user_id), public_user_id=RESERVED_USER_PUBLIC
+                            ),
+                            SqlSessionPermission.level >= required_level,
+                        )
+                    )
+                )
+                is True
+            )
 
     def get_permission_level(
         self,
@@ -534,18 +582,31 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return None
         if self.is_admin(user_id):
             return LEVEL_OWNER
-        grant = self.get(user_id, conversation_id)
-        if grant is not None:
-            return grant.level
-        public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None:
-            return public_grant.level
-        return None
+        with self._session("get_permission_level") as session:
+            rows = session.execute(
+                select(SqlSessionPermission.user_id, SqlSessionPermission.level).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == conversation_id,
+                    permission_principal_filter(
+                        access_principals(user_id), public_user_id=RESERVED_USER_PUBLIC
+                    ),
+                )
+            ).all()
+        levels = [level for principal, level in rows if principal != RESERVED_USER_PUBLIC]
+        return (
+            max(levels)
+            if levels
+            else next(
+                (level for principal, level in rows if principal == RESERVED_USER_PUBLIC), None
+            )
+        )
 
-    def _resolve_cache_lookup(self, conversation_id: str, user_id: str) -> ResolvedAccess | None:
+    def _resolve_cache_lookup(
+        self, conversation_id: str, user_id: str, principals: tuple[str, ...]
+    ) -> ResolvedAccess | None:
         """Return a live cached resolve_access result, or ``None`` on miss/expiry."""
         now = self._resolve_cache_clock()
-        key = (conversation_id, user_id, account_generation(user_id))
+        key = (conversation_id, user_id, account_generation(user_id), principals)
         with self._resolve_cache_lock:
             entry = self._resolve_cache.get(key)
             if entry is None:
@@ -568,6 +629,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         user_id: str,
         access: ResolvedAccess,
         generation: int,
+        principals: tuple[str, ...],
     ) -> None:
         """Cache one *granted* resolve_access result until now + TTL.
 
@@ -576,7 +638,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
         be stored on top of the eviction it already performed. Enforces the LRU
         entry cap so the cache cannot grow without bound on a long-lived replica.
         """
-        key = (conversation_id, user_id, account_generation(user_id))
+        if principals != access_principals(user_id):
+            return
+        key = (conversation_id, user_id, account_generation(user_id), principals)
         expiry = self._resolve_cache_clock() + self._resolve_cache_ttl_s
         with self._resolve_cache_lock:
             if generation != self._resolve_cache_generation:
@@ -615,10 +679,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 public_grant_level=None,
             )
         workspace_id = current_workspace_id()
+        principals = access_principals(user_id)
         cache_enabled = self._resolve_cache_ttl_s > 0
         generation = 0
         if cache_enabled:
-            cached = self._resolve_cache_lookup(conversation_id, user_id)
+            cached = self._resolve_cache_lookup(conversation_id, user_id, principals)
             if cached is not None:
                 return cached
             # Sampled before the read: an invalidation landing while the rows
@@ -633,9 +698,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # did — see the GET /v1/sessions/{id} snapshot path).
         with self._session("resolve_access") as session:
             user_row = session.get(SqlUser, (workspace_id, user_id))
-            user_grant = session.get(
-                SqlSessionPermission, (workspace_id, user_id, conversation_id)
-            )
+            levels = session.scalars(
+                select(SqlSessionPermission.level).where(
+                    SqlSessionPermission.workspace_id == workspace_id,
+                    SqlSessionPermission.conversation_id == conversation_id,
+                    permission_principal_filter(principals),
+                )
+            ).all()
             public_grant = session.get(
                 SqlSessionPermission,
                 (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
@@ -644,7 +713,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 is_admin=user_row is not None
                 and user_row.deleted_at is None
                 and user_row.is_admin,
-                user_grant_level=user_grant.level if user_grant is not None else None,
+                user_grant_level=max(levels, default=None),
                 public_grant_level=public_grant.level if public_grant is not None else None,
             )
         # Cache only a positive standing: a no-access result is left uncached so
@@ -655,7 +724,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             or access.user_grant_level is not None
             or access.public_grant_level is not None
         ):
-            self._resolve_cache_store(conversation_id, user_id, access, generation)
+            self._resolve_cache_store(conversation_id, user_id, access, generation, principals)
         return access
 
     def has_any_grants(self, conversation_id: str) -> bool:

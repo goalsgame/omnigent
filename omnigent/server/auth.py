@@ -431,6 +431,7 @@ class _ConnectionIdentity:
     workspace_id: int
     user_id: str | None
     generation: str | None
+    group_authority: dict[str, object] | None = None
 
 
 class UnifiedAuthProvider(AuthProvider):
@@ -546,6 +547,14 @@ class UnifiedAuthProvider(AuthProvider):
             del self._cookie_cache[key]
 
     @property
+    def supports_group_sharing(self) -> bool:
+        return (
+            self._source == "oidc"
+            and self._oidc_config is not None
+            and self._oidc_config.provider_type == "oidc"
+        )
+
+    @property
     def login_url(self) -> str | None:
         """Where the frontend should redirect on 401.
 
@@ -595,7 +604,9 @@ class UnifiedAuthProvider(AuthProvider):
         """
         from omnigent.db.account_authority import bind_account_authority, clear_account_authority
         from omnigent.db.db_models import current_workspace_id
+        from omnigent.db.group_authority import bind_group_authority, clear_group_authority
 
+        clear_group_authority()
         clear_account_authority()
         identity = request.scope.get(_CONNECTION_IDENTITY_KEY)
         if (
@@ -605,6 +616,16 @@ class UnifiedAuthProvider(AuthProvider):
         ):
             if identity.user_id is not None and identity.generation is not None:
                 bind_account_authority(identity.user_id, identity.generation)
+            if (
+                self.supports_group_sharing
+                and identity.user_id is not None
+                and identity.group_authority is not None
+            ):
+                bind_group_authority(
+                    identity.user_id,
+                    identity.group_authority.get("groups"),
+                    identity.group_authority.get("expires_at"),
+                )
             return identity.user_id
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
@@ -626,7 +647,9 @@ class UnifiedAuthProvider(AuthProvider):
         :returns: An HS256-signed JWT, or ``None`` for header mode, an
             empty/reserved user, or a missing cookie config.
         """
-        if not user_id or user_id in _RESERVED_USERS:
+        from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX
+
+        if not user_id or user_id in _RESERVED_USERS or user_id.startswith(GROUP_PRINCIPAL_PREFIX):
             return None
         if self._source not in ("oidc", "accounts"):
             return None
@@ -731,7 +754,14 @@ class UnifiedAuthProvider(AuthProvider):
         ):
             return None
         user_id = payload.get("sub")
-        if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
+        from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX, bind_group_authority
+
+        if (
+            not isinstance(user_id, str)
+            or not user_id
+            or user_id in _RESERVED_USERS
+            or user_id.startswith(GROUP_PRINCIPAL_PREFIX)
+        ):
             return None
 
         from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
@@ -782,10 +812,25 @@ class UnifiedAuthProvider(AuthProvider):
             # replaced, so it keeps that authority (revocable via ``grant_id``).
             if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
-            return user_id
-
         # Machine owner JWTs require live binding/admin checks on every request.
-        if self._account_check is None and not is_machine:
+        if self.supports_group_sharing and not is_machine:
+            group_claim = payload.get("group_authority")
+            if isinstance(group_claim, dict):
+                bind_group_authority(
+                    user_id,
+                    group_claim.get("groups"),
+                    min(payload["exp"], group_claim.get("expires_at", 0))
+                    if isinstance(group_claim.get("expires_at"), int)
+                    else None,
+                )
+
+        if (
+            self._account_check is None
+            and not is_machine
+            and grant_id is None
+            and scope is None
+            and "group_authority" not in payload
+        ):
             remaining = payload.get("exp", 0) - time.time()
             if remaining > 0:
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
@@ -830,7 +875,9 @@ class UnifiedAuthProvider(AuthProvider):
         if email:
             if self._header_strip_prefix:
                 email = email.removeprefix(self._header_strip_prefix)
-            if not email or email in _RESERVED_USERS:
+            from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX
+
+            if not email or email in _RESERVED_USERS or email.startswith(GROUP_PRINCIPAL_PREFIX):
                 return None
             return email
         if self._local_single_user:
@@ -872,8 +919,9 @@ class AccountAuthorityMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         from omnigent.db.account_authority import account_checks_scope
+        from omnigent.db.group_authority import group_authority_scope
 
-        with account_checks_scope(self._checks_enabled):
+        with account_checks_scope(self._checks_enabled), group_authority_scope():
             await self._app(scope, receive, send)
 
 
@@ -891,6 +939,7 @@ class AccountAuthenticationMiddleware:
     def _authenticate(self, connection: HTTPConnection) -> _ConnectionIdentity:
         from omnigent.db.account_authority import account_generation
         from omnigent.db.db_models import current_workspace_id
+        from omnigent.db.group_authority import group_snapshot
 
         user_id = self._auth_provider.get_user_id(connection)
         return _ConnectionIdentity(
@@ -898,6 +947,7 @@ class AccountAuthenticationMiddleware:
             current_workspace_id(),
             user_id,
             account_generation(user_id) if user_id is not None else None,
+            group_snapshot(user_id) if user_id is not None else None,
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

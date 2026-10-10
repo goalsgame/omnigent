@@ -20,6 +20,7 @@ class SessionPermission:
     user_id: str
     conversation_id: str
     level: int
+    is_group: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 from typing import cast
 
@@ -76,6 +77,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
         account_generation=row.account_generation,
+        group_authority=json.loads(row.group_authority_json) if row.group_authority_json else None,
     )
 
 
@@ -161,6 +163,7 @@ class DeviceGrantStore:
         client_id: str | None,
         refresh_token_hash: str,
         created_at: int,
+        group_authority: dict[str, object] | None = None,
     ) -> DeviceGrant:
         """Persist a grant born ``redeemed`` — no device-code consent step.
 
@@ -191,6 +194,7 @@ class DeviceGrantStore:
             generation = require_active_account(session, user_id)
             row = SqlDeviceGrant(
                 account_generation=generation,
+                group_authority_json=json.dumps(group_authority) if group_authority else None,
                 id=grant_id,
                 device_code_hash=device_code_hash,
                 user_code=user_code,
@@ -288,6 +292,7 @@ class DeviceGrantStore:
         *,
         user_id: str,
         now_epoch_seconds: int,
+        group_authority: dict[str, object] | None = None,
     ) -> DeviceGrant | None:
         """Atomically bind a ``pending`` grant to an approving identity.
 
@@ -326,6 +331,9 @@ class DeviceGrantStore:
                         user_id=user_id,
                         account_generation=generation,
                         approved_at=now_epoch_seconds,
+                        group_authority_json=json.dumps(group_authority)
+                        if group_authority
+                        else None,
                     )
                 ),
             )

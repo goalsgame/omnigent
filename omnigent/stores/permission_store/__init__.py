@@ -10,6 +10,10 @@ from abc import ABC, abstractmethod
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 
 
+class PrincipalTypeConflict(ValueError):
+    """A grant key already belongs to a different principal type."""
+
+
 class PermissionStore(ABC):
     """Abstract base for session permission persistence.
 
@@ -32,6 +36,8 @@ class PermissionStore(ABC):
         user_id: str,
         conversation_id: str,
         level: int,
+        *,
+        is_group: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant.
 
@@ -47,6 +53,8 @@ class PermissionStore(ABC):
         :param level: Numeric permission level (1=read, 2=edit,
             3=manage).
         :returns: The resulting :class:`SessionPermission`.
+        :param is_group: Explicit group discriminator; existing individual grants
+            cannot be converted to groups. A conflicting principal type raises ValueError.
         """
         ...
 
