@@ -165,7 +165,8 @@ def test_machine_never_falls_back_to_a_user_connection(db_uri: str) -> None:
     )
     tc = _app(hs, github_store=store)
     assert tc.get("/v1/hosts/host1/credentials/github", headers=_HDR).json() == {
-        "connected": False
+        "connected": False,
+        "reason": "machine_not_authorized",
     }
 
 

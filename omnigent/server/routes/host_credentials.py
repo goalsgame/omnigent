@@ -80,7 +80,8 @@ def create_host_credentials_router(
         token doesn't resolve; ``404`` for a provider with no broker resolver or
         not configured on this server; ``{"connected": false}`` when the owner
         hasn't linked it, so a caller can fall back cleanly. Human GitHub
-        accounts include ``reason: not_connected`` only for a missing connection;
+        accounts include ``reason: not_connected`` only for a missing connection.
+        Machines without authorized App access include ``reason: machine_not_authorized``;
         credential-resolution failures return ``503``.
         """
         # Never let a proxy/browser cache a vended credential.
@@ -159,8 +160,11 @@ def create_host_credentials_router(
                 headers={"Cache-Control": "no-store"},
             ) from None
         if payload is None:
-            if provider == "github" and not is_github_machine:
-                return {"connected": False, "reason": "not_connected"}
+            if provider == "github":
+                return {
+                    "connected": False,
+                    "reason": "machine_not_authorized" if is_github_machine else "not_connected",
+                }
             return {"connected": False}
         if provider == "google_cloud":
             # Refresh may wait on the provider; recheck consent before releasing a token.

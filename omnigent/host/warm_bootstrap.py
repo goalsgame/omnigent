@@ -31,6 +31,8 @@ from omnigent.host.identity_env import (
     HOST_TOKEN_ENV_VAR,
 )
 from omnigent.host.workspace_errors import (
+    GITHUB_CHECKOUT_MACHINE_UNAVAILABLE,
+    GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT,
     GITHUB_CHECKOUT_UNCONNECTED,
     GITHUB_CHECKOUT_UNCONNECTED_EXIT,
     WORKSPACE_ERROR_MESSAGES,
@@ -281,9 +283,10 @@ def _prepare_once(directory: Path, activation: Activation, signals: _Signals) ->
             directory,
             activation,
             "prepared" if returncode == 0 else "failed",
-            GITHUB_CHECKOUT_UNCONNECTED
-            if returncode == GITHUB_CHECKOUT_UNCONNECTED_EXIT
-            else None,
+            {
+                GITHUB_CHECKOUT_UNCONNECTED_EXIT: GITHUB_CHECKOUT_UNCONNECTED,
+                GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT: GITHUB_CHECKOUT_MACHINE_UNAVAILABLE,
+            }.get(returncode),
         )
 
 

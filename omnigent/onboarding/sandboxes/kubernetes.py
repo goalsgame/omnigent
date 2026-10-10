@@ -66,6 +66,8 @@ from omnigent.host.identity import (
     HOST_TOKEN_ENV_VAR,
 )
 from omnigent.host.workspace_errors import (
+    GITHUB_CHECKOUT_MACHINE_UNAVAILABLE,
+    GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT,
     GITHUB_CHECKOUT_UNCONNECTED,
     GITHUB_CHECKOUT_UNCONNECTED_EXIT,
     WORKSPACE_ERROR_MESSAGES,
@@ -534,6 +536,7 @@ def _render_workspace_prep_command(
             "if wired == 'broker' else []); "
             f"verified=(bool(token) and wired == 'broker' and helpers=={expected_helpers!r}); "
             "sys.exit(11 if bool(token) and wired == 'unconnected' "
+            "else 12 if bool(token) and wired == 'machine_unavailable' "
             "else 10 if bool(token) and wired == 'disabled' else 0 if verified else 1)"
         )
         # Clone every repo concurrently, then wait on each and fail the init
@@ -562,7 +565,8 @@ def _render_workspace_prep_command(
             f"PYTHONNOUSERSITE=1 PYTHONPATH= python3 -c {shlex.quote(wire)} || wire_rc=$?\n"
             '  if [ "$wire_rc" -eq 0 ]; then\n'
             '    export GIT_CONFIG_GLOBAL="$credential_config"\n'
-            '  elif [ "$wire_rc" -eq 10 ] || [ "$wire_rc" -eq 11 ]; then\n'
+            '  elif [ "$wire_rc" -eq 10 ] || [ "$wire_rc" -eq 11 ] '
+            '|| [ "$wire_rc" -eq 12 ]; then\n'
             '    rm -f -- "$credential_config"\n'
             "    credential_config=''\n"
             "  else\n"
@@ -650,10 +654,16 @@ def _render_workspace_prep_command(
                 and urlsplit(repo.url).hostname == "github.com"
             ):
                 message = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_UNCONNECTED])
+                machine_message = shlex.quote(
+                    WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_MACHINE_UNAVAILABLE]
+                )
                 clone_failure = (
                     'if [ "$wire_rc" -eq 11 ]; then '
                     f"printf '%s\\n' {message} >&2; "
-                    f"exit {GITHUB_CHECKOUT_UNCONNECTED_EXIT}; fi; exit 1"
+                    f"exit {GITHUB_CHECKOUT_UNCONNECTED_EXIT}; fi; "
+                    'if [ "$wire_rc" -eq 12 ]; then '
+                    f"printf '%s\\n' {machine_message} >&2; "
+                    f"exit {GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT}; fi; exit 1"
                 )
             script += (
                 f"  ( ( {clone} || {{ {clone_failure}; }} ) "

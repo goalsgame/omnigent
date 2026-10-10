@@ -226,6 +226,11 @@ if sys.argv[1:2] == ["-c"]:
             "import httpx; g.httpx.get=lambda *a,**k:"
             "httpx.Response(404,json={'detail':'unknown credential provider'}); "
         )
+    elif mutation == "machine_unavailable":
+        prefix += (
+            "import httpx; g.httpx.get=lambda *a,**k:"
+            "httpx.Response(200,json={'connected':False,'reason':'machine_not_authorized'}); "
+        )
     elif mutation in {"disconnected_broker", "unavailable_broker"}:
         code = 200 if mutation == "disconnected_broker" else 503
         payload = (
@@ -297,7 +302,12 @@ raise SystemExit(128)
     fake_git.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
-    if wire_mutation in {"disconnected_broker", "disabled_provider", "legacy_false"}:
+    if wire_mutation in {
+        "disconnected_broker",
+        "disabled_provider",
+        "machine_unavailable",
+        "legacy_false",
+    }:
         fallback_log = tmp_path / "fallback-used"
         (home / ".gitconfig").write_text(
             json.dumps(
@@ -2067,6 +2077,8 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
     ("wire_mutation", "repo_url", "expected_code"),
     [
         ("disconnected_broker", "https://github.com/org/private.git", 81),
+        ("machine_unavailable", "https://github.com/org/private.git", 85),
+        ("machine_unavailable", "https://example.com/org/private.git", 1),
         ("disconnected_broker", "https://example.com/org/private.git", 1),
         (None, "https://github.com/org/private.git", 1),
         ("disabled_provider", "https://github.com/org/private.git", 1),
@@ -2088,6 +2100,7 @@ def test_failed_clone_reports_missing_github_connection_only_when_confirmed(
     )
     assert result.returncode == expected_code
     assert ("connect GitHub in Settings > Integrations" in result.stderr) == (expected_code == 81)
+    assert ("GitHub App access is not authorized" in result.stderr) == (expected_code == 85)
     assert not (tmp_path / "home/workspace/private").exists()
 
 

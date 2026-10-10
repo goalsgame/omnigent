@@ -390,11 +390,11 @@ def configure_clone_credentials(server_url: str, host_id: str) -> bool:
 def configure_clone_credentials_status(
     server_url: str,
     host_id: str,
-) -> Literal["broker", "unconnected", "disabled"]:
+) -> Literal["broker", "unconnected", "machine_unavailable", "disabled"]:
     """Wire clone credentials and distinguish unlinked users from disabled integration.
 
     Unknown probe results still wire the broker, preserving fail-closed behavior.
-    Only an explicit missing-connection reason produces connection guidance.
+    Explicit missing-connection or machine-authorization reasons produce targeted guidance.
     Disabled providers and legacy negative responses keep a generic error;
     all negative responses preserve the ambient/shared helper chain.
     """
@@ -404,7 +404,11 @@ def configure_clone_credentials_status(
     data = _fetch(server_url, host_id, token)
     if data is not None and not data.get("connected"):
         # Older brokers do not distinguish missing connections from resolution failures.
-        return "unconnected" if data.get("reason") == "not_connected" else "disabled"
+        if data.get("reason") == "not_connected":
+            return "unconnected"
+        if data.get("reason") == "machine_not_authorized":
+            return "machine_unavailable"
+        return "disabled"
     _install_broker_helper(server_url, host_id, token)
     return "broker"
 
