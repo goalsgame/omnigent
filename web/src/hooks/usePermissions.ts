@@ -57,8 +57,18 @@ export function useSessionOwner(sessionId: string | null) {
 export function useGrantPermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ userId, level }: { userId: string; level: number }) =>
-      grantPermission(sessionId, userId, level),
+    mutationFn: ({
+      userId,
+      level,
+      principalType,
+    }: {
+      userId: string;
+      level: number;
+      principalType?: "user" | "group";
+    }) =>
+      principalType
+        ? grantPermission(sessionId, userId, level, principalType)
+        : grantPermission(sessionId, userId, level),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
     },

@@ -1287,7 +1287,12 @@ def _permission_level_from_grants(
         return None
     if is_admin:
         return LEVEL_OWNER
-    user_grant = next((g for g in grants if g.user_id == user_id), None)
+    from omnigent.db.group_authority import access_principals
+
+    principals = access_principals(user_id)
+    user_grant = max(
+        (g for g in grants if g.user_id in principals), key=lambda grant: grant.level, default=None
+    )
     if user_grant is not None:
         return user_grant.level
     public_grant = next((g for g in grants if g.user_id == RESERVED_USER_PUBLIC), None)

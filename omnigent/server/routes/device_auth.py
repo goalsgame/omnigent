@@ -199,6 +199,7 @@ def mint_delegated_token(
     jti: str,
     scope: str | None = DELEGATED_SCOPE,
     account_generation: str | None = None,
+    group_authority: dict[str, object] | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -242,7 +243,7 @@ def mint_delegated_token(
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
-    payload = {
+    payload: dict[str, object] = {
         "sub": user_id,
         "iat": now,
         "exp": now + ttl_seconds,
@@ -250,6 +251,8 @@ def mint_delegated_token(
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if group_authority is not None:
+        payload["group_authority"] = group_authority
     if account_generation is not None:
         payload["account_generation"] = account_generation
     if grant_id is not None:
@@ -335,6 +338,7 @@ def issue_login_grant(
     *,
     user_id: str,
     cookie_secret: bytes,
+    group_authority: dict[str, object] | None = None,
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -356,6 +360,7 @@ def issue_login_grant(
         secrets.token_urlsafe(24),
         user_id=user_id,
         client_id=LOGIN_GRANT_CLIENT_ID,
+        group_authority=group_authority,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
         created_at=int(time.time()),
     )
@@ -448,6 +453,7 @@ def create_oauth_token_router(
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
+            group_authority=grant.group_authority,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -686,6 +692,7 @@ def create_device_auth_router(
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
+            group_authority=grant.group_authority,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -905,10 +912,13 @@ def create_device_auth_router(
                 status_code=200,
             )
 
+        from omnigent.db.group_authority import group_snapshot
+
         approved = device_grant_store.approve(
             grant.id,
             user_id=user_id,
             now_epoch_seconds=now,
+            group_authority=group_snapshot(user_id),
         )
         if approved is None:
             return HTMLResponse(

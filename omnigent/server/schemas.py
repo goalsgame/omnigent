@@ -2944,11 +2944,14 @@ class GrantPermissionRequest(BaseModel):
     :param user_id: The user to grant access to, e.g.
         ``"alice@example.com"`` or ``"__public__"`` for public
         read access.
+    :param principal_type: ``user`` (default), or ``group`` to interpret
+        ``user_id`` as an exact group name from verified OIDC claims.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
     """
 
     user_id: str
+    principal_type: Literal["user", "group"] = "user"
     level: int = Field(ge=1, le=3)
 
 
@@ -2966,6 +2969,8 @@ class PermissionObject(BaseModel):
     user_id: str
     conversation_id: str
     level: int
+    principal_type: Literal["user", "group"] = "user"
+    group_name: str | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────

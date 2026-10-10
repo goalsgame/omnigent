@@ -114,6 +114,11 @@ class OIDCHumanVerifier:
             return None
         if self._identity_check is None or not self._identity_check(email):
             return None
+        from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX, bind_group_authority
+
+        if email.startswith(GROUP_PRINCIPAL_PREFIX):
+            return None
+        bind_group_authority(email, claims.get("groups"), claims["exp"])
         return email
 
 

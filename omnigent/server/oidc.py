@@ -59,6 +59,7 @@ def mint_session_token(
     *,
     account_generation: str | None = None,
     credential_delegate: bool = False,
+    group_authority: dict[str, object] | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -78,12 +79,14 @@ def mint_session_token(
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
-    payload = {
+    payload: dict[str, object] = {
         "sub": user_id,
         "iat": now,
         "exp": now + ttl_seconds,
         "provider": provider,
     }
+    if group_authority is not None:
+        payload["group_authority"] = group_authority
     if credential_delegate:
         payload["credential_delegate"] = True
     if account_generation is not None:
@@ -98,6 +101,7 @@ def mint_session_cookie(
     provider: str,
     *,
     account_generation: str | None = None,
+    group_authority: dict[str, object] | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -110,7 +114,12 @@ def mint_session_cookie(
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
-        user_id, cookie_secret, ttl_hours * 3600, provider, account_generation=account_generation
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        account_generation=account_generation,
+        group_authority=group_authority,
     )
 
 

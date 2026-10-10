@@ -144,6 +144,7 @@ export interface ServerInfo {
    * Independent of ``sharing_mode`` — drives whether the Share modal shows
    * the "Public access" toggle. Fails open to ``true``.
    */
+  group_sharing_enabled?: boolean;
   public_sharing_enabled: boolean;
   /**
    * Installed omnigent server version (same value as ``/api/version``),
@@ -359,6 +360,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : "on",
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
+          group_sharing_enabled: data.group_sharing_enabled === true,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: smartRoutingEnabled,
           smart_routing_sources: parseSmartRoutingSources(

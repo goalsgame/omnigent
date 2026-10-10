@@ -60,6 +60,7 @@ from omnigent.db.enum_codecs import (
     encode_item_type,
     encode_session_live_status,
 )
+from omnigent.db.group_authority import access_principals
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     _supports_fts5,
@@ -2634,7 +2635,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         meta_sess.execute(
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
-                                SqlSessionPermission.user_id == accessible_by,
+                                SqlSessionPermission.user_id.in_(access_principals(accessible_by)),
                             )
                         ).scalars()
                     )
@@ -2680,7 +2681,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlSessionPermission.workspace_id == SqlConversationLabel.workspace_id,
                             SqlSessionPermission.conversation_id
                             == SqlConversationLabel.conversation_id,
-                            SqlSessionPermission.user_id == accessible_by,
+                            SqlSessionPermission.user_id.in_(access_principals(accessible_by)),
                         )
                         .exists()
                     )
@@ -2865,7 +2866,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         meta_sess.execute(
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
-                                SqlSessionPermission.user_id == acl_user,
+                                SqlSessionPermission.user_id.in_(access_principals(acl_user)),
                             )
                         ).scalars()
                     )
@@ -2929,7 +2930,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .where(
                             SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
                             SqlSessionPermission.conversation_id == SqlConversation.id,
-                            SqlSessionPermission.user_id == accessible_by,
+                            SqlSessionPermission.user_id.in_(access_principals(accessible_by)),
                         )
                         .exists()
                     )

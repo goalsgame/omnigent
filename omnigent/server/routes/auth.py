@@ -131,6 +131,7 @@ class _NativeCode:
     code_challenge: str
     redirect_uri: str
     created_at: float = field(default_factory=time.time)
+    group_authority: dict[str, object] | None = None
 
 
 def create_auth_router(
@@ -513,9 +514,12 @@ def create_auth_router(
             return fail(403, f"Email domain {domain!r} is not permitted on this server")
 
         # Reject reserved user names.
+        from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX
         from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
 
-        if email in _RESERVED_USERS or email.startswith(MACHINE_PRINCIPAL_PREFIX):
+        if email in _RESERVED_USERS or email.startswith(
+            (MACHINE_PRINCIPAL_PREFIX, GROUP_PRINCIPAL_PREFIX)
+        ):
             return fail(403, f"Reserved user name {email!r}")
 
         # Ensure user exists in the permission store, then apply the
@@ -527,6 +531,19 @@ def create_auth_router(
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
 
+        from omnigent.db.group_authority import group_name, verified_groups
+
+        claims = _validate_id_token(token_json, config) if config.provider_type == "oidc" else None
+        groups = verified_groups(claims.get("groups")) if claims is not None else ()
+        group_authority: dict[str, object] | None = (
+            {
+                "groups": [group_name(group) for group in groups],
+                "expires_at": int(time.time()) + config.session_ttl_hours * 3600,
+            }
+            if groups
+            else None
+        )
+
         # A native sign-in gets a one-time code at its redirect URI;
         # the session is minted when the app exchanges it with its verifier.
         # The browser gets no session cookie: it never asked for one.
@@ -537,6 +554,7 @@ def create_auth_router(
                 user_id=email,
                 code_challenge=native["code_challenge"],
                 redirect_uri=native["redirect_uri"],
+                group_authority=group_authority,
             )
             response = _native_redirect(native, {"code": native_code})
             response.delete_cookie(
@@ -547,6 +565,7 @@ def create_auth_router(
         # Mint session cookie.
         session_jwt = mint_session_cookie(
             user_id=email,
+            group_authority=group_authority,
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
@@ -567,6 +586,7 @@ def create_auth_router(
                     ticket.refresh_token = issue_login_grant(
                         device_grant_store,
                         user_id=email,
+                        group_authority=group_authority,
                         cookie_secret=config.cookie_secret,
                     )
                 except Exception:
@@ -820,6 +840,7 @@ def create_auth_router(
         content: dict[str, object] = {
             "token": mint_session_cookie(
                 user_id=pending.user_id,
+                group_authority=pending.group_authority,
                 cookie_secret=config.cookie_secret,
                 ttl_hours=config.session_ttl_hours,
                 provider=config.provider_type,
@@ -834,6 +855,7 @@ def create_auth_router(
                 content["refresh_token"] = issue_login_grant(
                     device_grant_store,
                     user_id=pending.user_id,
+                    group_authority=pending.group_authority,
                     cookie_secret=config.cookie_secret,
                 )
             except Exception:

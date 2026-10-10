@@ -179,6 +179,7 @@ class ServerInfoResponse(BaseModel):
     enabled_connections: list[str]
     machine_google_cloud_enabled: bool = False
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
+    group_sharing_enabled: bool = False
     public_sharing_enabled: bool
     server_version: str
     smart_routing_enabled: bool
@@ -3064,6 +3065,8 @@ def create_app(
                 "machine_google_cloud_enabled": app.state.google_cloud_machine_broker is not None,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
+                "group_sharing_enabled": isinstance(auth_provider, UnifiedAuthProvider)
+                and auth_provider.supports_group_sharing,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,

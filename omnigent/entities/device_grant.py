@@ -50,3 +50,4 @@ class DeviceGrant:
     approved_at: int | None
     last_polled_at: int | None
     account_generation: str | None = None
+    group_authority: dict[str, object] | None = None

@@ -94,6 +94,8 @@ export function PermissionsModal({
   const grant = useGrantPermission(sessionId);
   const revoke = useRevokePermission(sessionId);
 
+  const groupSharingEnabled = info !== "loading" && info.group_sharing_enabled === true;
+  const [principalType, setPrincipalType] = useState<"user" | "group">("user");
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
@@ -126,7 +128,11 @@ export function PermissionsModal({
     if (!trimmed || workspaceBlocked) return;
     setError(null);
     grant.mutate(
-      { userId: trimmed, level: parseInt(newLevel, 10) },
+      {
+        userId: trimmed,
+        level: parseInt(newLevel, 10),
+        ...(principalType === "group" ? { principalType } : {}),
+      },
       {
         onSuccess: () => {
           setNewUserId("");
@@ -147,7 +153,12 @@ export function PermissionsModal({
   function handleChangeLevel(userId: string, level: number) {
     if (workspaceBlocked) return;
     setError(null);
-    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
+    const permission = permissions?.find((p) => p.user_id === userId);
+    const payload =
+      permission?.principal_type === "group" && permission.group_name
+        ? { userId: permission.group_name, level, principalType: "group" as const }
+        : { userId, level };
+    grant.mutate(payload, { onError: (err) => setError(err.message) });
   }
 
   function handlePublicToggle(checked: boolean) {
@@ -285,13 +296,51 @@ export function PermissionsModal({
           )}
         </div>
 
+        {groupSharingEnabled && (
+          <div>
+            <label
+              htmlFor="perm-principal-type"
+              className="text-sm font-medium text-muted-foreground"
+            >
+              Share with
+            </label>
+            <Select
+              value={principalType}
+              onValueChange={(value) => {
+                setPrincipalType(value as "user" | "group");
+                setNewUserId("");
+              }}
+              componentId="diagnostics.permissions.principal_type"
+              valueHasNoPii
+            >
+              <SelectTrigger id="perm-principal-type" className="mt-1">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="user">User</SelectItem>
+                <SelectItem value="group">OIDC group</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+
         {/* Add grant form */}
         <form onSubmit={handleGrant} className="flex items-end gap-2">
           <div className="flex-1">
             <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
-              User ID
+              {principalType === "group" ? "Group name" : "User ID"}
             </label>
-            <AddUserField value={newUserId} onChange={setNewUserId} />
+            {principalType === "group" ? (
+              <Input
+                id="perm-user"
+                value={newUserId}
+                onChange={(event) => setNewUserId(event.target.value)}
+                placeholder="Exact group claim, e.g. /engineering"
+                className="mt-1 h-8"
+              />
+            ) : (
+              <AddUserField value={newUserId} onChange={setNewUserId} />
+            )}
           </div>
           <div>
             <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
@@ -682,8 +731,10 @@ function GrantRow({
       {/* Tail truncation keeps the local part — the distinguishing half when
           every grantee shares one company domain — and the title tooltip
           carries the full id. */}
-      <span className="flex-1 truncate text-ui" title={permission.user_id}>
-        {permission.user_id}
+      <span className="flex-1 truncate text-ui" title={permission.group_name ?? permission.user_id}>
+        {permission.principal_type === "group"
+          ? `Group: ${permission.group_name}`
+          : permission.user_id}
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">

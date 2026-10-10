@@ -909,3 +909,70 @@ describe("PermissionsModal", () => {
     });
   });
 });
+
+describe("OIDC group sharing", () => {
+  it("submits an explicit group grant using the exact claim name", async () => {
+    listMock.mockResolvedValue([]);
+    grantMock.mockResolvedValue({
+      user_id: "oidc-group:encoded",
+      principal_type: "group",
+      group_name: "/engineering",
+      conversation_id: "conv_abc",
+      level: 1,
+    });
+    render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+      wrapper: createInfoWrapper({ group_sharing_enabled: true }),
+    });
+    const type = screen.getByRole("combobox", { name: "Share with" });
+    type.focus();
+    fireEvent.keyDown(type, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "OIDC group" }));
+    fireEvent.change(screen.getByLabelText("Group name"), { target: { value: "/engineering" } });
+    fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+    await waitFor(() =>
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "/engineering", 1, "group"),
+    );
+  });
+
+  it("labels groups and uses their name for updates and opaque key for revocation", async () => {
+    listMock.mockResolvedValue([
+      {
+        user_id: "oidc-group:encoded",
+        principal_type: "group",
+        group_name: "/engineering",
+        conversation_id: "conv_abc",
+        level: 1,
+      },
+    ]);
+    grantMock.mockResolvedValue({
+      user_id: "oidc-group:encoded",
+      principal_type: "group",
+      group_name: "/engineering",
+      conversation_id: "conv_abc",
+      level: 2,
+    });
+    revokeMock.mockResolvedValue(undefined);
+    render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+      wrapper: createInfoWrapper({ group_sharing_enabled: true }),
+    });
+    await screen.findByText("Group: /engineering");
+    const level = screen.getByRole("combobox", { name: "Permission level for oidc-group:encoded" });
+    level.focus();
+    fireEvent.keyDown(level, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Edit" }));
+    await waitFor(() =>
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "/engineering", 2, "group"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /revoke/i }));
+    await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "oidc-group:encoded"));
+  });
+
+  it("hides group sharing when the server does not advertise support", async () => {
+    listMock.mockResolvedValue([]);
+    render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+      wrapper: createInfoWrapper({ group_sharing_enabled: false }),
+    });
+    await waitFor(() => expect(listMock).toHaveBeenCalled());
+    expect(screen.queryByRole("combobox", { name: "Share with" })).not.toBeInTheDocument();
+  });
+});
