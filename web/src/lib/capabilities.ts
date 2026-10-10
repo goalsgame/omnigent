@@ -144,8 +144,9 @@ export interface ServerInfo {
    * Independent of ``sharing_mode`` — drives whether the Share modal shows
    * the "Public access" toggle. Fails open to ``true``.
    */
-  group_sharing_enabled?: boolean;
   public_sharing_enabled: boolean;
+  /** Whether verified OIDC group sharing is available. Fails closed to false. */
+  group_sharing_enabled?: boolean;
   /**
    * Installed omnigent server version (same value as ``/api/version``),
    * e.g. ``"0.3.0.dev0"``. Shown in the session info popover's version

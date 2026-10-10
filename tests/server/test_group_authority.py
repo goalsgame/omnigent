@@ -113,7 +113,7 @@ def test_group_expiry_during_read_cannot_poison_individual_cache(db_uri, monkeyp
     session_id = SqlAlchemyConversationStore(db_uri).create_conversation().id
     store.ensure_user("member")
     store.grant("member", session_id, 1)
-    store.grant(group_principal("engineering"), session_id, 3)
+    store.grant(group_principal("engineering"), session_id, 3, is_group=True)
     clock = SimpleNamespace(time=lambda: 1000)
     monkeypatch.setattr(group_authority, "time", clock)
     bind_group_authority("member", ["engineering"], 1001)
@@ -198,7 +198,7 @@ def test_group_acl_max_level_cache_revocation_and_owner_guard(db_uri):
     store.ensure_user("member")
     store.grant("member", session_id, 1)
     group = group_principal("engineering")
-    store.grant(group, session_id, 3)
+    store.grant(group, session_id, 3, is_group=True)
     bind_group_authority("member", ["engineering"], int(time.time()) + 300)
     assert store.check_access("member", session_id, 3)
     assert not store.check_access("member", session_id, 4)
@@ -210,7 +210,7 @@ def test_group_acl_max_level_cache_revocation_and_owner_guard(db_uri):
     store.revoke(group, session_id)
     assert store.resolve_access("member", session_id).user_grant_level == 1
     with pytest.raises(ValueError, match="cannot own"):
-        store.grant(group, session_id, 4)
+        store.grant(group, session_id, 4, is_group=True)
     with pytest.raises(ValueError, match="cannot become"):
         store.ensure_user(group)
     assert store.get_user(group) is None
@@ -222,8 +222,8 @@ def test_case_colliding_encoded_group_keys_never_share_access(db_uri):
     first, second = group_principal("aaa"), group_principal("aaG")
     assert first != second and first.lower() == second.lower()
     store.ensure_user("member")
-    store.grant(first, session_id, 1)
-    store.grant(second, session_id, 3)
+    store.grant(first, session_id, 1, is_group=True)
+    store.grant(second, session_id, 3, is_group=True)
     bind_group_authority("member", ["aaa"], int(time.time()) + 300)
     assert store.resolve_access("member", session_id).user_grant_level == 1
     assert not store.check_access("member", session_id, 2)
@@ -233,6 +233,85 @@ def test_case_colliding_encoded_group_keys_never_share_access(db_uri):
     assert store.resolve_access("member", session_id).user_grant_level == 3
     bind_group_authority("member", ["aaa"], int(time.time()) + 300)
     assert store.resolve_access("member", session_id).user_grant_level is None
+
+
+@pytest.mark.parametrize("split_permissions", [False, True])
+def test_legacy_group_looking_individual_grant_never_confers_group_access(
+    db_uri, split_permissions, monkeypatch
+):
+    from omnigent.server.routes._sessions.helpers import _permission_level_from_grants
+    from omnigent.stores.permission_store import PrincipalTypeConflict
+
+    store = SqlAlchemyPermissionStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    if split_permissions:
+        monkeypatch.setattr(
+            conversations, "_conv_engine", SimpleNamespace(dialect=conversations._engine.dialect)
+        )
+    session_id = conversations.create_conversation(title="Legacy share").id
+    conversations.set_labels(session_id, {"omni_project": "Legacy project"})
+    principal = group_principal("engineering")
+    # Default user writes model arbitrary pre-upgrade individual principal IDs.
+    store.grant(principal, session_id, 3)
+    store.ensure_user("member")
+    bind_group_authority("member", ["engineering"], int(time.time()) + 300)
+    assert not store.check_access("member", session_id, 1)
+    assert store.get_permission_level("member", session_id) is None
+    assert store.resolve_access("member", session_id).user_grant_level is None
+    grants = store.list_for_sessions([session_id])[session_id]
+    assert not grants[0].is_group
+    assert _permission_level_from_grants("member", grants, is_admin=False) is None
+    assert conversations.list_conversations(accessible_by="member").data == []
+    assert (
+        conversations.list_conversations(accessible_by="member", search_query="Legacy").data == []
+    )
+    assert conversations.list_projects(accessible_by="member") == []
+    with pytest.raises(PrincipalTypeConflict):
+        store.grant(principal, session_id, 1, is_group=True)
+    assert store.get(principal, session_id).level == 3
+    assert not store.get(principal, session_id).is_group
+    store.revoke(principal, session_id)
+    store.grant(principal, session_id, 1, is_group=True)
+    assert store.get(principal, session_id).is_group
+    assert store.check_access("member", session_id, 1)
+    assert [row.id for row in conversations.list_conversations(accessible_by="member").data] == [
+        session_id
+    ]
+    assert conversations.list_projects(accessible_by="member") == ["Legacy project"]
+    with pytest.raises(PrincipalTypeConflict):
+        store.grant(principal, session_id, 3)
+    assert store.get(principal, session_id).is_group
+    assert store.get(principal, session_id).level == 1
+
+
+@pytest.mark.parametrize("operation", ["delete", "remap", "reassign"])
+def test_account_operations_do_not_mutate_explicit_group_grants(db_uri, operation):
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlUser
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.server.identity_migration import remap_identities
+
+    principal = group_principal("engineering")
+    engine = get_or_create_engine(db_uri)
+    # A pre-upgrade account may have used the newly reserved prefix.
+    with Session(engine) as session, session.begin():
+        session.add(SqlUser(id=principal, is_admin=False))
+    store = SqlAlchemyPermissionStore(db_uri)
+    session_id = SqlAlchemyConversationStore(db_uri).create_conversation().id
+    store.grant(principal, session_id, 1, is_group=True)
+    if operation == "delete":
+        assert SqlAlchemyAccountStore(db_uri).delete_user(principal)
+    elif operation == "remap":
+        remap_identities(engine, {principal: "person@example.test"}, dry_run=False)
+    else:
+        assert store.reassign_user_grants(principal, "person@example.test") == 0
+    grant = store.get(principal, session_id)
+    assert grant is not None and grant.is_group and grant.level == 1
+    assert store.get("person@example.test", session_id) is None
+    store.grant(principal, session_id, 2, is_group=True)
+    assert store.get(principal, session_id).level == 2
 
 
 def test_refresh_keeps_original_group_membership_deadline(db_uri, oidc):

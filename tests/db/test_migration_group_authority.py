@@ -14,13 +14,22 @@ from omnigent.db.group_authority import group_principal
 from omnigent.db.utils import _build_alembic_config
 
 
-def test_group_authority_upgrade_and_downgrade_preserve_grants(tmp_path):
-    uri = f"sqlite:///{tmp_path / 'groups.db'}"
+def test_group_authority_upgrade_and_downgrade_preserve_grants(db_uri):
+    uri = db_uri
     engine = sa.create_engine(uri)
     config = _build_alembic_config(uri)
     with engine.begin() as connection:
         config.attributes["connection"] = connection
-        command.upgrade(config, "oo1a2b3c4d5e")
+        command.downgrade(config, "oo1a2b3c4d5e")
+        legacy_permissions = sa.Table(
+            "session_permissions", sa.MetaData(), autoload_with=connection
+        )
+        legacy_id = group_principal("engineering")
+        connection.execute(
+            legacy_permissions.insert().values(
+                workspace_id=0, user_id=legacy_id, conversation_id=b"a" * 16, level=2
+            )
+        )
         connection.execute(
             sa.text(
                 "INSERT INTO device_grants (workspace_id, id, device_code_hash, user_code, "
@@ -29,6 +38,17 @@ def test_group_authority_upgrade_and_downgrade_preserve_grants(tmp_path):
             )
         )
         command.upgrade(config, "head")
+        assert connection.execute(
+            sa.text("SELECT user_id, is_group FROM session_permissions")
+        ).all() == [(legacy_id, 0)]
+        connection.execute(
+            sa.text(
+                "INSERT INTO session_permissions "
+                "(workspace_id, user_id, conversation_id, level, is_group) "
+                "VALUES (0, :principal, :conversation, 1, true)"
+            ),
+            {"principal": group_principal("other"), "conversation": b"a" * 16},
+        )
         assert (
             connection.execute(
                 sa.text("SELECT group_authority_json FROM device_grants WHERE id='existing'")
@@ -36,6 +56,13 @@ def test_group_authority_upgrade_and_downgrade_preserve_grants(tmp_path):
             is None
         )
         command.downgrade(config, "oo1a2b3c4d5e")
+        assert connection.execute(
+            sa.text("SELECT user_id FROM session_permissions")
+        ).scalars().all() == [legacy_id]
+        command.upgrade(config, "head")
+        assert connection.execute(
+            sa.text("SELECT user_id, is_group FROM session_permissions")
+        ).all() == [(legacy_id, 0)]
         assert (
             connection.execute(
                 sa.text("SELECT user_id FROM device_grants WHERE id='existing'")

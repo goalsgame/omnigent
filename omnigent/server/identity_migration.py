@@ -234,6 +234,7 @@ def remap_identities(
                     select(SqlSessionPermission).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == old_id,
+                        SqlSessionPermission.is_group.is_(False),
                     )
                 )
                 .scalars()

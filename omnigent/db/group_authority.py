@@ -10,7 +10,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from omnigent.db.db_models import current_workspace_id
+from sqlalchemy import and_, or_
+from sqlalchemy.sql.elements import ColumnElement
+
+from omnigent.db.db_models import SqlSessionPermission, current_workspace_id
+from omnigent.entities.permission import SessionPermission
 
 GROUP_PRINCIPAL_PREFIX = "oidc-group:"
 # Leave room for the rest of the JWT and cookie within a 4 KiB browser limit.
@@ -112,3 +116,21 @@ def group_snapshot(user_id: str) -> dict[str, object] | None:
         "groups": [group_name(principal) for principal in authority.principals],
         "expires_at": authority.expires_at,
     }
+
+
+def permission_principal_filter(
+    principals: tuple[str, ...], *, public_user_id: str | None = None
+) -> ColumnElement[bool]:
+    """Match individual and verified group authority by persisted principal type."""
+    users = principals[:1] + ((public_user_id,) if public_user_id is not None else ())
+    return or_(
+        and_(SqlSessionPermission.is_group.is_(False), SqlSessionPermission.user_id.in_(users)),
+        and_(
+            SqlSessionPermission.is_group.is_(True),
+            SqlSessionPermission.user_id.in_(principals[1:]),
+        ),
+    )
+
+
+def permission_matches(permission: SessionPermission, principals: tuple[str, ...]) -> bool:
+    return permission.user_id in (principals[1:] if permission.is_group else principals[:1])

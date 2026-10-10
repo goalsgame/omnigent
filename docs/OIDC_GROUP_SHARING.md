@@ -54,12 +54,17 @@ and cross-replica cache lifetime.
 
 Existing logins and refresh grants contain no group authority. After configuring
 the issuer and deploying group support, members must sign in again. Startup
-adds a nullable group-authority column to device grants. On MySQL, startup also
-changes permission keys to `utf8mb4_bin` comparison so case-sensitive encoded
+adds a nullable group-authority column to device grants and an explicit group
+discriminator to permission grants. Existing grants are always marked individual,
+even if their IDs begin with `oidc-group:`. A group share that conflicts with an
+existing individual key returns HTTP 409; revoke the conflicting grant before
+adding the group share. On MySQL, startup also changes permission keys to
+`utf8mb4_bin` comparison so case-sensitive encoded
 group keys cannot collide; existing key values are preserved. All MySQL
 permission principals therefore compare case-sensitively after upgrade.
-Downgrade retains this binary comparison to avoid merging distinct keys.
-Existing grants retain their individual permissions and refresh behavior.
+Downgrade removes explicit group grants and retains this binary comparison to
+avoid merging distinct keys. Existing grants retain their individual permissions
+and refresh behavior.
 
 To verify a deployment, share a session with a known group as Read. A newly
 signed-in member should see it under Shared, read it, and fork it, but should

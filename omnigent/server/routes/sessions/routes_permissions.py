@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from typing import TypedDict
 
 from fastapi import (
@@ -70,7 +71,7 @@ from omnigent.spec.types import (
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import PermissionStore, PrincipalTypeConflict
 
 
 class _PermissionListResponse(TypedDict):
@@ -191,8 +192,16 @@ def register_permissions_routes(
                     "Public access is limited to read-only (level 1)",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        target = await asyncio.to_thread(permission_store.get_user, target_id)
-        with target_account_scope(target_id, target.account_generation if target else None):
+        target = (
+            await asyncio.to_thread(permission_store.get_user, target_id)
+            if body.principal_type == "user"
+            else None
+        )
+        with (
+            target_account_scope(target_id, target.account_generation if target else None)
+            if body.principal_type == "user"
+            else nullcontext()
+        ):
             existing = await asyncio.to_thread(permission_store.get, target_id, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
                 raise OmnigentError(
@@ -201,9 +210,16 @@ def register_permissions_routes(
                 )
             if body.principal_type == "user":
                 await asyncio.to_thread(permission_store.ensure_user, target_id)
-            perm = await asyncio.to_thread(
-                permission_store.grant, target_id, session_id, body.level
-            )
+            try:
+                perm = await asyncio.to_thread(
+                    permission_store.grant,
+                    target_id,
+                    session_id,
+                    body.level,
+                    is_group=body.principal_type == "group",
+                )
+            except PrincipalTypeConflict as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(target_id, session_id)
@@ -212,8 +228,8 @@ def register_permissions_routes(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
             level=perm.level,
-            principal_type="group" if group_name(perm.user_id) is not None else "user",
-            group_name=group_name(perm.user_id),
+            principal_type="group" if perm.is_group else "user",
+            group_name=group_name(perm.user_id) if perm.is_group else None,
         )
 
     @router.delete(
@@ -371,8 +387,8 @@ def register_permissions_routes(
                     user_id=g.user_id,
                     conversation_id=g.conversation_id,
                     level=g.level,
-                    principal_type="group" if group_name(g.user_id) is not None else "user",
-                    group_name=group_name(g.user_id),
+                    principal_type="group" if g.is_group else "user",
+                    group_name=group_name(g.user_id) if g.is_group else None,
                 )
                 for g in grants
             ],

@@ -675,6 +675,10 @@ class SqlSessionPermission(OmnigentBase):
 
     __tablename__ = "session_permissions"
 
+    is_group: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
         BigInteger,

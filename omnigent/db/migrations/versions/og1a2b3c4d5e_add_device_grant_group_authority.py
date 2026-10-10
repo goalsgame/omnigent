@@ -1,4 +1,4 @@
-"""Persist bounded OIDC group authority and compare permission keys exactly.
+"""Persist verified memberships and distinguish group grants from individual grants.
 
 MySQL permission keys use binary collation, including on downgrade, so distinct
 group principals cannot merge under a case-insensitive database default.
@@ -20,6 +20,13 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if "is_group" not in {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("session_permissions")
+    }:
+        op.add_column(
+            "session_permissions",
+            sa.Column("is_group", sa.Boolean(), nullable=False, server_default=sa.false()),
+        )
     if op.get_bind().dialect.name == "mysql":
         column = next(
             column
@@ -41,5 +48,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Older servers cannot safely distinguish group grants from individual grants.
+    op.execute(sa.text("DELETE FROM session_permissions WHERE is_group = true"))
+    with op.batch_alter_table("session_permissions") as batch:
+        batch.drop_column("is_group")
     with op.batch_alter_table("device_grants") as batch:
         batch.drop_column("group_authority_json")

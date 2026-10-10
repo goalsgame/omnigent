@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import cast
 
-from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy import case, delete, exists, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -19,7 +19,12 @@ from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import account_generation, require_active_account
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
-from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX, access_principals, group_name
+from omnigent.db.group_authority import (
+    GROUP_PRINCIPAL_PREFIX,
+    access_principals,
+    group_name,
+    permission_principal_filter,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -31,7 +36,7 @@ from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
 )
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import PermissionStore, PrincipalTypeConflict
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
@@ -121,6 +126,7 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
         user_id=row.user_id,
         conversation_id=row.conversation_id,
         level=row.level,
+        is_group=row.is_group,
     )
 
 
@@ -177,20 +183,21 @@ class SqlAlchemyPermissionStore(PermissionStore):
         user_id: str,
         conversation_id: str,
         level: int,
+        *,
+        is_group: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
-        if user_id.startswith(GROUP_PRINCIPAL_PREFIX) and (
-            group_name(user_id) is None or level >= LEVEL_OWNER
-        ):
+        if is_group and (group_name(user_id) is None or level >= LEVEL_OWNER):
             raise ValueError("Groups cannot own sessions and require a valid group principal")
 
         def write(session: Session) -> None:
-            require_active_account(session, user_id)
+            require_active_account(session, None if is_group else user_id)
             dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "level": level,
+                "is_group": is_group,
             }
             stmt: Insert
             if dialect == "sqlite":
@@ -200,13 +207,19 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
                         set_={"level": level},
+                        where=SqlSessionPermission.is_group == is_group,
                     )
                 )
             elif dialect == "mysql":
                 stmt = (
                     mysql_insert(SqlSessionPermission)
                     .values(**values)
-                    .on_duplicate_key_update(level=level)
+                    .on_duplicate_key_update(
+                        level=case(
+                            (SqlSessionPermission.is_group == is_group, level),
+                            else_=SqlSessionPermission.level,
+                        )
+                    )
                 )
             else:
                 stmt = (
@@ -215,10 +228,23 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
                         set_={"level": level},
+                        where=SqlSessionPermission.is_group == is_group,
                     )
                 )
             session.execute(stmt)
             session.flush()
+            stored_type = session.scalar(
+                select(SqlSessionPermission.is_group).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                    SqlSessionPermission.conversation_id == conversation_id,
+                )
+            )
+            if stored_type != is_group:
+                raise PrincipalTypeConflict(
+                    "This grant key belongs to a different principal type. "
+                    "Revoke the conflicting grant before adding this share."
+                )
 
         run_write_transaction(
             self._session_immediate,
@@ -231,6 +257,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             user_id=user_id,
             conversation_id=conversation_id,
             level=level,
+            is_group=is_group,
         )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
@@ -286,6 +313,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
         :returns: The number of grants repointed to *to_user_id*.
         """
 
+        if to_user_id.startswith(GROUP_PRINCIPAL_PREFIX):
+            raise ValueError("Group principals cannot become users")
+
         def write(session: Session) -> tuple[int, bool]:
             require_active_account(session, to_user_id)
             # FK target: ensure the destination users.id row exists. Don't
@@ -298,6 +328,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     select(SqlSessionPermission).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.is_group.is_(False),
                     )
                 )
                 .scalars()
@@ -325,6 +356,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     delete(SqlSessionPermission).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.is_group.is_(False),
                         SqlSessionPermission.conversation_id.in_(duplicate_ids),
                     )
                 )
@@ -336,6 +368,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.is_group.is_(False),
                         SqlSessionPermission.conversation_id.in_(reassign_ids),
                     )
                     .values(user_id=to_user_id)
@@ -415,6 +448,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.is_group.is_(False),
                     )
                     .limit(limit)
                 )
@@ -528,8 +562,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
                         exists().where(
                             SqlSessionPermission.workspace_id == current_workspace_id(),
                             SqlSessionPermission.conversation_id == conversation_id,
-                            SqlSessionPermission.user_id.in_(
-                                (*access_principals(user_id), RESERVED_USER_PUBLIC)
+                            permission_principal_filter(
+                                access_principals(user_id), public_user_id=RESERVED_USER_PUBLIC
                             ),
                             SqlSessionPermission.level >= required_level,
                         )
@@ -553,8 +587,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 select(SqlSessionPermission.user_id, SqlSessionPermission.level).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
                     SqlSessionPermission.conversation_id == conversation_id,
-                    SqlSessionPermission.user_id.in_(
-                        (*access_principals(user_id), RESERVED_USER_PUBLIC)
+                    permission_principal_filter(
+                        access_principals(user_id), public_user_id=RESERVED_USER_PUBLIC
                     ),
                 )
             ).all()
@@ -668,7 +702,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 select(SqlSessionPermission.level).where(
                     SqlSessionPermission.workspace_id == workspace_id,
                     SqlSessionPermission.conversation_id == conversation_id,
-                    SqlSessionPermission.user_id.in_(principals),
+                    permission_principal_filter(principals),
                 )
             ).all()
             public_grant = session.get(

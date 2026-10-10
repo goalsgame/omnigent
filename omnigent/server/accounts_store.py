@@ -472,6 +472,7 @@ class SqlAlchemyAccountStore:
                 delete(SqlSessionPermission).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
                     SqlSessionPermission.user_id == user_id,
+                    SqlSessionPermission.is_group.is_(False),
                 )
             )
             _revoke_durable_authority(session, user_id, now=int(time.time()))
