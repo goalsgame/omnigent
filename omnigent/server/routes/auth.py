@@ -90,10 +90,37 @@ if TYPE_CHECKING:
     from omnigent.server.oidc import OIDCConfig
 
 
+def _split_quoted_header(value: str, separator: str) -> list[str]:
+    """Split an HTTP header outside quoted strings, retaining quoted escapes."""
+    parts = []
+    start = 0
+    quoted = False
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+        elif quoted and character == "\\":
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+        elif character == separator and not quoted:
+            parts.append(value[start:index])
+            start = index + 1
+    if quoted or escaped:
+        raise ValueError("Unterminated quoted header parameter")
+    parts.append(value[start:])
+    return parts
+
+
 def _accepts_callback_html(accept: str) -> bool:
     """Require an explicit HTML media range with a valid, positive quality."""
-    for media_range in accept.split(","):
-        media_type, *parameters = media_range.split(";")
+    try:
+        media_ranges = [
+            _split_quoted_header(part, ";") for part in _split_quoted_header(accept, ",")
+        ]
+    except ValueError:
+        return False
+    for media_type, *parameters in media_ranges:
         if media_type.strip().lower() != "text/html":
             continue
         quality = 1.0
