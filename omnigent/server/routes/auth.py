@@ -30,13 +30,14 @@ import secrets
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from html import escape
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import jwt
 from fastapi import APIRouter, Query, Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
@@ -62,6 +63,7 @@ _logger = logging.getLogger(__name__)
 _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
+_AUTH_STATE_RETRY_PARAM = "_ap_cookie_retry"
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
 # A native sign-in code is exchanged by the app right after the browser
 # hands it over, so it only needs to outlive one redirect round trip.
@@ -86,6 +88,110 @@ _OIDC_INVITE_TTL_SECONDS = 72 * 3600
 
 if TYPE_CHECKING:
     from omnigent.server.oidc import OIDCConfig
+
+
+def _split_quoted_header(value: str, separator: str) -> list[str]:
+    """Split an HTTP header outside quoted strings, retaining quoted escapes."""
+    parts = []
+    start = 0
+    quoted = False
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+        elif quoted and character == "\\":
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+        elif character == separator and not quoted:
+            parts.append(value[start:index])
+            start = index + 1
+    if quoted or escaped:
+        raise ValueError("Unterminated quoted header parameter")
+    parts.append(value[start:])
+    return parts
+
+
+def _accepts_callback_html(accept: str) -> bool:
+    """Require an explicit HTML media range with a valid, positive quality."""
+    try:
+        media_ranges = [
+            _split_quoted_header(part, ";") for part in _split_quoted_header(accept, ",")
+        ]
+    except ValueError:
+        return False
+    for media_type, *parameters in media_ranges:
+        if media_type.strip().lower() != "text/html":
+            continue
+        quality = 1.0
+        quality_seen = False
+        for parameter in parameters:
+            name, _, value = parameter.partition("=")
+            if name.strip().lower() != "q":
+                continue
+            if quality_seen:
+                quality = 0.0
+                break
+            quality_seen = True
+            value = value.strip()
+            quality = (
+                float(value) if re.fullmatch(r"0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?", value) else 0.0
+            )
+        if 0 < quality <= 1:
+            return True
+    return False
+
+
+def _missing_auth_state_response(request: Request, callback_path: str) -> Response:
+    """Retry a browser callback once from a committed same-origin document."""
+    if not _accepts_callback_html(request.headers.get("accept", "")):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing auth state cookie"},
+            headers=NO_STORE_HEADERS,
+        )
+
+    nonce = secrets.token_urlsafe(16)
+    headers = {
+        **NO_STORE_HEADERS,
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": (
+            f"default-src 'none'; script-src 'nonce-{nonce}'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+        ),
+    }
+    if request.query_params.get(_AUTH_STATE_RETRY_PARAM) == "1":
+        return HTMLResponse(
+            "<!doctype html><html><head><meta name='viewport' "
+            "content='width=device-width,initial-scale=1'><title>Sign-in interrupted</title>"
+            "</head><body><h1>Sign-in could not finish</h1>"
+            "<p>Your browser did not provide the sign-in cookie. "
+            "Open the original session link in your browser and try again. "
+            "Check that cookies are allowed for this site.</p></body></html>",
+            status_code=400,
+            headers=headers,
+        )
+
+    # A cross-site redirect may omit a stored cookie. Committing this document
+    # makes the retry same-origin; the callback still verifies state and PKCE.
+    query = [
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key != _AUTH_STATE_RETRY_PARAM
+    ]
+    query.append((_AUTH_STATE_RETRY_PARAM, "1"))
+    retry_url = f"{_sanitize_return_to(callback_path)}?{urlencode(query)}"
+    return HTMLResponse(
+        "<!doctype html><html><head><meta name='viewport' "
+        "content='width=device-width,initial-scale=1'><title>Finishing sign-in</title>"
+        "</head><body><h1>Finishing sign-in</h1>"
+        f'<a id="continue-sign-in" href="{escape(retry_url, quote=True)}">'
+        "Continue signing in</a>"
+        f'<script nonce="{nonce}">'
+        'window.location.replace(document.getElementById("continue-sign-in").href);'
+        "</script></body></html>",
+        headers=headers,
+    )
 
 
 @dataclass
@@ -333,7 +439,7 @@ def create_auth_router(
         ]
         auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
-        response = RedirectResponse(url=auth_url, status_code=302)
+        response = RedirectResponse(url=auth_url, status_code=302, headers=NO_STORE_HEADERS)
         response.set_cookie(
             key=_state_cookie,
             value=state_jwt,
@@ -381,10 +487,7 @@ def create_auth_router(
         # Verify state from the cookie.
         state_cookie = request.cookies.get(_state_cookie)
         if not state_cookie:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Missing auth state cookie"},
-            )
+            return _missing_auth_state_response(request, urlsplit(config.redirect_uri).path)
 
         try:
             state_payload = jwt.decode(state_cookie, config.cookie_secret, algorithms=["HS256"])

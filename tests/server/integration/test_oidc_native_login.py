@@ -7,7 +7,9 @@ routes on a FastAPI app with OIDC auth enabled. Only the external IdP
 
 from __future__ import annotations
 
+import re
 import tempfile
+from html import unescape
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -173,6 +175,33 @@ async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
     assert body["refresh_token"] == "refresh-abc"
     issue.assert_called_once()
     assert issue.call_args.kwargs["user_id"] == "alice@example.com"
+
+
+@pytest.mark.parametrize("redirect", [_REDIRECT, _IOS_REDIRECT])
+async def test_native_sign_in_preserves_pkce_after_browser_cookie_retry(redirect: str) -> None:
+    async with _client(_transport()) as client:
+        idp_state, state_cookie = await _start(client, redirect)
+        client.cookies.clear()
+        first = await client.get(
+            "/auth/callback",
+            params={"code": "idp-code", "state": idp_state},
+            headers={"Accept": "text/html"},
+        )
+        assert first.status_code == 200
+        assert not first.cookies
+        match = re.search(r'<a id="continue-sign-in" href="([^"]+)"', first.text)
+        assert match is not None
+        client.cookies.set("ap_auth_state", state_cookie)
+        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=_idp_client()):
+            callback = await client.get(unescape(match[1]), headers={"Accept": "text/html"})
+        query = _loopback_query(callback) if redirect == _REDIRECT else _ios_query(callback)
+        assert query["state"] == _NATIVE_STATE
+        assert "ap_session" not in callback.cookies
+        response = await _exchange(
+            client, code=query["code"], code_verifier=_VERIFIER, redirect_uri=redirect
+        )
+        assert response.status_code == 200
+        assert response.json()["user_id"] == "alice@example.com"
 
 
 async def test_native_token_omits_refresh_without_grant_store() -> None:
