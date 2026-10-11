@@ -90,9 +90,34 @@ if TYPE_CHECKING:
     from omnigent.server.oidc import OIDCConfig
 
 
+def _accepts_callback_html(accept: str) -> bool:
+    """Require an explicit HTML media range with a valid, positive quality."""
+    for media_range in accept.split(","):
+        media_type, *parameters = media_range.split(";")
+        if media_type.strip().lower() != "text/html":
+            continue
+        quality = 1.0
+        quality_seen = False
+        for parameter in parameters:
+            name, _, value = parameter.partition("=")
+            if name.strip().lower() != "q":
+                continue
+            if quality_seen:
+                quality = 0.0
+                break
+            quality_seen = True
+            value = value.strip()
+            quality = (
+                float(value) if re.fullmatch(r"0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?", value) else 0.0
+            )
+        if 0 < quality <= 1:
+            return True
+    return False
+
+
 def _missing_auth_state_response(request: Request, callback_path: str) -> Response:
     """Retry a browser callback once from a committed same-origin document."""
-    if "text/html" not in request.headers.get("accept", ""):
+    if not _accepts_callback_html(request.headers.get("accept", "")):
         return JSONResponse(
             status_code=400,
             content={"error": "Missing auth state cookie"},

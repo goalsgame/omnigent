@@ -22,6 +22,51 @@ def _retry_url(response: httpx.Response) -> str:
     return unescape(match[1])
 
 
+@pytest.mark.parametrize(
+    ("accept", "html"),
+    [
+        ("application/json, text/html;q=0", False),
+        ("text/html;q=0.000", False),
+        ("*/*", False),
+        ("text/*", False),
+        ("text/html-suffix", False),
+        ("text/html;q=invalid", False),
+        ("text/html;q=-0.5", False),
+        ("text/html;q=1.1", False),
+        ("text/html;q=NaN", False),
+        ("text/html;q=inf", False),
+        ("text/html;q=+1", False),
+        ("text/html;q=1e0", False),
+        ("text/html;q=0.0001", False),
+        ("text/html;q=1;q=0", False),
+        ("text/html", True),
+        ("TEXT/HTML", True),
+        ("Text/Html ; Q=0.5", True),
+        ("application/json, text/html;q=0.2", True),
+        ("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", True),
+    ],
+)
+def test_recovery_document_requires_explicit_acceptable_html(
+    callback_client: tuple[TestClient, _IdpKeys], accept: str, html: bool
+) -> None:
+    client, _ = callback_client
+    response = client.get("/auth/callback?code=c&state=s", headers={"Accept": accept})
+    assert response.status_code == (200 if html else 400)
+    assert response.headers["content-type"].startswith("text/html" if html else "application/json")
+    assert not response.cookies
+
+
+def test_login_redirect_does_not_cache_auth_state(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    client, _ = callback_client
+    response = client.get("/auth/login", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.cookies["ap_auth_state"]
+
+
 def test_missing_cookie_document_recovers_original_link(
     callback_client: tuple[TestClient, _IdpKeys], monkeypatch: pytest.MonkeyPatch
 ) -> None:
