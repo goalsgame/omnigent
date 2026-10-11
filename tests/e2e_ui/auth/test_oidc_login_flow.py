@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.auth._oidc_server import OIDCServer, spawn_oidc_server
 
@@ -91,3 +92,77 @@ def test_oidc_cli_ticket_completes_through_browser(oidc_server: OIDCServer, page
         f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
     )
     assert replay.status == 410
+
+
+@pytest.mark.parametrize("drop_callback_cookie", [False, True], ids=["normal", "cookie-retry"])
+def test_oidc_deep_link_survives_first_callback_cookie_omission(
+    oidc_server: OIDCServer, page: Page, drop_callback_cookie: bool
+) -> None:
+    """A one-request cookie omission must not strand a signed-in deep link."""
+    callbacks: list[str] = []
+
+    def callback(route: Route) -> None:
+        callbacks.append(route.request.url)
+        if drop_callback_cookie and len(callbacks) == 1:
+            callback_url = urlsplit(route.request.url)
+            response = route.fetch(
+                url=f"{oidc_server.base_url}{callback_url.path}?{callback_url.query}",
+                headers={**route.request.all_headers(), "cookie": ""},
+                max_redirects=0,
+            )
+            assert response.status == 200
+            assert response.headers["content-type"].startswith("text/html")
+            route.fulfill(response=response)
+        else:
+            route.continue_()
+
+    page.route("**/auth/callback?**", callback)
+    target = "/c/shared-chat?tab=files"
+    page.goto(f"{oidc_server.public_url}{target}")
+    continue_link = page.locator("#fake-idp-continue")
+    expect(continue_link).to_be_visible(timeout=15_000)
+    continue_link.click()
+    expect(page).to_have_url(f"{oidc_server.public_url}{target}", timeout=15_000)
+    expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
+    identity = page.evaluate(
+        "async () => { const r = await fetch('/v1/me'); "
+        "return {status: r.status, body: await r.json()}; }"
+    )
+    assert identity["status"] == 200
+    assert identity["body"]["user_id"] == oidc_server.idp.email
+    assert len(callbacks) == (2 if drop_callback_cookie else 1)
+    if drop_callback_cookie:
+        first, second = [parse_qs(urlsplit(url).query) for url in callbacks]
+        assert first["code"] == second["code"]
+        assert first["state"] == second["state"]
+
+
+def test_oidc_missing_cookie_does_not_loop_or_authenticate(
+    oidc_server: OIDCServer, page: Page
+) -> None:
+    """A browser that omits the cookie on both attempts gets a bounded error."""
+    callbacks: list[str] = []
+
+    def callback(route: Route) -> None:
+        callbacks.append(route.request.url)
+        callback_url = urlsplit(route.request.url)
+        response = route.fetch(
+            url=f"{oidc_server.base_url}{callback_url.path}?{callback_url.query}",
+            headers={**route.request.all_headers(), "cookie": ""},
+            max_redirects=0,
+        )
+        route.fulfill(response=response)
+
+    page.route("**/auth/callback?**", callback)
+    page.goto(oidc_server.public_url)
+    continue_link = page.locator("#fake-idp-continue")
+    expect(continue_link).to_be_visible(timeout=15_000)
+    continue_link.click()
+    expect(page.get_by_role("heading", name="Sign-in could not finish")).to_be_visible(
+        timeout=15_000
+    )
+    assert len(callbacks) == 2
+    assert page.locator("script").count() == 0
+    assert not any(cookie["name"] == "ap_session" for cookie in page.context.cookies())
+    identity = page.request.get(f"{oidc_server.base_url}/v1/me")
+    assert identity.status == 401

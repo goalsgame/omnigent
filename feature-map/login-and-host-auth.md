@@ -12,6 +12,11 @@ be able to write resources without a separate Omnigent account.
 
 ## Sub-features
 
+- `web-oidc-sign-in`: opening a session link while signed out completes SSO
+  and returns to that link. If the first callback omits the sign-in cookie,
+  retry once from a same-origin document. A persistently missing cookie stops
+  sign-in with guidance to open the original link in a browser allowing cookies.
+
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
@@ -60,6 +65,7 @@ and `disable`.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).
+Open a shared session URL while signed out to start the web OIDC sign-in flow.
 
 **Desktop:** Connect on the setup screen (or the server selector) to an OIDC
 server; relaunching the app, New Window, deep links, and switching servers on a
@@ -83,6 +89,15 @@ This entry point has no CLI login step.
 Preconditions: the verification instance runs a header-mode server with no
 sign-in and no host daemon, so most of this feature cannot be driven there.
 Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
+
+- **`web-oidc-sign-in` (own environment):**
+  `tests/e2e_ui/auth/test_oidc_login_flow.py` starts an isolated server and fake
+  identity provider. It covers normal sign-in, deep-link return with a
+  transiently omitted callback cookie, CLI tickets, and a bounded failure when
+  both callbacks omit the cookie. Run with plain `uv run pytest` and a built SPA.
+  `tests/server/test_oidc_cookie_retry.py` and
+  `tests/server/integration/test_oidc_native_login.py` cover state/PKCE checks,
+  safe retry URLs, and desktop/iOS native-code exchange after cookie recovery.
 
 - **Isolated CLI loop:** use [cli-setup-verify](../.claude/skills/cli-setup-verify/SKILL.md),
   which drives the real `omnigent` binary in a PTY with a throwaway config and
