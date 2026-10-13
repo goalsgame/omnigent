@@ -89,6 +89,7 @@ function displayRank(name: string): number {
 export function sortAgentsForDisplay<T extends AvailableAgent>(agents: readonly T[]): T[] {
   return [...agents].sort(
     (a, b) =>
+      Number(b.default_for_new_sessions === true) - Number(a.default_for_new_sessions === true) ||
       nativeAgentSortRank(a) - nativeAgentSortRank(b) ||
       displayRank(a.display_name) - displayRank(b.display_name),
   );

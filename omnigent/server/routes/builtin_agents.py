@@ -227,6 +227,8 @@ def create_builtin_agents_router(
     artifact_store: ArtifactStore | None = None,
     conversation_store: ConversationStore | None = None,
     auth_provider: AuthProvider | None = None,
+    default_agent_name: str | None = None,
+    agent_display_names: dict[str, str] | None = None,
 ) -> APIRouter:
     """Build the ``/v1/agents`` router (server agent list, user agents).
 
@@ -242,6 +244,8 @@ def create_builtin_agents_router(
         removing it; ``None`` skips the check.
     :param auth_provider: Optional auth provider; when set, the caller
         must be authenticated.
+    :param default_agent_name: Operator default for new-session pickers.
+    :param agent_display_names: Operator labels keyed by catalog agent name.
     :returns: A FastAPI router exposing the list, install, and remove routes.
     """
     router = APIRouter()
@@ -279,7 +283,15 @@ def create_builtin_agents_router(
         if scope != "user":
             page = agent_store.list(limit=limit, after=after, before=before, order=order)
             return PaginatedList(
-                data=[_to_agent_object(a, agent_cache) for a in page.data],
+                data=[
+                    _to_agent_object(a, agent_cache).model_copy(
+                        update={
+                            "display_name": (agent_display_names or {}).get(a.name),
+                            "default_for_new_sessions": a.name == default_agent_name,
+                        }
+                    )
+                    for a in page.data
+                ],
                 first_id=page.first_id,
                 last_id=page.last_id,
                 has_more=page.has_more,

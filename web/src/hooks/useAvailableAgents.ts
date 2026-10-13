@@ -8,7 +8,6 @@ import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/a
 import {
   nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForAgentName,
-  nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
 import type { SkillSummary } from "@/lib/types";
 
@@ -16,6 +15,7 @@ export interface AvailableAgent {
   id: string;
   name: string;
   display_name: string;
+  default_for_new_sessions?: boolean;
   description: string | null;
   // Harness/kind from GET /v1/agents, e.g. "codex", "codex-native",
   // "claude-native", or "claude-sdk". null when the server couldn't load
@@ -68,9 +68,8 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+function displayNameForAgent(name: string): string {
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
     nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
@@ -82,7 +81,10 @@ function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const nativeIndex = new Map<string, number>();
   for (const agent of agents) {
     const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-    if (nativeAgent === undefined) {
+    if (
+      nativeAgent === undefined ||
+      nativeCodingAgentForAgentName(agentRootName(agent.name)) === undefined
+    ) {
       result.push(agent);
       continue;
     }
@@ -105,6 +107,8 @@ interface BuiltinAgentWire {
   id: string;
   name: string;
   description?: string | null;
+  display_name?: string | null;
+  default_for_new_sessions?: boolean;
   harness?: string | null;
   skills?: SkillSummary[];
   // True only for server-seeded built-ins (deterministic id). Absent on
@@ -148,7 +152,8 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
   return {
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: a.display_name ?? displayNameForAgent(a.name),
+    ...(a.default_for_new_sessions ? { default_for_new_sessions: true } : {}),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -265,7 +270,7 @@ export async function prefetchAvailableAgentDetails(
           ? a
           : {
               ...a,
-              display_name: displayNameForAgent(json.name, json.harness),
+              display_name: displayNameForAgent(json.name),
               description: json.description ?? null,
               harness: json.harness ?? null,
               skills: json.skills ?? [],

@@ -94,6 +94,40 @@ function sessionResponse(
 const EMPTY_MINE = mockResponse({ object: "list", data: [], has_more: false });
 
 describe("useAvailableAgents", () => {
+  it("preserves distinct configured profiles sharing a native harness", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [
+          {
+            id: "review",
+            name: "team-reviewer",
+            harness: "pi-native",
+            builtin: true,
+            display_name: "Code Reviewer",
+          },
+          {
+            id: "general",
+            name: "team-assistant",
+            harness: "pi-native",
+            builtin: true,
+            display_name: "Pi",
+            default_for_new_sessions: true,
+          },
+        ],
+      }),
+      [MINE_URL]: EMPTY_MINE,
+    });
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.map((a) => [a.id, a.display_name])).toEqual([
+      ["review", "Code Reviewer"],
+      ["general", "Pi"],
+    ]);
+    expect(result.current.data?.find((a) => a.id === "general")?.default_for_new_sessions).toBe(
+      true,
+    );
+  });
+
   it("does not fetch while disabled", async () => {
     const { result } = renderHook(() => useAvailableAgents({ enabled: false }), { wrapper });
     await Promise.resolve();
@@ -602,9 +636,6 @@ describe("useAvailableAgents", () => {
     });
 
     // ag_session_kiro appears on initial load with harness: null because
-    // enrichment is deferred. prefetchAvailableAgentDetails (called on picker
-    // open) would later detect harness: "kiro-native" and remove the duplicate.
-    // ag_legacy_kiro is filtered by kiroLegacyNames (name: "kiro").
     expect(result.current.data).toEqual([
       {
         id: "ag_codex",
@@ -623,22 +654,20 @@ describe("useAvailableAgents", () => {
         skills: [],
       },
       {
+        id: "ag_stale_kiro",
+        name: "kiro-naitive",
+        display_name: "Kiro-naitive",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+      },
+      {
         id: "ag_kiro",
         name: "kiro-native-ui",
         display_name: "Kiro",
         description: null,
         harness: "kiro-native",
         skills: [],
-      },
-      {
-        id: "ag_session_kiro",
-        name: "kiro-naitive",
-        display_name: "Kiro-naitive",
-        description: null,
-        harness: null,
-        skills: [],
-        sessionId: "session_0",
-        created_at: 1,
       },
     ]);
   });

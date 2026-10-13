@@ -6,7 +6,7 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.agent_catalog import agent_catalog_names
+from omnigent.server.agent_catalog import agent_catalog_names, agent_catalog_presentation
 from omnigent.server.app import _ensure_default_agents
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -82,3 +82,60 @@ async def test_hidden_template_cannot_start_new_session_but_remains_readable(db_
         )
     assert exc.value.code == ErrorCode.FORBIDDEN
     assert store.get(agent.id) is not None
+
+
+def test_catalog_presentation() -> None:
+    assert agent_catalog_presentation({}) == (None, {})
+    assert agent_catalog_presentation(
+        {
+            "agents": {
+                "allowed_names": ["assistant", "reviewer"],
+                "default_name": "assistant",
+                "display_names": {"reviewer": "Code Reviewer"},
+            }
+        }
+    ) == ("assistant", {"reviewer": "Code Reviewer"})
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"default_name": ""},
+        {"display_names": []},
+        {"display_names": {"x": ""}},
+        {"allowed_names": [], "default_name": "hidden"},
+        {"allowed_names": [], "display_names": {"hidden": "Hidden"}},
+    ],
+)
+def test_catalog_presentation_rejects_invalid_config(section: dict) -> None:
+    with pytest.raises(ValueError):
+        agent_catalog_presentation({"agents": section})
+
+
+@pytest.mark.asyncio
+async def test_catalog_presentation_is_exposed_on_discovery(db_uri: str, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from omnigent.server.routes.builtin_agents import create_builtin_agents_router
+
+    store = SqlAlchemyAgentStore(db_uri)
+    store.create("a" * 32, "assistant", "missing/assistant")
+    store.create("b" * 32, "reviewer", "missing/reviewer")
+    cache = AgentCache(LocalArtifactStore(str(tmp_path)), tmp_path / "cache")
+    app = FastAPI()
+    app.include_router(
+        create_builtin_agents_router(
+            store,
+            cache,
+            default_agent_name="assistant",
+            agent_display_names={"assistant": "Pi", "reviewer": "Code Reviewer"},
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/agents")
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()["data"]}
+    assert rows["assistant"]["default_for_new_sessions"] is True
+    assert rows["reviewer"]["default_for_new_sessions"] is False
+    assert rows["reviewer"]["display_name"] == "Code Reviewer"

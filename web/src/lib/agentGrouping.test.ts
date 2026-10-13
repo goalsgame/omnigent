@@ -19,6 +19,13 @@ function agent(overrides: Partial<AvailableAgent> & Pick<AvailableAgent, "name">
 }
 
 describe("selectableSessionAgents", () => {
+  it("puts the operator default before another profile on the same harness", () => {
+    const result = selectableSessionAgents([
+      agent({ name: "reviewer", harness: "pi-native" }),
+      agent({ name: "assistant", harness: "pi-native", default_for_new_sessions: true }),
+    ]);
+    expect(result.map((a) => a.name)).toEqual(["assistant", "reviewer"]);
+  });
   it("drops the hidden agents every session-creation surface must exclude", () => {
     // Shared by the composer picker AND project settings — filter parity is
     // what stops a project from pinning a default the composer can't show.

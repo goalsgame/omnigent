@@ -293,6 +293,8 @@ class AgentObject(BaseModel):
     id: str
     object: str = "agent"
     name: str
+    display_name: str | None = None
+    default_for_new_sessions: bool = False
     version: int = 1
     description: str | None = None
     created_at: int
