@@ -403,3 +403,31 @@ def test_scoped_human_token_cannot_approve_google_cloud_access(oidc):
         )
         is None
     )
+
+
+def test_delegated_machine_keeps_original_principal(verifier, signing_key):
+    verifier.config = dataclasses.replace(
+        verifier.config, exchange_clients=frozenset({"mcp-exchange"})
+    )
+    assert verifier.authenticate(signed_token(signing_key, azp="mcp-exchange")) == PRINCIPAL
+    assert verifier.authenticate(signed_token(signing_key, azp="other-exchange")) is None
+    assert (
+        verifier.authenticate(signed_token(signing_key, azp="mcp-exchange", sub="unbound")) is None
+    )
+    assert (
+        verifier.authenticate(signed_token(signing_key, azp="mcp-exchange", resource_access={}))
+        is None
+    )
+
+
+def test_exchange_bindings_require_unambiguous_subjects():
+    with pytest.raises(RuntimeError):
+        OIDCMachineConfig.parse(
+            {
+                "audience": "api",
+                "role_client": "web",
+                "role": "automation",
+                "clients": {"one": "same", "two": "same"},
+                "exchange_clients": ["exchange"],
+            }
+        )

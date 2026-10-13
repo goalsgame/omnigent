@@ -1828,6 +1828,8 @@ def create_app(
             # endpoint. Best-effort — individual close failures are logged
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
+            if mcp_broker is not None:
+                await asyncio.to_thread(mcp_broker.client.close)
 
     from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
 
@@ -1865,6 +1867,56 @@ def create_app(
     # GitHub App integration: enabled only when both the config and the
     # connection store are wired. The client is stateless (holds config),
     # built once and reused for the connect flow.
+    # Outbound MCP grants stay server-side and are bound to the managed host owner.
+    from omnigent.server.oidc_mcp import MCPDelegationBroker, MCPDelegationConfig
+
+    mcp_config = MCPDelegationConfig.parse(resolved_server_config.get("oidc_mcp"))
+    mcp_broker = None
+    if mcp_config is not None:
+        from omnigent.server.routes.mcp_identity import create_mcp_identity_router
+        from omnigent.stores.credential_store import CredentialStore, build_secret_cipher
+
+        oidc = getattr(auth_provider, "_oidc_config", None)
+        cipher = build_secret_cipher()
+        if (
+            not isinstance(auth_provider, UnifiedAuthProvider)
+            or oidc is None
+            or cipher is None
+            or host_store is None
+            or permission_store is None
+        ):
+            raise RuntimeError("oidc_mcp requires OIDC, credential encryption and managed hosts")
+        mcp_broker = MCPDelegationBroker(
+            mcp_config,
+            oidc,
+            CredentialStore(permission_store.storage_location, cipher),
+            auth_provider,
+        )
+        app.include_router(create_mcp_identity_router(host_store, mcp_broker), prefix="/v1")
+    app.state.mcp_identity_broker = mcp_broker
+    if mcp_broker is not None:
+
+        @app.middleware("http")
+        async def capture_mcp_identity(request: Request, call_next):
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            path = request.url.path.removeprefix(resolved_base_path)
+            bearer = request.headers.get("authorization", "")
+            if (
+                request.method == "POST"
+                and (path == "/v1/sessions" or path.startswith("/v1/sessions/"))
+                and bearer.lower().startswith("bearer ")
+            ):
+                try:
+                    await asyncio.to_thread(mcp_broker.capture_bearer, bearer[7:])
+                except DelegationUnavailable:
+                    return JSONResponse(
+                        {"detail": "MCP identity delegation unavailable; renew your IdP session"},
+                        status_code=403,
+                        headers={"Cache-Control": "no-store"},
+                    )
+            return await call_next(request)
+
     # Per-user connection providers (GitHub, ...). One registry entry per
     # provider (connections_registry) drives uniform wiring: each gets
     # ``app.state.<name>_{config,store,client}``, populated only when both its

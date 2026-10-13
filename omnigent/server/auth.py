@@ -492,7 +492,9 @@ class UnifiedAuthProvider(AuthProvider):
         if human_verifier is not None and source != "oidc":
             raise RuntimeError("OIDC human delegation requires oidc auth mode")
         if machine_verifier is not None and human_verifier is not None:
-            if human_verifier.config.clients.intersection(machine_verifier.config.clients):
+            if human_verifier.config.clients.intersection(
+                set(machine_verifier.config.clients) | machine_verifier.config.exchange_clients
+            ):
                 raise RuntimeError("OIDC human and machine clients must not overlap")
         self.human_verifier = human_verifier
         self.machine_verifier = machine_verifier
@@ -1049,7 +1051,9 @@ def create_auth_provider() -> AuthProvider:
     if machine_config is not None and (source != "oidc" or oidc_config is None):
         raise RuntimeError("oidc_machine_auth requires oidc auth mode")
     if human_config is not None and machine_config is not None:
-        if human_config.clients.intersection(machine_config.clients):
+        if human_config.clients.intersection(
+            set(machine_config.clients) | machine_config.exchange_clients
+        ):
             raise RuntimeError("OIDC human and machine clients must not overlap")
     human_verifier = (
         OIDCHumanVerifier(

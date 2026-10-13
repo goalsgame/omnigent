@@ -12,10 +12,16 @@ sit on top of this. See ``designs/CREDENTIAL_STORE.md``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any, cast
 
+from filelock import FileLock, Timeout
 from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -242,6 +248,110 @@ class CredentialStore:
                 provider,
             )
         return updated
+
+    def refresh_locked(
+        self,
+        user_id: str,
+        provider: str,
+        refresh: Callable[[ProviderConnection], dict[str, Any]],
+    ) -> ProviderConnection | None:
+        """Serialize token rotation against reconnect/delete across database replicas.
+
+        The callback must use bounded provider timeouts.
+        PostgreSQL uses FOR UPDATE. SQLite serializes refresh per credential
+        with a file lock and compare-and-swap, outside database transactions.
+        """
+        if self._engine.dialect.name == "sqlite":
+            return self._refresh_sqlite(user_id, provider, refresh)
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> ProviderConnection | None:
+            require_active_account(session, user_id)
+            row = session.scalar(
+                select(SqlConnection)
+                .where(
+                    SqlConnection.workspace_id == workspace_id,
+                    SqlConnection.user_id == user_id,
+                    SqlConnection.provider == provider,
+                    SqlConnection.account_id == "",
+                )
+                .with_for_update()
+            )
+            if row is None:
+                return None
+            connection = self._to_entity(row, with_secret=True)
+            secret = refresh(connection)
+            if secret != connection.secret:
+                row.secret_enc = self._cipher.encrypt(
+                    json.dumps(secret),
+                    context=_enc_context(
+                        workspace_id,
+                        user_id,
+                        provider,
+                        "",
+                    ),
+                )
+                row.updated_at = now_epoch()
+            return self._build_entity(row, secret)
+
+        # Refresh is an external side effect and must not be replayed on DB conflicts.
+        with self._session_immediate("refresh_locked") as session:
+            return write(session)
+
+    def _refresh_sqlite(
+        self,
+        user_id: str,
+        provider: str,
+        refresh: Callable[[ProviderConnection], dict[str, Any]],
+    ) -> ProviderConnection | None:
+        """Serialize rotating grants without holding SQLite's global writer lock."""
+        workspace_id = current_workspace_id()
+        database = self._engine.url.database
+        if database and database != ":memory:":
+            lock_dir = Path(str(Path(database).resolve()) + ".credential-locks")
+        else:
+            lock_dir = (
+                Path(tempfile.gettempdir())
+                / f"omnigent-credentials-{os.getpid()}-{id(self._engine)}"
+            )
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        key = hashlib.sha256(json.dumps([workspace_id, user_id, provider]).encode()).hexdigest()
+        identity = (
+            SqlConnection.workspace_id == workspace_id,
+            SqlConnection.user_id == user_id,
+            SqlConnection.provider == provider,
+            SqlConnection.account_id == "",
+        )
+        try:
+            with FileLock(str(lock_dir / (key + ".lock")), timeout=30):
+                with self._session("refresh_snapshot") as session:
+                    require_active_account(session, user_id)
+                    row = session.scalar(select(SqlConnection).where(*identity))
+                    if row is None:
+                        return None
+                    ciphertext, metadata = row.secret_enc, row.metadata_json
+                    connection = self._to_entity(row, with_secret=True)
+                # Provider and cipher I/O must not run inside SQLite write transactions.
+                secret = refresh(connection)
+                if secret == connection.secret:
+                    return connection
+                encrypted = self._cipher.encrypt(
+                    json.dumps(secret), context=_enc_context(workspace_id, user_id, provider, "")
+                )
+                with self._session_immediate("refresh_compare_swap") as session:
+                    require_active_account(session, user_id)
+                    row = session.scalar(select(SqlConnection).where(*identity))
+                    if (
+                        row is None
+                        or row.secret_enc != ciphertext
+                        or row.metadata_json != metadata
+                    ):
+                        return None  # A disconnect/reconnect supersedes the in-flight refresh.
+                    row.secret_enc = encrypted
+                    row.updated_at = now_epoch()
+                    return self._build_entity(row, secret)
+        except Timeout:
+            return None
 
     def get(
         self,
