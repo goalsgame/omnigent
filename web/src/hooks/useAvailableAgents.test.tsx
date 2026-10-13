@@ -96,7 +96,7 @@ const EMPTY_MINE = mockResponse({ object: "list", data: [], has_more: false });
 describe("useAvailableAgents", () => {
   it("keeps user session uploads but filters disabled server templates", async () => {
     routeFetch({
-      [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
+      [BUILTINS_URL]: mockResponse({ data: [], has_more: false, agent_catalog_names: [] }),
       [MINE_URL]: mockResponse({
         data: [
           {
@@ -121,11 +121,7 @@ describe("useAvailableAgents", () => {
       [HARNESSES_URL]: mockResponse({ data: [] }),
     });
     const { result } = renderHook(() => useAvailableAgents(), {
-      wrapper: ({ children }: { children: ReactNode }) => (
-        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_catalog_names: [] }}>
-          {wrapper({ children })}
-        </CapabilitiesProvider>
-      ),
+      wrapper,
     });
     await waitFor(() => expect(result.current.data?.map((a) => a.id)).toEqual(["custom"]));
     expect(result.current.data?.[0].origin).toBe("user");

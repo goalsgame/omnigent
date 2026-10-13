@@ -124,8 +124,6 @@ export interface ServerInfo {
     string,
     { multi_repo?: boolean; inference_models?: boolean }
   >;
-  /** Operator template names allowed in new-session pickers. */
-  agent_catalog_names?: string[];
   /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
@@ -354,13 +352,6 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             !Array.isArray(data.sandbox_provider_capabilities)
               ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
               : {},
-          ...(Array.isArray(data.agent_catalog_names)
-            ? {
-                agent_catalog_names: data.agent_catalog_names.filter(
-                  (name): name is string => typeof name === "string",
-                ),
-              }
-            : {}),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],

@@ -50,6 +50,12 @@ _USER_AGENTS_PAGE_LIMIT = 50
 _IN_USE_COUNT_CAP = 100
 
 
+class AgentCatalogList(PaginatedList):
+    """Authenticated discovery metadata for filtering historical server profiles."""
+
+    agent_catalog_names: list[str] | None = None
+
+
 def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     """
     Convert a runtime Agent entity to an API-layer AgentObject.
@@ -262,7 +268,7 @@ def create_builtin_agents_router(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         scope: str | None = Query(default=None, pattern="^user$"),
-    ) -> PaginatedList:
+    ) -> AgentCatalogList:
         """List server agents, or with ``scope=user`` the caller's own agents.
 
         Server agents come from ``agent_store.list()``, which never returns
@@ -282,7 +288,7 @@ def create_builtin_agents_router(
         user_id = _require_user(request, auth_provider)
         if scope != "user":
             page = agent_store.list(limit=limit, after=after, before=before, order=order)
-            return PaginatedList(
+            return AgentCatalogList(
                 data=[
                     _to_agent_object(a, agent_cache).model_copy(
                         update={
@@ -295,6 +301,9 @@ def create_builtin_agents_router(
                 first_id=page.first_id,
                 last_id=page.last_id,
                 has_more=page.has_more,
+                agent_catalog_names=sorted(agent_store.catalog_names)
+                if agent_store.catalog_names is not None
+                else None,
             )
         require_user_agents()
         if before is not None or order != "desc":
@@ -311,7 +320,7 @@ def create_builtin_agents_router(
         data = await asyncio.to_thread(
             lambda: [_to_agent_object(a, agent_cache) for a in page.data]
         )
-        return PaginatedList(
+        return AgentCatalogList(
             data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
         )
 

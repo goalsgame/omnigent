@@ -157,3 +157,39 @@ async def test_session_list_exposes_origin_for_disabled_template_and_user_upload
     assert kinds == {server.id: "server", user.id: "user"}
     assert store.get_kinds([]) == {}
     assert store.get_kinds(["e" * 32]) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("names", [["private-project-reviewer"], []])
+async def test_catalog_names_require_authenticated_discovery(
+    db_uri, tmp_path, runtime_init, names
+):
+    from httpx import ASGITransport, AsyncClient
+
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifacts, tmp_path / "cache"),
+        auth_provider=UnifiedAuthProvider(
+            "header", local_single_user=False, header_name="X-Test-User"
+        ),
+        server_config={"agents": {"allowed_names": names}},
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        public = await client.get("/v1/info")
+        assert public.status_code == 200
+        assert "agent_catalog_names" not in public.json()
+        assert "private-project-reviewer" not in public.text
+        denied = await client.get("/v1/agents")
+        assert denied.status_code == 401
+        assert "private-project-reviewer" not in denied.text
+        catalog = await client.get("/v1/agents", headers={"X-Test-User": "person@example.test"})
+        assert catalog.status_code == 200, catalog.text
+        assert catalog.json()["agent_catalog_names"] == names

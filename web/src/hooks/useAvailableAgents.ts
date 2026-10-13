@@ -122,6 +122,7 @@ interface BuiltinAgentWire {
 }
 
 interface BuiltinAgentsListWire {
+  agent_catalog_names?: string[] | null;
   data: BuiltinAgentWire[];
   has_more?: boolean;
   last_id?: string | null;
@@ -131,7 +132,13 @@ interface BuiltinAgentsListWire {
  * Fetch the built-in agents from the read-only list `GET /v1/agents`
  * (see designs/BUILTIN_AGENTS.md).
  */
-export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
+interface AgentCatalog {
+  agents: AvailableAgent[];
+  names?: string[];
+}
+
+export async function fetchAgentCatalog(): Promise<AgentCatalog> {
+  let names: string[] | undefined;
   const rows: BuiltinAgentWire[] = [];
   let after: string | null = null;
   // Each page provides the cursor for the next request.
@@ -143,12 +150,13 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     const res = await authenticatedFetch(url);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
+    if (Array.isArray(body.agent_catalog_names)) names = body.agent_catalog_names;
     rows.push(...body.data);
     after = body.has_more === true && body.last_id ? body.last_id : null;
   } while (after != null);
   /* oxlint-enable no-await-in-loop */
 
-  return rows.map(agentFromWire);
+  return { agents: rows.map(agentFromWire), names };
 }
 
 function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
@@ -308,7 +316,6 @@ async function fetchAvailableAgents(
   queryClient: QueryClient,
   sessionAgents: AvailableAgent[],
   includeUserAgents = false,
-  catalogNames?: string[],
 ): Promise<AvailableAgent[]> {
   // In parallel, so the caller's agents add no latency to the picker.
   const [catalog, userAgents] = await Promise.all([
@@ -327,19 +334,19 @@ async function fetchAvailableAgents(
           .catch(() => [] as AvailableAgent[])
       : ([] as AvailableAgent[]),
   ]);
-  const visibleSessionAgents = filterToAgentCatalog(sessionAgents, catalogNames);
+  const visibleSessionAgents = filterToAgentCatalog(sessionAgents, catalog.names);
   const discovered = visibleSessionAgents.map((agent) => ({
     agentId: agent.id,
     agentName: agent.name,
     createdAt: agent.created_at ?? null,
     agent,
   }));
-  const merged = mergeAvailableAgents(catalog, discovered, userAgents);
+  const merged = mergeAvailableAgents(catalog.agents, discovered, userAgents);
   for (const id of pinnedAgentIds) {
     if (merged.some((agent) => agent.id === id)) continue;
     const agent =
       visibleSessionAgents.find((a) => a.id === id) ??
-      catalog.find((a) => a.id === id) ??
+      catalog.agents.find((a) => a.id === id) ??
       userAgents.find((a) => a.id === id);
     if (agent) merged.push(agent);
   }
@@ -510,16 +517,6 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // stable identity and TanStack doesn't hand consumers a fresh array per render.
   const acpHarnessIds = useAcpHarnessIds(enabled);
   const harnessLabels = useHarnessLabels(enabled);
-  const catalogNames = serverInfo === "loading" ? undefined : serverInfo.agent_catalog_names;
-  const select = useMemo(
-    () => (agents: AvailableAgent[]) =>
-      applyAcpHarnessCatalog(
-        filterToAgentCatalog(agents, catalogNames),
-        acpHarnessIds,
-        harnessLabels,
-      ),
-    [acpHarnessIds, harnessLabels, catalogNames],
-  );
   const queryClient = useQueryClient();
   // The harness/built-in rows come entirely from GET /v1/agents, so they must
   // not wait for a slow Mine session load (managed deployments with
@@ -532,13 +529,23 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
     staleTime: AVAILABLE_AGENTS_STALE_MS,
   });
   const { data: catalog } = catalogQuery;
+  const catalogNames = catalog?.names;
+  const select = useMemo(
+    () => (agents: AvailableAgent[]) =>
+      applyAcpHarnessCatalog(
+        filterToAgentCatalog(agents, catalogNames),
+        acpHarnessIds,
+        harnessLabels,
+      ),
+    [acpHarnessIds, harnessLabels, catalogNames],
+  );
   // Catalog merged with an empty discovery — the same rows a failing discovery degrades
   // to — shown while the merged fetch is in flight and upgraded in place when
   // the discovery lands. Consumers that must not resolve stored ids against a
   // partial list read isPlaceholderData to tell this state apart.
   //
   const placeholderData = useMemo(
-    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
+    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog.agents, [])),
     [catalog],
   );
   const query = useQuery({
@@ -558,7 +565,6 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
         queryClient,
         sessionAgents.data ?? [],
         includeUserAgents,
-        catalogNames,
       ),
     enabled: enabled && (sessionAgents.data !== undefined || sessionAgents.isError),
     staleTime: AVAILABLE_AGENTS_STALE_MS,
