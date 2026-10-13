@@ -23,6 +23,7 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import re
@@ -323,9 +324,17 @@ def create_auth_router(
     # One-time codes for native sign-ins. Single-use, 60 s.
     _native_codes: dict[str, _NativeCode] = {}
 
+    def _flow_cookie(state: str) -> str:
+        return f"{_state_cookie}_{hashlib.sha256(state.encode()).hexdigest()}"
+
+    def _callback_cookie(request: Request, state: str | None) -> str:
+        # Accept pending logins started by an older server during a rollout.
+        name = _flow_cookie(state) if state else _state_cookie
+        return name if name in request.cookies else _state_cookie
+
     def _verified_state(request: Request, state: str | None) -> dict[str, object] | None:
         """Return the signed auth state when its cookie is valid and matches ``state``."""
-        raw = request.cookies.get(_state_cookie)
+        raw = request.cookies.get(_callback_cookie(request, state))
         if not state or not raw:
             return None
         try:
@@ -334,11 +343,13 @@ def create_auth_router(
             return None
         return payload if payload.get("state") == state else None
 
-    def _native_failure(native: Mapping[str, str], error: str, description: str) -> Response:
+    def _native_failure(
+        native: Mapping[str, str], error: str, description: str, cookie_name: str
+    ) -> Response:
         """Report a failed native sign-in to the app's redirect URI."""
         response = _native_redirect(native, {"error": error, "error_description": description})
         response.delete_cookie(
-            key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
+            key=cookie_name, path="/", secure=_secure, httponly=True, samesite="lax"
         )
         return response
 
@@ -440,8 +451,17 @@ def create_auth_router(
         auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
         response = RedirectResponse(url=auth_url, status_code=302, headers=NO_STORE_HEADERS)
+        # Keep a small set of independent pending flows instead of overwriting
+        # another tab's verifier. Abandoned cookies also expire after five minutes.
+        pending = [
+            name
+            for name in request.cookies
+            if re.fullmatch(re.escape(_state_cookie) + r"_[0-9a-f]{64}", name)
+        ]
+        for name in pending[:-7]:
+            response.delete_cookie(name, path="/", secure=_secure, httponly=True, samesite="lax")
         response.set_cookie(
-            key=_state_cookie,
+            key=_flow_cookie(state),
             value=state_jwt,
             max_age=_AUTH_STATE_TTL_SECONDS,
             httponly=True,
@@ -461,7 +481,7 @@ def create_auth_router(
 
         :param request: The incoming FastAPI request containing
             ``code`` and ``state`` query parameters plus the
-            ``__Host-ap_auth_state`` cookie.
+            flow-specific auth-state cookie.
         :returns: 302 redirect to the app with session cookie set,
             or 400/403 on validation failure.
         """
@@ -469,6 +489,7 @@ def create_auth_router(
 
         code = request.query_params.get("code")
         state = request.query_params.get("state")
+        cookie_name = _callback_cookie(request, state)
         if not code or not state:
             # An IdP error (e.g. the user declined) arrives without a code.
             # A native sign-in hears about it at its redirect URI.
@@ -478,6 +499,7 @@ def create_auth_router(
                     early_native,
                     "access_denied",
                     "Sign-in was cancelled or declined at the identity provider.",
+                    cookie_name,
                 )
             return JSONResponse(
                 status_code=400,
@@ -485,7 +507,7 @@ def create_auth_router(
             )
 
         # Verify state from the cookie.
-        state_cookie = request.cookies.get(_state_cookie)
+        state_cookie = request.cookies.get(cookie_name)
         if not state_cookie:
             return _missing_auth_state_response(request, urlsplit(config.redirect_uri).path)
 
@@ -509,7 +531,7 @@ def create_auth_router(
             # A native sign-in hears about failures at its redirect URI
             # instead of waiting out its timeout.
             if native is not None:
-                return _native_failure(native, error, message)
+                return _native_failure(native, error, message, cookie_name)
             return JSONResponse(status_code=status_code, content={"error": message})
 
         code_verifier = state_payload.get("code_verifier", "")
@@ -662,7 +684,7 @@ def create_auth_router(
             )
             response = _native_redirect(native, {"code": native_code})
             response.delete_cookie(
-                key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
+                key=cookie_name, path="/", secure=_secure, httponly=True, samesite="lax"
             )
             return response
 
@@ -723,7 +745,7 @@ def create_auth_router(
                 path="/",
             )
             resp.delete_cookie(
-                key=_state_cookie,
+                key=cookie_name,
                 path="/",
                 secure=_secure,
                 httponly=True,
@@ -744,7 +766,7 @@ def create_auth_router(
         )
         # Clear the auth state cookie.
         response.delete_cookie(
-            key=_state_cookie,
+            key=cookie_name,
             path="/",
             secure=_secure,
             httponly=True,

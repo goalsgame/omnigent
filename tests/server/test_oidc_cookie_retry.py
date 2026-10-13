@@ -74,7 +74,7 @@ def test_login_redirect_does_not_cache_auth_state(
     assert response.status_code == 302
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
-    assert response.cookies["ap_auth_state"]
+    assert any(name.startswith("ap_auth_state_") for name in response.cookies)
 
 
 def test_missing_cookie_document_recovers_original_link(
@@ -95,7 +95,8 @@ def test_missing_cookie_document_recovers_original_link(
     target = "/c/shared-session?tab=files"
     login = client.get("/auth/login", params={"return_to": target}, follow_redirects=False)
     state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
-    cookie = client.cookies["ap_auth_state"]
+    cookie_name = next(iter(login.cookies))
+    cookie = login.cookies[cookie_name]
     client.cookies.clear()
     callback = client.get(
         "/auth/callback",
@@ -115,7 +116,7 @@ def test_missing_cookie_document_recovers_original_link(
     assert query["code"] == ["original-code"]
     assert query["state"] == [state]
     assert urlsplit(retry).netloc == ""
-    client.cookies.set("ap_auth_state", cookie)
+    client.cookies.set(cookie_name, cookie)
     recovered = client.get(retry, headers={"Accept": "text/html"}, follow_redirects=False)
     assert recovered.status_code == 302
     assert recovered.headers["location"] == target
@@ -170,7 +171,8 @@ def test_retry_does_not_bypass_invalid_cookie_or_state(
     client, _ = callback_client
     login = client.get("/auth/login", follow_redirects=False)
     state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
-    cookie = client.cookies["ap_auth_state"]
+    cookie_name = next(iter(login.cookies))
+    cookie = login.cookies[cookie_name]
     client.cookies.clear()
     first = client.get(
         "/auth/callback", params={"code": "c", "state": state}, headers={"Accept": "text/html"}
@@ -181,7 +183,7 @@ def test_retry_does_not_bypass_invalid_cookie_or_state(
         cookie = jwt.encode(payload, _TEST_SECRET, algorithm="HS256")
     else:
         cookie = "forged-cookie"
-    client.cookies.set("ap_auth_state", cookie)
+    client.cookies.set(cookie_name, cookie)
 
     async def no_exchange(*args, **kwargs):
         pytest.fail("An invalid cookie or mismatched state must never redeem a code")

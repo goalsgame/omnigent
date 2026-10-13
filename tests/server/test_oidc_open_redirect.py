@@ -107,7 +107,14 @@ def _decode_state_cookie(client: TestClient) -> dict[str, Any]:
     :returns: The verified state-cookie claims (``state``,
         ``code_verifier``, ``return_to``, ``exp``).
     """
-    raw = client.cookies.get(_STATE_COOKIE)
+    raw = next(
+        (
+            value
+            for name, value in reversed(list(client.cookies.items()))
+            if name.startswith(_STATE_COOKIE + "_")
+        ),
+        None,
+    )
     assert raw is not None, "login did not set the auth state cookie"
     return jwt.decode(raw, _TEST_SECRET, algorithms=["HS256"])
 
