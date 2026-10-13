@@ -194,7 +194,9 @@ def provider_client(oidc_env, monkeypatch, tmp_path: Path, db_uri):
             **claims,
         }
         token = jwt.encode(payload, private_key, algorithm="PS256", headers={"kid": "test-key"})
-        return httpx.Response(200, json={"id_token": token})
+        return httpx.Response(
+            200, json={"id_token": token, "access_token": "verified-login-access"}
+        )
 
     def fetch_jwks(client):
         jwks_requests.append(client.uri)
@@ -314,3 +316,45 @@ def test_public_pkce_login_fulfills_cli_ticket(provider_client):
     poll = client.get("/auth/cli-poll", params={"ticket": ticket["ticket"]})
     assert poll.status_code == 200, poll.text
     assert poll.json()["token"]
+
+
+@pytest.mark.parametrize("surface", ["browser", "cli", "native"])
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_login_captures_mcp_identity_before_issuing_session(provider_client, surface, unavailable):
+    from types import SimpleNamespace
+
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    client, codes, _, _, _ = provider_client
+    captured = []
+
+    def capture(owner, subject, access):
+        captured.append((owner, subject, access))
+        if unavailable:
+            raise DelegationUnavailable("fixture provider unavailable")
+
+    client.app.state.mcp_identity_broker = SimpleNamespace(capture=capture)
+    login_params = {}
+    if surface == "cli":
+        ticket = client.post("/auth/cli-login").json()["ticket"]
+        login_params["ticket"] = ticket
+    elif surface == "native":
+        login_params = {
+            "native_redirect_uri": "http://127.0.0.1:53682/callback",
+            "native_state": "test-state",
+            "code_challenge": derive_code_challenge("v" * 64),
+            "code_challenge_method": "S256",
+        }
+    params = begin_login(client, codes, login_params)
+    response = client.get("/auth/callback", params=params, follow_redirects=False)
+    assert captured == [("alice@example.test", "test-user", "verified-login-access")]
+    if surface == "native":
+        query = parse_qs(urlsplit(response.headers["location"]).query)
+        assert ("error" if unavailable else "code") in query
+    elif unavailable:
+        assert response.status_code == 503
+        assert not response.cookies.get("ap_session")
+    elif surface == "cli":
+        assert client.get("/auth/cli-poll", params={"ticket": ticket}).json()["token"]
+    else:
+        assert response.cookies.get("ap_session")

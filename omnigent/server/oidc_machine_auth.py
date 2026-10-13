@@ -48,13 +48,14 @@ class OIDCMachineConfig:
     role_client: str
     role: str
     clients: Mapping[str, str]
+    exchange_clients: frozenset[str] = frozenset()
 
     @classmethod
     def parse(cls, value: object) -> OIDCMachineConfig | None:
         """Validate a configured section; absent configuration leaves auth disabled."""
         if value is None:
             return None
-        if not isinstance(value, dict) or set(value) != {
+        if not isinstance(value, dict) or set(value) - {"exchange_clients"} != {
             "audience",
             "role_client",
             "role",
@@ -82,7 +83,24 @@ class OIDCMachineConfig:
             ):
                 raise RuntimeError("oidc_machine_auth contains an invalid client/subject binding")
             bindings[client] = subject
-        return cls(*strings, clients=MappingProxyType(bindings))
+        exchange_clients = value.get("exchange_clients", [])
+        if (
+            not isinstance(exchange_clients, list)
+            or any(
+                not isinstance(client, str) or _CLIENT_ID.fullmatch(client) is None
+                for client in exchange_clients
+            )
+            or set(exchange_clients) & set(bindings)
+            or (exchange_clients and len(set(bindings.values())) != len(bindings))
+        ):
+            raise RuntimeError(
+                "oidc_machine_auth exchange clients require unique subject bindings"
+            )
+        return cls(
+            *strings,
+            clients=MappingProxyType(bindings),
+            exchange_clients=frozenset(exchange_clients),
+        )
 
     @property
     def principals(self) -> frozenset[str]:
@@ -130,6 +148,13 @@ class OIDCMachineVerifier:
         if claims is None:
             return None
         client = claims.get("azp")
+        if isinstance(client, str) and client in self.config.exchange_clients:
+            matches = [
+                name
+                for name, subject in self.config.clients.items()
+                if subject == claims.get("sub")
+            ]
+            client = matches[0] if len(matches) == 1 else None
         if not isinstance(client, str) or self.config.clients.get(client) != claims.get("sub"):
             return None
         access = claims.get("resource_access")

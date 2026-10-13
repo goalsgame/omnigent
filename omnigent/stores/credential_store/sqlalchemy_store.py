@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any, cast
 
 from sqlalchemy import delete, select, update
@@ -242,6 +243,52 @@ class CredentialStore:
                 provider,
             )
         return updated
+
+    def refresh_locked(
+        self,
+        user_id: str,
+        provider: str,
+        refresh: Callable[[ProviderConnection], dict[str, Any]],
+    ) -> ProviderConnection | None:
+        """Serialize token rotation against reconnect/delete across database replicas.
+
+        The callback runs under a row lock and must use bounded provider timeouts.
+        SQLite uses an immediate transaction; PostgreSQL uses FOR UPDATE.
+        """
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> ProviderConnection | None:
+            require_active_account(session, user_id)
+            row = session.scalar(
+                select(SqlConnection)
+                .where(
+                    SqlConnection.workspace_id == workspace_id,
+                    SqlConnection.user_id == user_id,
+                    SqlConnection.provider == provider,
+                    SqlConnection.account_id == "",
+                )
+                .with_for_update()
+            )
+            if row is None:
+                return None
+            connection = self._to_entity(row, with_secret=True)
+            secret = refresh(connection)
+            if secret != connection.secret:
+                row.secret_enc = self._cipher.encrypt(
+                    json.dumps(secret),
+                    context=_enc_context(
+                        workspace_id,
+                        user_id,
+                        provider,
+                        "",
+                    ),
+                )
+                row.updated_at = now_epoch()
+            return self._build_entity(row, secret)
+
+        # Refresh is an external side effect and must not be replayed on DB conflicts.
+        with self._session_immediate("refresh_locked") as session:
+            return write(session)
 
     def get(
         self,
