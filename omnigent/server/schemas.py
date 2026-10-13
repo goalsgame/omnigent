@@ -293,6 +293,8 @@ class AgentObject(BaseModel):
     id: str
     object: str = "agent"
     name: str
+    display_name: str | None = None
+    default_for_new_sessions: bool = False
     version: int = 1
     description: str | None = None
     created_at: int
@@ -2802,6 +2804,7 @@ class SessionListItem(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
+    agent_kind: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int

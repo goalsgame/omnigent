@@ -1594,9 +1594,15 @@ def register_core_routes(
         unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
         perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
-            perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
+            (
+                perms_by_conv,
+                agent_names_by_id,
+                agent_kinds_by_id,
+                child_ids_by_parent,
+            ) = await asyncio.gather(
                 asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
                 asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+                asyncio.to_thread(agent_store.get_kinds, unique_agent_ids),
                 asyncio.to_thread(
                     conversation_store.list_child_conversation_ids_by_parent,
                     conv_ids,
@@ -1608,8 +1614,9 @@ def register_core_routes(
                 else False
             )
         else:
-            agent_names_by_id, child_ids_by_parent = await asyncio.gather(
+            agent_names_by_id, agent_kinds_by_id, child_ids_by_parent = await asyncio.gather(
                 asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+                asyncio.to_thread(agent_store.get_kinds, unique_agent_ids),
                 asyncio.to_thread(
                     conversation_store.list_child_conversation_ids_by_parent,
                     conv_ids,
@@ -1684,6 +1691,7 @@ def register_core_routes(
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                agent_kinds_by_id=agent_kinds_by_id,
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -1802,8 +1810,14 @@ def register_core_routes(
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
         conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
+        (
+            agent_names_by_id,
+            agent_kinds_by_id,
+            child_ids_by_parent,
+            comments_fingerprints,
+        ) = await asyncio.gather(
             asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+            asyncio.to_thread(agent_store.get_kinds, unique_agent_ids),
             asyncio.to_thread(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
@@ -1815,6 +1829,7 @@ def register_core_routes(
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                agent_kinds_by_id=agent_kinds_by_id,
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,

@@ -28,6 +28,14 @@ class AgentStore(ABC):
         self.storage_location = storage_location
         self.catalog_names: frozenset[str] | None = None
 
+    def get_kinds(self, agent_ids: builtins.list[str]) -> dict[str, str]:
+        """Return persisted origins for picker filtering; unknown IDs are omitted."""
+        return {
+            agent_id: agent.kind
+            for agent_id in agent_ids
+            if (agent := self.get(agent_id)) is not None
+        }
+
     def is_catalog_agent(self, name: str) -> bool:
         """Whether a template is enabled for discovery and new sessions."""
         return self.catalog_names is None or name in self.catalog_names

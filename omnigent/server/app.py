@@ -1489,9 +1489,10 @@ def create_app(
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
-    from omnigent.server.agent_catalog import agent_catalog_names
+    from omnigent.server.agent_catalog import agent_catalog_names, agent_catalog_presentation
 
     agent_store.catalog_names = agent_catalog_names(resolved_server_config)
+    default_agent_name, agent_display_names = agent_catalog_presentation(resolved_server_config)
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
@@ -3288,6 +3289,8 @@ def create_app(
             artifact_store=artifact_store,
             conversation_store=conversation_store,
             auth_provider=auth_provider,
+            default_agent_name=default_agent_name,
+            agent_display_names=agent_display_names,
         ),
         prefix="/v1",
         tags=["agents"],
