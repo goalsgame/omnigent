@@ -17,6 +17,7 @@ export interface AvailableAgent {
   name: string;
   display_name: string;
   operatorDisplayName?: boolean;
+  origin?: string | null;
   default_for_new_sessions?: boolean;
   description: string | null;
   // Harness/kind from GET /v1/agents, e.g. "codex", "codex-native",
@@ -223,6 +224,7 @@ export function useSessionAgents(enabled = true) {
       agents.set(row.agent_id, {
         id: row.agent_id,
         name: row.agent_name,
+        origin: row.agent_kind,
         display_name: displayNameForAgent(row.agent_name),
         description: null,
         harness: null,
@@ -306,6 +308,7 @@ async function fetchAvailableAgents(
   queryClient: QueryClient,
   sessionAgents: AvailableAgent[],
   includeUserAgents = false,
+  catalogNames?: string[],
 ): Promise<AvailableAgent[]> {
   // In parallel, so the caller's agents add no latency to the picker.
   const [catalog, userAgents] = await Promise.all([
@@ -324,7 +327,8 @@ async function fetchAvailableAgents(
           .catch(() => [] as AvailableAgent[])
       : ([] as AvailableAgent[]),
   ]);
-  const discovered = sessionAgents.map((agent) => ({
+  const visibleSessionAgents = filterToAgentCatalog(sessionAgents, catalogNames);
+  const discovered = visibleSessionAgents.map((agent) => ({
     agentId: agent.id,
     agentName: agent.name,
     createdAt: agent.created_at ?? null,
@@ -334,7 +338,7 @@ async function fetchAvailableAgents(
   for (const id of pinnedAgentIds) {
     if (merged.some((agent) => agent.id === id)) continue;
     const agent =
-      sessionAgents.find((a) => a.id === id) ??
+      visibleSessionAgents.find((a) => a.id === id) ??
       catalog.find((a) => a.id === id) ??
       userAgents.find((a) => a.id === id);
     if (agent) merged.push(agent);
@@ -534,7 +538,13 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   );
   const query = useQuery({
     // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
-    queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null, includeUserAgents],
+    queryKey: [
+      "available-agents",
+      pinnedKey,
+      sessionAgents.data ?? null,
+      includeUserAgents,
+      catalogNames,
+    ],
     // fetchQuery dedupes with the catalog query's in-flight fetch, so the
     // merged fetch reuses (not repeats) the catalog request.
     queryFn: () =>
@@ -543,6 +553,7 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
         queryClient,
         sessionAgents.data ?? [],
         includeUserAgents,
+        catalogNames,
       ),
     enabled: enabled && (sessionAgents.data !== undefined || sessionAgents.isError),
     staleTime: AVAILABLE_AGENTS_STALE_MS,

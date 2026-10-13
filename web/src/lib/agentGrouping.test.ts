@@ -107,11 +107,14 @@ it("does not resurrect disabled templates from session history", () => {
     agent({ name: "assistant" }),
     agent({ name: "retired", sessionId: "old" }),
     agent({ name: "personal", mine: true }),
+    agent({ name: "uploaded", sessionId: "custom-session", origin: "user" }),
+    agent({ name: "retired-server", sessionId: "old-server", origin: "server" }),
   ];
   expect(filterToAgentCatalog(agents, ["assistant"]).map((a) => a.name)).toEqual([
     "assistant",
     "personal",
+    "uploaded",
   ]);
   expect(filterToAgentCatalog(agents)).toEqual(agents);
-  expect(filterToAgentCatalog(agents, []).map((a) => a.name)).toEqual(["personal"]);
+  expect(filterToAgentCatalog(agents, []).map((a) => a.name)).toEqual(["personal", "uploaded"]);
 });

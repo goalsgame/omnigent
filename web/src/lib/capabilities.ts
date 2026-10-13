@@ -124,13 +124,14 @@ export interface ServerInfo {
     string,
     { multi_repo?: boolean; inference_models?: boolean }
   >;
+  /** Operator template names allowed in new-session pickers. */
+  agent_catalog_names?: string[];
   /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
    * Sandbox Integrations nav; the SPA renders one panel per provider via
    * CONNECTION_PANELS. Adding a provider adds a string here, not a new flag.
    */
-  agent_catalog_names?: string[];
   enabled_connections: string[];
   machine_google_cloud_enabled?: boolean;
   /**

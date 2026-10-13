@@ -103,6 +103,8 @@ def test_catalog_presentation() -> None:
         {"default_name": ""},
         {"display_names": []},
         {"display_names": {"x": ""}},
+        {"display_names": {" assistant": "Assistant"}},
+        {"display_names": {"assistant ": "Assistant"}},
         {"allowed_names": [], "default_name": "hidden"},
         {"allowed_names": [], "display_names": {"hidden": "Hidden"}},
     ],
@@ -139,3 +141,19 @@ async def test_catalog_presentation_is_exposed_on_discovery(db_uri: str, tmp_pat
     assert rows["assistant"]["default_for_new_sessions"] is True
     assert rows["reviewer"]["default_for_new_sessions"] is False
     assert rows["reviewer"]["display_name"] == "Code Reviewer"
+
+
+@pytest.mark.asyncio
+async def test_session_list_exposes_origin_for_disabled_template_and_user_upload(client, db_uri):
+    store = SqlAlchemyAgentStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    server = store.create("a" * 32, "retired", "bundle/server")
+    user = store.create_user_agent("b" * 32, "custom-upload", "bundle/user", None)
+    conversations.create_conversation(conversation_id="c" * 32, agent_id=server.id)
+    conversations.create_conversation(conversation_id="d" * 32, agent_id=user.id)
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200
+    kinds = {row["agent_id"]: row["agent_kind"] for row in response.json()["data"]}
+    assert kinds == {server.id: "server", user.id: "user"}
+    assert store.get_kinds([]) == {}
+    assert store.get_kinds(["e" * 32]) == {}

@@ -17,8 +17,9 @@ Supply their YAML definitions through `OMNIGENT_BUILTIN_AGENT_DIRS` as usual.
 
 Existing database records remain available to their sessions and history.
 Changing the list does not delete sessions, templates, or workspace data.
-The web picker also filters history-derived templates against this catalog;
-installed user agents remain available.
+The web picker filters history-derived server templates against this catalog.
+Session-list origin metadata preserves user-authored uploads and installed user
+agents, including those not named in the operator catalog.
 This setting curates templates; it does not disable session-scoped agents or
 user-authored session bundles.
 

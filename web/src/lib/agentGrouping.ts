@@ -144,5 +144,7 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
 export function filterToAgentCatalog<T extends AvailableAgent>(agents: T[], names?: string[]): T[] {
   if (names === undefined) return agents;
   const allowed = new Set(names);
-  return agents.filter((agent) => agent.mine || allowed.has(agentRootName(agent.name)));
+  return agents.filter(
+    (agent) => agent.mine || agent.origin === "user" || allowed.has(agentRootName(agent.name)),
+  );
 }

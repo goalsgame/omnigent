@@ -2804,6 +2804,7 @@ class SessionListItem(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
+    agent_kind: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int

@@ -32,6 +32,7 @@ def agent_catalog_presentation(config: Mapping[str, Any]) -> tuple[str | None, d
     if not isinstance(labels, dict) or any(
         not isinstance(name, str)
         or not name.strip()
+        or name != name.strip()
         or not isinstance(label, str)
         or not label.strip()
         for name, label in labels.items()

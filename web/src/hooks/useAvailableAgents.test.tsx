@@ -94,6 +94,43 @@ function sessionResponse(
 const EMPTY_MINE = mockResponse({ object: "list", data: [], has_more: false });
 
 describe("useAvailableAgents", () => {
+  it("keeps user session uploads but filters disabled server templates", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
+      [MINE_URL]: mockResponse({
+        data: [
+          {
+            id: "custom-session",
+            agent_id: "custom",
+            agent_name: "uploaded",
+            agent_kind: "user",
+            created_at: 1,
+            permission_level: 4,
+          },
+          {
+            id: "old-session",
+            agent_id: "retired",
+            agent_name: "uploaded",
+            agent_kind: "server",
+            created_at: 2,
+            permission_level: 4,
+          },
+        ],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: mockResponse({ data: [] }),
+    });
+    const { result } = renderHook(() => useAvailableAgents(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_catalog_names: [] }}>
+          {wrapper({ children })}
+        </CapabilitiesProvider>
+      ),
+    });
+    await waitFor(() => expect(result.current.data?.map((a) => a.id)).toEqual(["custom"]));
+    expect(result.current.data?.[0].origin).toBe("user");
+  });
+
   it("preserves distinct configured profiles sharing a native harness", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({

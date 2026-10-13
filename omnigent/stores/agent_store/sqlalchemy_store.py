@@ -14,7 +14,7 @@ from omnigent.db.db_models import (
     SqlConversation,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import encode_agent_kind
+from omnigent.db.enum_codecs import decode_agent_kind, encode_agent_kind
 from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
@@ -286,6 +286,18 @@ class SqlAlchemyAgentStore(AgentStore):
                 last_id=entities[-1].id if entities else None,
                 has_more=has_more,
             )
+
+    def get_kinds(self, agent_ids: builtins.list[str]) -> dict[str, str]:
+        """Batch-read origins without loading agent bundles or individual sessions."""
+        if not agent_ids:
+            return {}
+        with self._session("select_agent_kinds") as session:
+            rows = session.execute(
+                select(SqlAgent.id, SqlAgent.kind).where(
+                    SqlAgent.workspace_id == current_workspace_id(), SqlAgent.id.in_(agent_ids)
+                )
+            ).all()
+            return {row.id: decode_agent_kind(row.kind) for row in rows}
 
     def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:
         """
