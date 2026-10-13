@@ -66,6 +66,8 @@ def test_owner_isolation_and_refresh(broker):
         service.credential("bob@example.com")
     assert service.credential("alice@example.com") == "access"
     assert len(requests) == 1
+    assert "audience" not in requests[0]
+    assert requests[0]["scope"] == ["openid mcp-api"]
     connection = service.store.get("alice@example.com", "oidc_mcp", with_secret=True)
     service.store.update_secret(
         "alice@example.com", "oidc_mcp", secret={**connection.secret, "expires_at": 0}

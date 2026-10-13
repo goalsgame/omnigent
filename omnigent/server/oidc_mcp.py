@@ -30,9 +30,7 @@ class MCPDelegationConfig:
     scope: str
     machine_client_id: str
     machine_client_secret: str = field(repr=False)
-    additional_audiences: tuple[str, ...] = ()
     machine_scope: str | None = None
-    machine_audience: str | None = None
 
     @classmethod
     def parse(cls, value: object) -> MCPDelegationConfig | None:
@@ -52,20 +50,13 @@ class MCPDelegationConfig:
         ):
             if not isinstance(value.get(key), str) or not value[key].strip():
                 raise ValueError(f"oidc_mcp.{key} must be a non-empty string")
-        for key in ("machine_scope", "machine_audience"):
+        for key in ("machine_scope",):
             if value.get(key) is not None and (
                 not isinstance(value[key], str) or not value[key].strip()
             ):
                 raise ValueError(f"oidc_mcp.{key} must be a non-empty string")
-        audiences = value.get("additional_audiences", [])
-        if not isinstance(audiences, list) or any(
-            not isinstance(a, str) or not a for a in audiences
-        ):
-            raise ValueError("oidc_mcp.additional_audiences must be a list of audience names")
         result = cls(
-            additional_audiences=tuple(audiences),
             machine_scope=value.get("machine_scope"),
-            machine_audience=value.get("machine_audience"),
             upstream_url=str(value.get("upstream_url", "")),
             audience=str(value.get("audience", "")),
             scope=str(value.get("scope", "")),
@@ -167,15 +158,7 @@ class MCPDelegationBroker:
                 "subject_token_type": _TOKEN_TYPE + "access_token",
                 "subject_token": token,
                 "requested_token_type": _TOKEN_TYPE + "refresh_token",
-                "audience": [
-                    self.config.audience,
-                    *self.config.additional_audiences,
-                    *(
-                        [self.config.machine_audience]
-                        if owner.startswith("oidc-machine:") and self.config.machine_audience
-                        else []
-                    ),
-                ],
+                # Scopes supply audiences and roles; audience filtering can strip role scopes.
                 "scope": (self.config.machine_scope or self.config.scope)
                 if owner.startswith("oidc-machine:")
                 else self.config.scope,

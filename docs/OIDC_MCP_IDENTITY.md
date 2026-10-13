@@ -26,11 +26,8 @@ oidc_mcp:
   scope: openid tools-api
   machine_client_id: tools-machine-exchange
   machine_client_secret_env: MCP_EXCHANGE_CLIENT_SECRET
-  # Include only additional audiences needed by your upstream delegation chain.
-  additional_audiences: [tools-onward-exchange]
-  # Optional distinct requested scope/audience for machine grants.
+  # Optional distinct requested scope for machine grants.
   machine_scope: openid tools-api application-api
-  machine_audience: application-api
 ```
 
 Mount the client secret into the named environment variable. The fixed HTTPS
@@ -63,7 +60,11 @@ persistent service-account sessions; transient sessions cannot supply a
 same-session refresh grant. Do not request offline access.
 
 The exchanged access token must retain the original subject, use the expected
-requester as `azp`, and include the configured upstream audience. Configure
+requester as `azp`, and include the configured upstream audience. The exchange
+request uses scopes without an audience filter so role-bearing scopes are not
+removed. Configure audience mappers on those scopes for each required service
+and onward exchange client. The configured `audience` is required when validating
+the returned access token. Configure
 upstream authorization for the human requester's verified groups and each
 machine requester's exact original subject. Sharing a requester does not imply
 sharing grants. Keep human and machine requester client IDs distinct.
