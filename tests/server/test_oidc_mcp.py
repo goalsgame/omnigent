@@ -242,3 +242,47 @@ def test_concurrent_refresh_uses_one_rotation(broker):
         futures = [pool.submit(resolve), pool.submit(resolve)]
         assert [f.result(timeout=10) for f in futures] == ["access", "access"]
     assert len(requests) == 2
+
+
+def test_sqlite_refresh_does_not_block_unrelated_writes_or_overwrite_reconnect(broker, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    service, _, _ = broker
+    service.store = CredentialStore(f"sqlite:///{tmp_path / 'refresh.db'}", _FakeCipher())
+    service.capture("alice@example.com", "person-sub", "original")
+    entered, release = Event(), Event()
+
+    def refresh(connection):
+        entered.set()
+        assert release.wait(timeout=10)
+        return {**connection.secret, "access_token": "obsolete-refresh"}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(
+            service.store.refresh_locked, "alice@example.com", "oidc_mcp", refresh
+        )
+        try:
+            assert entered.wait(timeout=5)
+            unrelated = pool.submit(
+                service.store.upsert,
+                "bob@example.com",
+                "other",
+                secret={"token": "bob"},
+                metadata={},
+            )
+            unrelated.result(timeout=2)
+            reconnect = pool.submit(
+                service.store.upsert,
+                "alice@example.com",
+                "oidc_mcp",
+                secret={"access_token": "new-login"},
+                metadata={"subject": "person-sub"},
+            )
+            reconnect.result(timeout=2)
+        finally:
+            release.set()
+        assert pending.result(timeout=5) is None
+    assert service.store.get("alice@example.com", "oidc_mcp", with_secret=True).secret == {
+        "access_token": "new-login"
+    }

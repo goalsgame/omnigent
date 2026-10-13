@@ -77,8 +77,10 @@ check. Direct machine token verification remains unchanged.
 
 ## Renewal and rollout
 
-Grants are encrypted per owner. Refresh uses a database row lock so replicas do
-not rotate the same refresh token concurrently. Removing a machine binding or
+Grants are encrypted per owner. Refresh uses PostgreSQL row locks or SQLite per-credential file locks with
+compare-and-swap, so replicas do not rotate the same refresh token concurrently.
+SQLite provider requests run outside database transactions; unrelated writes
+remain available while refresh is pending. Removing a machine binding or
 promoting its principal to admin prevents further use. Provider errors require
 a fresh sign-in or API delegation; they never select another identity.
 

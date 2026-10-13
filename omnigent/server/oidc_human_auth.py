@@ -135,7 +135,9 @@ def authenticate_oidc_bearer(
     client = claims.get("azp")
     if not isinstance(client, str):
         return None
-    if machine is not None and client in machine.config.clients:
+    if machine is not None and (
+        client in machine.config.clients or client in machine.config.exchange_clients
+    ):
         return machine.authenticate(token)
     if human is not None and client in human.config.clients:
         return human.authenticate(token)
