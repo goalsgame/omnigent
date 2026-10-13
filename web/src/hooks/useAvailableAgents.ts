@@ -289,7 +289,7 @@ export async function prefetchAvailableAgentDetails(
       const enrichedKey = enrichedAgent
         ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
         : undefined;
-      if (enrichedKey) {
+      if (enrichedKey && enrichedAgent?.origin !== "user") {
         const builtinExists = enriched.some(
           (a) => a.id !== agent.id && nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
         );
