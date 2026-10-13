@@ -1073,31 +1073,34 @@ describe("prefetchAvailableAgentDetails", () => {
     expect(queryClient.getQueryData(["available-agents"])).toEqual([agent]);
   });
 
-  it("preserves user-authored native bundles during enrichment", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const builtin = testAgent("ag_pi", "pi-native-ui", { harness: "pi-native" });
-    const upload = testAgent("ag_reviewer", "reviewer", {
-      origin: "user",
-      harness: null,
-      sessionId: "review-session",
-    });
-    queryClient.setQueryData(["available-agents"], [builtin, upload]);
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ name: "reviewer", harness: "pi-native", description: "Review code" }),
-    );
+  it.each([{ origin: "user" }, { mine: true as const }])(
+    "preserves user-authored native bundles during enrichment (%j)",
+    async (ownership) => {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const builtin = testAgent("ag_pi", "pi-native-ui", { harness: "pi-native" });
+      const upload = testAgent("ag_reviewer", "reviewer", {
+        ...ownership,
+        harness: null,
+        sessionId: "review-session",
+      });
+      queryClient.setQueryData(["available-agents"], [builtin, upload]);
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ name: "reviewer", harness: "pi-native", description: "Review code" }),
+      );
 
-    await prefetchAvailableAgentDetails(upload, queryClient);
+      await prefetchAvailableAgentDetails(upload, queryClient);
 
-    expect(queryClient.getQueryData(["available-agents"])).toEqual([
-      builtin,
-      expect.objectContaining({
-        id: "ag_reviewer",
-        origin: "user",
-        harness: "pi-native",
-        description: "Review code",
-      }),
-    ]);
-  });
+      expect(queryClient.getQueryData(["available-agents"])).toEqual([
+        builtin,
+        expect.objectContaining({
+          id: "ag_reviewer",
+          ...ownership,
+          harness: "pi-native",
+          description: "Review code",
+        }),
+      ]);
+    },
+  );
 
   it("removes a session agent when enrichment reveals it is a native shadow", async () => {
     // A session bound a kiro agent with a non-canonical name ("kiro-naitive"
@@ -1393,6 +1396,27 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     object: "list",
     data: [{ id: "ag_orion", name: "orion", created_at: 5 }],
     has_more: false,
+  });
+
+  it("preserves an installed Kiro profile alongside the seeded harness", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [
+          { id: "seeded-kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: true },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+      [USER_AGENTS_URL]: mockResponse({
+        data: [{ id: "user-reviewer", name: "reviewer", harness: "kiro-native", builtin: false }],
+        has_more: false,
+      }),
+    });
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper: wrapperWithInfo(true) });
+    await waitFor(() =>
+      expect(result.current.data?.map((a) => a.id)).toEqual(["seeded-kiro", "user-reviewer"]),
+    );
+    expect(result.current.data?.[1]).toMatchObject({ mine: true, harness: "kiro-native" });
   });
 
   it("merges the caller's agents in, one per name, keeping built-in names", async () => {

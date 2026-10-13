@@ -289,7 +289,7 @@ export async function prefetchAvailableAgentDetails(
       const enrichedKey = enrichedAgent
         ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
         : undefined;
-      if (enrichedKey && enrichedAgent?.origin !== "user") {
+      if (enrichedKey && !enrichedAgent?.mine && enrichedAgent?.origin !== "user") {
         const builtinExists = enriched.some(
           (a) => a.id !== agent.id && nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
         );
@@ -397,7 +397,12 @@ function mergeAvailableAgents(
     if (userAgentIds.has(agent.agentId)) continue;
     // Seeded built-in name (incl. fork/switch clones): the built-in wins.
     if (seededNames.has(base)) continue;
-    if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
+    if (
+      hasKiroBuiltin &&
+      kiroLegacyNames.has(base.toLocaleLowerCase()) &&
+      agent.agent.origin !== "user"
+    )
+      continue;
     // Genuine custom upload (or a clone of one). Newest same-named row wins,
     // superseding an older user-registered template seeded above. Strict `>`
     // so equal recency keeps the FIRST seen — the discovery is newest-first, so
@@ -425,7 +430,7 @@ function mergeAvailableAgents(
     .map((c) => (c.template !== null ? c.template : sessionAgentFromDiscovery(c.discovered!)))
     .filter((agent) => {
       const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
-      return nativeKey !== "kiro" || !hasKiroBuiltin;
+      return agent.mine || agent.origin === "user" || nativeKey !== "kiro" || !hasKiroBuiltin;
     });
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names
