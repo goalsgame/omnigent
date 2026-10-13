@@ -273,6 +273,43 @@ describe("useAvailableAgents", () => {
     expect(polly?.acpHarness).toBeUndefined();
   });
 
+  it("preserves distinct operator labels for profiles on one ACP harness", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "assistant",
+            name: "custom-assistant",
+            harness: "grok",
+            display_name: "Assistant",
+            builtin: true,
+          },
+          {
+            id: "reviewer",
+            name: "custom-reviewer",
+            harness: "grok",
+            display_name: "Reviewer",
+            builtin: true,
+          },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "grok", label: "Grok Build", capabilities: { integration_mode: "acp-subprocess" } },
+        ],
+      }),
+    });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() =>
+      expect(result.current.data?.find((a) => a.id === "reviewer")?.acpHarness).toBe(true),
+    );
+    expect(result.current.data?.find((a) => a.id === "assistant")?.display_name).toBe("Assistant");
+    expect(result.current.data?.find((a) => a.id === "reviewer")?.display_name).toBe("Reviewer");
+  });
+
   it("paginates built-ins so defaults pushed past fork rows are still listed", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({

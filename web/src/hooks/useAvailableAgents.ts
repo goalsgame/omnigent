@@ -16,6 +16,7 @@ export interface AvailableAgent {
   id: string;
   name: string;
   display_name: string;
+  operatorDisplayName?: boolean;
   default_for_new_sessions?: boolean;
   description: string | null;
   // Harness/kind from GET /v1/agents, e.g. "codex", "codex-native",
@@ -154,6 +155,7 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
     id: a.id,
     name: a.name,
     display_name: a.display_name ?? displayNameForAgent(a.name),
+    ...(a.display_name != null ? { operatorDisplayName: true } : {}),
     ...(a.default_for_new_sessions ? { default_for_new_sessions: true } : {}),
     description: a.description ?? null,
     harness: a.harness ?? null,
@@ -469,10 +471,11 @@ function applyAcpHarnessCatalog(
     return {
       ...agent,
       acpHarness: true,
-      // The user's own agent keeps its own name rather than the vendor's.
-      display_name: agent.mine
-        ? agent.display_name
-        : (harnessLabels[harness] ?? agent.display_name),
+      // Explicit profile labels take precedence over the vendor harness label.
+      display_name:
+        agent.mine || agent.operatorDisplayName
+          ? agent.display_name
+          : (harnessLabels[harness] ?? agent.display_name),
     };
   });
 }
