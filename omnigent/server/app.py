@@ -176,6 +176,7 @@ class ServerInfoResponse(BaseModel):
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    agent_catalog_names: list[str] | None = None
     enabled_connections: list[str]
     machine_google_cloud_enabled: bool = False
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
@@ -3062,6 +3063,9 @@ def create_app(
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "agent_catalog_names": sorted(agent_store.catalog_names)
+                if agent_store.catalog_names is not None
+                else None,
                 "enabled_connections": enabled_connections,
                 "machine_google_cloud_enabled": app.state.google_cloud_machine_broker is not None,
                 "sharing_mode": sharing_mode.value,

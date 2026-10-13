@@ -130,6 +130,7 @@ export interface ServerInfo {
    * Sandbox Integrations nav; the SPA renders one panel per provider via
    * CONNECTION_PANELS. Adding a provider adds a string here, not a new flag.
    */
+  agent_catalog_names?: string[];
   enabled_connections: string[];
   machine_google_cloud_enabled?: boolean;
   /**
@@ -352,6 +353,13 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             !Array.isArray(data.sandbox_provider_capabilities)
               ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
               : {},
+          ...(Array.isArray(data.agent_catalog_names)
+            ? {
+                agent_catalog_names: data.agent_catalog_names.filter(
+                  (name): name is string => typeof name === "string",
+                ),
+              }
+            : {}),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],

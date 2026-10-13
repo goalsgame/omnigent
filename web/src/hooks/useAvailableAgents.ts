@@ -3,6 +3,7 @@ import { useMemo } from "react";
 import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { filterToAgentCatalog } from "@/lib/agentGrouping";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
@@ -497,10 +498,15 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // stable identity and TanStack doesn't hand consumers a fresh array per render.
   const acpHarnessIds = useAcpHarnessIds(enabled);
   const harnessLabels = useHarnessLabels(enabled);
+  const catalogNames = serverInfo === "loading" ? undefined : serverInfo.agent_catalog_names;
   const select = useMemo(
     () => (agents: AvailableAgent[]) =>
-      applyAcpHarnessCatalog(agents, acpHarnessIds, harnessLabels),
-    [acpHarnessIds, harnessLabels],
+      applyAcpHarnessCatalog(
+        filterToAgentCatalog(agents, catalogNames),
+        acpHarnessIds,
+        harnessLabels,
+      ),
+    [acpHarnessIds, harnessLabels, catalogNames],
   );
   const queryClient = useQueryClient();
   // The harness/built-in rows come entirely from GET /v1/agents, so they must

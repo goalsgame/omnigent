@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
+  filterToAgentCatalog,
   isAcpHarnessAgent,
   partitionAgentsByKind,
   selectableSessionAgents,
@@ -99,4 +100,18 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: null })).toBe(false);
     expect(isAcpHarnessAgent(null)).toBe(false);
   });
+});
+
+it("does not resurrect disabled templates from session history", () => {
+  const agents = [
+    agent({ name: "assistant" }),
+    agent({ name: "retired", sessionId: "old" }),
+    agent({ name: "personal", mine: true }),
+  ];
+  expect(filterToAgentCatalog(agents, ["assistant"]).map((a) => a.name)).toEqual([
+    "assistant",
+    "personal",
+  ]);
+  expect(filterToAgentCatalog(agents)).toEqual(agents);
+  expect(filterToAgentCatalog(agents, []).map((a) => a.name)).toEqual(["personal"]);
 });
