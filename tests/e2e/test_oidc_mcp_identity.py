@@ -198,6 +198,9 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
                 sandbox_id="fixture-sandbox",
                 token_expires_at=int(time.time()) + 300,
             )
+            hosts.upsert_on_connect(
+                host_id, "fixture", owner, managed_token="fixture-launch-token"
+            )
             coords = tmp_path / "host-credentials.json"
             coords.write_text(
                 json.dumps(

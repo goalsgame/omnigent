@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 
 from omnigent.server.oidc_mcp import DelegationUnavailable, MCPDelegationBroker
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import HostStore, host_is_live
 
 _REQUEST_HEADERS = {
     "accept",
@@ -38,7 +38,7 @@ def create_mcp_identity_router(host_store: HostStore, broker: MCPDelegationBroke
         if not token:
             raise HTTPException(401, "Managed host authentication required")
         host = await asyncio.to_thread(host_store.resolve_launch_token, host_id, token)
-        if host is None:
+        if host is None or not host_is_live(host):
             raise HTTPException(401, "Managed host authentication required")
         body = bytearray()
         async for chunk in request.stream():

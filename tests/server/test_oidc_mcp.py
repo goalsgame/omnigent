@@ -23,6 +23,7 @@ def broker(db_uri, monkeypatch):
     )
     oidc = SimpleNamespace(
         provider_type="oidc",
+        cookie_secret=b"c" * 32,
         client_id="app",
         client_secret="secret",
         issuer="https://id.example.com",
@@ -184,7 +185,11 @@ async def test_relay_binds_upstream_session_to_host_owner(broker, monkeypatch):
     app = FastAPI()
     hosts = SimpleNamespace(
         resolve_launch_token=lambda host, token: (
-            SimpleNamespace(user_id="alice@example.com") if token == "host-secret" else None
+            SimpleNamespace(
+                user_id="alice@example.com", status="online", updated_at=int(time.time())
+            )
+            if token == "host-secret"
+            else None
         )
     )
     app.include_router(create_mcp_identity_router(hosts, service))
@@ -286,3 +291,67 @@ def test_sqlite_refresh_does_not_block_unrelated_writes_or_overwrite_reconnect(b
     assert service.store.get("alice@example.com", "oidc_mcp", with_secret=True).secret == {
         "access_token": "new-login"
     }
+
+
+@pytest.mark.asyncio
+async def test_relay_requires_live_managed_host(broker, db_uri, monkeypatch):
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.mcp_identity import create_mcp_identity_router
+    from omnigent.stores.host_store import HOST_LIVENESS_TTL_S, HostStore
+
+    service, _, _ = broker
+    service.capture("alice@example.com", "person-sub", "original")
+    hosts = HostStore(db_uri)
+    hosts.register_managed_host(
+        host_id="a" * 32,
+        name="managed",
+        user_id="alice@example.com",
+        token="launch-token",
+        provider="agent_sandbox",
+        sandbox_id="sandbox",
+        token_expires_at=int(time.time()) + 86400,
+    )
+    app = FastAPI()
+    app.include_router(create_mcp_identity_router(hosts, service))
+    original_client = httpx.AsyncClient
+    calls = []
+
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.mcp_identity.httpx.AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(upstream), **kwargs),
+    )
+    async with original_client(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+
+        async def request(status):
+            response = await client.post(
+                f"/hosts/{'a' * 32}/mcp", headers={"X-Omnigent-Host-Token": "launch-token"}
+            )
+            assert response.status_code == status
+
+        await request(401)  # Registered, but not connected.
+        hosts.upsert_on_connect(
+            "a" * 32, "managed", "alice@example.com", managed_token="launch-token"
+        )
+        await request(200)
+        hosts.set_offline("a" * 32)
+        assert hosts.resolve_launch_token("a" * 32, "launch-token") is not None
+        await request(401)
+        hosts.upsert_on_connect(
+            "a" * 32, "managed", "alice@example.com", managed_token="launch-token"
+        )
+        await request(200)
+        host = hosts.get_host("a" * 32)
+        with monkeypatch.context() as stale:
+            stale.setattr(
+                "omnigent.stores.host_store.now_epoch",
+                lambda: host.updated_at + HOST_LIVENESS_TTL_S + 1,
+            )
+            await request(401)
+        assert len(calls) == 2

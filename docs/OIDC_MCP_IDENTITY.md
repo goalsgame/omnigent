@@ -49,7 +49,9 @@ tools:
 
 Both server and runner must contain the implementation. The bridge requires
 managed-host credential coordinates; an arbitrary local host does not inherit
-the server-side identity.
+the server-side identity. Each relay request also requires an online host with a
+fresh heartbeat. Suspended, disconnected, and stale hosts cannot invoke tools;
+access resumes after an authenticated host reconnect.
 
 ## Identity provider and upstream policy
 
