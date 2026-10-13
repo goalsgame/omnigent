@@ -106,7 +106,9 @@ async def _start(client: httpx.AsyncClient, redirect: str = _REDIRECT) -> tuple[
     resp = await client.get("/auth/login", params=_native_params(native_redirect_uri=redirect))
     assert resp.status_code == 302
     idp_state = parse_qs(urlparse(resp.headers["location"]).query)["state"][0]
-    return idp_state, resp.cookies["ap_auth_state"]
+    return idp_state, next(
+        value for name, value in resp.cookies.items() if name.startswith("ap_auth_state_")
+    )
 
 
 async def _callback(
@@ -322,7 +324,11 @@ async def test_login_accepts_ipv6_loopback() -> None:
         resp = await client.get("/auth/login", params=_native_params(native_redirect_uri=redirect))
 
     assert resp.status_code == 302
-    state = jwt.decode(resp.cookies["ap_auth_state"], _TEST_SECRET, algorithms=["HS256"])
+    state = jwt.decode(
+        next(value for name, value in resp.cookies.items() if name.startswith("ap_auth_state_")),
+        _TEST_SECRET,
+        algorithms=["HS256"],
+    )
     assert state["native"]["redirect_uri"] == redirect
 
 
@@ -397,7 +403,13 @@ async def test_browser_login_is_unchanged_by_native_support() -> None:
     async with _client(_transport()) as client:
         resp = await client.get("/auth/login", params={"return_to": "/c/1"})
         idp_state = parse_qs(urlparse(resp.headers["location"]).query)["state"][0]
-        callback = await _callback(client, idp_state, resp.cookies["ap_auth_state"])
+        callback = await _callback(
+            client,
+            idp_state,
+            next(
+                value for name, value in resp.cookies.items() if name.startswith("ap_auth_state_")
+            ),
+        )
 
     assert callback.status_code == 302
     assert callback.headers["location"] == "/c/1"
