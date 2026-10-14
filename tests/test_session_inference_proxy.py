@@ -281,6 +281,8 @@ def test_config_requires_explicit_models_and_strong_signing_key(monkeypatch):
         {"models": []},
         {"public_url": "http://server.example"},
         {"public_url": "https://:"},
+        {"public_url": "https://server example.com"},
+        {"public_url": "https://exa%mple.com"},
         {"public_url": "https://server.example:notaport"},
         {"public_url": "https://server.example:65536"},
         {"public_url": "https://server.example:0"},
@@ -566,3 +568,72 @@ def test_personal_or_unavailable_harness_does_not_use_server_inference(readiness
     registry.inference_config_resolver = lambda *args: pytest.fail("unexpected server binding")
     conv = SimpleNamespace(host_id="host", inference_snapshot=None)
     assert registry.runner_inference_config(conv, "runner", "openai-agents") is None
+
+
+@pytest.mark.asyncio
+async def test_slow_upload_reserves_session_and_global_capacity(setup):
+    import asyncio
+    import copy
+    from dataclasses import replace
+
+    service, app, conv, _, calls = setup
+    service.config = replace(service.config, max_concurrent_requests=1)
+    other = copy.copy(conv)
+    other.id = "other"
+    service.conversations.get_conversation = lambda sid: {conv.id: conv, other.id: other}.get(sid)
+    started = asyncio.Event()
+
+    async def slow_body():
+        yield b'{"model":'
+        started.set()
+        await asyncio.Event().wait()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        owner = service.conversations.get_session_owner_authority(other.id, owner_only=True)
+        grant = service.launch_config(
+            other, other.runner_id, "openai-agents", other.host_id, owner.user_id, owner.generation
+        )["server_inference"]["grant"]
+        response = await client.post(
+            "/v1/inference/sessions/other/token", headers={"Authorization": "Bearer " + grant}
+        )
+        other_token = response.json()["token"]
+        pending = asyncio.create_task(
+            client.post(
+                "/v1/inference/sessions/session/responses",
+                content=slow_body(),
+                headers={"Authorization": "Bearer " + token},
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            assert service.active_requests == 1
+            for sid, bearer in ((conv.id, token), (other.id, other_token)):
+                blocked = await client.post(
+                    f"/v1/inference/sessions/{sid}/responses",
+                    json={"model": "model-a"},
+                    headers={"Authorization": "Bearer " + bearer},
+                )
+                assert blocked.status_code == 429
+        finally:
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        assert service.active_requests == 0
+        assert not service.active_sessions
+        for payload, expected in (
+            (b"bad json", 400),
+            (b'{"model":"other"}', 403),
+            (b'{"model":"model-a","store":true}', 400),
+        ):
+            response = await client.post(
+                "/v1/inference/sessions/session/responses",
+                content=payload,
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert response.status_code == expected
+            assert service.active_requests == 0
+            assert not service.active_sessions
+    assert not calls

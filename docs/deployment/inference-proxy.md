@@ -47,6 +47,7 @@ runners must be relaunched. The host
 stores the inference refresh capability in its data directory with private file
 permissions on POSIX and inherited account permissions on Windows. Protect that
 account and directory: the capability permits inference spending for its session.
+Grant files are removed when the runner stops or exits, or a launch fails.
 
 ## Authorization and limits
 
@@ -60,8 +61,9 @@ control-plane operations. Provider credentials remain on the server.
 The proxy forwards only `POST chat/completions` and `POST responses` to a fixed
 OpenRouter endpoint. It permits only configured models, strips incoming headers,
 disables redirects, limits request size, and enforces one concurrent request per
-session plus the configured total per server replica. These are concurrency
-limits, not a distributed quota or per-user spending budget. Configure spending
+session plus the configured total per server replica. Capacity is reserved before
+reading the request body and released on upload failure, cancellation or response
+completion. These are concurrency limits, not a distributed quota or per-user spending budget. Configure spending
 limits on the OpenRouter policy's backing key. Responses requests are stateless:
 background processing, stored responses and provider conversation references are
 rejected. Streaming content and usage events pass through to the harness.

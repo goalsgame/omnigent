@@ -3843,3 +3843,34 @@ def test_generic_gateway_secondary_preserves_thinking(
     assert launch.args[4:] == expected
     settings = json.loads((tmp_path / "pi-agent/settings.json").read_text())
     assert settings["defaultThinkingLevel"] == "medium"
+
+
+def test_server_inference_binding_renders_pi_chat_models_and_refresh_command(
+    tmp_path: Path,
+) -> None:
+    from omnigent.host.inference_proxy import prepare
+
+    url = "https://server.example/v1/inference/sessions/session"
+    config = prepare(
+        {
+            "server_inference": {
+                "url": url,
+                "grant": "g" * 64,
+                "harness": "pi-native",
+                "models": ["model-a", "model-b"],
+            }
+        },
+        tmp_path / "grants",
+    )
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.model == "model-a"
+    assert provider.api == "openai-completions"
+    rendered = provider.to_models_config()["providers"][provider.provider_id]
+    assert rendered["baseUrl"] == url
+    assert rendered["api"] == "openai-completions"
+    assert rendered["apiKey"].startswith("!")
+    assert "omnigent.host.inference_proxy" in rendered["apiKey"]
+    assert str(next((tmp_path / "grants").glob("*.json"))) in rendered["apiKey"]
+    assert [model["id"] for model in rendered["models"]] == ["model-a", "model-b"]
+    assert "g" * 64 not in str(rendered)

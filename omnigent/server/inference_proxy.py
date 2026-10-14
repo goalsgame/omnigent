@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import time
@@ -15,6 +16,7 @@ from urllib.parse import urlsplit
 
 import anyio
 import httpx
+import idna
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import JSONResponse, StreamingResponse
 
@@ -55,6 +57,11 @@ class InferenceProxyConfig:
             parts = urlsplit(url)
             hostname = parts.hostname
             port = parts.port
+            if hostname:
+                try:
+                    ipaddress.ip_address(hostname)
+                except ValueError:
+                    idna.encode(hostname, uts46=True, std3_rules=True)
         except ValueError as exc:
             raise ValueError("inference_proxy.public_url must be an HTTPS origin") from exc
         if (
@@ -273,32 +280,6 @@ class InferenceProxy:
             await self.authorize(session_id, access)
             if request.headers.get("content-encoding", "identity") != "identity":
                 raise HTTPException(415, "Compressed requests are unsupported")
-            body = bytearray()
-            try:
-                async with asyncio.timeout(30):
-                    async for chunk in request.stream():
-                        body.extend(chunk)
-                        if len(body) > self.config.max_request_bytes:
-                            raise HTTPException(413, "Inference request too large")
-            except TimeoutError:
-                raise HTTPException(408, "Inference request timed out") from None
-            try:
-                payload = json.loads(body)
-            except (ValueError, UnicodeDecodeError):
-                raise HTTPException(400, "Invalid inference JSON") from None
-            if (
-                not isinstance(payload, dict)
-                or payload.get("model") not in self.config.models
-                or any(key in payload for key in ("models", "route"))
-            ):
-                raise HTTPException(403, "Model is not permitted")
-            if endpoint == "responses":
-                if any(
-                    payload.get(key)
-                    for key in ("previous_response_id", "conversation", "background", "store")
-                ):
-                    raise HTTPException(400, "Only stateless inference is supported")
-                payload["store"] = False
             session_key = (current_workspace_id(), session_id)
             if (
                 session_key in self.active_sessions
@@ -307,12 +288,7 @@ class InferenceProxy:
                 raise HTTPException(429, "Inference capacity exhausted")
             self.active_requests += 1
             self.active_sessions.add(session_key)
-            client = httpx.AsyncClient(
-                timeout=httpx.Timeout(180, connect=10),
-                follow_redirects=False,
-                trust_env=False,
-                transport=self.transport,
-            )
+            client = None
             upstream = None
             released = False
 
@@ -328,9 +304,42 @@ class InferenceProxy:
                         if upstream is not None:
                             await upstream.aclose()
                     finally:
-                        await client.aclose()
+                        if client is not None:
+                            await client.aclose()
 
             try:
+                body = bytearray()
+                try:
+                    async with asyncio.timeout(30):
+                        async for chunk in request.stream():
+                            if len(body) + len(chunk) > self.config.max_request_bytes:
+                                raise HTTPException(413, "Inference request too large")
+                            body.extend(chunk)
+                except TimeoutError:
+                    raise HTTPException(408, "Inference request timed out") from None
+                try:
+                    payload = json.loads(body)
+                except (ValueError, UnicodeDecodeError):
+                    raise HTTPException(400, "Invalid inference JSON") from None
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("model") not in self.config.models
+                    or any(key in payload for key in ("models", "route"))
+                ):
+                    raise HTTPException(403, "Model is not permitted")
+                if endpoint == "responses":
+                    if any(
+                        payload.get(key)
+                        for key in ("previous_response_id", "conversation", "background", "store")
+                    ):
+                        raise HTTPException(400, "Only stateless inference is supported")
+                    payload["store"] = False
+                client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(180, connect=10),
+                    follow_redirects=False,
+                    trust_env=False,
+                    transport=self.transport,
+                )
                 credential = await self.broker.credential()
                 await self.authorize(session_id, access)
                 upstream = await client.send(

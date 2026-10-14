@@ -30,7 +30,7 @@ def _valid_url(url: object) -> bool:
     )
 
 
-def prepare(config: dict, directory: Path) -> dict:
+def prepare(config: dict, directory: Path, *, credential_files: list[Path] | None = None) -> dict:
     proxy = config.get("server_inference")
     if proxy is None:
         return config
@@ -49,14 +49,16 @@ def prepare(config: dict, directory: Path) -> dict:
         raise ValueError("Invalid inference harness or model list")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     digest = hashlib.sha256(json.dumps(proxy, sort_keys=True).encode()).hexdigest()
-    credential = directory / (digest + ".json")
-    fd, temporary = tempfile.mkstemp(dir=directory)
+    fd, filename = tempfile.mkstemp(prefix=digest + "-", suffix=".json", dir=directory)
+    credential = Path(filename)
+    if credential_files is not None:
+        credential_files.append(credential)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump({"url": url, "grant": proxy["grant"]}, stream)
-        os.replace(temporary, credential)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    except BaseException:
+        credential.unlink(missing_ok=True)
+        raise
     args = [sys.executable, "-m", "omnigent.host.inference_proxy", str(credential)]
     command = subprocess.list2cmdline(args) if sys.platform == "win32" else shlex.join(args)
     return {
