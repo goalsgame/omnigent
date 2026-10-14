@@ -92,7 +92,10 @@ beforeEach(() => {
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 describe("ProjectSettingsDialog", () => {
   it("seeds fields from the project's stored config", async () => {
@@ -471,6 +474,7 @@ describe("managed project model defaults", () => {
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
         host_id: "__sandbox__",
+        sandbox_provider: "agent_sandbox",
         agent_id: "ag_pi",
         model: "provider/example",
       }),
@@ -488,4 +492,83 @@ describe("managed project model defaults", () => {
     );
     expect(screen.getByTestId("project-settings-model")).toBeDisabled();
   });
+});
+
+it("binds the previewed provider to the project even when user defaults differ", async () => {
+  localStorage.setItem("omnigent:last-sandbox-provider", "kubernetes");
+  serverInfoMock.mockReturnValue({
+    managed_sandboxes_enabled: true,
+    sandbox_provider: "agent_sandbox",
+    sandbox_providers: ["agent_sandbox", "kubernetes"],
+  });
+  availableAgentsMock.mockReturnValue({
+    data: [pickerAgent({ id: "ag_pi", harness: "pi-native" })],
+  });
+  getProjectMock.mockResolvedValue({
+    id: "p_1",
+    name: "Work",
+    config: { host_id: "__sandbox__", agent_id: "ag_pi" },
+  });
+  sandboxModelsMock.mockReturnValue({
+    data: { status: "ready", models: [{ id: "provider/example" }] },
+  });
+  renderDialog();
+  await waitFor(() =>
+    expect(sandboxModelsMock).toHaveBeenLastCalledWith(
+      "kubernetes",
+      "pi-native",
+      "ag_pi",
+      null,
+      true,
+    ),
+  );
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() =>
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      host_id: "__sandbox__",
+      sandbox_provider: "kubernetes",
+      agent_id: "ag_pi",
+    }),
+  );
+});
+
+it("uses the project's saved provider rather than the user's last provider", async () => {
+  localStorage.setItem("omnigent:last-sandbox-provider", "kubernetes");
+  serverInfoMock.mockReturnValue({
+    managed_sandboxes_enabled: true,
+    sandbox_provider: "kubernetes",
+    sandbox_providers: ["kubernetes", "agent_sandbox"],
+  });
+  availableAgentsMock.mockReturnValue({
+    data: [pickerAgent({ id: "ag_pi", harness: "pi-native" })],
+  });
+  getProjectMock.mockResolvedValue({
+    id: "p_1",
+    name: "Work",
+    config: {
+      host_id: "__sandbox__",
+      sandbox_provider: "agent_sandbox",
+      agent_id: "ag_pi",
+      model: "provider/saved",
+    },
+  });
+  renderDialog();
+  await waitFor(() =>
+    expect(sandboxModelsMock).toHaveBeenLastCalledWith(
+      "agent_sandbox",
+      "pi-native",
+      "ag_pi",
+      null,
+      true,
+    ),
+  );
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() =>
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      host_id: "__sandbox__",
+      sandbox_provider: "agent_sandbox",
+      agent_id: "ag_pi",
+      model: "provider/saved",
+    }),
+  );
 });
