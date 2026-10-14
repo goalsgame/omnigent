@@ -1,0 +1,97 @@
+"""Real TLS server with a server-only mock provider for inference proxy tests."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import httpx
+import uvicorn
+
+from omnigent.runtime import init as init_runtime
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
+from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+
+def main() -> None:
+    root = Path(os.environ["OMNIGENT_E2E_ROOT"])
+    port = int(os.environ["OMNIGENT_E2E_PORT"])
+    db = f"sqlite:///{root / 'server.db'}"
+    artifacts = LocalArtifactStore(str(root / "artifacts"))
+    agent_store = SqlAlchemyAgentStore(db)
+    conversations = SqlAlchemyConversationStore(db)
+    files = SqlAlchemyFileStore(db)
+    cache = AgentCache(artifact_store=artifacts, cache_dir=root / "cache")
+    init_runtime(
+        conversation_store=conversations,
+        agent_store=agent_store,
+        agent_cache=cache,
+        file_store=files,
+        artifact_store=artifacts,
+    )
+    app = create_app(
+        agent_store=agent_store,
+        file_store=files,
+        conversation_store=conversations,
+        artifact_store=artifacts,
+        agent_cache=cache,
+        host_store=HostStore(db),
+        permission_store=SqlAlchemyPermissionStore(db),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=True),
+        server_config={
+            "openrouter_wif": {"policy_id": "mock-policy"},
+            "inference_proxy": {
+                "public_url": f"https://127.0.0.1:{port}",
+                "signing_key_env": "OMNIGENT_E2E_SIGNING_KEY",
+                "models": ["test-model"],
+            },
+        },
+    )
+    proxy = app.state.inference_proxy
+    calls = []
+
+    async def credential():
+        return {"token": "server-only-provider"}
+
+    class ProviderTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.inner = httpx.AsyncHTTPTransport()
+
+        async def handle_async_request(self, request):
+            assert str(request.url) == "https://openrouter.ai/api/v1/chat/completions"
+            calls.append(
+                {"authorized": request.headers["authorization"] == "Bearer server-only-provider"}
+            )
+            request.url = httpx.URL(os.environ["OMNIGENT_E2E_PROVIDER"] + "/v1/chat/completions")
+            return await self.inner.handle_async_request(request)
+
+        async def aclose(self):
+            await self.inner.aclose()
+
+    proxy.broker.credential = credential
+    proxy.transport = ProviderTransport()
+
+    @app.get("/v1/_e2e/proxy_requests")
+    async def requests():
+        return {"calls": calls, "active": proxy.active_requests}
+
+    app.router.routes.insert(0, app.router.routes.pop())
+
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=port,
+        ssl_keyfile=str(root / "key.pem"),
+        ssl_certfile=str(root / "cert.pem"),
+    )
+
+
+if __name__ == "__main__":
+    main()

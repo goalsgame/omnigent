@@ -1,3 +1,4 @@
+import sys
 import time
 from types import SimpleNamespace
 
@@ -509,3 +510,21 @@ async def test_sdk_auth_command_does_not_block_async_loop(monkeypatch):
         release.set()
     assert (await pending).headers["Authorization"] == "Bearer refreshed-token"
     await flow.aclose()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Executes the actual Windows cmd and PowerShell parsers"
+)
+def test_windows_cmd_executes_nested_powershell_command(tmp_path):
+    import os
+
+    from omnigent.inner.os_env import _shell_impl
+
+    result = _shell_impl(
+        command='powershell.exe -NoProfile -Command "Write-Output editor-host-ok"',
+        timeout=10,
+        shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+        cwd=tmp_path,
+    )
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == "editor-host-ok"
