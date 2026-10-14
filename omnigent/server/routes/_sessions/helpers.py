@@ -26,7 +26,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePath
 from typing import Any, Final, Literal, cast
 
@@ -6079,7 +6079,8 @@ async def _launch_runner_on_host_locked(
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.server.routes._host_launch import agent_has_explicit_auth
 
-    harness = _resolve_harness(conv)
+    launch_conv = replace(conv, harness_override=None) if conv.harness_override == "auto" else conv
+    harness = _resolve_harness(launch_conv)
     agent_has_auth = (
         await agent_has_explicit_auth(conv)
         if host_registry.server_inference_eligible(host_conn, harness)

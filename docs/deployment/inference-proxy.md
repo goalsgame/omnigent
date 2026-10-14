@@ -47,7 +47,8 @@ runners must be relaunched. The host
 stores the inference refresh capability in its data directory with private file
 permissions on POSIX and inherited account permissions on Windows. Protect that
 account and directory: the capability permits inference spending for its session.
-Grant files are removed when the runner stops or exits, or a launch fails.
+Grant files and generated runtime configs are removed when the runner stops or
+exits, or a launch fails.
 
 ## Authorization and limits
 

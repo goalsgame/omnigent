@@ -4098,8 +4098,9 @@ async def test_agent_auth_preserves_direct_launch_on_credential_free_host(
     ],
 )
 @pytest.mark.parametrize("agent_auth", [False, True])
+@pytest.mark.parametrize("launch_path", ["explicit", "relaunch"])
 async def test_explicit_launch_uses_persisted_harness_override(
-    client, app, root_harness, override, agent_auth, db_uri
+    client, app, root_harness, override, agent_auth, db_uri, launch_path
 ):
     client.headers["X-Forwarded-Email"] = "alice@example.com"
     comm = await _connect_host(app, inference=True)
@@ -4125,6 +4126,18 @@ async def test_explicit_launch_uses_persisted_harness_override(
     )
     frame = await responder
     assert response.status_code == 200, response.text
+    if launch_path == "relaunch":
+        from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+
+        store = SqlAlchemyConversationStore(db_uri)
+        sid = created.json()["id"]
+        await asyncio.to_thread(store.clear_runner_id, sid)
+        conv = await asyncio.to_thread(store.get_conversation, sid)
+        registry = app.state.host_registry
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        attempt = await _launch_runner_on_host_impl(conv, store, registry, registry.get(_HOST_ID))
+        frame = await responder
+        assert attempt.runner_id
     expected_harness = root_harness if override == "auto" else override
     assert frame.harness == expected_harness
     if expected_harness == "openai-agents" and not agent_auth:
