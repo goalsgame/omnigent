@@ -4085,3 +4085,46 @@ async def test_agent_auth_preserves_direct_launch_on_credential_free_host(
         frame = await responder
         assert attempt.runner_id
         assert frame.inference_config is None
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize(
+    "root_harness,override",
+    [
+        ("claude-sdk", "openai-agents"),
+        ("openai-agents", "claude-sdk"),
+    ],
+)
+@pytest.mark.parametrize("agent_auth", [False, True])
+async def test_explicit_launch_uses_persisted_harness_override(
+    client, app, root_harness, override, agent_auth
+):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    executor = {"type": "omnigent", "config": {"harness": root_harness}}
+    if agent_auth:
+        executor["auth"] = {"type": "api_key", "api_key": "$AGENT_TEST_API_KEY"}
+    agent = await create_test_agent(client, executor=executor)
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": override,
+        },
+    )
+    assert created.status_code == 201, created.text
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={
+            "session_id": created.json()["id"],
+            "workspace": _WORKSPACE,
+        },
+    )
+    frame = await responder
+    assert response.status_code == 200, response.text
+    assert frame.harness == override
+    if override == "openai-agents" and not agent_auth:
+        assert frame.inference_config["server_inference"]["harness"] == override
+    else:
+        assert frame.inference_config is None

@@ -913,8 +913,8 @@ def create_hosts_router(
                 raise HTTPException(status_code=400, detail=exc.message) from exc
 
         # Resolve the harness before creating host-side state.
-        harness: str | None = None
-        if agent_store is not None and agent_cache is not None:
+        harness = target.conv.harness_override
+        if harness is None and agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 
         from omnigent.server.routes._host_launch import agent_has_explicit_auth
