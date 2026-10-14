@@ -1,0 +1,110 @@
+"""Prepare session inference credentials and exchange them for short-lived bearers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import httpx
+
+
+def _valid_url(url: object) -> bool:
+    if not isinstance(url, str):
+        return False
+    parts = urlsplit(url)
+    return bool(
+        parts.scheme == "https"
+        and parts.netloc
+        and not parts.username
+        and not parts.password
+        and not parts.query
+        and not parts.fragment
+        and parts.path.startswith("/v1/inference/sessions/")
+    )
+
+
+def prepare(config: dict, directory: Path) -> dict:
+    proxy = config.get("server_inference")
+    if proxy is None:
+        return config
+    if not isinstance(proxy, dict) or set(proxy) != {"url", "grant", "models", "harness"}:
+        raise ValueError("Invalid server inference configuration")
+    url = proxy["url"]
+    if not _valid_url(url):
+        raise ValueError("Server inference requires HTTPS")
+    if not isinstance(proxy["grant"], str) or len(proxy["grant"]) != 64:
+        raise ValueError("Invalid inference grant")
+    if proxy["harness"] not in ("openai-agents", "pi-native") or (
+        not isinstance(proxy["models"], list)
+        or not proxy["models"]
+        or any(not isinstance(model, str) or not model for model in proxy["models"])
+    ):
+        raise ValueError("Invalid inference harness or model list")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    digest = hashlib.sha256(json.dumps(proxy, sort_keys=True).encode()).hexdigest()
+    credential = directory / (digest + ".json")
+    fd, temporary = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"url": url, "grant": proxy["grant"]}, stream)
+        os.replace(temporary, credential)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    args = [sys.executable, "-m", "omnigent.host.inference_proxy", str(credential)]
+    command = subprocess.list2cmdline(args) if sys.platform == "win32" else shlex.join(args)
+    return {
+        "providers": {
+            "server-inference": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": url,
+                    "auth_command": command,
+                    "wire_api": "chat",
+                    "auth_refresh_interval_ms": 60000,
+                },
+            }
+        },
+        "inference": {
+            "harnesses": {
+                proxy["harness"]: {
+                    "provider": "server-inference",
+                    "model_allowlist": proxy["models"],
+                    "default_model": proxy["models"][0],
+                }
+            }
+        },
+    }
+
+
+def main() -> int:
+    try:
+        config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        if not _valid_url(config["url"]):
+            raise ValueError("HTTPS required")
+        response = httpx.post(
+            config["url"] + "/token",
+            headers={"Authorization": "Bearer " + config["grant"]},
+            timeout=8,
+            trust_env=False,
+            follow_redirects=False,
+        )
+        response.raise_for_status()
+        token = response.json()["token"]
+        if not isinstance(token, str) or not token or any(c.isspace() for c in token):
+            raise ValueError("Invalid credential")
+        sys.stdout.write(token + "\n")
+        return 0
+    except (OSError, ValueError, KeyError, IndexError, TypeError, httpx.HTTPError):
+        print("Session inference authentication unavailable", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

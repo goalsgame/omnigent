@@ -498,9 +498,46 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        self.server_inference_harnesses: tuple[str, ...] = ()
+        self.inference_config_resolver: (
+            Callable[[Any, str, str | None, str, str | None, str | None], dict[str, Any] | None]
+            | None
+        ) = None
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def inference_readiness(self, capabilities: list[str], reported: dict | None) -> dict | None:
+        """Supply server authentication only when an opted-in host has the harness."""
+        if "server-inference-v1" not in capabilities or reported is None:
+            return reported
+        result = dict(reported)
+        for harness in self.server_inference_harnesses:
+            if result.get(harness) in (True, "needs-auth"):
+                result[harness] = True
+        return result
+
+    def runner_inference_config(
+        self, conversation: Any, runner_id: str, harness: str | None, *, host_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve optional server inference before the saved direct-provider binding."""
+        host_id = host_id or conversation.host_id
+        conn = self.get(host_id) if host_id else None
+        if (
+            self.inference_config_resolver is not None
+            and conn is not None
+            and "server-inference-v1" in conn.hello.capabilities
+        ):
+            config = self.inference_config_resolver(
+                conversation, runner_id, harness, host_id, conn.owner, conn.account_generation
+            )
+            if config is not None:
+                return config
+        return (
+            conversation.inference_snapshot["runtime_config"]
+            if conversation.inference_snapshot
+            else None
+        )
 
     def register(
         self,

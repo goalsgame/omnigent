@@ -6146,7 +6146,9 @@ async def _launch_runner_on_host_locked(
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
                 inference_config=(
-                    conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
+                    host_registry.runner_inference_config(
+                        conv, new_runner_id, _resolve_harness(conv)
+                    )
                 ),
             )
         )

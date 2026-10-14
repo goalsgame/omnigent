@@ -792,6 +792,17 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        proxy = getattr(request.app.state, "inference_proxy", None)
+        canonical = canonicalize_harness(harness) or harness
+        if (
+            proxy is not None
+            and "server-inference-v1" in conn.hello.capabilities
+            and canonical in proxy.config.harnesses
+        ):
+            return HostModelOptionsResponse(
+                models=[{"id": model, "name": model} for model in proxy.config.models],
+                routable_models=list(proxy.config.models),
+            )
         _require_harness_setup_support(conn, "pre-launch model listing")
 
         result = await _proxy_model_options(
@@ -1117,9 +1128,9 @@ def create_hosts_router(
                 session_id=body.session_id,
                 harness=harness,
                 inference_config=(
-                    target.conv.inference_snapshot["runtime_config"]
-                    if target.conv.inference_snapshot
-                    else None
+                    host_registry.runner_inference_config(
+                        target.conv, runner_id, harness, host_id=host_id
+                    )
                 ),
             )
         )

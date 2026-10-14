@@ -618,17 +618,31 @@ class _ShellCommandBearerAuth(httpx.Auth):
         :yields: The request with the auth header set.
         :raises RuntimeError: When the command fails or prints no token.
         """
-        result = subprocess.run(
-            ["sh", "-c", self._command],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        token = result.stdout.strip()
-        if result.returncode != 0 or not token:
-            raise RuntimeError("Databricks auth command failed to return a bearer token.")
+        request.headers["Authorization"] = f"Bearer {self._token()}"
+        yield request
+
+    async def async_auth_flow(self, request: httpx.Request):
+        """Refresh outside the event loop so host heartbeats remain responsive."""
+        token = await asyncio.to_thread(self._token)
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
+
+    def _token(self) -> str:
+        try:
+            result = subprocess.run(
+                self._command,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError("Provider auth command failed.") from None
+        token = result.stdout.strip()
+        if result.returncode != 0 or not token or any(c.isspace() for c in token):
+            raise RuntimeError("Provider auth command failed to return a bearer token.")
+        return token
 
 
 # Sentinel pushed onto the per-turn event queue when

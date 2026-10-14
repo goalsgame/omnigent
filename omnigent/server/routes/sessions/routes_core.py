@@ -648,9 +648,7 @@ def register_core_routes(
                 # host-side check.
                 harness=harness,
                 inference_config=(
-                    target.conv.inference_snapshot["runtime_config"]
-                    if target.conv.inference_snapshot
-                    else None
+                    host_registry.runner_inference_config(target.conv, runner_id, harness)
                 ),
             )
         )

@@ -123,7 +123,7 @@ def _runner_hello() -> HelloFrame:
 
 
 @pytest.fixture()
-def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
+def app(runtime_init: None, db_uri: str, tmp_path, request, monkeypatch) -> FastAPI:
     """FastAPI app wired WITH ``host_store`` so the inline host-launch
     branch of ``POST /v1/sessions`` is active.
 
@@ -138,7 +138,28 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     :returns: A configured FastAPI app with host routes mounted.
     """
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    server_config = None
+    auth_provider = None
+    permission_store = None
+    if getattr(request, "param", None) == "proxy":
+        from omnigent.server.auth import UnifiedAuthProvider
+        from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+        auth_provider = UnifiedAuthProvider(source="header")
+        permission_store = SqlAlchemyPermissionStore(db_uri)
+        monkeypatch.setenv("TEST_PROXY_KEY", "k" * 32)
+        server_config = {
+            "openrouter_wif": {"policy_id": "test-policy"},
+            "inference_proxy": {
+                "public_url": "https://server.example",
+                "signing_key_env": "TEST_PROXY_KEY",
+                "models": ["model-a"],
+            },
+        }
     return create_app(
+        server_config=server_config,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
@@ -152,7 +173,7 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     )
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+async def _connect_host(app: FastAPI, *, inference: bool = False) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
@@ -161,13 +182,22 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
     path = f"/v1/hosts/{_HOST_ID}/tunnel"
-    comm = ApplicationCommunicator(app, _websocket_scope(path))
+    scope = _websocket_scope(path)
+    if inference:
+        scope["headers"].append((b"x-forwarded-email", b"alice@example.com"))
+    comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="laptop",
+            capabilities=["server-inference-v1"] if inference else [],
+            configured_harnesses={"openai-agents": "needs-auth"} if inference else None,
+        )
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
@@ -3895,3 +3925,33 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
             f"host refusal: {item!r}"
         )
         assert "omnigent setup" in item["message"], item
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+async def test_inline_launch_with_server_inference(client, app):
+    """A credential-free host gets readiness, models and a usable scoped grant."""
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "openai-agents"}}
+    )
+    registry = app.state.host_registry
+    assert registry.get(_HOST_ID).hello.configured_harnesses["openai-agents"] is True
+    models = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/openai-agents/model-options")
+    assert models.status_code == 200
+    assert models.json()["routable_models"] == ["model-a"]
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    frame = await responder
+    assert response.status_code == 201, response.text
+    proxy = frame.inference_config["server_inference"]
+    assert proxy["models"] == ["model-a"]
+    token = await client.post(
+        proxy["url"].replace("https://server.example", "") + "/token",
+        headers={"Authorization": "Bearer " + proxy["grant"]},
+    )
+    assert token.status_code == 200, token.text
+    assert token.json()["expires_in"] == 300

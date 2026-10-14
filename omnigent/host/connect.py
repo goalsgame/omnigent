@@ -1876,6 +1876,20 @@ class HostProcess:
         # CLI, which inline would stall the keepalive pong and every other frame.
         from omnigent.inference_config import binding_for_harness
 
+        if frame.inference_config and "server_inference" in frame.inference_config:
+            from dataclasses import replace
+
+            from omnigent.host.inference_proxy import prepare
+            from omnigent.process_logging import data_dir
+
+            try:
+                config = await asyncio.to_thread(
+                    prepare, frame.inference_config, data_dir() / "inference-grants"
+                )
+                frame = replace(frame, inference_config=config)
+            except (OSError, ValueError):
+                return self._launch_failed(frame, "Cannot configure server inference")
+
         has_binding = (
             frame.harness is not None
             and frame.inference_config is not None
@@ -4564,7 +4578,12 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
-            capabilities=list(HOST_CAPABILITIES),
+            capabilities=list(HOST_CAPABILITIES)
+            + (
+                ["server-inference-v1"]
+                if os.environ.get("OMNIGENT_SERVER_INFERENCE") == "1"
+                else []
+            ),
         )
         try:
             encoded_hello = encode_host_frame(hello)

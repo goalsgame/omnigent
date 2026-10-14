@@ -3947,6 +3947,27 @@ def create_app(
         OpenRouterWIFBroker(openrouter_wif_config) if openrouter_wif_config else None
     )
 
+    from omnigent.server.inference_proxy import InferenceProxy, InferenceProxyConfig
+
+    inference_proxy_config = InferenceProxyConfig.parse(
+        resolved_server_config.get("inference_proxy")
+    )
+    app.state.inference_proxy = None
+    if inference_proxy_config is not None:
+        if host_store is None or openrouter_wif_broker is None or host_registry is None:
+            raise ValueError("inference_proxy requires hosts and openrouter_wif")
+        inference_proxy = InferenceProxy(
+            inference_proxy_config,
+            conversation_store,
+            host_store,
+            openrouter_wif_broker,
+            machine_allowed=machine_verifier.principal_allowed if machine_verifier else None,
+        )
+        app.state.inference_proxy = inference_proxy
+        host_registry.inference_config_resolver = inference_proxy.launch_config
+        host_registry.server_inference_harnesses = inference_proxy_config.harnesses
+        app.include_router(inference_proxy.router(), prefix="/v1", tags=["inference"])
+
     # Host tunnel + REST endpoints (DAEMON_API.md). Mounted only when a
     # host_store is configured: the routers call host_store on every
     # request, so mounting them with host_store=None would fail each

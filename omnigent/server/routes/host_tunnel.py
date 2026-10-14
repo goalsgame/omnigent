@@ -331,6 +331,9 @@ def create_host_tunnel_router(
                 await ws.close(code=4002, reason=error)
                 return
 
+            frame.configured_harnesses = host_registry.inference_readiness(
+                frame.capabilities, frame.configured_harnesses
+            )
             stage = "registration"
             persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
@@ -662,6 +665,12 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostHarnessReadinessFrame):
+            frame.configured_harnesses = (
+                host_registry.inference_readiness(
+                    conn.hello.capabilities, frame.configured_harnesses
+                )
+                or {}
+            )
             await asyncio.to_thread(
                 host_store.update_harness_readiness,
                 host_id,
