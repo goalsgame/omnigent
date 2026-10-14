@@ -324,6 +324,17 @@ def test_host_opt_in_and_transfer_use_destination_host(setup):
         registry, conv, "new-runner", "openai-agents", host_id="destination"
     ) == {"direct": True}
     conv.inference_snapshot = None
+    assert (
+        HostRegistry.runner_inference_config(
+            registry,
+            conv,
+            "new-runner",
+            "openai-agents",
+            host_id="destination",
+            agent_has_auth=True,
+        )
+        is None
+    )
     config = HostRegistry.runner_inference_config(
         registry, conv, "new-runner", "openai-agents", host_id="destination"
     )

@@ -527,11 +527,19 @@ class HostRegistry:
         )
 
     def runner_inference_config(
-        self, conversation: Any, runner_id: str, harness: str | None, *, host_id: str | None = None
+        self,
+        conversation: Any,
+        runner_id: str,
+        harness: str | None,
+        *,
+        host_id: str | None = None,
+        agent_has_auth: bool = False,
     ) -> dict[str, Any] | None:
         """Preserve direct bindings, supplying server auth only when needed."""
         if conversation.inference_snapshot:
             return conversation.inference_snapshot["runtime_config"]
+        if agent_has_auth:
+            return None
         host_id = host_id or conversation.host_id
         conn = self.get(host_id) if host_id else None
         if (

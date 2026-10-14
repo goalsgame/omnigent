@@ -917,6 +917,13 @@ def create_hosts_router(
         if agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 
+        from omnigent.server.routes._host_launch import agent_has_explicit_auth
+
+        agent_has_auth = (
+            await agent_has_explicit_auth(target.conv, agent_store, agent_cache)
+            if host_registry.needs_server_inference(conn, harness)
+            else False
+        )
         git_branch: str | None = None
         worktree = None
 
@@ -1125,7 +1132,11 @@ def create_hosts_router(
                 harness=harness,
                 inference_config=(
                     host_registry.runner_inference_config(
-                        target.conv, runner_id, harness, host_id=host_id
+                        target.conv,
+                        runner_id,
+                        harness,
+                        host_id=host_id,
+                        agent_has_auth=agent_has_auth,
                     )
                 ),
             )

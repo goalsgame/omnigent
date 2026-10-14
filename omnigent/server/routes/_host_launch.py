@@ -18,6 +18,7 @@ Centralizing the checks here keeps the two call sites from drifting
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import importlib.util
 from dataclasses import dataclass
@@ -26,10 +27,12 @@ from fastapi import HTTPException
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
+from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
@@ -211,3 +214,26 @@ def resolve_host_launch(
             raise HTTPException(status_code=404, detail="session not found")
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
+
+
+async def agent_has_explicit_auth(
+    conv: Conversation,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+) -> bool:
+    """Preserve agent-owned authentication when selecting a host inference route."""
+    from omnigent.runtime import get_agent_cache, get_agent_store
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    if conv.agent_id is None:
+        return True
+    store = agent_store if agent_store is not None else get_agent_store()
+    cache = agent_cache if agent_cache is not None else get_agent_cache()
+    agent = await asyncio.to_thread(store.get, conv.agent_id)
+    if agent is None or agent.bundle_location is None:
+        return True
+    loaded = await asyncio.to_thread(cache.load, agent.id, agent.bundle_location, expand_env=False)
+    spec = loaded.spec
+    if conv.sub_agent_name:
+        spec = _find_spec_by_name(spec, conv.sub_agent_name) or spec
+    return spec.executor.auth is not None

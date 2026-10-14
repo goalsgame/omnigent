@@ -6077,7 +6077,14 @@ async def _launch_runner_on_host_locked(
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.server.routes._host_launch import agent_has_explicit_auth
 
+    harness = _resolve_harness(conv)
+    agent_has_auth = (
+        await agent_has_explicit_auth(conv)
+        if host_registry.needs_server_inference(host_conn, harness)
+        else False
+    )
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
@@ -6144,10 +6151,13 @@ async def _launch_runner_on_host_locked(
                 # Canonical harness (see _resolve_harness) so the host runs the
                 # same configuration check it does at create-time launch. None
                 # (agent not resolvable) skips the host-side check — fail open.
-                harness=_resolve_harness(conv),
+                harness=harness,
                 inference_config=(
                     host_registry.runner_inference_config(
-                        conv, new_runner_id, _resolve_harness(conv)
+                        conv,
+                        new_runner_id,
+                        harness,
+                        agent_has_auth=agent_has_auth,
                     )
                 ),
             )

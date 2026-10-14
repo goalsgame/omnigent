@@ -4013,3 +4013,60 @@ async def test_personal_provider_keeps_direct_launch_and_models(client, app, mon
         assert models.json()["routable_models"] == (
             ["model-a"] if server_auth else ["personal-model"]
         )
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize("launch_path", ["inline", "explicit", "relaunch"])
+async def test_agent_auth_preserves_direct_launch_on_credential_free_host(
+    client, app, launch_path, db_uri
+):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    agent = await create_test_agent(
+        client,
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "openai-agents"},
+            "auth": {"type": "api_key", "api_key": "$AGENT_TEST_API_KEY"},
+        },
+    )
+    if launch_path == "explicit":
+        created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert created.status_code == 201, created.text
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={
+                "session_id": created.json()["id"],
+                "workspace": _WORKSPACE,
+            },
+        )
+        assert response.status_code == 200, response.text
+    else:
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        response = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": _WORKSPACE,
+            },
+        )
+        assert response.status_code == 201, response.text
+    frame = await responder
+    registry = app.state.host_registry
+    conn = registry.get(_HOST_ID)
+    assert registry.needs_server_inference(conn, "openai-agents")
+    assert frame.inference_config is None
+    if launch_path == "relaunch":
+        from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+
+        store = SqlAlchemyConversationStore(db_uri)
+        sid = response.json()["id"]
+        await asyncio.to_thread(store.clear_runner_id, sid)
+        conv = await asyncio.to_thread(store.get_conversation, sid)
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        attempt = await _launch_runner_on_host_impl(conv, store, registry, conn)
+        frame = await responder
+        assert attempt.runner_id
+        assert frame.inference_config is None

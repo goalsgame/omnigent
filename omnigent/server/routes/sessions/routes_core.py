@@ -587,7 +587,10 @@ def register_core_routes(
             encode_host_frame,
         )
         from omnigent.runner.identity import token_bound_runner_id
-        from omnigent.server.routes._host_launch import resolve_host_launch
+        from omnigent.server.routes._host_launch import (
+            agent_has_explicit_auth,
+            resolve_host_launch,
+        )
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -602,6 +605,11 @@ def register_core_routes(
                 conversation=conversation,
             )
         conn = target.conn
+        agent_has_auth = (
+            await agent_has_explicit_auth(target.conv, agent_store, agent_cache)
+            if host_registry.needs_server_inference(conn, harness)
+            else False
+        )
         await host_registry.admit_launch(conn, session_id)
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
@@ -648,7 +656,12 @@ def register_core_routes(
                 # host-side check.
                 harness=harness,
                 inference_config=(
-                    host_registry.runner_inference_config(target.conv, runner_id, harness)
+                    host_registry.runner_inference_config(
+                        target.conv,
+                        runner_id,
+                        harness,
+                        agent_has_auth=agent_has_auth,
+                    )
                 ),
             )
         )
