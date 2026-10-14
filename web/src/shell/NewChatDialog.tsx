@@ -2162,6 +2162,7 @@ export function NewChatLandingScreen() {
     if (!c) return {};
     return {
       hostId: c.host_id,
+      sandboxProvider: c.sandbox_provider,
       workspace: c.workspace,
       agentId: c.agent_id,
       useWorktree: c.use_worktree,
@@ -4497,7 +4498,7 @@ export function NewChatLandingScreen() {
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      setSandboxProvider(prefillConfig?.sandboxProvider ?? defaultSandboxProvider());
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {

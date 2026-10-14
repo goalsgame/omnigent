@@ -36,11 +36,13 @@ import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
+import { getCurrentUserId } from "@/lib/identity";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
-import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import { SANDBOX_HOST_CHOICE, readLastSandboxProvider } from "@/lib/hostPreferences";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isNativeCodingAgent,
@@ -120,7 +122,13 @@ export function ProjectSettingsDialog({
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
   // can only fail on create.
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
-  const sandboxProvider = info !== "loading" ? info.sandbox_provider : null;
+  const providers = info !== "loading" ? sandboxProviderOptions(info) : [];
+  const rememberedProvider = readLastSandboxProvider();
+  const sandboxProvider =
+    stored?.sandbox_provider ??
+    (rememberedProvider !== null && providers.includes(rememberedProvider)
+      ? rememberedProvider
+      : (providers[0] ?? null));
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
@@ -203,6 +211,11 @@ export function ProjectSettingsDialog({
     const config: ProjectConfig = { ...(stored ?? {}) };
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
+    if (hostId === SANDBOX_HOST_CHOICE && sandboxProvider !== null) {
+      config.sandbox_provider = sandboxProvider;
+    } else if (hostId !== SANDBOX_HOST_CHOICE) {
+      delete config.sandbox_provider;
+    }
     // A workspace is host-relative and only meaningful with a concrete host —
     // don't persist a stale path from a since-cleared host, and drop it for the
     // sandbox (a sandbox create provisions its own workspace and ignores this).
@@ -276,22 +289,46 @@ export function ProjectSettingsDialog({
   // else the first online host (the composer's auto-pick) — without the
   // fallback a Codex project (no static catalog) could never populate the
   // picker unless a host default was also stored.
-  const modelCatalogHostId = browsableHostId ?? onlineHosts[0]?.host_id ?? null;
+  const sandboxSelected = hostId === SANDBOX_HOST_CHOICE;
+  const modelCatalogHostId = sandboxSelected
+    ? null
+    : (browsableHostId ?? onlineHosts[0]?.host_id ?? null);
+  const previewHarness = selectedNativeSpec?.harness ?? selectedAgent?.harness ?? null;
+  const sandboxCatalogEnabled =
+    open &&
+    sandboxSelected &&
+    managedSandboxesEnabled &&
+    sandboxProvider !== null &&
+    previewHarness !== null &&
+    harnessTakesModel &&
+    info.sandbox_provider_capabilities?.[sandboxProvider]?.inference_models === true;
+  const sandboxModels = useSandboxModelOptions(
+    sandboxProvider,
+    previewHarness,
+    agentId,
+    getCurrentUserId(),
+    sandboxCatalogEnabled,
+  );
   const { data: hostModelOptions } = useHostModelOptions(
     modelCatalogHostId,
     selectedNativeSpec?.harness ?? "",
     harnessTakesModel && modelCatalogHostId !== null,
   );
   const modelOptions = useMemo(() => {
-    const live = (hostModelOptions ?? []).map((o) => ({
+    const source = sandboxSelected
+      ? sandboxModels.data?.status === "ready"
+        ? sandboxModels.data.models
+        : []
+      : (hostModelOptions ?? []);
+    const live = source.map((o) => ({
       id: o.id,
       label: o.displayName ?? o.id,
     }));
-    if (live.length > 0) return live;
+    if (live.length > 0 || sandboxSelected) return live;
     return selectedNativeSpec?.harness === "claude-native"
       ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
       : [];
-  }, [hostModelOptions, selectedNativeSpec]);
+  }, [hostModelOptions, selectedNativeSpec, sandboxSelected, sandboxModels.data]);
   // Keep a stored model the current options don't list as a labeled fallback
   // item, so opening + saving the dialog doesn't silently drop the default.
   const storedModelMissing = model !== NONE && !modelOptions.some((m) => m.id === model);
@@ -517,9 +554,15 @@ export function ProjectSettingsDialog({
             <Field
               label="Model"
               hint={
-                modelPickerEmpty
-                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
-                  : "Default model for new sessions with this agent"
+                sandboxSelected && modelPickerEmpty
+                  ? sandboxModels.isLoading
+                    ? "Loading sandbox models…"
+                    : (sandboxModels.error?.message ??
+                      sandboxModels.data?.error ??
+                      "No model catalog available for this sandbox and agent")
+                  : modelPickerEmpty
+                    ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
+                    : "Default model for new sessions with this agent"
               }
             >
               <Select

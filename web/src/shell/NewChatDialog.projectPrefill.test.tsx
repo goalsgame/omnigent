@@ -1,3 +1,4 @@
+import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -213,7 +214,9 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
 }
 
 /** Same as renderLanding, but with the managed-sandbox host option enabled. */
-function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
+function renderSandboxLanding(overrides: Partial<ServerInfo> = {}): {
+  rerender: (ui: ReactNode) => void;
+} {
   const info: ServerInfo = {
     accounts_enabled: false,
     single_user: false,
@@ -232,6 +235,7 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    ...overrides,
   };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   function Wrapper({ children }: { children: ReactNode }) {
@@ -1126,4 +1130,19 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
   });
+});
+
+it("prefills the project's saved sandbox provider instead of the sticky last provider", async () => {
+  localStorage.setItem("omnigent:last-sandbox-provider", "kubernetes");
+  setProjectConfig({ host_id: "__sandbox__", sandbox_provider: "agent_sandbox", agent_id: "ag_1" });
+  renderSandboxLanding({
+    sandbox_provider: "kubernetes",
+    sandbox_providers: ["kubernetes", "agent_sandbox"],
+    sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
+  });
+  await waitFor(() =>
+    expect(
+      vi.mocked(useSandboxModelOptions).mock.calls.some((call) => call[0] === "agent_sandbox"),
+    ).toBe(true),
+  );
 });

@@ -17,6 +17,7 @@ type ProjectPrefillPhase = "location" | "settled";
  */
 export interface ProjectPrefillConfig {
   hostId?: string;
+  sandboxProvider?: string;
   workspace?: string;
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */

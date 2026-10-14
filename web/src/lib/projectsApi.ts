@@ -21,6 +21,8 @@ import { authenticatedFetch } from "./identity";
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */
   host_id?: string;
+  /** Provider bound to a sandbox project default and its model catalog. */
+  sandbox_provider?: string;
   /** Default working directory / repo path on that host. */
   workspace?: string;
   /** Default agent id for new sessions. */
