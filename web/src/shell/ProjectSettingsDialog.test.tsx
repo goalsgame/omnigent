@@ -39,9 +39,12 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
-vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ managed_sandboxes_enabled: false, sandbox_provider: null }),
+const { serverInfoMock, sandboxModelsMock } = vi.hoisted(() => ({
+  serverInfoMock: vi.fn(),
+  sandboxModelsMock: vi.fn(),
 }));
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: serverInfoMock }));
+vi.mock("@/hooks/useSandboxModelOptions", () => ({ useSandboxModelOptions: sandboxModelsMock }));
 // The filesystem browser owns its own data-fetching; stub its explicit commit
 // action so this suite can drive the shared dialog without filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
@@ -76,6 +79,9 @@ function renderDialog(projectId: string | null = "p_1") {
 }
 
 beforeEach(() => {
+  serverInfoMock.mockReturnValue({ managed_sandboxes_enabled: false, sandbox_provider: null });
+  sandboxModelsMock.mockReset();
+  sandboxModelsMock.mockReturnValue({ data: undefined, isLoading: false });
   getProjectMock.mockReset();
   updateMock.mockReset();
   createMock.mockReset();
@@ -419,5 +425,67 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
     );
+  });
+});
+
+describe("managed project model defaults", () => {
+  beforeEach(() => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+    });
+    availableAgentsMock.mockReturnValue({
+      data: [pickerAgent({ id: "ag_pi", name: "configured-pi", harness: "pi-native" })],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { host_id: "__sandbox__", agent_id: "ag_pi" },
+    });
+  });
+  it("loads sandbox models without a local host and saves the selection", async () => {
+    sandboxModelsMock.mockReturnValue({
+      data: {
+        status: "ready",
+        configured: true,
+        models: [{ id: "provider/example", displayName: "Example model" }],
+      },
+    });
+    hostModelOptionsMock.mockReturnValue({ data: [{ id: "local-only" }] });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeEnabled());
+    expect(sandboxModelsMock).toHaveBeenLastCalledWith(
+      "agent_sandbox",
+      "pi-native",
+      "ag_pi",
+      null,
+      true,
+    );
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "Example model" })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("option", { name: "local-only" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "Example model" }));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        host_id: "__sandbox__",
+        agent_id: "ag_pi",
+        model: "provider/example",
+      }),
+    );
+  });
+  it("shows sandbox catalog failures instead of offering local models", async () => {
+    sandboxModelsMock.mockReturnValue({
+      error: new Error("Sandbox catalog unavailable"),
+      isLoading: false,
+    });
+    hostModelOptionsMock.mockReturnValue({ data: [{ id: "local-only" }] });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByText("Sandbox catalog unavailable")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("project-settings-model")).toBeDisabled();
   });
 });
