@@ -8,16 +8,15 @@ their authenticated host connection and exchange it for five-minute access token
 Configure the server alongside `openrouter_wif`:
 
 ```yaml
-server:
-  inference_proxy:
-    public_url: https://omnigent.example.com
-    signing_key_env: OMNIGENT_INFERENCE_SIGNING_KEY
-    models:
-      - provider/model-id
-    harnesses:
-      - openai-agents
-    max_request_bytes: 8388608
-    max_concurrent_requests: 32
+inference_proxy:
+  public_url: https://omnigent.example.com
+  signing_key_env: OMNIGENT_INFERENCE_SIGNING_KEY
+  models:
+    - provider/model-id
+  harnesses:
+    - openai-agents
+  max_request_bytes: 8388608
+  max_concurrent_requests: 32
 ```
 
 Use a random secret of at least 32 bytes for the signing key, shared by server
