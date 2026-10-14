@@ -637,3 +637,72 @@ async def test_slow_upload_reserves_session_and_global_capacity(setup):
             assert service.active_requests == 0
             assert not service.active_sessions
     assert not calls
+
+
+def test_windows_refresh_command_keeps_metacharacters_out_of_cmd(monkeypatch):
+    import base64
+
+    from omnigent.host import inference_proxy
+
+    monkeypatch.setattr(inference_proxy.sys, "platform", "win32")
+    args = [
+        r"C:\Python & %PATH% (tools)!\python.exe",
+        "-m",
+        "omnigent.host.inference_proxy",
+        r"C:\Omni & %TEMP% ! (data)'s\grant.json",
+    ]
+    command = inference_proxy._refresh_command(args)
+    prefix = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "
+    assert command.startswith(prefix)
+    script = base64.b64decode(command.removeprefix(prefix)).decode("utf-16-le")
+    assert script == (
+        "$ErrorActionPreference='Stop'; & "
+        + " ".join("'" + arg.replace("'", "''") + "'" for arg in args)
+        + "; exit $LASTEXITCODE"
+    )
+    assert not any(character in command for character in "&|%!'()")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Executes Windows cmd and PowerShell")
+def test_windows_refresh_command_executes_literal_metacharacter_paths(tmp_path, monkeypatch):
+    import subprocess
+
+    from omnigent.host.inference_proxy import _refresh_command
+
+    directory = tmp_path / "Omni & %PROXY_TEST_PATH% ! (data)'s"
+    directory.mkdir()
+    credential = directory / "grant.json"
+    credential.write_text("fixture-token", encoding="utf-8")
+    monkeypatch.setenv("PROXY_TEST_PATH", "unexpected-expansion")
+    command = _refresh_command(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text())",
+            str(credential),
+        ]
+    )
+    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fixture-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["NaN", "Infinity", "-Infinity", "1e999", "nested"])
+async def test_invalid_json_numbers_and_nesting_return_400_and_release_capacity(setup, invalid):
+    service, app, conv, _, calls = setup
+    depth = 10000
+    value = ("[" * depth + "0" + "]" * depth) if invalid == "nested" else invalid
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/responses",
+            content='{"model":"model-a","input":' + value + "}",
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert response.status_code == 400
+        assert service.active_requests == 0
+        assert not service.active_sessions
+        assert not calls

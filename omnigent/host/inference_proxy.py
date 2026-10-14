@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import shlex
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -28,6 +28,16 @@ def _valid_url(url: object) -> bool:
         and not parts.fragment
         and parts.path.startswith("/v1/inference/sessions/")
     )
+
+
+def _refresh_command(args: list[str]) -> str:
+    if sys.platform != "win32":
+        return shlex.join(args)
+    # cmd sees only ASCII base64; PowerShell treats every path as a literal.
+    literals = ["'" + arg.replace("'", "''") + "'" for arg in args]
+    script = "$ErrorActionPreference='Stop'; & " + " ".join(literals) + "; exit $LASTEXITCODE"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encoded
 
 
 def prepare(config: dict, directory: Path, *, credential_files: list[Path] | None = None) -> dict:
@@ -60,7 +70,7 @@ def prepare(config: dict, directory: Path, *, credential_files: list[Path] | Non
         credential.unlink(missing_ok=True)
         raise
     args = [sys.executable, "-m", "omnigent.host.inference_proxy", str(credential)]
-    command = subprocess.list2cmdline(args) if sys.platform == "win32" else shlex.join(args)
+    command = _refresh_command(args)
     return {
         "providers": {
             "server-inference": {

@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import time
 from collections.abc import Callable
@@ -25,6 +26,17 @@ from omnigent.stores.host_store import host_is_live
 
 _AUDIENCE = "omnigent-session-inference"
 _TTL = 300
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("Non-standard JSON constant")
+
+
+def _finite_json_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("Non-finite JSON number")
+    return result
 
 
 @dataclass(frozen=True)
@@ -318,8 +330,10 @@ class InferenceProxy:
                 except TimeoutError:
                     raise HTTPException(408, "Inference request timed out") from None
                 try:
-                    payload = json.loads(body)
-                except (ValueError, UnicodeDecodeError):
+                    payload = json.loads(
+                        body, parse_constant=_reject_json_constant, parse_float=_finite_json_float
+                    )
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     raise HTTPException(400, "Invalid inference JSON") from None
                 if (
                     not isinstance(payload, dict)

@@ -3870,7 +3870,12 @@ def test_server_inference_binding_renders_pi_chat_models_and_refresh_command(
     assert rendered["baseUrl"] == url
     assert rendered["api"] == "openai-completions"
     assert rendered["apiKey"].startswith("!")
-    assert "omnigent.host.inference_proxy" in rendered["apiKey"]
-    assert str(next((tmp_path / "grants").glob("*.json"))) in rendered["apiKey"]
+    command = rendered["apiKey"][1:]
+    if command.startswith("powershell.exe "):
+        import base64
+
+        command = base64.b64decode(command.rsplit(" ", 1)[1]).decode("utf-16-le")
+    assert "omnigent.host.inference_proxy" in command
+    assert str(next((tmp_path / "grants").glob("*.json"))) in command
     assert [model["id"] for model in rendered["models"]] == ["model-a", "model-b"]
     assert "g" * 64 not in str(rendered)
