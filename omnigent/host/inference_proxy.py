@@ -43,23 +43,27 @@ def _refresh_command(args: list[str]) -> str:
     return "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encoded
 
 
+def _validate_target(proxy: dict) -> None:
+    if not _valid_url(proxy.get("url")):
+        raise ValueError("Server inference requires HTTPS")
+    if proxy.get("harness") not in ("openai-agents", "pi-native") or (
+        not isinstance(proxy.get("models"), list)
+        or not proxy["models"]
+        or any(not isinstance(model, str) or not model for model in proxy["models"])
+    ):
+        raise ValueError("Invalid inference harness or model list")
+
+
 def prepare(config: dict, directory: Path, *, credential_files: list[Path] | None = None) -> dict:
     proxy = config.get("server_inference")
     if proxy is None:
         return config
     if not isinstance(proxy, dict) or set(proxy) != {"url", "grant", "models", "harness"}:
         raise ValueError("Invalid server inference configuration")
+    _validate_target(proxy)
     url = proxy["url"]
-    if not _valid_url(url):
-        raise ValueError("Server inference requires HTTPS")
     if not isinstance(proxy["grant"], str) or len(proxy["grant"]) != 64:
         raise ValueError("Invalid inference grant")
-    if proxy["harness"] not in ("openai-agents", "pi-native") or (
-        not isinstance(proxy["models"], list)
-        or not proxy["models"]
-        or any(not isinstance(model, str) or not model for model in proxy["models"])
-    ):
-        raise ValueError("Invalid inference harness or model list")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     digest = hashlib.sha256(json.dumps(proxy, sort_keys=True).encode()).hexdigest()
     fd, filename = tempfile.mkstemp(prefix=digest + "-", suffix=".json", dir=directory)
@@ -72,6 +76,19 @@ def prepare(config: dict, directory: Path, *, credential_files: list[Path] | Non
     except BaseException:
         credential.unlink(missing_ok=True)
         raise
+    result = runtime_config(proxy, credential)
+    result["server_inference_binding"] = {
+        "url": proxy["url"],
+        "harness": proxy["harness"],
+        "models": proxy["models"],
+        "credential_file": str(credential),
+    }
+    return result
+
+
+def runtime_config(proxy: dict, credential: Path) -> dict:
+    _validate_target(proxy)
+    url = proxy["url"]
     args = [sys.executable, "-m", "omnigent.host.inference_proxy", str(credential)]
     command = _refresh_command(args)
     return {

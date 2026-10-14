@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -84,6 +85,41 @@ def main() -> None:
         return {"calls": calls, "active": proxy.active_requests}
 
     app.router.routes.insert(0, app.router.routes.pop())
+
+    @app.post("/v1/_e2e/sessions/{sid}/initialize")
+    async def initialize(sid: str):
+        conv = await asyncio.to_thread(conversations.get_conversation, sid)
+        routed = app.state.runner_router.client_for_existing_conversation(sid)
+        response = await app.state.runner_session_initializer.initialize(
+            conv,
+            routed.client,
+            timeout=20,
+            suppress_recovery_turn=True,
+        )
+        connection = app.state.tunnel_registry.get(conv.runner_id)
+        return {
+            "status": response.status_code,
+            "payload": response.json(),
+            "generation": connection.generation,
+        }
+
+    @app.post("/v1/_e2e/sessions/{sid}/recycle")
+    async def recycle(sid: str):
+        conv = await asyncio.to_thread(conversations.get_conversation, sid)
+        registry = app.state.tunnel_registry
+        connection = registry.get(conv.runner_id)
+        generation = connection.generation
+        registry.deregister(conv.runner_id, session=connection)
+        async with asyncio.timeout(30):
+            while True:
+                replacement = registry.get(conv.runner_id)
+                if replacement is not None and replacement.generation != generation:
+                    return {"generation": replacement.generation}
+                await asyncio.sleep(0.05)
+
+    # Place test routes ahead of the SPA fallback.
+    for _ in range(2):
+        app.router.routes.insert(0, app.router.routes.pop())
 
     workspace = int(os.environ.get("OMNIGENT_E2E_WORKSPACE", "0"))
 

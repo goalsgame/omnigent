@@ -190,6 +190,23 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 session_id = created.json()["id"]
                 runner_id = created.json()["runner_id"]
                 assert runner_id
+                deadline = time.monotonic() + 30
+                while (
+                    client.get(f"/v1/runners/{runner_id}/status").json().get("online") is not True
+                ):
+                    assert time.monotonic() < deadline
+                    time.sleep(0.1)
+                initialized = client.post(f"/v1/_e2e/sessions/{session_id}/initialize").json()
+                assert initialized["status"] == 201, initialized
+                assert initialized["payload"]["inference_config_verified"] is True
+                generation = initialized["generation"]
+                recycled = client.post(
+                    f"/v1/_e2e/sessions/{session_id}/recycle", timeout=40
+                ).json()
+                assert recycled["generation"] != generation
+                recovered = client.post(f"/v1/_e2e/sessions/{session_id}/initialize").json()
+                assert recovered["status"] == 201, recovered
+                assert recovered["payload"]["inference_config_verified"] is True
                 response_id = send_user_message_to_session(
                     client, session_id=session_id, content="Reply briefly."
                 )

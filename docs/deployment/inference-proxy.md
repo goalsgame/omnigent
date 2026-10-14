@@ -47,6 +47,10 @@ runners must be relaunched. The host
 stores the inference refresh capability in its data directory with private file
 permissions on POSIX and inherited account permissions on Windows. Protect that
 account and directory: the capability permits inference spending for its session.
+Before session initialization, runners verify transient proxy configuration
+against the authoritative server, including the issued model policy, session,
+runner and refresh grant. Saved direct configurations retain exact-match
+validation. Reconnecting runners repeat this verification.
 Grant files and generated runtime configs are removed when the runner stops or
 exits, or a launch fails.
 

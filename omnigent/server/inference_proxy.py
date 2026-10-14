@@ -185,11 +185,19 @@ class InferenceProxy:
             self.config.signing_key.encode(), message.encode(), hashlib.sha256
         ).hexdigest()
 
-    def _workspace_route(self, session_id: str) -> str:
+    def _workspace_route(self, session_id: str, runner_id: str, harness: str) -> str:
         import jwt
 
         return jwt.encode(
-            {"aud": _WORKSPACE_AUDIENCE, "sub": session_id, "workspace": current_workspace_id()},
+            {
+                "aud": _WORKSPACE_AUDIENCE,
+                "sub": session_id,
+                "workspace": current_workspace_id(),
+                "runner": runner_id,
+                "origin": self.config.public_url,
+                "harness": harness,
+                "models": list(self.config.models),
+            },
             self.config.signing_key,
             algorithm="HS256",
         )
@@ -227,7 +235,7 @@ class InferenceProxy:
             return None
         path = (
             "/v1/inference/workspaces/"
-            + self._workspace_route(conversation.id)
+            + self._workspace_route(conversation.id, runner_id, harness)
             + "/sessions/"
             + conversation.id
         )
@@ -342,9 +350,30 @@ class InferenceProxy:
                 self.config.signing_key,
                 algorithm="HS256",
             )
-            return JSONResponse(
-                {"token": encoded, "expires_in": _TTL}, headers={"Cache-Control": "no-store"}
-            )
+            payload: dict[str, Any] = {"token": encoded, "expires_in": _TTL}
+            if workspace_route is not None:
+                claims = jwt.decode(
+                    workspace_route,
+                    self.config.signing_key,
+                    algorithms=["HS256"],
+                    audience=_WORKSPACE_AUDIENCE,
+                )
+                if claims.get("runner") is not None:
+                    if claims["runner"] != conv.runner_id:
+                        raise HTTPException(401, "Invalid inference binding")
+                    payload["runtime_binding"] = {
+                        "url": claims["origin"]
+                        + "/v1/inference/workspaces/"
+                        + workspace_route
+                        + "/sessions/"
+                        + session_id,
+                        "session_id": session_id,
+                        "runner_id": conv.runner_id,
+                        "models": claims["models"],
+                        "harness": claims["harness"],
+                        "grant_hash": binding,
+                    }
+            return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
         @router.get("/inference/workspaces/{workspace_route}/sessions/{session_id}/models")
         @router.get("/inference/sessions/{session_id}/models")

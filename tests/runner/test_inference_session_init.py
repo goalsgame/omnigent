@@ -116,3 +116,95 @@ async def test_inference_mismatch_response_does_not_expose_exception_details(
     }
     assert "credential-sentinel" not in response.text
     assert manager.get_client_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "valid",
+        "colocated-child",
+        "wrong-runner",
+        "wrong-session",
+        "tampered-provider",
+        "tampered-policy",
+        "revoked",
+        "saved-direct",
+    ],
+)
+async def test_transient_proxy_init_is_server_verified_and_runner_bound(
+    mode, tmp_path, monkeypatch
+):
+    import hashlib
+
+    import httpx
+
+    from omnigent.host.inference_proxy import prepare
+    from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, token_bound_runner_id
+
+    token = "transient-runner-binding"
+    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, token)
+    url = "https://server.example/v1/inference/workspaces/signed-selector/sessions/proxy-session"
+    proxy = {"url": url, "grant": "g" * 64, "harness": "openai-agents", "models": ["model-a"]}
+    actual = prepare({"server_inference": proxy}, tmp_path / "grants")
+    if mode == "tampered-provider":
+        actual["providers"]["server-inference"]["openai"]["base_url"] = "https://other.example"
+    config_path = tmp_path / "inference.json"
+    config_path.write_text(json.dumps(actual))
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(config_path))
+    if mode == "tampered-policy":
+        actual["server_inference_binding"]["models"] = ["other-model"]
+        actual["inference"]["harnesses"]["openai-agents"].update(
+            model_allowlist=["other-model"], default_model="other-model"
+        )
+        config_path.write_text(json.dumps(actual))
+    sid = "other-session" if mode in ("wrong-session", "colocated-child") else "proxy-session"
+    conversation = Conversation(
+        id=sid, created_at=1, updated_at=1, agent_id="agent", root_conversation_id=sid
+    )
+    if mode == "colocated-child":
+        conversation.parent_conversation_id = "proxy-session"
+        conversation.root_conversation_id = "proxy-session"
+    if mode == "saved-direct":
+        conversation.inference_snapshot = {
+            "runtime_config": {"providers": {"direct": {}}, "inference": {}}
+        }
+    binding = {
+        "url": url,
+        "session_id": "proxy-session",
+        "runner_id": token_bound_runner_id(token),
+        "harness": "openai-agents",
+        "models": ["model-a"],
+        "grant_hash": hashlib.sha256(b"g" * 64).hexdigest(),
+    }
+    if mode == "wrong-runner":
+        binding["runner_id"] = "other-runner"
+    verification_calls = []
+
+    class Server(NullServerClient):
+        async def post(self, url, **kwargs):
+            verification_calls.append((url, kwargs))
+            return httpx.Response(
+                401 if mode == "revoked" else 200,
+                json={"runtime_binding": binding},
+                request=httpx.Request("POST", "https://server.example" + url),
+            )
+
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=manager, server_client=Server())
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json=build_runner_session_init_payload(conversation, server_version="test"),
+        )
+    if mode in ("valid", "colocated-child"):
+        assert response.status_code == 201, response.text
+        assert response.json()["inference_config_verified"] is True
+        assert verification_calls[0][0].startswith("/v1/inference/workspaces/")
+        assert len(manager.get_client_calls) == 1
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["error"] == "inference_config_mismatch"
+        assert not manager.get_client_calls
+    if mode in ("wrong-session", "tampered-provider", "saved-direct"):
+        assert not verification_calls

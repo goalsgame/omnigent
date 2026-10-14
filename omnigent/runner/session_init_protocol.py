@@ -131,3 +131,83 @@ def parse_runner_session_init_envelope(
         return RunnerSessionInitEnvelope.model_validate(raw)
     except ValidationError as exc:
         raise ValueError("invalid runner session initialization envelope") from exc
+
+
+async def verify_transient_runner_inference_config(
+    server_client,
+    envelope: RunnerSessionInitEnvelope,
+) -> dict[str, object] | None:
+    """Verify a runner-local proxy binding with the authoritative server."""
+    import asyncio
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    from omnigent.host.inference_proxy import runtime_config
+    from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, token_bound_runner_id
+
+    path = os.environ.get("OMNIGENT_INFERENCE_CONFIG")
+    if not path:
+        return None
+    try:
+        actual = await asyncio.to_thread(lambda: json.loads(Path(path).read_text()))
+        marker = actual.get("server_inference_binding")
+        if marker is None:
+            return None
+        if not isinstance(marker, dict) or set(marker) != {
+            "url",
+            "harness",
+            "models",
+            "credential_file",
+        }:
+            raise ValueError("Invalid proxy binding metadata")
+        credential_file = Path(marker["credential_file"])
+        credential = await asyncio.to_thread(lambda: json.loads(credential_file.read_text()))
+        if credential["url"] != marker["url"]:
+            raise ValueError("Proxy binding URL mismatch")
+        parts = urlsplit(marker["url"])
+        allowed_sessions = {
+            envelope.session_id,
+            envelope.snapshot.parent_session_id,
+            envelope.snapshot.root_session_id,
+        }
+        binding_session = parts.path.rsplit("/", 1)[-1]
+        if (
+            not parts.path.startswith("/v1/inference/workspaces/")
+            or binding_session not in allowed_sessions
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError("Proxy binding session mismatch")
+        token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR)
+        if not token:
+            raise ValueError("Proxy runner identity missing")
+        expected = runtime_config(marker, credential_file)
+        if any(actual.get(key, {}) != expected.get(key, {}) for key in ("providers", "inference")):
+            raise ValueError("Proxy provider configuration mismatch")
+        response = await server_client.post(
+            parts.path + "/token",
+            headers={"Authorization": "Bearer " + credential["grant"]},
+            timeout=10,
+        )
+        response.raise_for_status()
+        attested = response.json().get("runtime_binding")
+        target = {
+            "url": marker["url"],
+            "harness": marker["harness"],
+            "models": marker["models"],
+            "session_id": binding_session,
+            "runner_id": token_bound_runner_id(token),
+            "grant_hash": hashlib.sha256(credential["grant"].encode()).hexdigest(),
+        }
+        if attested != target:
+            raise ValueError("Proxy binding verification failed")
+        return expected
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, httpx.HTTPError):
+        raise RunnerInferenceConfigMismatch(
+            "Cannot verify this runner's server inference binding."
+        ) from None
