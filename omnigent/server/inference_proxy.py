@@ -51,10 +51,16 @@ class InferenceProxyConfig:
         url = raw.get("public_url")
         if not isinstance(url, str):
             raise ValueError("inference_proxy.public_url is required")
-        parts = urlsplit(url)
+        try:
+            parts = urlsplit(url)
+            hostname = parts.hostname
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("inference_proxy.public_url must be an HTTPS origin") from exc
         if (
             parts.scheme != "https"
-            or not parts.netloc
+            or not hostname
+            or port == 0
             or parts.username
             or parts.password
             or parts.query

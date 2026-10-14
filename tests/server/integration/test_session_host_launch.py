@@ -38,6 +38,7 @@ from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -173,7 +174,9 @@ def app(runtime_init: None, db_uri: str, tmp_path, request, monkeypatch) -> Fast
     )
 
 
-async def _connect_host(app: FastAPI, *, inference: bool = False) -> ApplicationCommunicator:
+async def _connect_host(
+    app: FastAPI, *, inference: bool = False, personal_provider: bool = False
+) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
@@ -196,7 +199,9 @@ async def _connect_host(app: FastAPI, *, inference: bool = False) -> Application
             frame_protocol_version=1,
             name="laptop",
             capabilities=["server-inference-v1"] if inference else [],
-            configured_harnesses={"openai-agents": "needs-auth"} if inference else None,
+            configured_harnesses={"openai-agents": True if personal_provider else "needs-auth"}
+            if inference
+            else None,
         )
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
@@ -3955,3 +3960,56 @@ async def test_inline_launch_with_server_inference(client, app):
     )
     assert token.status_code == 200, token.text
     assert token.json()["expires_in"] == 300
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+async def test_personal_provider_keeps_direct_launch_and_models(client, app, monkeypatch):
+    from omnigent.server.routes import hosts
+
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True, personal_provider=True)
+    registry = app.state.host_registry
+    conn = registry.get(_HOST_ID)
+    conn.hello.version = "0.18.0"
+    personal_models = AsyncMock(
+        return_value={
+            "status": "ok",
+            "models": [{"id": "personal-model", "name": "Personal model"}],
+            "routable_models": ["personal-model"],
+        }
+    )
+    monkeypatch.setattr(hosts, "_proxy_model_options", personal_models)
+    models = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/openai-agents/model-options")
+    assert models.status_code == 200
+    assert models.json()["routable_models"] == ["personal-model"]
+    personal_models.assert_awaited_once()
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "openai-agents"}}
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    frame = await responder
+    assert response.status_code == 201, response.text
+    assert frame.inference_config is None
+
+    # Credential changes on an existing tunnel update both routing and catalog.
+    for readiness, server_auth in (("needs-auth", True), (True, False)):
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"openai-agents": readiness})
+                ),
+            }
+        )
+        async with asyncio.timeout(budget(2.0)):
+            while registry.needs_server_inference(conn, "openai-agents") != server_auth:
+                await asyncio.sleep(0.01)
+        models = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/openai-agents/model-options")
+        assert models.status_code == 200
+        assert models.json()["routable_models"] == (
+            ["model-a"] if server_auth else ["personal-model"]
+        )

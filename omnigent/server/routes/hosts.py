@@ -794,11 +794,7 @@ def create_hosts_router(
             raise _host_absent_error(host)
         proxy = getattr(request.app.state, "inference_proxy", None)
         canonical = canonicalize_harness(harness) or harness
-        if (
-            proxy is not None
-            and "server-inference-v1" in conn.hello.capabilities
-            and canonical in proxy.config.harnesses
-        ):
+        if proxy is not None and host_registry.needs_server_inference(conn, canonical):
             return HostModelOptionsResponse(
                 models=[{"id": model, "name": model} for model in proxy.config.models],
                 routable_models=list(proxy.config.models),

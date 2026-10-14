@@ -280,6 +280,10 @@ def test_config_requires_explicit_models_and_strong_signing_key(monkeypatch):
     for patch in (
         {"models": []},
         {"public_url": "http://server.example"},
+        {"public_url": "https://:"},
+        {"public_url": "https://server.example:notaport"},
+        {"public_url": "https://server.example:65536"},
+        {"public_url": "https://server.example:0"},
         {"public_url": "https://user:password@server.example"},
         {"max_concurrent_requests": 0},
         {"signing_key_env": "MISSING_KEY"},
@@ -297,10 +301,12 @@ def test_host_opt_in_and_transfer_use_destination_host(setup):
     class Registry:
         server_inference_harnesses = ("openai-agents",)
         inference_config_resolver = service.launch_config
+        needs_server_inference = HostRegistry.needs_server_inference
         get = staticmethod(
             lambda host: (
                 SimpleNamespace(
                     hello=SimpleNamespace(capabilities=["server-inference-v1"]),
+                    reported_harnesses={"openai-agents": "needs-auth"},
                     owner="alice",
                     account_generation="generation",
                 )
@@ -314,6 +320,10 @@ def test_host_opt_in_and_transfer_use_destination_host(setup):
     assert HostRegistry.runner_inference_config(registry, conv, "new-runner", "openai-agents") == {
         "direct": True
     }
+    assert HostRegistry.runner_inference_config(
+        registry, conv, "new-runner", "openai-agents", host_id="destination"
+    ) == {"direct": True}
+    conv.inference_snapshot = None
     config = HostRegistry.runner_inference_config(
         registry, conv, "new-runner", "openai-agents", host_id="destination"
     )
@@ -528,3 +538,19 @@ def test_windows_cmd_executes_nested_powershell_command(tmp_path):
     )
     assert result["exit_code"] == 0
     assert result["stdout"].strip() == "editor-host-ok"
+
+
+@pytest.mark.parametrize("readiness", [True, "needs-cli", None])
+def test_personal_or_unavailable_harness_does_not_use_server_inference(readiness):
+    from omnigent.server.host_registry import HostRegistry
+
+    registry = HostRegistry()
+    registry.server_inference_harnesses = ("openai-agents",)
+    conn = SimpleNamespace(
+        hello=SimpleNamespace(capabilities=["server-inference-v1"]),
+        reported_harnesses={"openai-agents": readiness},
+    )
+    registry.get = lambda host: conn
+    registry.inference_config_resolver = lambda *args: pytest.fail("unexpected server binding")
+    conv = SimpleNamespace(host_id="host", inference_snapshot=None)
+    assert registry.runner_inference_config(conv, "runner", "openai-agents") is None

@@ -94,7 +94,15 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     host_root.mkdir()
     host_id = uuid.uuid4().hex
     host_config = host_root / "config.yaml"
-    host_config.write_text(yaml.safe_dump({"host": {"host_id": host_id, "name": "proxy-host"}}))
+    host_config.write_text(
+        yaml.safe_dump(
+            {
+                "host": {"host_id": host_id, "name": "proxy-host"},
+                # A developer's local Ollama must not make this credential-free host ready.
+                "dismissed_detections": ["ollama"],
+            }
+        )
+    )
     host_env = {
         **env,
         "OMNIGENT_CONFIG": str(host_config),

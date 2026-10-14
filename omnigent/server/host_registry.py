@@ -404,6 +404,7 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
+    reported_harnesses: dict | None = None
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -517,27 +518,33 @@ class HostRegistry:
                 result[harness] = True
         return result
 
+    def needs_server_inference(self, conn: HostConnection, harness: str | None) -> bool:
+        """Use server auth only for installed harnesses lacking personal credentials."""
+        return (
+            "server-inference-v1" in conn.hello.capabilities
+            and harness in self.server_inference_harnesses
+            and (conn.reported_harnesses or {}).get(harness) == "needs-auth"
+        )
+
     def runner_inference_config(
         self, conversation: Any, runner_id: str, harness: str | None, *, host_id: str | None = None
     ) -> dict[str, Any] | None:
-        """Resolve optional server inference before the saved direct-provider binding."""
+        """Preserve direct bindings, supplying server auth only when needed."""
+        if conversation.inference_snapshot:
+            return conversation.inference_snapshot["runtime_config"]
         host_id = host_id or conversation.host_id
         conn = self.get(host_id) if host_id else None
         if (
             self.inference_config_resolver is not None
             and conn is not None
-            and "server-inference-v1" in conn.hello.capabilities
+            and self.needs_server_inference(conn, harness)
         ):
             config = self.inference_config_resolver(
                 conversation, runner_id, harness, host_id, conn.owner, conn.account_generation
             )
             if config is not None:
                 return config
-        return (
-            conversation.inference_snapshot["runtime_config"]
-            if conversation.inference_snapshot
-            else None
-        )
+        return None
 
     def register(
         self,
@@ -579,6 +586,12 @@ class HostRegistry:
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         host_id = _canonical_host_id(host_id)
         now = time.time()
+        reported_harnesses = (
+            dict(hello.configured_harnesses) if hello.configured_harnesses is not None else None
+        )
+        hello.configured_harnesses = self.inference_readiness(
+            hello.capabilities, reported_harnesses
+        )
         conn = HostConnection(
             workspace_id=ws_id,
             host_id=host_id,
@@ -590,6 +603,7 @@ class HostRegistry:
             connected_at=now,
             last_frame_at=now,
             registered_with_managed_token=registered_with_managed_token,
+            reported_harnesses=reported_harnesses,
         )
         with self._lock:
             key = (ws_id, host_id)
