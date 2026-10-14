@@ -300,7 +300,8 @@ export function ProjectSettingsDialog({
     managedSandboxesEnabled &&
     sandboxProvider !== null &&
     previewHarness !== null &&
-    harnessTakesModel;
+    harnessTakesModel &&
+    info.sandbox_provider_capabilities?.[sandboxProvider]?.inference_models === true;
   const sandboxModels = useSandboxModelOptions(
     sandboxProvider,
     previewHarness,

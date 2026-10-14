@@ -436,6 +436,7 @@ describe("managed project model defaults", () => {
     serverInfoMock.mockReturnValue({
       managed_sandboxes_enabled: true,
       sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
     });
     availableAgentsMock.mockReturnValue({
       data: [pickerAgent({ id: "ag_pi", name: "configured-pi", harness: "pi-native" })],
@@ -480,6 +481,27 @@ describe("managed project model defaults", () => {
       }),
     );
   });
+  it("does not poll a provider without inference model support", async () => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { inference_models: false } },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(sandboxModelsMock).toHaveBeenLastCalledWith(
+        "agent_sandbox",
+        "pi-native",
+        "ag_pi",
+        null,
+        false,
+      ),
+    );
+    expect(screen.getByTestId("project-settings-model")).toBeDisabled();
+    expect(
+      screen.getByText("No model catalog available for this sandbox and agent"),
+    ).toBeInTheDocument();
+  });
   it("shows sandbox catalog failures instead of offering local models", async () => {
     sandboxModelsMock.mockReturnValue({
       error: new Error("Sandbox catalog unavailable"),
@@ -500,6 +522,7 @@ it("binds the previewed provider to the project even when user defaults differ",
     managed_sandboxes_enabled: true,
     sandbox_provider: "agent_sandbox",
     sandbox_providers: ["agent_sandbox", "kubernetes"],
+    sandbox_provider_capabilities: { kubernetes: { inference_models: true } },
   });
   availableAgentsMock.mockReturnValue({
     data: [pickerAgent({ id: "ag_pi", harness: "pi-native" })],
@@ -538,6 +561,7 @@ it("uses the project's saved provider rather than the user's last provider", asy
     managed_sandboxes_enabled: true,
     sandbox_provider: "kubernetes",
     sandbox_providers: ["kubernetes", "agent_sandbox"],
+    sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
   });
   availableAgentsMock.mockReturnValue({
     data: [pickerAgent({ id: "ag_pi", harness: "pi-native" })],
