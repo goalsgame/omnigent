@@ -40,9 +40,10 @@ OMNIGENT_SERVER_INFERENCE=1 omnigent host --server https://omnigent.example.com
 
 The host still needs the harness installed. Opted-in hosts advertise server-backed
 readiness and model choices only for configured harnesses that report missing
-authentication. Personal provider credentials, explicit `executor.auth` and saved direct bindings
-retain their direct routing. Runner launches needing server authentication receive the
-proxy binding; already-running runners must be relaunched. The host
+authentication. Personal provider credentials, explicit `executor.auth`, legacy
+executor profiles and saved direct bindings retain their direct routing. Runner
+launches needing server authentication receive the proxy binding; already-running
+runners must be relaunched. The host
 stores the inference refresh capability in its data directory with private file
 permissions on POSIX and inherited account permissions on Windows. Protect that
 account and directory: the capability permits inference spending for its session.

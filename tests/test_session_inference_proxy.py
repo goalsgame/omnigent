@@ -302,6 +302,7 @@ def test_host_opt_in_and_transfer_use_destination_host(setup):
         server_inference_harnesses = ("openai-agents",)
         inference_config_resolver = service.launch_config
         needs_server_inference = HostRegistry.needs_server_inference
+        server_inference_eligible = HostRegistry.server_inference_eligible
         get = staticmethod(
             lambda host: (
                 SimpleNamespace(

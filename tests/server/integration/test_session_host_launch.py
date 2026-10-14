@@ -4017,19 +4017,32 @@ async def test_personal_provider_keeps_direct_launch_and_models(client, app, mon
 
 @pytest.mark.parametrize("app", ["proxy"], indirect=True)
 @pytest.mark.parametrize("launch_path", ["inline", "explicit", "relaunch"])
+@pytest.mark.parametrize("auth_kind", ["api_key", "profile", "config_profile"])
+@pytest.mark.parametrize("readiness_changes", [False, True])
 async def test_agent_auth_preserves_direct_launch_on_credential_free_host(
-    client, app, launch_path, db_uri
+    client, app, launch_path, db_uri, auth_kind, readiness_changes, monkeypatch
 ):
     client.headers["X-Forwarded-Email"] = "alice@example.com"
-    comm = await _connect_host(app, inference=True)
-    agent = await create_test_agent(
-        client,
-        executor={
-            "type": "omnigent",
-            "config": {"harness": "openai-agents"},
-            "auth": {"type": "api_key", "api_key": "$AGENT_TEST_API_KEY"},
-        },
-    )
+    comm = await _connect_host(app, inference=True, personal_provider=readiness_changes)
+    registry = app.state.host_registry
+    conn = registry.get(_HOST_ID)
+    if readiness_changes:
+        original_admit = registry.admit_launch
+
+        async def lose_personal_credentials(*args, **kwargs):
+            # Readiness changes after auth lookup, while launch admission yields.
+            conn.reported_harnesses = {"openai-agents": "needs-auth"}
+            await original_admit(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "admit_launch", lose_personal_credentials)
+    executor = {"type": "omnigent", "config": {"harness": "openai-agents"}}
+    if auth_kind == "api_key":
+        executor["auth"] = {"type": "api_key", "api_key": "$AGENT_TEST_API_KEY"}
+    elif auth_kind == "profile":
+        executor["profile"] = "agent-test-profile"
+    else:
+        executor["config"]["profile"] = "agent-test-profile"
+    agent = await create_test_agent(client, executor=executor)
     if launch_path == "explicit":
         created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
         assert created.status_code == 201, created.text
@@ -4065,6 +4078,8 @@ async def test_agent_auth_preserves_direct_launch_on_credential_free_host(
         sid = response.json()["id"]
         await asyncio.to_thread(store.clear_runner_id, sid)
         conv = await asyncio.to_thread(store.get_conversation, sid)
+        if readiness_changes:
+            conn.reported_harnesses = {"openai-agents": True}
         responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
         attempt = await _launch_runner_on_host_impl(conv, store, registry, conn)
         frame = await responder

@@ -518,11 +518,17 @@ class HostRegistry:
                 result[harness] = True
         return result
 
-    def needs_server_inference(self, conn: HostConnection, harness: str | None) -> bool:
-        """Use server auth only for installed harnesses lacking personal credentials."""
+    def server_inference_eligible(self, conn: HostConnection, harness: str | None) -> bool:
+        """Whether this connection and harness opt into configured server inference."""
         return (
             "server-inference-v1" in conn.hello.capabilities
             and harness in self.server_inference_harnesses
+        )
+
+    def needs_server_inference(self, conn: HostConnection, harness: str | None) -> bool:
+        """Use server auth only for installed harnesses lacking personal credentials."""
+        return (
+            self.server_inference_eligible(conn, harness)
             and (conn.reported_harnesses or {}).get(harness) == "needs-auth"
         )
 

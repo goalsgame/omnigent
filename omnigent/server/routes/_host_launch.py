@@ -236,4 +236,9 @@ async def agent_has_explicit_auth(
     spec = loaded.spec
     if conv.sub_agent_name:
         spec = _find_spec_by_name(spec, conv.sub_agent_name) or spec
-    return spec.executor.auth is not None
+    executor = spec.executor
+    return (
+        executor.auth is not None
+        or bool(getattr(executor, "profile", None))
+        or bool(executor.config.get("profile"))
+    )

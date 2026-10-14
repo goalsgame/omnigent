@@ -921,7 +921,7 @@ def create_hosts_router(
 
         agent_has_auth = (
             await agent_has_explicit_auth(target.conv, agent_store, agent_cache)
-            if host_registry.needs_server_inference(conn, harness)
+            if host_registry.server_inference_eligible(conn, harness)
             else False
         )
         git_branch: str | None = None

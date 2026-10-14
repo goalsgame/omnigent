@@ -6082,7 +6082,7 @@ async def _launch_runner_on_host_locked(
     harness = _resolve_harness(conv)
     agent_has_auth = (
         await agent_has_explicit_auth(conv)
-        if host_registry.needs_server_inference(host_conn, harness)
+        if host_registry.server_inference_eligible(host_conn, harness)
         else False
     )
     await host_registry.admit_launch(host_conn, conv.id)
