@@ -914,6 +914,8 @@ def create_hosts_router(
 
         # Resolve the harness before creating host-side state.
         harness = target.conv.harness_override
+        if harness == "auto":
+            harness = None
         if harness is None and agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 

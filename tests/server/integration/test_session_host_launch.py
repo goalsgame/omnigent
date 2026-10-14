@@ -4093,11 +4093,13 @@ async def test_agent_auth_preserves_direct_launch_on_credential_free_host(
     [
         ("claude-sdk", "openai-agents"),
         ("openai-agents", "claude-sdk"),
+        ("openai-agents", "auto"),
+        ("claude-sdk", "auto"),
     ],
 )
 @pytest.mark.parametrize("agent_auth", [False, True])
 async def test_explicit_launch_uses_persisted_harness_override(
-    client, app, root_harness, override, agent_auth
+    client, app, root_harness, override, agent_auth, db_uri
 ):
     client.headers["X-Forwarded-Email"] = "alice@example.com"
     comm = await _connect_host(app, inference=True)
@@ -4123,8 +4125,13 @@ async def test_explicit_launch_uses_persisted_harness_override(
     )
     frame = await responder
     assert response.status_code == 200, response.text
-    assert frame.harness == override
-    if override == "openai-agents" and not agent_auth:
-        assert frame.inference_config["server_inference"]["harness"] == override
+    expected_harness = root_harness if override == "auto" else override
+    assert frame.harness == expected_harness
+    if expected_harness == "openai-agents" and not agent_auth:
+        assert frame.inference_config["server_inference"]["harness"] == expected_harness
     else:
         assert frame.inference_config is None
+    conv = await asyncio.to_thread(
+        SqlAlchemyConversationStore(db_uri).get_conversation, created.json()["id"]
+    )
+    assert conv.harness_override == override
