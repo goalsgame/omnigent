@@ -21,10 +21,11 @@ import idna
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import JSONResponse, StreamingResponse
 
-from omnigent.db.db_models import current_workspace_id
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.stores.host_store import host_is_live
 
 _AUDIENCE = "omnigent-session-inference"
+_WORKSPACE_AUDIENCE = "omnigent-inference-workspace"
 _TTL = 300
 
 
@@ -162,6 +163,35 @@ class InferenceProxy:
             self.config.signing_key.encode(), message.encode(), hashlib.sha256
         ).hexdigest()
 
+    def _workspace_route(self, session_id: str) -> str:
+        import jwt
+
+        return jwt.encode(
+            {"aud": _WORKSPACE_AUDIENCE, "sub": session_id, "workspace": current_workspace_id()},
+            self.config.signing_key,
+            algorithm="HS256",
+        )
+
+    def _request_workspace(self, session_id: str, route: str | None) -> int:
+        import jwt
+
+        if route is None:
+            return current_workspace_id()
+        try:
+            claims = jwt.decode(
+                route,
+                self.config.signing_key,
+                algorithms=["HS256"],
+                audience=_WORKSPACE_AUDIENCE,
+                options={"require": ["sub", "workspace"]},
+            )
+            workspace = claims["workspace"]
+            if claims["sub"] != session_id or type(workspace) is not int or workspace < 0:
+                raise ValueError("Invalid workspace selector")
+            return workspace
+        except (jwt.PyJWTError, ValueError):
+            raise HTTPException(401, "Invalid inference workspace") from None
+
     def launch_config(
         self,
         conversation: Any,
@@ -173,9 +203,15 @@ class InferenceProxy:
     ) -> dict[str, Any] | None:
         if harness not in self.config.harnesses or not owner:
             return None
+        path = (
+            "/v1/inference/workspaces/"
+            + self._workspace_route(conversation.id)
+            + "/sessions/"
+            + conversation.id
+        )
         return {
             "server_inference": {
-                "url": self.config.public_url + "/v1/inference/sessions/" + conversation.id,
+                "url": self.config.public_url + path,
                 "grant": self._grant(conversation.id, runner_id, host_id, owner, generation),
                 "models": list(self.config.models),
                 "harness": harness,
@@ -205,7 +241,19 @@ class InferenceProxy:
             raise HTTPException(401, "Inference session unavailable")
         return conv, owner
 
-    async def authorize(self, session_id: str, token: str, *, refresh: bool = False) -> Any:
+    async def authorize(
+        self,
+        session_id: str,
+        token: str,
+        *,
+        refresh: bool = False,
+        workspace_id: int | None = None,
+    ) -> Any:
+        workspace = current_workspace_id() if workspace_id is None else workspace_id
+        with workspace_scope(workspace):
+            return await self._authorize_scoped(session_id, token, refresh=refresh)
+
+    async def _authorize_scoped(self, session_id: str, token: str, *, refresh: bool) -> Any:
         import jwt
 
         conv, owner = await self._session(session_id)
@@ -246,11 +294,17 @@ class InferenceProxy:
                 raise HTTPException(401, "Inference bearer required")
             return value[7:]
 
+        @router.post("/inference/workspaces/{workspace_route}/sessions/{session_id}/token")
         @router.post("/inference/sessions/{session_id}/token")
-        async def token(request: Request, session_id: str) -> JSONResponse:
+        async def token(
+            request: Request, session_id: str, workspace_route: str | None = None
+        ) -> JSONResponse:
             import jwt
 
-            conv, binding = await self.authorize(session_id, bearer(request), refresh=True)
+            workspace = self._request_workspace(session_id, workspace_route)
+            conv, binding = await self.authorize(
+                session_id, bearer(request), refresh=True, workspace_id=workspace
+            )
             now = int(time.time())
             encoded = jwt.encode(
                 {
@@ -258,7 +312,7 @@ class InferenceProxy:
                     "sub": session_id,
                     "runner": conv.runner_id,
                     "host": conv.host_id,
-                    "workspace": current_workspace_id(),
+                    "workspace": workspace,
                     "binding": binding,
                     "iat": now,
                     "exp": now + _TTL,
@@ -270,9 +324,13 @@ class InferenceProxy:
                 {"token": encoded, "expires_in": _TTL}, headers={"Cache-Control": "no-store"}
             )
 
+        @router.get("/inference/workspaces/{workspace_route}/sessions/{session_id}/models")
         @router.get("/inference/sessions/{session_id}/models")
-        async def models(request: Request, session_id: str) -> JSONResponse:
-            await self.authorize(session_id, bearer(request))
+        async def models(
+            request: Request, session_id: str, workspace_route: str | None = None
+        ) -> JSONResponse:
+            workspace = self._request_workspace(session_id, workspace_route)
+            await self.authorize(session_id, bearer(request), workspace_id=workspace)
             return JSONResponse(
                 {
                     "object": "list",
@@ -284,15 +342,21 @@ class InferenceProxy:
                 headers={"Cache-Control": "no-store"},
             )
 
+        @router.post(
+            "/inference/workspaces/{workspace_route}/sessions/{session_id}/{endpoint:path}"
+        )
         @router.post("/inference/sessions/{session_id}/{endpoint:path}")
-        async def inference(request: Request, session_id: str, endpoint: str) -> StreamingResponse:
+        async def inference(
+            request: Request, session_id: str, endpoint: str, workspace_route: str | None = None
+        ) -> StreamingResponse:
             if endpoint not in ("chat/completions", "responses") or request.url.query:
                 raise HTTPException(404, "Unsupported inference endpoint")
+            workspace = self._request_workspace(session_id, workspace_route)
             access = bearer(request)
-            await self.authorize(session_id, access)
+            await self.authorize(session_id, access, workspace_id=workspace)
             if request.headers.get("content-encoding", "identity") != "identity":
                 raise HTTPException(415, "Compressed requests are unsupported")
-            session_key = (current_workspace_id(), session_id)
+            session_key = (workspace, session_id)
             if (
                 session_key in self.active_sessions
                 or self.active_requests >= self.config.max_concurrent_requests
@@ -355,7 +419,7 @@ class InferenceProxy:
                     transport=self.transport,
                 )
                 credential = await self.broker.credential()
-                await self.authorize(session_id, access)
+                await self.authorize(session_id, access, workspace_id=workspace)
                 upstream = await client.send(
                     client.build_request(
                         "POST",

@@ -57,7 +57,9 @@ host, live owner account generation, and machine authorization when applicable.
 Deleted or archived sessions, offline/deleted hosts, changed runner bindings and
 revoked machine identities reject subsequent requests. Requests already streaming
 are allowed to finish. Tokens are workspace-bound and do not authorize Omnigent
-control-plane operations. Provider credentials remain on the server.
+control-plane operations. Provider credentials remain on the server. Proxy URLs
+carry a signed workspace/session selector, verified before workspace-scoped
+authorization lookups. Access tokens must match the selected workspace.
 
 The proxy forwards only `POST chat/completions` and `POST responses` to a fixed
 OpenRouter endpoint. It permits only configured models, strips incoming headers,

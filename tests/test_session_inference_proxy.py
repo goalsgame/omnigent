@@ -706,3 +706,97 @@ async def test_invalid_json_numbers_and_nesting_return_400_and_release_capacity(
         assert service.active_requests == 0
         assert not service.active_sessions
         assert not calls
+
+
+@pytest.mark.asyncio
+async def test_signed_workspace_route_bootstraps_refresh_and_preserves_isolation(setup, tmp_path):
+    from omnigent.db.db_models import current_workspace_id, workspace_scope
+    from omnigent.host.inference_proxy import prepare
+
+    service, app, conv, host, calls = setup
+    lookups = []
+
+    def conversation(sid):
+        lookups.append(("session", current_workspace_id()))
+        return conv if current_workspace_id() in (42, 43) and sid == conv.id else None
+
+    def get_host(hid):
+        lookups.append(("host", current_workspace_id()))
+        return host if current_workspace_id() in (42, 43) and hid == conv.host_id else None
+
+    owner = service.conversations.get_session_owner_authority(conv.id, owner_only=True)
+
+    def get_owner(sid, owner_only):
+        lookups.append(("owner", current_workspace_id()))
+        return owner if current_workspace_id() in (42, 43) else None
+
+    service.conversations.get_conversation = conversation
+    service.conversations.get_session_owner_authority = get_owner
+    service.hosts.get_host = get_host
+    with workspace_scope(42):
+        proxy = service.launch_config(
+            conv, conv.runner_id, "openai-agents", conv.host_id, owner.user_id, owner.generation
+        )["server_inference"]
+    with workspace_scope(43):
+        other = service.launch_config(
+            conv, conv.runner_id, "openai-agents", conv.host_id, owner.user_id, owner.generation
+        )["server_inference"]
+    assert current_workspace_id() == 0
+    config = prepare({"server_inference": proxy}, tmp_path)
+    assert config["providers"]["server-inference"]["openai"]["base_url"] == proxy["url"]
+    path = proxy["url"].removeprefix("https://server.example")
+    other_path = other["url"].removeprefix("https://server.example")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        refreshed = await client.post(
+            path + "/token", headers={"Authorization": "Bearer " + proxy["grant"]}
+        )
+        assert refreshed.status_code == 200, refreshed.text
+        token = refreshed.json()["token"]
+        claims = jwt.decode(
+            token,
+            service.config.signing_key,
+            algorithms=["HS256"],
+            audience="omnigent-session-inference",
+        )
+        assert claims["workspace"] == 42
+        headers = {"Authorization": "Bearer " + token}
+        assert (await client.get(path + "/models", headers=headers)).status_code == 200
+        response = await client.post(
+            path + "/responses", headers=headers, json={"model": "model-a"}
+        )
+        assert response.status_code == 200
+        assert calls
+        assert all(workspace == 42 for _, workspace in lookups)
+        assert current_workspace_id() == 0
+        assert service.active_requests == 0
+        assert not service.active_sessions
+        count = len(calls)
+        assert (
+            await client.post(
+                other_path + "/token", headers={"Authorization": "Bearer " + proxy["grant"]}
+            )
+        ).status_code == 401
+        assert (
+            await client.post(
+                other_path + "/responses", headers=headers, json={"model": "model-a"}
+            )
+        ).status_code == 401
+        assert len(calls) == count
+        before = len(lookups)
+        corrupt = path.replace("/workspaces/", "/workspaces/x", 1)
+        assert (
+            await client.post(
+                corrupt + "/token", headers={"Authorization": "Bearer " + proxy["grant"]}
+            )
+        ).status_code == 401
+        assert len(lookups) == before
+        wrong_session = path.rsplit("/", 1)[0] + "/another-session"
+        assert (
+            await client.post(
+                wrong_session + "/token", headers={"Authorization": "Bearer " + proxy["grant"]}
+            )
+        ).status_code == 401
+        assert len(lookups) == before
+        assert current_workspace_id() == 0

@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -84,8 +85,16 @@ def main() -> None:
 
     app.router.routes.insert(0, app.router.routes.pop())
 
+    workspace = int(os.environ.get("OMNIGENT_E2E_WORKSPACE", "0"))
+
+    async def scoped_app(scope, receive, send):
+        # Refresh/inference arrive at the global origin without tenant context.
+        selected = 0 if scope.get("path", "").startswith("/v1/inference/") else workspace
+        with workspace_scope(selected):
+            await app(scope, receive, send)
+
     uvicorn.run(
-        app,
+        scoped_app,
         host="127.0.0.1",
         port=port,
         ssl_keyfile=str(root / "key.pem"),

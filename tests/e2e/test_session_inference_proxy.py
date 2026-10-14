@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import yaml
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -61,10 +62,12 @@ def _certificate(root: Path) -> None:
     (root / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
+@pytest.mark.parametrize("workspace", [0, 42])
 def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     tmp_path: Path,
     unused_tcp_port: int,
     isolated_mock_llm_server_url: str,
+    workspace: int,
 ) -> None:
     root = Path(__file__).resolve().parents[2]
     _certificate(tmp_path)
@@ -116,6 +119,7 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
         "OMNIGENT_E2E_PORT": str(unused_tcp_port),
         "OMNIGENT_E2E_PROVIDER": isolated_mock_llm_server_url,
         "OMNIGENT_E2E_SIGNING_KEY": "s" * 32,
+        "OMNIGENT_E2E_WORKSPACE": str(workspace),
         "OMNIGENT_DATA_DIR": str(tmp_path / "server-data"),
     }
     marker = "INFERENCE_PROXY_HOST_TURN_OK"

@@ -26,7 +26,10 @@ def _valid_url(url: object) -> bool:
         and not parts.password
         and not parts.query
         and not parts.fragment
-        and parts.path.startswith("/v1/inference/sessions/")
+        and (
+            parts.path.startswith("/v1/inference/sessions/")
+            or (parts.path.startswith("/v1/inference/workspaces/") and "/sessions/" in parts.path)
+        )
     )
 
 
