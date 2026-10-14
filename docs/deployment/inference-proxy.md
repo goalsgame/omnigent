@@ -69,7 +69,9 @@ reading the request body and released on upload failure, cancellation or respons
 completion. These are concurrency limits, not a distributed quota or per-user spending budget. Configure spending
 limits on the OpenRouter policy's backing key. Responses requests are stateless:
 background processing, stored responses and provider conversation references are
-rejected. Streaming content and usage events pass through to the harness.
+rejected. Streaming content and usage events pass through to the harness. A
+shared upstream client reuses connections and closes during server shutdown.
+Provider cookies are not retained between requests.
 
 `GET models` returns the configured catalog. Upstream HTTP errors return sanitized
 errors rather than provider response bodies. A disconnected client cancels the

@@ -4148,3 +4148,65 @@ async def test_explicit_launch_uses_persisted_harness_override(
         SqlAlchemyConversationStore(db_uri).get_conversation, created.json()["id"]
     )
     assert conv.harness_override == override
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+async def test_server_lifespan_closes_inference_pool(app):
+    proxy = app.state.inference_proxy
+    proxy.transport = httpx.MockTransport(lambda request: httpx.Response(200))
+    async with app.router.lifespan_context(app):
+        pool = proxy._upstream_client()
+        assert not pool.is_closed
+    assert pool.is_closed
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize(
+    "root_harness,child_harness",
+    [
+        ("claude-sdk", "openai-agents"),
+        ("openai-agents", "claude-sdk"),
+    ],
+)
+@pytest.mark.parametrize("child_auth", [False, True])
+async def test_explicit_subagent_launch_uses_child_harness(
+    client, app, db_uri, root_harness, child_harness, child_auth
+):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    child_executor = {"type": "omnigent", "config": {"harness": child_harness}}
+    if child_auth:
+        child_executor["auth"] = {"type": "api_key", "api_key": "$CHILD_TEST_API_KEY"}
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": root_harness}},
+        sub_agents=[{"name": "worker", "executor": child_executor}],
+    )
+    parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert parent.status_code == 201, parent.text
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent.json()["id"],
+            "sub_agent_name": "worker",
+        },
+    )
+    assert child.status_code == 201, child.text
+    conv = await asyncio.to_thread(
+        SqlAlchemyConversationStore(db_uri).get_conversation, child.json()["id"]
+    )
+    assert conv.sub_agent_name == "worker"
+    assert conv.harness_override is None
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={"session_id": child.json()["id"], "workspace": _WORKSPACE},
+    )
+    frame = await responder
+    assert response.status_code == 200, response.text
+    assert frame.harness == child_harness
+    if child_harness == "openai-agents" and not child_auth:
+        assert frame.inference_config["server_inference"]["harness"] == child_harness
+    else:
+        assert frame.inference_config is None

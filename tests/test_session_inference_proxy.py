@@ -800,3 +800,54 @@ async def test_signed_workspace_route_bootstraps_refresh_and_preserves_isolation
         ).status_code == 401
         assert len(lookups) == before
         assert current_workspace_id() == 0
+
+
+@pytest.mark.asyncio
+async def test_proxy_reuses_client_closes_responses_and_does_not_retain_cookies(setup):
+    service, app, conv, _, calls = setup
+    closed_responses = []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"data: done\n\n"
+
+        async def aclose(self):
+            closed_responses.append(True)
+
+    class Transport(httpx.AsyncBaseTransport):
+        closes = 0
+
+        async def handle_async_request(self, request):
+            calls.append(request)
+            return httpx.Response(
+                200, stream=Body(), headers={"set-cookie": "session=private; Path=/"}
+            )
+
+        async def aclose(self):
+            self.closes += 1
+
+    transport = Transport()
+    service.transport = transport
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        pool = None
+        for _ in range(2):
+            response = await client.post(
+                "/v1/inference/sessions/session/responses",
+                json={"model": "model-a"},
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert response.status_code == 200
+            if pool is None:
+                pool = service._client
+            assert service._client is pool
+            assert not pool.is_closed
+            assert transport.closes == 0
+            assert "cookie" not in calls[-1].headers
+            assert service.active_requests == 0
+    assert len(closed_responses) == 2
+    await service.aclose()
+    assert pool.is_closed
+    assert transport.closes == 1

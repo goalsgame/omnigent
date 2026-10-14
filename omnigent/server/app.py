@@ -1797,6 +1797,9 @@ def create_app(
         try:
             yield
         finally:
+            inference_proxy = getattr(app_inst.state, "inference_proxy", None)
+            if inference_proxy is not None:
+                await inference_proxy.aclose()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a

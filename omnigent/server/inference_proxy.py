@@ -12,6 +12,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -143,6 +144,27 @@ class InferenceProxy:
         self.machine_allowed = machine_allowed
         self.active_requests = 0
         self.active_sessions: set[tuple[int, str]] = set()
+        self._client: httpx.AsyncClient | None = None
+
+    def _upstream_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(180, connect=10),
+                follow_redirects=False,
+                trust_env=False,
+                transport=self.transport,
+                cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+                limits=httpx.Limits(
+                    max_connections=self.config.max_concurrent_requests,
+                    max_keepalive_connections=self.config.max_concurrent_requests,
+                    keepalive_expiry=60,
+                ),
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
 
     def _grant(
         self, session_id: str, runner_id: str, host_id: str, owner: str, generation: str | None
@@ -364,7 +386,6 @@ class InferenceProxy:
                 raise HTTPException(429, "Inference capacity exhausted")
             self.active_requests += 1
             self.active_sessions.add(session_key)
-            client = None
             upstream = None
             released = False
 
@@ -376,12 +397,8 @@ class InferenceProxy:
                 self.active_requests -= 1
                 self.active_sessions.discard(session_key)
                 with anyio.CancelScope(shield=True):
-                    try:
-                        if upstream is not None:
-                            await upstream.aclose()
-                    finally:
-                        if client is not None:
-                            await client.aclose()
+                    if upstream is not None:
+                        await upstream.aclose()
 
             try:
                 body = bytearray()
@@ -412,12 +429,7 @@ class InferenceProxy:
                     ):
                         raise HTTPException(400, "Only stateless inference is supported")
                     payload["store"] = False
-                client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(180, connect=10),
-                    follow_redirects=False,
-                    trust_env=False,
-                    transport=self.transport,
-                )
+                client = self._upstream_client()
                 credential = await self.broker.credential()
                 await self.authorize(session_id, access, workspace_id=workspace)
                 upstream = await client.send(

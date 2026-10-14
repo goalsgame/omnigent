@@ -626,7 +626,19 @@ async def _resolve_agent_harness(
     if agent is None or agent.bundle_location is None:
         return None
     loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
-    return canonicalize_harness(loaded.spec.executor.harness_kind)
+    executor = loaded.spec.executor
+    if conv.sub_agent_name:
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+        if sub is not None:
+            executor = sub.executor
+    harness = (
+        executor.config.get("harness")
+        or loaded.spec.executor.config.get("harness")
+        or executor.type
+    )
+    return canonicalize_harness(harness) or harness
 
 
 def create_hosts_router(
