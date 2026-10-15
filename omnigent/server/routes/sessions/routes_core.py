@@ -640,6 +640,9 @@ def register_core_routes(
                 stage="runner_launch",
             ),
         )
+        from omnigent.server.routes._host_launch import remember_inference_host_policy
+
+        await remember_inference_host_policy(target.conv, conn, host_registry, conversation_store)
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -2702,6 +2705,16 @@ def register_core_routes(
                     extra=debug_event("session_runner_unbound", session_id=session_id),
                 )
             else:
+                from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+                if (
+                    conv.labels.get(SEPARATE_INFERENCE_RUNNER_LABEL) == "1"
+                    and body.runner_id.strip() != conv.runner_id
+                ):
+                    raise OmnigentError(
+                        "This session requires its own runner; relaunch it on its host",
+                        code=ErrorCode.CONFLICT,
+                    )
                 from omnigent.server.routes import sessions as _sf
 
                 if (
@@ -3558,7 +3571,16 @@ def register_core_routes(
         # labels from the fork; otherwise the copied label would shadow the
         # freshly chosen mode. Only on an explicit pick: an untouched picker
         # sends no launch args and the label carries over as before.
-        dropped_label_keys_set: set[str] = set()
+        from omnigent.inference_config import (
+            INFERENCE_HOST_POLICY_LABEL,
+            SEPARATE_INFERENCE_RUNNER_LABEL,
+        )
+
+        # Physical placement belongs to this fork's own launch, not its source.
+        dropped_label_keys_set: set[str] = {
+            INFERENCE_HOST_POLICY_LABEL,
+            SEPARATE_INFERENCE_RUNNER_LABEL,
+        }
         if launch_args_set:
             dropped_label_keys_set |= {
                 _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -3589,7 +3611,37 @@ def register_core_routes(
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
 
-        # Side chats use the source for shared-runner routing and stay hidden
+        independent_side_host = None
+        if body.side_chat and body.host_type != "managed":
+            from omnigent.server.routes._host_launch import (
+                independent_inference_child_host,
+            )
+
+            independent_side_host = await independent_inference_child_host(
+                source,
+                source.runner_id,
+                getattr(request.app.state, "host_registry", None),
+                conversation_store,
+                host_store=getattr(request.app.state, "host_store", None),
+                user_id=user_id,
+            )
+            if independent_side_host is not None:
+                from omnigent.server.routes._sessions.helpers import _validate_session_workspace
+
+                side_workspace = await _validate_session_workspace(
+                    user_id=user_id,
+                    host_id=independent_side_host[0],
+                    workspace=independent_side_host[1],
+                    agent=base_agent,
+                    agent_cache=agent_cache,
+                    request=request,
+                )
+                independent_side_host = independent_side_host[0], side_workspace
+                from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+                extra_labels[SEPARATE_INFERENCE_RUNNER_LABEL] = "1"
+
+        # Side chats retain source ancestry for routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
@@ -3863,6 +3915,26 @@ def register_core_routes(
         # real-time path bypasses the list-endpoint's side-chat filter).
         if not body.side_chat:
             _announce_session_added(user_id, new_conv.id)
+
+        if independent_side_host is not None:
+            new_conv = await asyncio.to_thread(
+                conversation_store.set_host_id,
+                new_conv.id,
+                independent_side_host[0],
+                independent_side_host[1],
+            )
+            await _bind_and_launch_on_caller_host(
+                request,
+                user_id=user_id,
+                session_id=new_conv.id,
+                host_id=independent_side_host[0],
+                workspace=independent_side_host[1],
+                harness=None,
+                conversation=new_conv,
+            )
+            new_conv = await asyncio.to_thread(conversation_store.get_conversation, new_conv.id)
+            if new_conv is None:
+                raise _session_not_found()
 
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 

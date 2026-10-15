@@ -53,7 +53,9 @@ runner and refresh grant. Saved direct configurations retain exact-match
 validation. Reconnecting runners repeat this verification.
 On opted-in hosts, children launch independent runner processes in their inherited
 workspace so each harness retains its own provider configuration.
-JSON and uploaded-agent sessions use the same placement policy. Recovery keeps
+JSON and uploaded-agent sessions use the same placement policy. Generic side chats
+also receive independent runners and inference bindings so source and side turns
+can stream concurrently, subject to the shared server capacity. Recovery keeps
 these runners separate. Shared runner bindings are verified against authoritative
 same-runner lineage, including independently launched intermediate ancestors and generic side-chat sources.
 Grant files and generated runtime configs are removed when the runner stops or

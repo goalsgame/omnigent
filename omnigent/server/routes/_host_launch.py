@@ -217,6 +217,49 @@ def resolve_host_launch(
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
 
 
+async def remember_inference_host_policy(
+    conv: Conversation, conn: HostConnection, registry: HostRegistry, store: ConversationStore
+) -> None:
+    """Remember opt-in placement across host tunnel gaps and server restarts."""
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+    if not registry.server_inference_harnesses:
+        return
+    policy = conn.host_id if "server-inference-v1" in conn.hello.capabilities else ""
+    if conv.labels.get(INFERENCE_HOST_POLICY_LABEL, "") != policy:
+        await asyncio.to_thread(store.set_labels, conv.id, {INFERENCE_HOST_POLICY_LABEL: policy})
+        conv.labels[INFERENCE_HOST_POLICY_LABEL] = policy
+
+
+def inherited_inference_host_policy(
+    parent: Conversation, store: ConversationStore, host_id: str
+) -> bool:
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+
+    current = parent
+    visited: set[str] = set()
+    for _ in range(16):
+        if current.id in visited:
+            break
+        visited.add(current.id)
+        if current.host_id is not None:
+            return (
+                current.host_id == host_id
+                and current.labels.get(INFERENCE_HOST_POLICY_LABEL) == host_id
+            )
+        ancestor_id = (
+            current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if current.kind == "default" and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+            else current.parent_conversation_id
+        )
+        ancestor = store.get_conversation(ancestor_id) if ancestor_id else None
+        if ancestor is None:
+            break
+        current = ancestor
+    return False
+
+
 async def independent_inference_child_host(
     parent: Conversation | None,
     inherited_runner_id: str | None,
@@ -236,6 +279,8 @@ async def independent_inference_child_host(
     host_id = await asyncio.to_thread(routing_host_id, parent, store)
     conn = registry.get(host_id) if host_id else None
     if host_id is not None and conn is None:
+        if not await asyncio.to_thread(inherited_inference_host_policy, parent, store, host_id):
+            return None
         if host_store is not None:
             host = await asyncio.to_thread(
                 resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store

@@ -175,7 +175,11 @@ def app(runtime_init: None, db_uri: str, tmp_path, request, monkeypatch) -> Fast
 
 
 async def _connect_host(
-    app: FastAPI, *, inference: bool = False, personal_provider: bool = False
+    app: FastAPI,
+    *,
+    inference: bool = False,
+    personal_provider: bool = False,
+    opted_in: bool = True,
 ) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
@@ -198,7 +202,7 @@ async def _connect_host(
             version="0.1.0-test",
             frame_protocol_version=1,
             name="laptop",
-            capabilities=["server-inference-v1"] if inference else [],
+            capabilities=["server-inference-v1"] if inference and opted_in else [],
             configured_harnesses={"openai-agents": True if personal_provider else "needs-auth"}
             if inference
             else None,
@@ -4159,6 +4163,9 @@ async def test_explicit_launch_uses_persisted_harness_override(
         SqlAlchemyConversationStore(db_uri).get_conversation, created.json()["id"]
     )
     assert conv.harness_override == override
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+    assert conv.labels[INFERENCE_HOST_POLICY_LABEL] == _HOST_ID
 
 
 @pytest.mark.parametrize("app", ["proxy"], indirect=True)
@@ -4408,6 +4415,7 @@ async def test_json_and_uploaded_children_get_required_inference_runner(
     parent_frame = await responder
     if side_chat:
         source_runner = parent.json()["runner_id"]
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
         fork = await client.post(
             f"/v1/sessions/{parent.json()['id']}/fork",
             json={
@@ -4417,10 +4425,11 @@ async def test_json_and_uploaded_children_get_required_inference_runner(
         )
         assert fork.status_code == 201, fork.text
         side_id = fork.json()["id"]
+        parent_frame = await responder
         store = SqlAlchemyConversationStore(db_uri)
-        await asyncio.to_thread(store.set_runner_id, side_id, source_runner)
         side = await asyncio.to_thread(store.get_conversation, side_id)
-        assert side.workspace is None and side.parent_conversation_id is None
+        assert side.runner_id != source_runner
+        assert side.workspace == _WORKSPACE and side.parent_conversation_id is None
         parent = Mock(json=lambda: {"id": side_id})
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     if upload:
@@ -4590,3 +4599,177 @@ async def test_managed_child_preserves_own_placement(
     assert conv.runner_id is None and conv.host_id is None
     assert conv.workspace == workspace
     assert not (conv.labels or {}).get(SEPARATE_INFERENCE_RUNNER_LABEL)
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize("upload", [False, True])
+async def test_non_opted_in_host_gap_preserves_child_runner_affinity(
+    client, app, db_uri, upload, monkeypatch
+):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True, personal_provider=True, opted_in=False)
+    executor = {"type": "omnigent", "config": {"harness": "openai-agents"}}
+    agent = await create_test_agent(
+        client, executor=executor, sub_agents=[{"name": "worker", "executor": executor}]
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    parent = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    parent_frame = await responder
+    assert parent_frame.inference_config is None
+    monkeypatch.setattr(app.state.host_registry, "get", lambda *args, **kwargs: None)
+    if upload:
+        child = await client.post(
+            "/v1/sessions",
+            data={
+                "metadata": json.dumps({"parent_session_id": parent.json()["id"]}),
+            },
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="ordinary-child", executor=executor),
+                    "application/gzip",
+                )
+            },
+        )
+    else:
+        child = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent.json()["id"],
+                "sub_agent_name": "worker",
+            },
+        )
+    assert child.status_code == 201, child.text
+    sid = child.json().get("id") or child.json()["session_id"]
+    conv = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).get_conversation, sid)
+    assert conv.runner_id == parent.json()["runner_id"]
+    assert conv.host_id is None
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+async def test_proxy_side_chat_has_independent_binding_and_concurrent_admission(
+    client, app, db_uri
+):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "openai-agents"}}
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    parent = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    parent_frame = await responder
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    side = await client.post(f"/v1/sessions/{parent.json()['id']}/fork", json={"side_chat": True})
+    assert side.status_code == 201, side.text
+    side_frame = await responder
+    assert side.json()["runner_id"] != parent.json()["runner_id"]
+    assert side.json()["host_id"] == _HOST_ID
+    assert side.json()["workspace"] == _WORKSPACE
+    assert (
+        side_frame.inference_config["server_inference"]["url"]
+        != parent_frame.inference_config["server_inference"]["url"]
+    )
+    rebound = await client.patch(
+        f"/v1/sessions/{side.json()['id']}", json={"runner_id": parent.json()["runner_id"]}
+    )
+    assert rebound.status_code == 409, rebound.text
+    conv = await asyncio.to_thread(
+        SqlAlchemyConversationStore(db_uri).get_conversation, side.json()["id"]
+    )
+    assert conv.runner_id == side.json()["runner_id"]
+    ordinary = await client.post(f"/v1/sessions/{side.json()['id']}/fork", json={})
+    assert ordinary.status_code == 201, ordinary.text
+    assert ordinary.json()["runner_id"] is None
+    assert ordinary.json()["host_id"] is None
+    for label in ("omnigent.inference_host_policy", "omnigent.separate_inference_runner"):
+        assert label not in ordinary.json()["labels"]
+    service = app.state.inference_proxy
+    release = asyncio.Event()
+
+    class HeldStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await release.wait()
+            yield b"data: [DONE]\n\n"
+
+    async def credential():
+        return {"token": "server-only-secret"}
+
+    service.broker.credential = credential
+    service.transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=HeldStream(),
+        )
+    )
+    requests = []
+    try:
+        for frame in (parent_frame, side_frame):
+            binding = frame.inference_config["server_inference"]
+            url = binding["url"].removeprefix("https://server.example")
+            token = await client.post(
+                url + "/token", headers={"Authorization": "Bearer " + binding["grant"]}
+            )
+            assert token.status_code == 200, token.text
+            headers = {"Authorization": "Bearer " + token.json()["token"]}
+            requests.append(
+                asyncio.create_task(
+                    client.post(
+                        url + "/chat/completions",
+                        headers=headers,
+                        json={"model": "model-a", "stream": True},
+                    )
+                )
+            )
+            async with asyncio.timeout(budget(2.0)):
+                while service.active_requests < len(requests):
+                    await asyncio.sleep(0.01)
+            duplicate = await client.post(
+                url + "/chat/completions",
+                headers=headers,
+                json={"model": "model-a", "stream": True},
+            )
+            assert duplicate.status_code == 429, duplicate.text
+        assert service.active_requests == 2
+    finally:
+        release.set()
+        results = await asyncio.gather(*requests)
+    assert all(result.status_code == 200 for result in results)
+    assert service.active_requests == 0 and not service.active_sessions
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize(
+    "label", ["omnigent.inference_host_policy", "omnigent.separate_inference_runner"]
+)
+async def test_inference_placement_labels_cannot_be_forged_or_cleared(client, app, label):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    agent = await create_test_agent(client)
+    forged = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "labels": {label: "1"}}
+    )
+    assert forged.status_code == 400, forged.text
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    for value in ("1", "0", ""):
+        patched = await client.patch(
+            f"/v1/sessions/{created.json()['id']}", json={"labels": {label: value}}
+        )
+        assert patched.status_code == 400, patched.text

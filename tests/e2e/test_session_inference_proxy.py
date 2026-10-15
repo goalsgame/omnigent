@@ -225,7 +225,7 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 assert "server-only-provider" not in "".join(
                     path.read_text() for path in host_root.rglob("*.json")
                 )
-                # Follow the generic /side UI path: fork, reuse the source runner, then turn.
+                # The generic /side path receives an independent proxy-backed runner.
                 fork = client.post(
                     f"/v1/sessions/{session_id}/fork",
                     json={
@@ -235,8 +235,15 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 )
                 fork.raise_for_status()
                 side_id = fork.json()["id"]
-                bound = client.patch(f"/v1/sessions/{side_id}", json={"runner_id": runner_id})
-                bound.raise_for_status()
+                side_runner_id = fork.json()["runner_id"]
+                assert side_runner_id and side_runner_id != runner_id
+                deadline = time.monotonic() + 30
+                while (
+                    client.get(f"/v1/runners/{side_runner_id}/status").json().get("online")
+                    is not True
+                ):
+                    assert time.monotonic() < deadline, "side-chat runner did not connect"
+                    time.sleep(0.1)
                 side_initialized = client.post(f"/v1/_e2e/sessions/{side_id}/initialize").json()
                 assert side_initialized["status"] == 201, side_initialized
                 assert side_initialized["payload"]["inference_config_verified"] is True
@@ -281,6 +288,7 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 assert child_result["status"] == "completed", child_result
                 assert "CHILD_FROM_SIDE_OK" in final_assistant_text(child_result)
                 client.post(f"/v1/sessions/{child_id}/stop")
+                client.post(f"/v1/sessions/{side_id}/stop")
                 client.post(f"/v1/sessions/{session_id}/stop")
         finally:
             for process in reversed(processes):

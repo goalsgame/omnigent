@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
 SEPARATE_INFERENCE_RUNNER_LABEL = "omnigent.separate_inference_runner"
+INFERENCE_HOST_POLICY_LABEL = "omnigent.inference_host_policy"
 
 _runtime_config: ContextVar[dict[str, object] | None] = ContextVar(
     "inference_config", default=None

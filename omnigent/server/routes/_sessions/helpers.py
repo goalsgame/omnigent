@@ -6131,6 +6131,9 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
+        from omnigent.server.routes._host_launch import remember_inference_host_policy
+
+        await remember_inference_host_policy(conv, host_conn, host_registry, conversation_store)
         request_id = secrets.token_hex(8)
         launch_future: asyncio.Future[dict[str, str | None]] = (
             asyncio.get_running_loop().create_future()
@@ -10278,8 +10281,19 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.inference_config import (
+        INFERENCE_HOST_POLICY_LABEL,
+        SEPARATE_INFERENCE_RUNNER_LABEL,
+    )
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
+
+    for key in (INFERENCE_HOST_POLICY_LABEL, SEPARATE_INFERENCE_RUNNER_LABEL):
+        if key in labels:
+            raise OmnigentError(
+                f"label {key!r} is server-internal and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     if SIDE_CHAT_SOURCE_LABEL_KEY in labels:
         raise OmnigentError(
