@@ -3905,3 +3905,44 @@ def test_length_completion_with_tool_call_is_not_empty_failure() -> None:
 """
     )
     _run_extension_script(node, _extension_path(), script)
+
+
+def test_assistant_events_use_current_relay_without_expired_launch_bearer(tmp_path: Path) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+const calls = [];
+let rejectRelay = false;
+global.fetch = async (url, request) => {
+  calls.push({url, headers: request.headers});
+  const isRelay = url.startsWith("http://127.0.0.1:");
+  return {ok: isRelay && !rejectRelay, status: isRelay && !rejectRelay ? 202 : 401};
+};
+function configureRelay(port, token) {
+  fs.writeFileSync(configPath, JSON.stringify({
+    serverUrl: "http://omnigent.test", sessionId: "session-1",
+    authHeaders: {authorization: "Bearer expired-launch-token"},
+    ...(port ? {relayUrl: `http://127.0.0.1:${port}`, relayToken: token} : {}),
+  }));
+}
+const message = {role: "assistant", responseId: "reply-1",
+  content: [{type: "text", text: "durable answer"}]};
+(async () => {
+  configureRelay(null, null);
+  await assert.rejects(handlers.message_end({message}, ctx), /HTTP 401/);
+  assert.equal(calls[0].url, "http://omnigent.test/v1/sessions/session-1/events");
+  configureRelay(12345, "local-one");
+  await handlers.message_end({message}, ctx);
+  assert.equal(calls[1].url, "http://127.0.0.1:12345/events");
+  assert.equal(calls[1].headers.authorization, "Bearer local-one");
+  configureRelay(12346, "local-two");
+  rejectRelay = true;
+  await assert.rejects(handlers.message_end({message: {...message, responseId: "reply-2"}}, ctx), /HTTP 401/);
+  assert.equal(calls.length, 3, "relay failures must not fall back to stale server credentials");
+  assert.equal(calls[2].url, "http://127.0.0.1:12346/events");
+  assert.equal(calls[2].headers.authorization, "Bearer local-two");
+})().catch(error => {console.error(error.stack || error); process.exit(1);});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
