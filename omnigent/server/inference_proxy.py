@@ -248,14 +248,19 @@ class InferenceProxy:
             }
         }
 
+    def _owner_authority(self, conv: Any) -> Any:
+        owner = self.conversations.get_session_owner_authority(conv.id, owner_only=True)
+        root = getattr(conv, "root_conversation_id", None)
+        if owner is None and root and root != conv.id:
+            owner = self.conversations.get_session_owner_authority(root, owner_only=True)
+        return owner
+
     async def _session(self, session_id: str) -> Any:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.archived or not conv.host_id or not conv.runner_id:
             raise HTTPException(401, "Inference session unavailable")
         host = await asyncio.to_thread(self.hosts.get_host, conv.host_id)
-        owner = await asyncio.to_thread(
-            self.conversations.get_session_owner_authority, session_id, owner_only=True
-        )
+        owner = await asyncio.to_thread(self._owner_authority, conv)
         if (
             host is None
             or owner is None
@@ -270,6 +275,29 @@ class InferenceProxy:
         ):
             raise HTTPException(401, "Inference session unavailable")
         return conv, owner
+
+    def _verify_runner_lineage(self, binding: Any, target_id: str) -> None:
+        """Require the target and its ancestor binding to share runner and ownership."""
+        target = self.conversations.get_conversation(target_id)
+        if target is None or target.archived or target.runner_id != binding.runner_id:
+            raise HTTPException(401, "Invalid inference lineage")
+        target_owner = self._owner_authority(target)
+        binding_owner = self._owner_authority(binding)
+        if target_owner != binding_owner or target_owner is None:
+            raise HTTPException(401, "Invalid inference lineage")
+        current = target
+        visited: set[str] = set()
+        for _ in range(32):
+            if current.id == binding.id:
+                return
+            if current.id in visited or not current.parent_conversation_id:
+                break
+            visited.add(current.id)
+            ancestor = self.conversations.get_conversation(current.parent_conversation_id)
+            if ancestor is None or ancestor.archived or ancestor.runner_id != binding.runner_id:
+                break
+            current = ancestor
+        raise HTTPException(401, "Invalid inference lineage")
 
     async def authorize(
         self,
@@ -327,7 +355,10 @@ class InferenceProxy:
         @router.post("/inference/workspaces/{workspace_route}/sessions/{session_id}/token")
         @router.post("/inference/sessions/{session_id}/token")
         async def token(
-            request: Request, session_id: str, workspace_route: str | None = None
+            request: Request,
+            session_id: str,
+            workspace_route: str | None = None,
+            runner_session_id: str | None = None,
         ) -> JSONResponse:
             import jwt
 
@@ -335,6 +366,9 @@ class InferenceProxy:
             conv, binding = await self.authorize(
                 session_id, bearer(request), refresh=True, workspace_id=workspace
             )
+            if runner_session_id is not None:
+                with workspace_scope(workspace):
+                    await asyncio.to_thread(self._verify_runner_lineage, conv, runner_session_id)
             now = int(time.time())
             encoded = jwt.encode(
                 {
@@ -372,6 +406,11 @@ class InferenceProxy:
                         "models": claims["models"],
                         "harness": claims["harness"],
                         "grant_hash": binding,
+                        **(
+                            {"runner_session_id": runner_session_id}
+                            if runner_session_id is not None
+                            else {}
+                        ),
                     }
             return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 

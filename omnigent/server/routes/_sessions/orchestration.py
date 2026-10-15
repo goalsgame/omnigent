@@ -10628,43 +10628,25 @@ async def _create_session_from_existing_agent(
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
 
-    if inherited_runner_id is not None and selection_spec is not None:
-        assert _parent_for_routing is not None
-        from omnigent.runner.routing import routing_host_id
-        from omnigent.server.routes._host_launch import (
-            executor_has_explicit_auth,
-            inherited_runner_workspace,
-        )
+    from omnigent.server.routes._host_launch import independent_inference_child_host
 
-        registry = getattr(request.app.state, "host_registry", None)
-        parent_host_id = await asyncio.to_thread(
-            routing_host_id, _parent_for_routing, conversation_store
+    independent_host = await independent_inference_child_host(
+        _parent_for_routing,
+        inherited_runner_id,
+        selection_spec,
+        harness_override,
+        getattr(request.app.state, "host_registry", None),
+        conversation_store,
+    )
+    if independent_host is not None:
+        separate_inference_runner = True
+        inherited_runner_id = None
+        body = body.model_copy(
+            update={
+                "host_id": body.host_id or independent_host[0],
+                "workspace": body.workspace or independent_host[1],
+            }
         )
-        parent_conn = registry.get(parent_host_id) if registry and parent_host_id else None
-        if (
-            registry is not None
-            and parent_conn is not None
-            and parent_host_id is not None
-            and "server-inference-v1" in parent_conn.hello.capabilities
-            and registry.server_inference_harnesses
-            and executor_has_explicit_auth(selection_spec.executor)
-            and not _parent_for_routing.inference_snapshot
-        ):
-            # Dedicated host binding also keeps child recovery off the parent's runner.
-            separate_inference_runner = True
-            inherited_runner_id = None
-            body = body.model_copy(
-                update={
-                    "host_id": body.host_id or parent_host_id,
-                    "workspace": body.workspace
-                    or await asyncio.to_thread(
-                        inherited_runner_workspace,
-                        _parent_for_routing,
-                        conversation_store,
-                        parent_host_id,
-                    ),
-                }
-            )
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must

@@ -170,15 +170,10 @@ async def verify_transient_runner_inference_config(
         if credential["url"] != marker["url"]:
             raise ValueError("Proxy binding URL mismatch")
         parts = urlsplit(marker["url"])
-        allowed_sessions = {
-            envelope.session_id,
-            envelope.snapshot.parent_session_id,
-            envelope.snapshot.root_session_id,
-        }
         binding_session = parts.path.rsplit("/", 1)[-1]
         if (
             not parts.path.startswith("/v1/inference/workspaces/")
-            or binding_session not in allowed_sessions
+            or not binding_session
             or parts.query
             or parts.fragment
         ):
@@ -193,6 +188,7 @@ async def verify_transient_runner_inference_config(
             parts.path + "/token",
             headers={"Authorization": "Bearer " + credential["grant"]},
             auth=None,
+            params={"runner_session_id": envelope.session_id},
             timeout=10,
         )
         response.raise_for_status()
@@ -204,6 +200,7 @@ async def verify_transient_runner_inference_config(
             "session_id": binding_session,
             "runner_id": token_bound_runner_id(token),
             "grant_hash": hashlib.sha256(credential["grant"].encode()).hexdigest(),
+            "runner_session_id": envelope.session_id,
         }
         if attested != target:
             raise ValueError("Proxy binding verification failed")

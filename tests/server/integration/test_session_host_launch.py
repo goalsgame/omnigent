@@ -67,7 +67,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.budgets import Deadline, budget
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
@@ -4252,13 +4252,14 @@ async def test_authenticated_child_gets_own_runner_on_proxy_host(
     parent_frame = await responder
     assert parent_frame.inference_config["server_inference"]
     if nested:
-        intermediate = await client.post(
-            "/v1/sessions",
-            json={"agent_id": agent["id"], "parent_session_id": parent.json()["id"]},
+        intermediate = await asyncio.to_thread(
+            SqlAlchemyConversationStore(db_uri).create_conversation,
+            agent_id=agent["id"],
+            parent_conversation_id=parent.json()["id"],
+            runner_id=parent.json()["runner_id"],
+            kind="sub_agent",
         )
-        assert intermediate.status_code == 201, intermediate.text
-        assert intermediate.json()["runner_id"] == parent.json()["runner_id"]
-        parent = intermediate
+        parent = Mock(json=lambda: {"id": intermediate.id})
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     child = await client.post(
         "/v1/sessions",
@@ -4287,3 +4288,111 @@ async def test_authenticated_child_gets_own_runner_on_proxy_host(
     # Losing the child's tunnel must not move its credentials back into the parent.
     assert await _heal_subagent_runner_binding_via_parent(conv, None, None, store) is None
     assert (await asyncio.to_thread(store.get_conversation, conv.id)).runner_id == conv.runner_id
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize("upload", [False, True])
+@pytest.mark.parametrize(
+    "root_harness,child_harness,child_auth",
+    [
+        ("claude-sdk", "openai-agents", False),
+        ("openai-agents", "pi-native", False),
+        ("openai-agents", "openai-agents", True),
+    ],
+)
+async def test_json_and_uploaded_children_get_required_inference_runner(
+    client,
+    app,
+    db_uri,
+    upload,
+    root_harness,
+    child_harness,
+    child_auth,
+):
+    from dataclasses import replace
+
+    from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    registry = app.state.host_registry
+    registry.server_inference_harnesses = ("openai-agents", "pi-native")
+    app.state.inference_proxy.config = replace(
+        app.state.inference_proxy.config,
+        harnesses=registry.server_inference_harnesses,
+    )
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHarnessReadinessFrame(
+                    configured_harnesses={
+                        "openai-agents": "needs-auth",
+                        "pi-native": "needs-auth",
+                        "claude-sdk": True,
+                    }
+                ),
+            ),
+        }
+    )
+    async with asyncio.timeout(budget(2.0)):
+        while registry.get(_HOST_ID).reported_harnesses.get("pi-native") != "needs-auth":
+            await asyncio.sleep(0.01)
+    child_executor = {"type": "omnigent", "config": {"harness": child_harness}}
+    if child_auth:
+        child_executor["auth"] = {"type": "api_key", "api_key": "$CHILD_TEST_API_KEY"}
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": root_harness}},
+        sub_agents=[{"name": "worker", "executor": child_executor}],
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    parent = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    parent_frame = await responder
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    if upload:
+        child = await client.post(
+            "/v1/sessions",
+            data={
+                "metadata": json.dumps({"parent_session_id": parent.json()["id"]}),
+            },
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(
+                        name="uploaded-worker",
+                        executor=child_executor,
+                    ),
+                    "application/gzip",
+                )
+            },
+        )
+    else:
+        child = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent.json()["id"],
+                "sub_agent_name": "worker",
+            },
+        )
+    assert child.status_code == 201, child.text
+    frame = await responder
+    assert frame.binding_token != parent_frame.binding_token
+    assert frame.harness == child_harness
+    if child_auth:
+        assert frame.inference_config is None
+    else:
+        assert frame.inference_config["server_inference"]["harness"] == child_harness
+    sid = child.json().get("id") or child.json()["session_id"]
+    conv = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).get_conversation, sid)
+    assert conv.labels[SEPARATE_INFERENCE_RUNNER_LABEL] == "1"
+    assert conv.host_id == _HOST_ID and conv.workspace == _WORKSPACE

@@ -851,3 +851,97 @@ async def test_proxy_reuses_client_closes_responses_and_does_not_retain_cookies(
     await service.aclose()
     assert pool.is_closed
     assert transport.closes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", [None, "unrelated", "runner", "owner", "archived", "cycle"])
+async def test_attestation_accepts_only_actual_same_runner_ancestor(setup, mutation):
+    from omnigent.entities import Conversation
+
+    service, app, binding, host, _ = setup
+    binding.parent_conversation_id = "root"
+    binding.root_conversation_id = "root"
+    rows = {
+        "root": Conversation(
+            id="root", created_at=1, updated_at=1, agent_id="agent", root_conversation_id="root"
+        ),
+        binding.id: binding,
+    }
+    parent_id = binding.id
+    for sid in ("child", "grandchild"):
+        rows[sid] = Conversation(
+            id=sid,
+            created_at=1,
+            updated_at=1,
+            agent_id="agent",
+            kind="sub_agent",
+            root_conversation_id="root",
+            parent_conversation_id=parent_id,
+            runner_id=binding.runner_id,
+        )
+        parent_id = sid
+    service.conversations.get_conversation = rows.get
+    service.conversations.get_session_owner_authority = lambda sid, owner_only: SimpleNamespace(
+        user_id="bob" if mutation == "owner" and sid == "grandchild" else "alice",
+        generation="generation",
+    )
+    if mutation == "unrelated":
+        rows["grandchild"].parent_conversation_id = "root"
+    if mutation == "runner":
+        rows["grandchild"].runner_id = "different"
+    if mutation == "archived":
+        rows["child"].archived = True
+    if mutation == "cycle":
+        rows["child"].parent_conversation_id = "grandchild"
+    config = service.launch_config(
+        binding,
+        binding.runner_id,
+        "openai-agents",
+        binding.host_id,
+        "alice",
+        host.account_generation,
+    )["server_inference"]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        response = await client.post(
+            config["url"] + "/token",
+            params={"runner_session_id": "grandchild"},
+            headers={"Authorization": "Bearer " + config["grant"]},
+        )
+    if mutation is None:
+        assert response.status_code == 200, response.text
+        assert response.json()["runtime_binding"]["runner_session_id"] == "grandchild"
+        assert response.json()["runtime_binding"]["session_id"] == binding.id
+    else:
+        assert response.status_code == 401, response.text
+
+
+@pytest.mark.asyncio
+async def test_inherited_owner_binding_revokes_when_root_authority_changes(setup):
+    service, app, binding, host, _ = setup
+    binding.root_conversation_id = "root"
+    root_owner = SimpleNamespace(user_id="alice", generation="generation")
+    service.conversations.get_session_owner_authority = lambda sid, owner_only: (
+        root_owner if sid == "root" else None
+    )
+    config = service.launch_config(
+        binding,
+        binding.runner_id,
+        "openai-agents",
+        binding.host_id,
+        "alice",
+        host.account_generation,
+    )["server_inference"]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        first = await client.post(
+            config["url"] + "/token", headers={"Authorization": "Bearer " + config["grant"]}
+        )
+        assert first.status_code == 200, first.text
+        root_owner.generation = "replacement-registration"
+        revoked = await client.post(
+            config["url"] + "/token", headers={"Authorization": "Bearer " + config["grant"]}
+        )
+        assert revoked.status_code == 401

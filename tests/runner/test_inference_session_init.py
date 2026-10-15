@@ -177,6 +177,7 @@ async def test_transient_proxy_init_is_server_verified_and_runner_bound(
         "harness": "openai-agents",
         "models": ["model-a"],
         "grant_hash": hashlib.sha256(b"g" * 64).hexdigest(),
+        "runner_session_id": sid,
     }
     if mode == "wrong-runner":
         binding["runner_id"] = "other-runner"
@@ -188,7 +189,7 @@ async def test_transient_proxy_init_is_server_verified_and_runner_bound(
                 return await authenticated.post(url, **kwargs)
             verification_calls.append((url, kwargs))
             return httpx.Response(
-                401 if mode == "revoked" else 200,
+                401 if mode in ("revoked", "wrong-session") else 200,
                 json={"runtime_binding": binding},
                 request=httpx.Request("POST", "https://server.example" + url),
             )
@@ -227,5 +228,5 @@ async def test_transient_proxy_init_is_server_verified_and_runner_bound(
         assert response.status_code == 409, response.text
         assert response.json()["error"] == "inference_config_mismatch"
         assert not manager.get_client_calls
-    if mode in ("wrong-session", "tampered-provider", "saved-direct"):
+    if mode in ("tampered-provider", "saved-direct"):
         assert not verification_calls

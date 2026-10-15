@@ -51,6 +51,11 @@ Before session initialization, runners verify transient proxy configuration
 against the authoritative server, including the issued model policy, session,
 runner and refresh grant. Saved direct configurations retain exact-match
 validation. Reconnecting runners repeat this verification.
+On opted-in hosts, children needing server inference or carrying agent-owned
+authentication launch independent runner processes in their inherited workspace.
+JSON and uploaded-agent sessions use the same placement policy. Recovery keeps
+these runners separate. Shared runner bindings are verified against authoritative
+same-runner lineage, including independently launched intermediate ancestors.
 Grant files and generated runtime configs are removed when the runner stops or
 exits, or a launch fails.
 

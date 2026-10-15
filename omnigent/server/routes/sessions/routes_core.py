@@ -1065,6 +1065,30 @@ def register_core_routes(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
 
+        from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+        from omnigent.server.routes._host_launch import independent_inference_child_host
+
+        independent_host = await independent_inference_child_host(
+            parent_conv,
+            inherited_runner_id,
+            spec,
+            None,
+            getattr(request.app.state, "host_registry", None),
+            conversation_store,
+        )
+        if independent_host is not None:
+            inherited_runner_id = None
+            parsed_metadata = parsed_metadata.model_copy(
+                update={
+                    "host_id": parsed_metadata.host_id or independent_host[0],
+                    "workspace": parsed_metadata.workspace or independent_host[1],
+                    "labels": {
+                        **(parsed_metadata.labels or {}),
+                        SEPARATE_INFERENCE_RUNNER_LABEL: "1",
+                    },
+                }
+            )
+
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
         # (mirroring the JSON path — a bad workspace never produces a
