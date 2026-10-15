@@ -553,6 +553,9 @@ class InferenceProxy:
                         if not task.done():
                             task.cancel()
                     await asyncio.gather(preparing, watching, return_exceptions=True)
+                if not watching.cancelled():
+                    watching.result()
+                    raise HTTPException(499, "Inference client disconnected")
                 assert upstream is not None
                 response = upstream
                 if response.status_code != 200:
