@@ -3845,10 +3845,27 @@ def test_generic_gateway_secondary_preserves_thinking(
     assert settings["defaultThinkingLevel"] == "medium"
 
 
+@pytest.mark.parametrize("windows_command", [False, True])
 def test_server_inference_binding_renders_pi_chat_models_and_refresh_command(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows_command: bool,
 ) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    from omnigent.host import inference_proxy
     from omnigent.host.inference_proxy import prepare
+
+    if windows_command:
+        monkeypatch.setattr(
+            inference_proxy, "sys", SimpleNamespace(platform="win32", executable=sys.executable)
+        )
+        monkeypatch.setattr(
+            inference_proxy,
+            "_system_powershell",
+            lambda: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        )
 
     url = "https://server.example/v1/inference/sessions/session"
     config = prepare(
@@ -3871,7 +3888,7 @@ def test_server_inference_binding_renders_pi_chat_models_and_refresh_command(
     assert rendered["api"] == "openai-completions"
     assert rendered["apiKey"].startswith("!")
     command = rendered["apiKey"][1:]
-    if command.startswith("powershell.exe "):
+    if " -EncodedCommand " in command:
         import base64
 
         command = base64.b64decode(command.rsplit(" ", 1)[1]).decode("utf-16-le")
