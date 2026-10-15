@@ -318,7 +318,7 @@ def _clone(args: list[str], config: dict, remote: str) -> int:
     refs.add_argument("--branch")
     refs.add_argument("--revision")
     try:
-        options, unknown = parser.parse_known_args(args)
+        options, unknown = parser.parse_known_intermixed_args(args)
     except argparse.ArgumentError:
         raise LoreCheckoutError("Invalid managed Lore clone arguments") from None
     if unknown or options.remote != remote:

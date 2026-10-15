@@ -552,7 +552,10 @@ def _render_workspace_prep_command(
         script += "pids=''\nwired=''\ncredential_config=''\n"
         script += (
             "cleanup_credentials() {\n"
-            '  if [ -n "$credential_config" ]; then rm -f -- "$credential_config"; fi\n'
+            "  cleanup_status=$?\n"
+            '  for p in $pids; do wait "$p" || :; done\n'
+            '  if [ -n "$credential_config" ]; then rm -f -- "$credential_config" || :; fi\n'
+            '  return "$cleanup_status"\n'
             "}\n"
             "trap cleanup_credentials EXIT\n"
         )

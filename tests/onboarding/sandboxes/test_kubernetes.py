@@ -2208,3 +2208,43 @@ git() {{
     assert result.returncode == 86, result.stderr
     assert (tmp_path / "git-finished").exists()
     assert not (tmp_path / "credentials-removed-early").exists()
+
+
+@pytest.mark.parametrize("failure", ["conflict", "credentials"])
+def test_foreground_preparation_failure_drains_lore_child(tmp_path: Path, failure: str) -> None:
+    workspace = tmp_path / "workspace"
+    if failure == "conflict":
+        destination = workspace / "git"
+        destination.mkdir(parents=True)
+        (destination / "preserve.txt").write_text("unsaved")
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [
+            RepoWorkspace(url="lores://lore.example.test/game", branch=None, repo_name="game"),
+            RepoWorkspace(url="https://git.example.test/team/git", branch=None, repo_name="git"),
+        ],
+        ":",
+        "host",
+    )
+    root = shlex.quote(str(tmp_path))
+    python = shlex.quote(sys.executable)
+    prefix = f"""
+root={root}
+python3() {{
+    if [ "$1" = "-I" ]; then
+        exec >/dev/null 2>&1
+        sleep 0.3
+        touch "$root/lore-finished"
+        return 0
+    fi
+    if [ "$1" = "-c" ]; then return 2; fi
+    {python} "$@"
+}}
+"""
+    result = subprocess.run(
+        ["bash", "-c", prefix + command[-1]], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == (1 if failure == "conflict" else 2), result.stderr
+    assert (tmp_path / "lore-finished").exists()
+    if failure == "conflict":
+        assert (workspace / "git/preserve.txt").read_text() == "unsaved"

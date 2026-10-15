@@ -119,8 +119,13 @@ print('ok')
             ("nested/copy", ["clone"], "--revision", "369"),
             ("branch-copy", ["repository", "clone"], "--branch", "main"),
         ):
+            clone_args = (
+                [*prefix, remote, relative, flag, ref]
+                if relative == "copy"
+                else [*prefix, remote, flag, ref, relative]
+            )
             copied = subprocess.run(
-                [str(lore_checkout._home() / "bin/lore"), *prefix, remote, relative, flag, ref],
+                [str(lore_checkout._home() / "bin/lore"), *clone_args],
                 cwd=home,
                 env=env,
                 capture_output=True,
