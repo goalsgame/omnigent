@@ -4303,6 +4303,7 @@ async def test_authenticated_child_gets_own_runner_on_proxy_host(
         ("openai-agents", "claude-sdk", False),
     ],
 )
+@pytest.mark.parametrize("side_chat", [False, True])
 async def test_json_and_uploaded_children_get_required_inference_runner(
     client,
     app,
@@ -4311,6 +4312,7 @@ async def test_json_and_uploaded_children_get_required_inference_runner(
     root_harness,
     child_harness,
     child_auth,
+    side_chat,
 ):
     from dataclasses import replace
 
@@ -4360,6 +4362,22 @@ async def test_json_and_uploaded_children_get_required_inference_runner(
     )
     assert parent.status_code == 201, parent.text
     parent_frame = await responder
+    if side_chat:
+        source_runner = parent.json()["runner_id"]
+        fork = await client.post(
+            f"/v1/sessions/{parent.json()['id']}/fork",
+            json={
+                "title": "Side chat",
+                "side_chat": True,
+            },
+        )
+        assert fork.status_code == 201, fork.text
+        side_id = fork.json()["id"]
+        store = SqlAlchemyConversationStore(db_uri)
+        await asyncio.to_thread(store.set_runner_id, side_id, source_runner)
+        side = await asyncio.to_thread(store.get_conversation, side_id)
+        assert side.workspace is None and side.parent_conversation_id is None
+        parent = Mock(json=lambda: {"id": side_id})
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     if upload:
         child = await client.post(

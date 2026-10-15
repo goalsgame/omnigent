@@ -243,6 +243,8 @@ def inherited_runner_workspace(
     parent: Conversation, store: ConversationStore, host_id: str
 ) -> str | None:
     """Find the shared runner's workspace without crossing an explicit host boundary."""
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+
     current = parent
     visited: set[str] = set()
     for _ in range(16):
@@ -251,9 +253,14 @@ def inherited_runner_workspace(
         visited.add(current.id)
         if current.workspace:
             return current.workspace
-        if not current.parent_conversation_id:
+        ancestor_id = (
+            current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if current.kind == "default" and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+            else current.parent_conversation_id
+        )
+        if not ancestor_id:
             return None
-        ancestor = store.get_conversation(current.parent_conversation_id)
+        ancestor = store.get_conversation(ancestor_id)
         if ancestor is None:
             return None
         current = ancestor

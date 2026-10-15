@@ -245,6 +245,38 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 )
                 assert side_result["status"] == "completed", side_result
                 assert "PROXY_SIDE_CHAT_OK" in final_assistant_text(side_result)
+                child = client.post(
+                    "/v1/sessions",
+                    json={
+                        "agent_id": agent_id,
+                        "parent_session_id": side_id,
+                    },
+                )
+                child.raise_for_status()
+                child_id = child.json()["id"]
+                assert child.json()["runner_id"] != runner_id
+                assert child.json()["workspace"] == str(tmp_path)
+                deadline = time.monotonic() + 30
+                while (
+                    client.get(f"/v1/runners/{child.json()['runner_id']}/status")
+                    .json()
+                    .get("online")
+                    is not True
+                ):
+                    assert time.monotonic() < deadline, "child runner did not connect"
+                    time.sleep(0.1)
+                child_initialized = client.post(f"/v1/_e2e/sessions/{child_id}/initialize").json()
+                assert child_initialized.get("status") == 201, child_initialized
+                configure_mock_llm(isolated_mock_llm_server_url, [{"text": "CHILD_FROM_SIDE_OK"}])
+                child_response = send_user_message_to_session(
+                    client, session_id=child_id, content="Reply from the child."
+                )
+                child_result = poll_session_until_terminal(
+                    client, session_id=child_id, response_id=child_response, timeout=120
+                )
+                assert child_result["status"] == "completed", child_result
+                assert "CHILD_FROM_SIDE_OK" in final_assistant_text(child_result)
+                client.post(f"/v1/sessions/{child_id}/stop")
                 client.post(f"/v1/sessions/{session_id}/stop")
         finally:
             for process in reversed(processes):
