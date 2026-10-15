@@ -168,7 +168,8 @@ server-authored policy reference; model changes and forks are checked against
 the server catalog without copying upstream credentials to the workspace.
 Child sessions on the same inference host inherit the policy for their own
 harness unless they declare personal authentication. Catalog choices remain
-available while the runner is offline. Start a new session to switch a
+available while the runner is offline. Managed forks retain their provider
+unless another compatible destination is explicitly selected. Start a new session to switch a
 proxy-backed session to another agent.
 A server and runner upgrade is
 required when introducing per-model protocols or limits; relaunch existing

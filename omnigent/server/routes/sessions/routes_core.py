@@ -3404,7 +3404,9 @@ def register_core_routes(
             PROXY_POLICY_LABEL,
             actual_harness,
             configured_snapshot,
+            managed_proxy_catalog,
             proxy_policy,
+            selected_catalog_model,
             validate_saved_selection,
         )
 
@@ -3550,13 +3552,36 @@ def register_core_routes(
                 "Start a new session to change a server inference agent",
                 code=ErrorCode.INVALID_INPUT,
             )
+        destination_proxy_policy = source_proxy_policy
+        destination_proxy_catalog = None
+        if source_proxy_policy is not None and body.host_type == "managed":
+            # An omitted destination preserves the source provider, independently
+            # of later deployment-default changes. Explicit destinations must
+            # support the same server-managed inference policy.
+            provider = body.sandbox_provider or source_proxy_policy["provider"]
+            destination_proxy_catalog = managed_proxy_catalog(
+                request, provider, source_proxy_policy["harness"]
+            )
+            if destination_proxy_catalog is None:
+                raise OmnigentError(
+                    "The destination sandbox does not support this session's server inference policy",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            target = request.app.state.sandbox_config.for_provider(provider)
+            assert target is not None
+            destination_proxy_policy = {**source_proxy_policy, "provider": target.provider}
+            body = body.model_copy(update={"sandbox_provider": target.provider})
         if source_configured or source_proxy_policy is not None:
             selected_model = (
                 (None if clear_override_model else override_model)
                 if model_override_set
                 else source.model_override
             )
-            override_model = await validate_saved_selection(request, source, selected_model)
+            override_model = (
+                selected_catalog_model(destination_proxy_catalog, selected_model)
+                if destination_proxy_catalog is not None
+                else await validate_saved_selection(request, source, selected_model)
+            )
             clear_override_model = False
             model_override_set = True
 
@@ -3622,8 +3647,8 @@ def register_core_routes(
         # so refuse to stamp it on a non-Codex fork). Stamped via extra_labels,
         # which the store applies AFTER the drop so the opt-in wins.
         extra_labels: dict[str, str] = {}
-        if source_proxy_policy is not None:
-            extra_labels[PROXY_POLICY_LABEL] = source.labels[PROXY_POLICY_LABEL]
+        if destination_proxy_policy is not None:
+            extra_labels[PROXY_POLICY_LABEL] = json.dumps(destination_proxy_policy)
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":

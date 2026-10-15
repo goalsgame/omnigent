@@ -1232,3 +1232,44 @@ async def test_proxy_child_inherits_policy_unless_personally_authenticated(
             f"/v1/sessions/{child_id}", json={"model_override": "claude-model", "silent": True}
         )
         assert changed.status_code == 400, changed.text
+
+
+@pytest.mark.parametrize(
+    "destination,expected",
+    [(None, "agent_sandbox"), ("kubernetes", "kubernetes"), ("modal", None)],
+)
+async def test_managed_proxy_fork_launch_and_policy_use_same_provider(
+    env: _Env, destination, expected
+):
+    from dataclasses import replace
+
+    _enable_managed_proxy(env)
+    source_id = await _proxy_session(env)
+    original = env.app.state.sandbox_config.default
+    env.app.state.sandbox_config = ManagedSandboxDeployment(
+        configs=(
+            replace(original, provider="modal", host_config={}),
+            replace(original, provider="kubernetes", host_config={}),
+            original,
+        )
+    )
+    before = env.persisted()
+    env.launch.reset_mock()
+    body = {"host_type": "managed"}
+    if destination is not None:
+        body["sandbox_provider"] = destination
+    response = await env.client.post(f"/v1/sessions/{source_id}/fork", json=body)
+    if expected is None:
+        assert response.status_code == 400, response.text
+        assert "destination sandbox" in response.text
+        assert env.persisted() == before
+        env.launch.assert_not_awaited()
+    else:
+        assert response.status_code == 201, response.text
+        fork = env.store.get_conversation(response.json()["id"])
+        assert fork.inference_snapshot is None
+        policy = json.loads(fork.labels["omnigent.sandbox.inference_policy"])
+        assert policy == {"provider": expected, "harness": "pi-native"}
+        env.launch.assert_awaited_once()
+        assert env.launch.call_args.kwargs["provider"] == expected
+        assert env.launch.call_args.kwargs["session_id"] == fork.id
