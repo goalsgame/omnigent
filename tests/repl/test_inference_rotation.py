@@ -166,3 +166,91 @@ async def test_fork_or_unbound_host_session_gets_own_runner(monkeypatch, target_
         client.sessions.bind_runner.assert_not_awaited()
     finally:
         await adapter.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attach_only", [False, True])
+async def test_switch_from_observed_session_does_not_stop_or_unbind_it(attach_only):
+    target = Session(
+        id="target",
+        agent_id="agent",
+        status="idle",
+        created_at=0,
+        runner_id="target-runner",
+    )
+    client = SimpleNamespace(
+        sessions=SimpleNamespace(
+            get=AsyncMock(return_value=target),
+            post_event=AsyncMock(),
+            unbind_runner=AsyncMock(),
+            bind_runner=AsyncMock(),
+        )
+    )
+    adapter = _SessionsChatReplAdapter(
+        client,
+        "agent",
+        session_id="observed",
+        runner_id="observed-runner",
+        attach_only=attach_only,
+    )
+    adapter._readonly_view = not attach_only
+    adapter._stream_pump = AsyncMock()
+    try:
+        await adapter.switch_to_session("target")
+        assert adapter.session_id == "target"
+        client.sessions.post_event.assert_not_awaited()
+        client.sessions.unbind_runner.assert_not_awaited()
+        client.sessions.bind_runner.assert_not_awaited()
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_new_from_observed_proxy_session_uses_own_runner_without_detaching_source():
+    source = Session(
+        id="observed",
+        agent_id="agent",
+        status="idle",
+        created_at=0,
+        runner_id="observed-runner",
+        host_id="host",
+        workspace="/work",
+        labels={INFERENCE_HOST_POLICY_LABEL: "host"},
+    )
+    fresh = Session(id="fresh", agent_id="agent", status="idle", created_at=1)
+    bound = Session(
+        id="fresh",
+        agent_id="agent",
+        status="idle",
+        created_at=1,
+        runner_id="fresh-runner",
+        host_id="host",
+        workspace="/work",
+        labels={INFERENCE_HOST_POLICY_LABEL: "host"},
+    )
+    client = SimpleNamespace(
+        _base_url="https://server.example",
+        sessions=SimpleNamespace(
+            create=AsyncMock(return_value=fresh),
+            launch_runner=AsyncMock(return_value=bound),
+            post_event=AsyncMock(),
+            unbind_runner=AsyncMock(),
+            bind_runner=AsyncMock(),
+        ),
+    )
+    adapter = _SessionsChatReplAdapter(
+        client, "agent", session_id="observed", session_bundle=b"bundle"
+    )
+    adapter._hydrate_from_session_snapshot(source)
+    adapter._readonly_view = True
+    adapter._stream_pump = AsyncMock()
+    try:
+        await adapter.start_new_conversation()
+        assert await adapter._ensure_session() == "fresh"
+        assert adapter._runner_id == "fresh-runner"
+        client.sessions.post_event.assert_not_awaited()
+        client.sessions.unbind_runner.assert_not_awaited()
+        client.sessions.bind_runner.assert_not_awaited()
+        client.sessions.launch_runner.assert_awaited_once()
+    finally:
+        await adapter.aclose()

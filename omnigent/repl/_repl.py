@@ -1904,8 +1904,10 @@ class _SessionsChatReplAdapter:
 
     async def _bind_runner_if_needed(self) -> None:
         """
-        Patch this session to the current registered runner.
+        Ensure this session has an appropriate runner before dispatch.
 
+        Unbound host sessions and proxy-backed forks launch their own runner.
+        Direct sessions bind the current registered runner through PATCH.
         The sessions API has one dispatch precondition: a session
         must be bound to an online runner before a turn is posted.
         ``PATCH /v1/sessions/{id}`` is last-write-wins, so resume
@@ -2138,8 +2140,9 @@ class _SessionsChatReplAdapter:
         """
         Re-point the adapter at a different existing session.
 
-        Unbinds the runner from the prior session so the 1:1
-        session↔runner invariant holds, cancels the SSE pump bound to
+        Stops and detaches an owned proxy-backed runner, preserving observed
+        sessions. Unbinds owned direct runners so the 1:1 session↔runner
+        invariant holds, cancels the SSE pump bound to
         the old session id, hydrates the new session snapshot, PATCHes
         the runner binding onto the new session, and restarts the
         pump. Called by ``/switch``.
@@ -2157,12 +2160,17 @@ class _SessionsChatReplAdapter:
         # co-drive) left over from diving into a sub-agent — otherwise the bind
         # below (and every later bind) no-ops and the switched-to session can
         # never dispatch a turn.
-        self._readonly_view = False
-        self._interactive_child = False
         old_session_id = self._session_id
-        if old_session_id is not None and old_session_id != new_session_id:
+        if (
+            old_session_id is not None
+            and old_session_id != new_session_id
+            and not self._readonly_view
+            and not self._attach_only
+        ):
             await self._stop_inference_runner_for_transition()
             await self._unbind_runner_soft(old_session_id)
+        self._readonly_view = False
+        self._interactive_child = False
         if self._stream_task is not None:
             self._stream_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2914,6 +2922,7 @@ class _SessionsChatReplAdapter:
         return
 
     async def _stop_inference_runner_for_transition(self) -> tuple[str, str] | None:
+        """Stop an owned, opted-in daemon runner before changing sessions."""
         if (
             self._session_id is not None
             and not self._attach_only
@@ -2949,17 +2958,19 @@ class _SessionsChatReplAdapter:
         Opted-in daemon runners stop before unbinding; the next create asks
         their host for a fresh runner with new session-specific credentials.
         """
+        observing = self._readonly_view or self._attach_only
+        old_session_id = self._session_id
         rotation = await self._stop_inference_runner_for_transition()
 
         # A fresh session is owned, not observed — clear any read-only-view
         # suppression / interactive-child co-drive from a sub-agent dive so the
         # new session can bind.
+        if old_session_id is not None:
+            if not observing:
+                await self._unbind_runner_soft(old_session_id)
+            self._rotation_placement = rotation
         self._readonly_view = False
         self._interactive_child = False
-        old_session_id = self._session_id
-        if old_session_id is not None:
-            await self._unbind_runner_soft(old_session_id)
-            self._rotation_placement = rotation
         if rotation is not None:
             self._runner_id = None
         if self._stream_task is not None:
