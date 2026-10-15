@@ -3929,7 +3929,7 @@ def register_core_routes(
                 session_id=new_conv.id,
                 host_id=independent_side_host[0],
                 workspace=independent_side_host[1],
-                harness=None,
+                harness=new_conv.harness_override,
                 conversation=new_conv,
             )
             new_conv = await asyncio.to_thread(conversation_store.get_conversation, new_conv.id)

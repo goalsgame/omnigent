@@ -4656,13 +4656,21 @@ async def test_non_opted_in_host_gap_preserves_child_runner_affinity(
 
 
 @pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize(
+    "declared_harness,override",
+    [
+        ("openai-agents", None),
+        ("claude-sdk", "openai-agents"),
+        ("openai-agents", "auto"),
+    ],
+)
 async def test_proxy_side_chat_has_independent_binding_and_concurrent_admission(
-    client, app, db_uri
+    client, app, db_uri, declared_harness, override
 ):
     client.headers["X-Forwarded-Email"] = "alice@example.com"
     comm = await _connect_host(app, inference=True)
     agent = await create_test_agent(
-        client, executor={"type": "omnigent", "config": {"harness": "openai-agents"}}
+        client, executor={"type": "omnigent", "config": {"harness": declared_harness}}
     )
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     parent = await client.post(
@@ -4671,6 +4679,7 @@ async def test_proxy_side_chat_has_independent_binding_and_concurrent_admission(
             "agent_id": agent["id"],
             "host_id": _HOST_ID,
             "workspace": _WORKSPACE,
+            "harness_override": override,
         },
     )
     assert parent.status_code == 201, parent.text
@@ -4679,6 +4688,7 @@ async def test_proxy_side_chat_has_independent_binding_and_concurrent_admission(
     side = await client.post(f"/v1/sessions/{parent.json()['id']}/fork", json={"side_chat": True})
     assert side.status_code == 201, side.text
     side_frame = await responder
+    assert side_frame.harness == "openai-agents"
     assert side.json()["runner_id"] != parent.json()["runner_id"]
     assert side.json()["host_id"] == _HOST_ID
     assert side.json()["workspace"] == _WORKSPACE
@@ -4694,6 +4704,7 @@ async def test_proxy_side_chat_has_independent_binding_and_concurrent_admission(
         SqlAlchemyConversationStore(db_uri).get_conversation, side.json()["id"]
     )
     assert conv.runner_id == side.json()["runner_id"]
+    assert conv.harness_override == override
     ordinary = await client.post(f"/v1/sessions/{side.json()['id']}/fork", json={})
     assert ordinary.status_code == 201, ordinary.text
     assert ordinary.json()["runner_id"] is None
