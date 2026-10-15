@@ -50,7 +50,11 @@ checkouts must match the recorded path, repository and requested ref, and retain
 on wake. Unrelated or changed directories are not overwritten.
 
 Managed POSIX hosts install a wrapper that obtains a fresh short-lived token for
-each Lore command through a loopback relay. The host capability stays in host
+each Lore command through a loopback relay. The wrapper supports
+`lore clone <url> [target]` (also `lore repository clone`) with `--branch` or
+`--revision`, applies the configured view, and registers successful copies for
+subsequent credential renewal. Other clone options fail explicitly. Commands in
+nested checkouts use the most specific registered root. The host capability stays in host
 memory; helper configuration contains no tokens. IdP refresh tokens stay on the
 backend. Local hosts are untouched, including Windows hosts with their own login.
 Login shell profiles must retain `$HOME/.omnigent/lore/bin` in `PATH` when

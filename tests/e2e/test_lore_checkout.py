@@ -71,7 +71,7 @@ if 'clone' in args:
     (dest / 'hello.txt').write_text('hello')
     view = Path(args[args.index('--view')+1]).read_text()
     assert view == '/Content\\n'
-    assert args[args.index('--revision')+1] == 'main@369'
+    assert args[args.index('--revision')+1] in ('main@369', '369', 'main@latest')
 else:
     assert args[-1] == 'status'
 print('ok')
@@ -96,11 +96,46 @@ print('ok')
         second = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
         assert second.returncode == 0, second.stderr
         assert (checkout / "hello.txt").read_text() == "unsaved work"
+        relocated = tmp_path / "new-image/bin/lore"
+        relocated.parent.mkdir(parents=True)
+        binary.rename(relocated)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(
+                [str(lore_checkout._home() / "bin"), str(relocated.parent), os.environ["PATH"]]
+            ),
+        )
+        wake = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        assert wake.returncode == 0, wake.stderr
+        assert (checkout / "hello.txt").read_text() == "unsaved work"
         lore_checkout.configure(url, "host1")
         config_text = (lore_checkout._home() / "host.json").read_text()
         assert "launch-token" not in config_text and "access" not in config_text
         env = dict(os.environ)
         env.pop(HOST_TOKEN_ENV_VAR)
+        # CLI-created copies outside the original checkout must renew too.
+        for relative, prefix, flag, ref in (
+            ("copy", ["clone"], "--revision", "main@369"),
+            ("nested/copy", ["clone"], "--revision", "369"),
+            ("branch-copy", ["repository", "clone"], "--branch", "main"),
+        ):
+            copied = subprocess.run(
+                [str(lore_checkout._home() / "bin/lore"), *prefix, remote, relative, flag, ref],
+                cwd=home,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert copied.returncode == 0, copied.stderr
+            status = subprocess.run(
+                [str(lore_checkout._home() / "bin/lore"), "status"],
+                cwd=home / relative,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert status.returncode == 0, status.stderr
+        assert len(list((lore_checkout._home() / "checkouts").glob("*.json"))) == 4
         for _ in range(2):
             current = broker.store.get("alice@example.com", "oidc_lore", with_secret=True)
             broker.store.update_secret(

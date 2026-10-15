@@ -70,6 +70,7 @@ from omnigent.host.workspace_errors import (
     GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT,
     GITHUB_CHECKOUT_UNCONNECTED,
     GITHUB_CHECKOUT_UNCONNECTED_EXIT,
+    WORKSPACE_ERROR_CODES,
     WORKSPACE_ERROR_MESSAGES,
 )
 from omnigent.onboarding.sandboxes.base import (
@@ -618,7 +619,7 @@ def _render_workspace_prep_command(
                 ]
                 if repo.branch:
                     args += ["--ref", repo.branch]
-                script += shlex.join(args) + "\n"
+                script += shlex.join(args) + ' & pids="$pids $!"\n'
                 continue
             staging_dir = f"{workspace}/{staging}"
             clone = shlex.join(
@@ -694,10 +695,8 @@ def _render_workspace_prep_command(
             )
             script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || { child_rc=$?; '
-        script += (
-            f'[ "$rc" -eq {GITHUB_CHECKOUT_UNCONNECTED_EXIT} ] || '
-            f'[ "$rc" -eq {GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT} ] || rc=$child_rc; '
-        )
+        script += " || ".join(f'[ "$rc" -eq {code} ]' for code in WORKSPACE_ERROR_CODES)
+        script += " || rc=$child_rc; "
         script += "} ; done\n"
         script += '[ "$rc" -eq 0 ] || exit "$rc"\n'
     if host_config is not None:

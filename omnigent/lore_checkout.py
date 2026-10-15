@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -187,7 +188,7 @@ def configure(server: str, host_id: str, *, relay: bool = True) -> None:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     config_path = root / "host.json"
     previous = json.loads(config_path.read_text()) if config_path.exists() else {}
-    binary = previous.get("binary") or shutil.which("lore")
+    binary = _find_binary(previous.get("binary"))
     if not binary:
         return
     config = {"server": server, "host_id": host_id, "binary": binary}
@@ -215,15 +216,49 @@ def configure(server: str, host_id: str, *, relay: bool = True) -> None:
     )
 
 
+def _find_binary(cached: object = None) -> str | None:
+    wrapper = (_home() / "bin/lore").resolve()
+    candidates = [cached] + [
+        shutil.which("lore", path=directory)
+        for directory in os.environ.get("PATH", os.defpath).split(os.pathsep)
+        if directory and Path(directory).resolve() != wrapper.parent
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not Path(candidate).is_absolute():
+            continue
+        try:
+            resolved = Path(candidate).resolve()
+            if resolved != wrapper and resolved.is_file() and os.access(resolved, os.X_OK):
+                return str(resolved)
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
 def _binary() -> str:
     path = _home() / "host.json"
-    binary = json.loads(path.read_text()).get("binary") if path.exists() else shutil.which("lore")
+    cached = json.loads(path.read_text()).get("binary") if path.exists() else None
+    binary = _find_binary(cached)
     if not binary:
         raise LoreClientUnavailable("Lore CLI is not installed in this runner image")
     return binary
 
 
-def prepare(server: str, host_id: str, remote: str, target: Path, ref: str | None) -> None:
+def _manifest(target: Path) -> Path:
+    key = hashlib.sha256(str(target.resolve()).encode()).hexdigest()
+    return _home() / "checkouts" / (key + ".json")
+
+
+def prepare(
+    server: str,
+    host_id: str,
+    remote: str,
+    target: Path,
+    ref: str | None,
+    *,
+    credential_payload: dict | None = None,
+    exact_revision: bool = False,
+) -> None:
     """Clone into owned staging storage; retained checkouts are never synchronized."""
     from omnigent.lore_urls import lore_remote
 
@@ -231,7 +266,10 @@ def prepare(server: str, host_id: str, remote: str, target: Path, ref: str | Non
     target = target.absolute()
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         raise LoreWorkspaceConflict("Refusing to replace a symlink or non-directory workspace")
-    manifest = _home() / "checkouts" / (target.name + ".json")
+    target = target.resolve()
+    manifest = _manifest(target)
+    if ref and not exact_revision and "@" not in ref and not re.fullmatch(r"[0-9a-fA-F]{64}", ref):
+        ref += "@latest"
     if target.exists() and any(target.iterdir()):
         stored = json.loads(manifest.read_text()) if manifest.exists() else {}
         if (
@@ -243,16 +281,17 @@ def prepare(server: str, host_id: str, remote: str, target: Path, ref: str | Non
             )
         return
     binary = _binary()
-    payload = credential(server, host_id, remote)
+    payload = (
+        credential_payload
+        if credential_payload is not None
+        else credential(server, host_id, remote)
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".omnigent-lore-", dir=target.parent) as temporary:
         staging = Path(temporary)
         args = [binary, "--identity-token", payload["token"], "clone"]
         if ref:
-            args += [
-                "--revision",
-                ref if "@" in ref or re.fullmatch(r"[0-9a-fA-F]{64}", ref) else ref + "@latest",
-            ]
+            args += ["--revision", ref]
         if payload.get("view"):
             view = staging / "view.txt"
             view.write_text(payload["view"], encoding="utf-8")
@@ -271,16 +310,53 @@ def prepare(server: str, host_id: str, remote: str, target: Path, ref: str | Non
     _write_json(manifest, {"path": str(target), "remote": remote, "ref": ref})
 
 
+def _clone(args: list[str], config: dict, remote: str) -> int:
+    parser = argparse.ArgumentParser(prog="lore clone", add_help=False, exit_on_error=False)
+    parser.add_argument("remote")
+    parser.add_argument("target", nargs="?")
+    refs = parser.add_mutually_exclusive_group()
+    refs.add_argument("--branch")
+    refs.add_argument("--revision")
+    try:
+        options, unknown = parser.parse_known_args(args)
+    except argparse.ArgumentError:
+        raise LoreCheckoutError("Invalid managed Lore clone arguments") from None
+    if unknown or options.remote != remote:
+        raise LoreCheckoutError(
+            "Managed Lore clone supports URL, target, --branch and --revision; "
+            "the view is configured by the operator"
+        )
+    target = Path(options.target or urlsplit(remote).path.rsplit("/", 1)[-1])
+    payload = relay_credential(config, remote)
+    prepare(
+        config["server"],
+        config["host_id"],
+        remote,
+        target,
+        options.revision or options.branch,
+        credential_payload=payload,
+        exact_revision=options.revision is not None,
+    )
+    return 0
+
+
 def execute(args: list[str]) -> int:
     config = json.loads((_home() / "host.json").read_text())
+    if any(arg in ("--help", "-h", "--version", "-V") for arg in args):
+        return subprocess.call([_binary(), *args])
+    if args[:2] == ["repository", "clone"]:
+        args = ["clone", *args[2:]]
     remote = next((arg for arg in args if arg.startswith("lores://")), None)
     cwd = Path.cwd().resolve()
-    for path in (_home() / "checkouts").glob("*.json"):
-        checkout = json.loads(path.read_text())
-        if cwd.is_relative_to(Path(checkout["path"])):
-            remote = checkout["remote"]
-            break
-    command = [config["binary"]]
+    if remote is None:
+        candidates = []
+        for path in (_home() / "checkouts").glob("*.json"):
+            checkout = json.loads(path.read_text())
+            if cwd.is_relative_to(Path(checkout["path"])):
+                candidates.append(checkout)
+        if candidates:
+            remote = max(candidates, key=lambda item: len(Path(item["path"]).parts))["remote"]
+    command = [_binary()]
     if remote:
         if any(
             arg.split("=", 1)[0] in ("--identity", "--identity-token", "--access-token")
@@ -289,6 +365,12 @@ def execute(args: list[str]) -> int:
             raise LoreCheckoutError("Managed Lore commands use the session owner's identity")
         if any(arg.startswith("lores://") and arg != remote for arg in args):
             raise LoreCheckoutError("Lore command targets a different repository")
+        if args and args[0] == "clone" and not any(arg in ("--help", "-h") for arg in args):
+            return _clone(args[1:], config, remote)
+        if "clone" in args and any(arg.startswith("lores://") for arg in args):
+            raise LoreCheckoutError(
+                "Managed clone requires 'lore clone' or 'lore repository clone'"
+            )
         payload = relay_credential(config, remote)
         command += ["--identity-token", payload["token"]]
     return subprocess.call([*command, *args])
