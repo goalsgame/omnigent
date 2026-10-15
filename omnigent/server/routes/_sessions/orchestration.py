@@ -3457,8 +3457,11 @@ async def _heal_subagent_runner_binding_via_parent(
     """
     from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
 
-    # This child requires a runner without its ancestor’s process-wide provider map.
-    if child_conv.labels.get(SEPARATE_INFERENCE_RUNNER_LABEL) == "1":
+    # Host-bound children recover on their own host, never an ancestor’s runner.
+    if (
+        child_conv.host_id is not None
+        or child_conv.labels.get(SEPARATE_INFERENCE_RUNNER_LABEL) == "1"
+    ):
         return None
 
     # Walk the ancestor chain (immediate parent first, then root) to find a
