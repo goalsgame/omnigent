@@ -1065,6 +1065,10 @@ def register_core_routes(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
 
+        # A requested sandbox must not share its parent's runner or local workspace.
+        if parsed_metadata.host_type == "managed":
+            inherited_runner_id = None
+
         from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
         from omnigent.server.routes._host_launch import independent_inference_child_host
 
@@ -1179,8 +1183,8 @@ def register_core_routes(
         # just-uploaded session-scoped agent (same background launch as
         # the JSON path). The managed runner fetches the uploaded bundle
         # over its tunnel like any session-scoped agent, so no separate
-        # bundle delivery is needed. A sub-agent child (inherited runner)
-        # is never itself managed — it co-locates on the parent's runner.
+        # bundle delivery is needed. Explicit managed children receive their
+        # own sandbox; other children can co-locate on the parent's runner.
         if parsed_metadata.host_type == "managed" and inherited_runner_id is None:
             await _schedule_managed_launch(
                 request,

@@ -10628,6 +10628,10 @@ async def _create_session_from_existing_agent(
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
 
+    # A requested sandbox has its own runner and repository workspace.
+    if body.host_type == "managed":
+        inherited_runner_id = None
+
     from omnigent.server.routes._host_launch import independent_inference_child_host
 
     independent_host = await independent_inference_child_host(

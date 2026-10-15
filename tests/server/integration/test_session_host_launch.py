@@ -4515,3 +4515,78 @@ async def test_reconnect_gap_does_not_create_child_on_shared_proxy_runner(
             )
     assert response.status_code == (400 if sharded else 409), response.text
     assert ("wrong_replica" if sharded else "offline") in response.text
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize("upload", [False, True])
+@pytest.mark.parametrize("workspace", [None, "https://github.com/example/repo#main"])
+@pytest.mark.parametrize("parent_online", [False, True])
+async def test_managed_child_preserves_own_placement(
+    client, app, db_uri, upload, workspace, parent_online, monkeypatch
+):
+    from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+    from omnigent.server.managed_hosts import parse_repo_workspace, parse_sandbox_config
+
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    executor = {"type": "omnigent", "config": {"harness": "openai-agents"}}
+    agent = await create_test_agent(
+        client, executor=executor, sub_agents=[{"name": "worker", "executor": executor}]
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    assert parent.status_code == 201, parent.text
+    await responder
+    app.state.sandbox_config = parse_sandbox_config(
+        {
+            "provider": "modal",
+            "server_url": "https://managed-test.example.com",
+            "modal": {"image": "docker.io/test/omnigent-host:latest"},
+        }
+    )
+    launch = AsyncMock()
+    monkeypatch.setattr("omnigent.server.routes.sessions.routes_core._run_managed_launch", launch)
+    local_launch = AsyncMock(side_effect=AssertionError("must not launch on parent host"))
+    monkeypatch.setattr(app.state.host_registry, "admit_launch", local_launch)
+    if not parent_online:
+        monkeypatch.setattr(app.state.host_registry, "get", lambda *args, **kwargs: None)
+    metadata = {
+        "parent_session_id": parent.json()["id"],
+        "host_type": "managed",
+        "workspace": workspace,
+    }
+    if upload:
+        child = await client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="managed-worker", executor=executor),
+                    "application/gzip",
+                )
+            },
+        )
+    else:
+        child = await client.post(
+            "/v1/sessions", json={**metadata, "agent_id": agent["id"], "sub_agent_name": "worker"}
+        )
+    assert child.status_code == 201, child.text
+    async with asyncio.timeout(budget(2.0)):
+        while launch.await_count == 0:
+            await asyncio.sleep(0.01)
+    launch.assert_awaited_once()
+    local_launch.assert_not_awaited()
+    sid = child.json().get("id") or child.json()["session_id"]
+    assert launch.await_args.kwargs["session_id"] == sid
+    assert launch.await_args.kwargs["repos"] == (
+        [parse_repo_workspace(workspace)] if workspace else []
+    )
+    conv = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).get_conversation, sid)
+    assert conv.parent_conversation_id == parent.json()["id"]
+    assert conv.runner_id is None and conv.host_id is None
+    assert conv.workspace == workspace
+    assert not (conv.labels or {}).get(SEPARATE_INFERENCE_RUNNER_LABEL)
