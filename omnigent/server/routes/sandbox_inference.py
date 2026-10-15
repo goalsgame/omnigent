@@ -57,9 +57,12 @@ def managed_proxy_catalog(
     profile: str | None = None,
 ) -> dict[str, Any] | None:
     """Preview proxy models without creating a direct-provider session snapshot."""
+    from omnigent.onboarding.provider_config import default_provider_for_harness
+
     proxy = getattr(request.app.state, "inference_proxy", None)
     deployment = getattr(request.app.state, "sandbox_config", None)
     target = deployment.for_provider(provider) if deployment is not None else None
+    harness = normalize_inference_harness(harness)
     if (
         proxy is None
         or not proxy.config.managed_sandboxes
@@ -68,9 +71,9 @@ def managed_proxy_catalog(
         or agent_auth is not None
         or profile
         or parse_inference_config(target.host_config or {})
+        or default_provider_for_harness(target.host_config or {}, harness) is not None
     ):
         return None
-    harness = normalize_inference_harness(harness)
     models = list(proxy.config.model_apis(harness)) if harness in proxy.config.harnesses else []
     return {
         "configured": True,

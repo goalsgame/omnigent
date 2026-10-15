@@ -45,6 +45,7 @@ class HarnessInferenceBinding:
     model_allowlist: tuple[str, ...] | None = None
     model_limits: dict[str, ModelLimitOverride] = field(default_factory=dict)
     model_apis: dict[str, str] = field(default_factory=dict)
+    model_reasoning: dict[str, bool] = field(default_factory=dict)
 
 
 def validate_inference_credentials(
@@ -116,6 +117,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             "model_allowlist",
             "model_limits",
             "model_apis",
+            "model_reasoning",
         }:
             raise ValueError(f"Unknown inference setting for harness {name!r}")
         provider = value.get("provider")
@@ -160,6 +162,14 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             or (model_apis and (allowed is None or set(model_apis) != set(allowed)))
         ):
             raise ValueError("model_apis requires an exact Pi model allowlist and supported APIs")
+        reasoning = value.get("model_reasoning", {})
+        if (
+            not isinstance(reasoning, dict)
+            or ("model_reasoning" in value and key != "pi-native")
+            or any(type(v) is not bool for v in reasoning.values())
+            or (reasoning and (allowed is None or not set(reasoning) <= set(allowed)))
+        ):
+            raise ValueError("model_reasoning requires allowed Pi models and boolean values")
         limits_raw = value.get("model_limits", {})
         if not isinstance(limits_raw, dict):
             raise ValueError(f"Harness {name!r} model_limits must be a mapping")
@@ -194,6 +204,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             model_allowlist=tuple(dict.fromkeys(allowed)) if allowed is not None else None,
             model_limits=limits,
             model_apis=dict(model_apis),
+            model_reasoning=dict(reasoning),
         )
     return result
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -38,6 +39,7 @@ def main() -> None:
         file_store=files,
         artifact_store=artifacts,
     )
+    named_route = os.environ.get("OMNIGENT_E2E_NAMED_ROUTE") == "1"
     app = create_app(
         agent_store=agent_store,
         file_store=files,
@@ -52,7 +54,23 @@ def main() -> None:
             "inference_proxy": {
                 "public_url": f"https://127.0.0.1:{port}",
                 "signing_key_env": "OMNIGENT_E2E_SIGNING_KEY",
-                "models": ["test-model"],
+                "models": ["friendly-alias" if named_route else "test-model"],
+                **(
+                    {
+                        "upstreams": {
+                            "vertex": {
+                                "kind": "vertex-openai",
+                                "project": "example-project",
+                                "location": "global",
+                            }
+                        },
+                        "model_routes": {
+                            "friendly-alias": {"upstream": "vertex", "model": "test-model"}
+                        },
+                    }
+                    if named_route
+                    else {}
+                ),
             },
         },
     )
@@ -67,9 +85,19 @@ def main() -> None:
             self.inner = httpx.AsyncHTTPTransport()
 
         async def handle_async_request(self, request):
-            assert str(request.url) == "https://openrouter.ai/api/v1/chat/completions"
+            expected_url = (
+                "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/endpoints/openapi/chat/completions"
+                if named_route
+                else "https://openrouter.ai/api/v1/chat/completions"
+            )
+            assert str(request.url) == expected_url
             calls.append(
-                {"authorized": request.headers["authorization"] == "Bearer server-only-provider"}
+                {
+                    "authorized": request.headers["authorization"]
+                    == "Bearer server-only-provider",
+                    "model": json.loads(request.content)["model"],
+                    "vertex": named_route,
+                }
             )
             request.url = httpx.URL(os.environ["OMNIGENT_E2E_PROVIDER"] + "/v1/chat/completions")
             return await self.inner.handle_async_request(request)
@@ -77,6 +105,10 @@ def main() -> None:
         async def aclose(self):
             await self.inner.aclose()
 
+    async def google_credential():
+        return "server-only-provider"
+
+    proxy.google_credential.credential = google_credential
     proxy.broker.credential = credential
     proxy.transport = ProviderTransport()
 

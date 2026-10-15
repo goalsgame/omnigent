@@ -1138,7 +1138,7 @@ def _multi_upstream_raw():
     return {
         "public_url": "https://server.example",
         "signing_key_env": "INFERENCE_TEST_SIGNING",
-        "models": ["model-a", "claude-alias", "gemini-alias", "external-alias"],
+        "models": ["model-a", "reasoning-model", "gemini-alias", "external-alias"],
         "harnesses": ["pi-native", "openai-agents"],
         "upstreams": {
             "router": {"kind": "openrouter"},
@@ -1156,11 +1156,14 @@ def _multi_upstream_raw():
         },
         "model_routes": {
             "model-a": {"upstream": "router", "model": "openai/model-a"},
-            "claude-alias": {"upstream": "claude", "model": "claude-test@20990101"},
+            "reasoning-model": {"upstream": "claude", "model": "claude-test@20990101"},
             "gemini-alias": {"upstream": "gemini", "model": "google/gemini-test"},
             "external-alias": {"upstream": "external", "model": "private/model"},
         },
-        "model_limits": {"claude-alias": {"context_window": 1000000, "max_output_tokens": 64000}},
+        "model_reasoning": {"reasoning-model": True, "gemini-alias": False},
+        "model_limits": {
+            "reasoning-model": {"context_window": 1000000, "max_output_tokens": 64000}
+        },
     }
 
 
@@ -1201,7 +1204,7 @@ def routed(setup, monkeypatch):
             "external-secret",
         ),
         (
-            "claude-alias",
+            "reasoning-model",
             "v1/messages",
             "https://aiplatform.eu.rep.googleapis.com/v1/projects/example-project/locations/eu/publishers/anthropic/models/claude-test@20990101:streamRawPredict",
             "google-secret",
@@ -1240,7 +1243,7 @@ async def test_routes_select_only_operator_upstream_and_credential(
 async def test_native_claude_preserves_tools_images_and_thinking(routed):
     service, app, conv, _, calls = routed
     payload = {
-        "model": "claude-alias",
+        "model": "reasoning-model",
         "max_tokens": 256,
         "stream": False,
         "system": [{"type": "text", "text": "help", "cache_control": {"type": "ephemeral"}}],
@@ -1285,7 +1288,7 @@ async def test_native_claude_preserves_tools_images_and_thinking(routed):
 @pytest.mark.parametrize(
     ("model", "endpoint"),
     [
-        ("claude-alias", "chat/completions"),
+        ("reasoning-model", "chat/completions"),
         ("model-a", "v1/messages"),
         ("gemini-alias", "responses"),
     ],
@@ -1365,7 +1368,7 @@ def test_native_model_protocols_and_limits_reach_real_pi_config(routed, tmp_path
         conv, conv.runner_id, "pi-native", conv.host_id, "alice", "generation"
     )
     runtime = prepare(config, tmp_path)
-    resolved = resolve_pi_native_provider(model="claude-alias", config_loader=lambda: runtime)
+    resolved = resolve_pi_native_provider(model="reasoning-model", config_loader=lambda: runtime)
     assert resolved is not None
     assert resolved.api == "anthropic-messages"
     assert resolved.auth_header is True
@@ -1375,7 +1378,7 @@ def test_native_model_protocols_and_limits_reach_real_pi_config(routed, tmp_path
     }
     assert protocols == {
         "model-a": "openai-completions",
-        "claude-alias": "anthropic-messages",
+        "reasoning-model": "anthropic-messages",
         "gemini-alias": "openai-completions",
         "external-alias": "openai-completions",
     }
@@ -1383,8 +1386,9 @@ def test_native_model_protocols_and_limits_reach_real_pi_config(routed, tmp_path
         row
         for provider in rendered.values()
         for row in provider["models"]
-        if row["id"] == "claude-alias"
+        if row["id"] == "reasoning-model"
     )
+    assert claude["reasoning"] is True
     assert claude["contextWindow"] == 1000000
     assert claude["maxTokens"] == 64000
     assert all(
@@ -1409,10 +1413,40 @@ async def test_protocol_and_limit_metadata_is_signed_and_attested(routed):
         )
     assert response.status_code == 200
     attested = response.json()["runtime_binding"]
+    assert attested["model_reasoning"] == config["model_reasoning"]
     assert attested["model_apis"] == config["model_apis"]
     assert attested["model_limits"] == config["model_limits"]
     openai_config = service.launch_config(
         conv, conv.runner_id, "openai-agents", conv.host_id, "alice", "generation"
     )["server_inference"]
-    assert "claude-alias" not in openai_config["models"]
+    assert "reasoning-model" not in openai_config["models"]
     assert "model_apis" not in openai_config and "model_limits" not in openai_config
+
+
+@pytest.mark.parametrize("wire_api", [None, "responses"])
+def test_explicit_model_api_overrides_openai_family_default(routed, tmp_path, wire_api):
+    from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
+    from omnigent.host.inference_proxy import prepare
+
+    service, _, conv, _, _ = routed
+    config = service.launch_config(
+        conv, conv.runner_id, "pi-native", conv.host_id, "alice", "generation"
+    )
+    runtime = prepare(config, tmp_path)
+    family = runtime["providers"]["server-inference"]["openai"]
+    if wire_api is None:
+        family.pop("wire_api")
+    else:
+        family["wire_api"] = wire_api
+    resolved = resolve_pi_native_provider(model="model-a", config_loader=lambda: runtime)
+    assert resolved is not None and resolved.api == "openai-completions"
+
+
+@pytest.mark.parametrize("value", [{"hidden": True}, {"model-a": "true"}, [], None])
+def test_reasoning_metadata_requires_allowed_models_and_booleans(routed, value):
+    from omnigent.server.inference_proxy import InferenceProxyConfig
+
+    raw = _multi_upstream_raw()
+    raw["model_reasoning"] = value
+    with pytest.raises(ValueError):
+        InferenceProxyConfig.parse(raw)

@@ -129,6 +129,8 @@ inference_proxy:
     code-model: {upstream: router, model: provider/model-id}
     reasoning-model: {upstream: claude, model: claude-model-id}
     fast-model: {upstream: gemini, model: google/gemini-model-id}
+  model_reasoning:
+    reasoning-model: true
   model_limits:
     reasoning-model: {context_window: 200000, max_output_tokens: 64000}
 ```
@@ -142,7 +144,9 @@ depend on the selected location. Google endpoints are derived from project and
 location; an ADC token cannot be sent to an operator-supplied URL. OpenRouter
 upstreams require `openrouter_wif`; Vertex-only configurations do not.
 
-Pi receives the per-model protocol and limits in its signed session binding.
+Pi receives per-model protocols, limits and optional `model_reasoning` boolean
+overrides in its signed session binding. Set reasoning support explicitly for
+opaque aliases whose names do not identify the underlying model.
 Native Claude messages, tools, images, thinking and SSE pass through; the backend
 adapts only Vertex's URL, model placement and `anthropic_version`. OpenAI Agents
 receives only OpenAI-compatible routes; Vertex's OpenAI endpoint accepts chat

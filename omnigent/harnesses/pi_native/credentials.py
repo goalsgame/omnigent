@@ -1745,7 +1745,9 @@ def resolve_pi_native_provider(
                 model_entry = replace(
                     provider_entry,
                     families={
-                        name: config
+                        name: replace(config, wire_api=CHAT_WIRE_API)
+                        if name == "openai"
+                        else config
                         for name, config in provider_entry.families.items()
                         if name == family
                     },
@@ -1788,13 +1790,15 @@ def resolve_pi_native_provider(
                 curated_models=True,
                 model_allowlist=binding.model_allowlist,
             )
-        if binding.model_limits:
+        if binding.model_limits or binding.model_reasoning:
 
             def apply_limits(models: list[_PiModelEntry]) -> list[_PiModelEntry]:
                 updated: list[_PiModelEntry] = []
                 for row in models:
                     limits = binding.model_limits.get(row["id"])
                     enriched: _PiModelEntry = {**row}
+                    if row["id"] in binding.model_reasoning:
+                        enriched["reasoning"] = binding.model_reasoning[row["id"]]
                     if limits is not None:
                         if limits.context_window is not None:
                             enriched["contextWindow"] = limits.context_window

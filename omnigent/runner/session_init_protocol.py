@@ -158,7 +158,11 @@ async def verify_transient_runner_inference_config(
         marker = actual.get("server_inference_binding")
         if marker is None:
             return None
-        if not isinstance(marker, dict) or set(marker) - {"model_apis", "model_limits"} != {
+        if not isinstance(marker, dict) or set(marker) - {
+            "model_apis",
+            "model_limits",
+            "model_reasoning",
+        } != {
             "url",
             "harness",
             "models",
@@ -201,7 +205,11 @@ async def verify_transient_runner_inference_config(
             "runner_id": token_bound_runner_id(token),
             "grant_hash": hashlib.sha256(credential["grant"].encode()).hexdigest(),
             "runner_session_id": envelope.session_id,
-            **{key: marker[key] for key in ("model_apis", "model_limits") if key in marker},
+            **{
+                key: marker[key]
+                for key in ("model_apis", "model_limits", "model_reasoning")
+                if key in marker
+            },
         }
         if attested != target:
             raise ValueError("Proxy binding verification failed")

@@ -134,6 +134,7 @@ async def test_inference_mismatch_response_does_not_expose_exception_details(
         "pi-protocols",
         "tampered-protocols",
         "tampered-limits",
+        "tampered-reasoning",
     ],
 )
 async def test_transient_proxy_init_is_server_verified_and_runner_bound(
@@ -150,10 +151,11 @@ async def test_transient_proxy_init_is_server_verified_and_runner_bound(
     monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, token)
     url = "https://server.example/v1/inference/workspaces/signed-selector/sessions/proxy-session"
     proxy = {"url": url, "grant": "g" * 64, "harness": "openai-agents", "models": ["model-a"]}
-    if mode in ("pi-protocols", "tampered-protocols", "tampered-limits"):
+    if mode in ("pi-protocols", "tampered-protocols", "tampered-limits", "tampered-reasoning"):
         proxy.update(
             harness="pi-native",
             model_apis={"model-a": "anthropic-messages"},
+            model_reasoning={"model-a": True},
             model_limits={"model-a": {"context_window": 200000, "max_output_tokens": 64000}},
         )
     actual = prepare({"server_inference": proxy}, tmp_path / "grants")
@@ -188,14 +190,19 @@ async def test_transient_proxy_init_is_server_verified_and_runner_bound(
         "grant_hash": hashlib.sha256(b"g" * 64).hexdigest(),
         "runner_session_id": sid,
     }
-    if mode in ("pi-protocols", "tampered-protocols", "tampered-limits"):
+    if mode in ("pi-protocols", "tampered-protocols", "tampered-limits", "tampered-reasoning"):
         binding.update(
-            harness="pi-native", model_apis=proxy["model_apis"], model_limits=proxy["model_limits"]
+            harness="pi-native",
+            model_apis=proxy["model_apis"],
+            model_limits=proxy["model_limits"],
+            model_reasoning=proxy["model_reasoning"],
         )
     if mode == "tampered-protocols":
         binding["model_apis"] = {"model-a": "openai-completions"}
     if mode == "tampered-limits":
         binding["model_limits"] = {"model-a": {"context_window": 1000000}}
+    if mode == "tampered-reasoning":
+        binding["model_reasoning"] = {"model-a": False}
     if mode == "wrong-runner":
         binding["runner_id"] = "other-runner"
     verification_calls = []

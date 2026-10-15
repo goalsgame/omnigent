@@ -76,7 +76,7 @@ def _validate_target(proxy: dict) -> None:
         raise ValueError("Invalid inference harness or model list")
     from omnigent.inference_config import parse_inference_config
 
-    if "model_limits" in proxy:
+    if "model_limits" in proxy or "model_reasoning" in proxy:
         parse_inference_config(
             {
                 "providers": {"proxy": {}},
@@ -85,7 +85,11 @@ def _validate_target(proxy: dict) -> None:
                         proxy["harness"]: {
                             "provider": "proxy",
                             "model_allowlist": proxy["models"],
-                            "model_limits": proxy["model_limits"],
+                            **{
+                                key: proxy[key]
+                                for key in ("model_limits", "model_reasoning")
+                                if key in proxy
+                            },
                         }
                     }
                 },
@@ -106,7 +110,8 @@ def prepare(config: dict, directory: Path, *, credential_files: list[Path] | Non
         return config
     if (
         not isinstance(proxy, dict)
-        or set(proxy) - {"url", "grant", "models", "harness", "model_apis", "model_limits"}
+        or set(proxy)
+        - {"url", "grant", "models", "harness", "model_apis", "model_limits", "model_reasoning"}
         or not {"url", "grant", "models", "harness"} <= set(proxy)
     ):
         raise ValueError("Invalid server inference configuration")
@@ -132,7 +137,11 @@ def prepare(config: dict, directory: Path, *, credential_files: list[Path] | Non
         "harness": proxy["harness"],
         "models": proxy["models"],
         "credential_file": str(credential),
-        **{key: proxy[key] for key in ("model_apis", "model_limits") if key in proxy},
+        **{
+            key: proxy[key]
+            for key in ("model_apis", "model_limits", "model_reasoning")
+            if key in proxy
+        },
     }
     return result
 
@@ -165,6 +174,11 @@ def runtime_config(proxy: dict, credential: Path) -> dict:
                     "default_model": proxy["models"][0],
                     **({"model_apis": apis} if apis else {}),
                     **({"model_limits": proxy["model_limits"]} if "model_limits" in proxy else {}),
+                    **(
+                        {"model_reasoning": proxy["model_reasoning"]}
+                        if "model_reasoning" in proxy
+                        else {}
+                    ),
                 }
             }
         },

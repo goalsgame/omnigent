@@ -63,6 +63,7 @@ class InferenceProxyConfig:
     model_routes: dict[str, InferenceRoute] = field(default_factory=dict)
     model_limits: dict[str, dict[str, int]] = field(default_factory=dict)
     managed_sandboxes: bool = False
+    model_reasoning: dict[str, bool] = field(default_factory=dict)
 
     @property
     def needs_openrouter(self) -> bool:
@@ -96,6 +97,7 @@ class InferenceProxyConfig:
             "model_routes",
             "model_limits",
             "managed_sandboxes",
+            "model_reasoning",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ValueError("Invalid inference_proxy configuration")
@@ -166,6 +168,7 @@ class InferenceProxyConfig:
                             "provider": "proxy",
                             "model_allowlist": models,
                             "model_limits": limits_raw,
+                            "model_reasoning": raw.get("model_reasoning", {}),
                         }
                     }
                 },
@@ -180,6 +183,7 @@ class InferenceProxyConfig:
             model_routes=routes,
             managed_sandboxes=raw.get("managed_sandboxes", False),
             model_limits={model: dict(limits) for model, limits in limits_raw.items()},
+            model_reasoning=dict(raw.get("model_reasoning", {})),
             **limits,
         )
 
@@ -259,6 +263,11 @@ class InferenceProxy:
         return {
             **({"model_apis": apis} if "anthropic-messages" in apis.values() else {}),
             **({"model_limits": self.config.model_limits} if self.config.model_limits else {}),
+            **(
+                {"model_reasoning": self.config.model_reasoning}
+                if self.config.model_reasoning
+                else {}
+            ),
         }
 
     def _workspace_route(self, session_id: str, runner_id: str, harness: str) -> str:
@@ -504,7 +513,7 @@ class InferenceProxy:
                         "harness": claims["harness"],
                         **{
                             key: claims[key]
-                            for key in ("model_apis", "model_limits")
+                            for key in ("model_apis", "model_limits", "model_reasoning")
                             if key in claims
                         },
                         "grant_hash": binding,

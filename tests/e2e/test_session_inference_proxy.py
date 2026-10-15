@@ -130,12 +130,13 @@ async def _verify_repl_rotation(base, cert, session_id, runner_id, bundle, mock_
                 await sdk.sessions.post_event(sid, {"type": "stop_session", "data": {}})
 
 
-@pytest.mark.parametrize("workspace", [0, 42])
+@pytest.mark.parametrize(("workspace", "named_route"), [(0, False), (42, False), (42, True)])
 def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     tmp_path: Path,
     unused_tcp_port: int,
     isolated_mock_llm_server_url: str,
     workspace: int,
+    named_route: bool,
 ) -> None:
     root = Path(__file__).resolve().parents[2]
     # Authentication must never import dependencies from the runner workspace.
@@ -192,6 +193,7 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
         "OMNIGENT_E2E_PROVIDER": isolated_mock_llm_server_url,
         "OMNIGENT_E2E_SIGNING_KEY": "s" * 32,
         "OMNIGENT_E2E_WORKSPACE": str(workspace),
+        "OMNIGENT_E2E_NAMED_ROUTE": "1" if named_route else "0",
         "OMNIGENT_DATA_DIR": str(tmp_path / "server-data"),
     }
     marker = "INFERENCE_PROXY_HOST_TURN_OK"
@@ -244,7 +246,10 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                     yaml.safe_dump(
                         {
                             "name": "proxy-agent",
-                            "executor": {"harness": "openai-agents", "model": "test-model"},
+                            "executor": {
+                                "harness": "openai-agents",
+                                "model": "friendly-alias" if named_route else "test-model",
+                            },
                             "prompt": "Reply briefly without using tools.",
                             "os_env": {"type": "caller_process", "cwd": str(tmp_path)},
                         }
@@ -289,6 +294,8 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 assert marker in final_assistant_text(result)
                 ledger = client.get("/v1/_e2e/proxy_requests").json()
                 assert ledger["calls"] and all(call["authorized"] for call in ledger["calls"])
+                assert all(call["model"] == "test-model" for call in ledger["calls"])
+                assert all(call["vertex"] == named_route for call in ledger["calls"])
                 assert ledger["active"] == 0
                 assert "server-only-provider" not in "".join(
                     path.read_text() for path in host_root.rglob("*.json")

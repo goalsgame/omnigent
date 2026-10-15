@@ -840,3 +840,20 @@ async def test_managed_proxy_preserves_explicit_direct_configuration(env: _Env):
     saved = env.store.get_conversation(response.json()["id"])
     assert saved is not None and saved.inference_snapshot is not None
     assert saved.model_override == "gateway/main"
+
+
+async def test_managed_proxy_preserves_default_provider_without_inference_binding(env: _Env):
+    _enable_managed_proxy(env, direct=True)
+    target = env.app.state.sandbox_config.default
+    target.host_config.pop("inference")
+    target.host_config["providers"]["bifrost"]["default"] = True
+    response = await env.client.get(
+        "/v1/sandbox-providers/agent_sandbox/harnesses/pi-native/model-options"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["provider_label"] == "Bifrost"
+    assert env.catalog.calls == [("agent_sandbox", "pi-native", None)]
+    created = await _json_create(env, model_override="gateway/fast")
+    assert created.status_code == 201, created.text
+    saved = env.store.get_conversation(created.json()["id"])
+    assert saved is not None and saved.model_override == "gateway/fast"
