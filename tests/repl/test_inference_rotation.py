@@ -13,7 +13,14 @@ from omnigent.repl._repl import _SessionsChatReplAdapter
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bundled", [False, True])
 @pytest.mark.parametrize("opted_in", [False, True])
-async def test_rotation_requests_fresh_host_runner_only_for_opted_in_sessions(bundled, opted_in):
+async def test_rotation_requests_fresh_host_runner_only_for_opted_in_sessions(
+    bundled, opted_in, monkeypatch
+):
+    from dataclasses import replace
+
+    from omnigent import chat
+
+    monkeypatch.setattr(chat, "_session_hosts", {})
     old = Session(
         id="old",
         agent_id="agent",
@@ -49,7 +56,19 @@ async def test_rotation_requests_fresh_host_runner_only_for_opted_in_sessions(bu
         runner_id="old-runner",
         session_bundle=b"bundle" if bundled else None,
     )
-    adapter._hydrate_from_session_snapshot(old)
+    adapter._hydrate_from_session_snapshot(
+        replace(
+            old,
+            host_id="previous-host",
+            workspace="/previous",
+            labels={INFERENCE_HOST_POLICY_LABEL: "previous-host"} if opted_in else {},
+        )
+    )
+
+    async def stop_on_current_host(*args, **kwargs):
+        assert chat.get_session_host("old") == "host"
+
+    client.sessions.post_event = AsyncMock(side_effect=stop_on_current_host)
     adapter._rotation_placement = ("stale-host", "/stale-workspace")
     await adapter.start_new_conversation()
     client.sessions.unbind_runner.assert_awaited_once_with("old")
@@ -332,3 +351,128 @@ async def test_cross_host_launch_repoints_real_auth_and_ignores_stale_snapshot(m
             await adapter.aclose()
     assert requests[0].headers[OMNIGENT_SLICE_KEY_HEADER] == "host-a"
     assert all(request.headers[OMNIGENT_SLICE_KEY_HEADER] == "host-b" for request in requests[1:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["read", "stop"])
+async def test_transition_does_not_stop_a_new_selection_or_discard_it(phase):
+    old = Session(
+        id="old",
+        agent_id="agent",
+        status="idle",
+        created_at=0,
+        runner_id="runner",
+        host_id="host",
+        workspace="/work",
+        labels={INFERENCE_HOST_POLICY_LABEL: "host"},
+    )
+    client = SimpleNamespace(
+        sessions=SimpleNamespace(
+            get=AsyncMock(),
+            post_event=AsyncMock(),
+            unbind_runner=AsyncMock(),
+        )
+    )
+    adapter = _SessionsChatReplAdapter(client, "agent", session_id="old", runner_id="runner")
+
+    async def change_session(*args):
+        adapter.switch_session("other")
+        return old
+
+    if phase == "read":
+        client.sessions.get.side_effect = change_session
+    else:
+        client.sessions.get.return_value = old
+        client.sessions.post_event.side_effect = change_session
+    with pytest.raises(RuntimeError, match="Session changed during transition"):
+        await adapter.start_new_conversation()
+    assert adapter.session_id == "other"
+    if phase == "read":
+        client.sessions.post_event.assert_not_awaited()
+    else:
+        client.sessions.post_event.assert_awaited_once_with(
+            "old", {"type": "stop_session", "data": {}}
+        )
+    client.sessions.unbind_runner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_runner", [False, True])
+async def test_remote_child_view_preserves_only_confirmed_shared_host(monkeypatch, shared_runner):
+    import httpx
+    from omnigent_client import OmnigentClient
+    from omnigent_client._errors import OmnigentError
+
+    from omnigent import chat
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    base = "https://workspace.example/api/2.0/omnigent"
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "synthetic-token")
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR, raising=False)
+    monkeypatch.setattr(chat, "_session_hosts", {})
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda url: None)
+    monkeypatch.setattr("omnigent.telemetry.request_headers.telemetry_request_headers", dict)
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda: SimpleNamespace(host_id="local-host"),
+    )
+    location = {"host": "remote-host", "runner": "shared-runner"}
+    requests = []
+
+    def body(sid):
+        return {
+            "id": sid,
+            "agent_id": "agent",
+            "status": "idle",
+            "created_at": 0,
+            "runner_id": location["runner"]
+            if sid == "parent" or shared_runner
+            else "other-runner",
+            "host_id": location["host"] if sid == "parent" else None,
+            "workspace": "/remote" if sid == "parent" else None,
+        }
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            expected = location["host"] if shared_runner else "local-host"
+            assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == expected
+            return (
+                httpx.Response(202, json={"queued": True})
+                if shared_runner
+                else httpx.Response(
+                    409, json={"error": {"code": "wrong_replica", "message": "host unknown"}}
+                )
+            )
+        return httpx.Response(200, json=body(request.url.path.rsplit("/", 1)[1]))
+
+    auth = chat._DatabricksTokenAuth(base, session_id="parent")
+    async with OmnigentClient(base_url=base, auth=auth) as client:
+        await client._http._transport.aclose()
+        client._http._transport = httpx.MockTransport(handler)
+        client._http._mounts.clear()
+        adapter = _SessionsChatReplAdapter(
+            client, "agent", session_id="parent", runner_id="shared-runner"
+        )
+        adapter._hydrate_from_session_snapshot(Session.from_dict(body("parent")))
+        adapter._stream_pump = AsyncMock()
+        try:
+            await adapter.view_session("child", read_only=True, interactive=True)
+            # Repeated hostless child snapshots keep the verified routing key.
+            adapter._hydrate_from_session_snapshot(await client.sessions.get("child"))
+            if shared_runner:
+                await client.sessions.post_event("child", {"type": "message", "data": {}})
+                location.update(host="moved-host", runner="replacement-runner")
+                await adapter.view_session("parent", read_only=False)
+                await adapter.view_session("child", read_only=True, interactive=True)
+                await client.sessions.post_event("child", {"type": "message", "data": {}})
+                assert chat.get_session_host("child") == "moved-host"
+            else:
+                with pytest.raises(OmnigentError):
+                    await client.sessions.post_event("child", {"type": "message", "data": {}})
+                assert chat.get_session_host("child") is None
+        finally:
+            await adapter.aclose()
+    assert requests[0].headers[OMNIGENT_SLICE_KEY_HEADER] == "remote-host"

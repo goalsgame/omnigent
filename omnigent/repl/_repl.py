@@ -1391,6 +1391,7 @@ class _SessionsChatReplAdapter:
         self._rotation_placement: tuple[str, str] | None = None
         self._server_inference_placement: tuple[str, str] | None = None
         self._pending_host_placement: tuple[str, str] | None = None
+        self._routing_host_id: str | None = None
         # Push-based event callback. The pump calls this for every
         # event — always, regardless of whether send() is active.
         # Set by run_repl() to the rendering callback.
@@ -1659,6 +1660,7 @@ class _SessionsChatReplAdapter:
         if self._session_id is None:
             return
         set_session_host(self._session_id, host_id)
+        self._routing_host_id = host_id
         auth = getattr(getattr(self._client, "_http", None), "auth", None)
         if isinstance(auth, _DatabricksTokenAuth):
             auth.pin_session(self._session_id)
@@ -1686,11 +1688,18 @@ class _SessionsChatReplAdapter:
         # or unresolved agent row).
         if session.agent_name:
             self._agent_name = session.agent_name
+        shares_runner = (
+            session.runner_id is not None and session.runner_id == self._bound_runner_id
+        )
         self._bound_runner_id = session.runner_id
+        from omnigent.chat import get_session_host
         from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
 
         host_id = getattr(session, "host_id", None)
-        self._pin_current_session_host(host_id)
+        routing_host = host_id or (self._routing_host_id if shares_runner else None)
+        if routing_host is None and session.runner_id is not None and self._session_id is not None:
+            routing_host = get_session_host(self._session_id)
+        self._pin_current_session_host(routing_host)
         workspace = getattr(session, "workspace", None)
         labels = getattr(session, "labels", {})
         placement = (host_id, workspace) if host_id and workspace else None
@@ -1699,7 +1708,8 @@ class _SessionsChatReplAdapter:
             if placement is not None and labels.get(INFERENCE_HOST_POLICY_LABEL) == host_id:
                 self._server_inference_placement = placement
             elif session.runner_id is not None or placement is not None:
-                self._server_inference_placement = None
+                if not (host_id is None and shares_runner and routing_host is not None):
+                    self._server_inference_placement = None
         # Don't clobber a runner if it is revived after timeout
         if self._runner_recover is None and session.runner_id:
             self._runner_id = session.runner_id
@@ -2938,15 +2948,19 @@ class _SessionsChatReplAdapter:
 
     async def _stop_inference_runner_for_transition(self) -> tuple[str, str] | None:
         """Stop an owned, opted-in daemon runner before changing sessions."""
+        session_id = self._session_id
         if (
-            self._session_id is not None
+            session_id is not None
             and not self._attach_only
             and not self._readonly_view
             and self._runner_recover is None
         ):
             from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
 
-            snapshot = await self._client.sessions.get(self._session_id)
+            snapshot = await self._client.sessions.get(session_id)
+            if self._session_id != session_id:
+                raise RuntimeError("Session changed during transition; retry the command")
+            self._hydrate_from_session_snapshot(snapshot)
             if (
                 snapshot.host_id
                 and snapshot.workspace
@@ -2954,8 +2968,10 @@ class _SessionsChatReplAdapter:
             ):
                 # Stop while the old binding still identifies its owned process.
                 await self._client.sessions.post_event(
-                    self._session_id, {"type": "stop_session", "data": {}}
+                    session_id, {"type": "stop_session", "data": {}}
                 )
+                if self._session_id != session_id:
+                    raise RuntimeError("Session changed during transition; retry the command")
                 return snapshot.host_id, snapshot.workspace
 
         return None
