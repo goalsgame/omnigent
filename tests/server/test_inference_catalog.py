@@ -734,3 +734,60 @@ async def test_another_saved_binding_cannot_persist_embedded_credentials(field, 
         )
     assert "inline-test-secret" not in str(error.value)
     assert "user:secret" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_pi_tier_aliases_normalize_protocol_reasoning_and_limits(monkeypatch):
+    from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
+
+    state = _state(allowed=("fast",), default="fast", harness="pi-native")
+    target = state.sandbox_config.default
+    target.model_discovery.clear()
+    target.host_config["providers"]["bifrost"]["openai"]["models"] = {"fast": "gateway/fast"}
+    binding = target.host_config["inference"]["harnesses"]["pi-native"]
+    binding.update(
+        model_apis={"fast": "openai-completions"},
+        model_reasoning={"fast": True},
+        model_limits={"fast": {"context_window": 200000, "max_output_tokens": 64000}},
+    )
+    snapshot = await SandboxInferenceService(state).prepare("agent_sandbox", "pi-native", "alice")
+    assert snapshot is not None
+    saved = snapshot["runtime_config"]["inference"]["harnesses"]["pi-native"]
+    assert saved["model_allowlist"] == ["gateway/fast"]
+    assert saved["default_model"] == "gateway/fast"
+    assert saved["model_apis"] == {"gateway/fast": "openai-completions"}
+    assert saved["model_reasoning"] == {"gateway/fast": True}
+    assert saved["model_limits"] == {
+        "gateway/fast": {"context_window": 200000, "max_output_tokens": 64000}
+    }
+    monkeypatch.setenv("POD_INFERENCE_KEY", "runner-only-key")
+    resolved = resolve_pi_native_provider(
+        model="gateway/fast", config_loader=lambda: snapshot["runtime_config"]
+    )
+    assert resolved is not None and resolved.api == "openai-completions"
+    model = resolved.to_models_config()["providers"][resolved.provider_id]["models"][0]
+    assert model["reasoning"] is True and model["contextWindow"] == 200000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata_key", "first", "second"),
+    [
+        ("model_apis", "openai-completions", "anthropic-messages"),
+        ("model_reasoning", True, False),
+        ("model_limits", {"context_window": 200000}, {"context_window": 1000000}),
+    ],
+)
+async def test_conflicting_metadata_for_collapsed_tier_aliases_is_rejected(
+    metadata_key, first, second
+):
+    state = _state(allowed=("fast", "gateway/fast"), default="fast", harness="pi-native")
+    target = state.sandbox_config.default
+    target.model_discovery.clear()
+    target.host_config["providers"]["bifrost"]["openai"]["models"] = {"fast": "gateway/fast"}
+    target.host_config["inference"]["harnesses"]["pi-native"][metadata_key] = {
+        "fast": first,
+        "gateway/fast": second,
+    }
+    with pytest.raises(OmnigentError, match="Conflicting"):
+        await SandboxInferenceService(state).prepare("agent_sandbox", "pi-native", "alice")

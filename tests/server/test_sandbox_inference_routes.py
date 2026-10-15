@@ -902,3 +902,31 @@ async def test_managed_proxy_preserves_agent_profiles_in_preview_and_create(env:
     assert saved is not None and saved.model_override == "personal-model"
     assert saved.inference_snapshot is not None
     assert env.catalog.calls
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+async def test_managed_proxy_preserves_unrelated_native_harnesses(env: _Env, harness):
+    _enable_managed_proxy(env)
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    response = await env.client.get(
+        f"/v1/sandbox-providers/agent_sandbox/harnesses/{harness}/model-options",
+        params={"agent_id": agent["id"]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["provider_label"] == "Bifrost"
+    created = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+        },
+    )
+    assert created.status_code == 201, created.text
+    saved = env.store.get_conversation(created.json()["id"])
+    assert saved is not None and saved.model_override is None
+    assert env.catalog.calls

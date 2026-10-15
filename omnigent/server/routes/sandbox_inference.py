@@ -66,6 +66,7 @@ def managed_proxy_catalog(
     if (
         proxy is None
         or not proxy.config.managed_sandboxes
+        or (harness != "auto" and harness not in proxy.config.harnesses)
         or target is None
         or target.provider not in ("agent_sandbox", "kubernetes")
         or agent_auth is not None

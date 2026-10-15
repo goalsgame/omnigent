@@ -280,6 +280,18 @@ class SandboxInferenceService:
                         for model in saved["model_allowlist"]
                     )
                 )
+            for metadata_key in ("model_apis", "model_reasoning", "model_limits"):
+                if metadata_key not in saved:
+                    continue
+                normalized = {}
+                for model, value in saved[metadata_key].items():
+                    resolved = _resolve_alias(entry, saved_harness, model)
+                    if resolved in normalized and normalized[resolved] != value:
+                        raise _invalid(
+                            f"Conflicting {metadata_key} for resolved model {resolved!r}."
+                        )
+                    normalized[resolved] = value
+                saved[metadata_key] = normalized
             if saved.get("default_model"):
                 saved["default_model"] = _resolve_alias(
                     entry, saved_harness, saved["default_model"]
