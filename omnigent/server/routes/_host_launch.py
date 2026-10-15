@@ -31,6 +31,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
+from omnigent.spec import ExecutorSpec
 from omnigent.stores import ConversationStore
 from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
@@ -216,6 +217,27 @@ def resolve_host_launch(
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
 
 
+def inherited_runner_workspace(
+    parent: Conversation, store: ConversationStore, host_id: str
+) -> str | None:
+    """Find the shared runner's workspace without crossing an explicit host boundary."""
+    current = parent
+    visited: set[str] = set()
+    for _ in range(16):
+        if current.id in visited or current.host_id not in (None, host_id):
+            return None
+        visited.add(current.id)
+        if current.workspace:
+            return current.workspace
+        if not current.parent_conversation_id:
+            return None
+        ancestor = store.get_conversation(current.parent_conversation_id)
+        if ancestor is None:
+            return None
+        current = ancestor
+    return None
+
+
 async def agent_has_explicit_auth(
     conv: Conversation,
     agent_store: AgentStore | None = None,
@@ -236,7 +258,11 @@ async def agent_has_explicit_auth(
     spec = loaded.spec
     if conv.sub_agent_name:
         spec = _find_spec_by_name(spec, conv.sub_agent_name) or spec
-    executor = spec.executor
+    return executor_has_explicit_auth(spec.executor)
+
+
+def executor_has_explicit_auth(executor: ExecutorSpec) -> bool:
+    """Recognize both current and legacy agent-owned authentication."""
     return (
         executor.auth is not None
         or bool(getattr(executor, "profile", None))

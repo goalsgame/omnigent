@@ -123,6 +123,7 @@ async def test_inference_mismatch_response_does_not_expose_exception_details(
     "mode",
     [
         "valid",
+        "authenticated-client",
         "colocated-child",
         "wrong-runner",
         "wrong-session",
@@ -183,6 +184,8 @@ async def test_transient_proxy_init_is_server_verified_and_runner_bound(
 
     class Server(NullServerClient):
         async def post(self, url, **kwargs):
+            if mode == "authenticated-client":
+                return await authenticated.post(url, **kwargs)
             verification_calls.append((url, kwargs))
             return httpx.Response(
                 401 if mode == "revoked" else 200,
@@ -190,14 +193,32 @@ async def test_transient_proxy_init_is_server_verified_and_runner_bound(
                 request=httpx.Request("POST", "https://server.example" + url),
             )
 
+    class ControlPlaneAuth(httpx.Auth):
+        def auth_flow(self, request):
+            request.headers["Authorization"] = "Bearer control-plane-token"
+            yield request
+
+    def refresh(request):
+        assert request.headers["Authorization"] == "Bearer " + "g" * 64
+        verification_calls.append((request.url.path, {}))
+        return httpx.Response(200, json={"runtime_binding": binding})
+
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(process_manager=manager, server_client=Server())
-    async with _runner_client(app) as client:
-        response = await client.post(
-            "/v1/sessions",
-            json=build_runner_session_init_payload(conversation, server_version="test"),
+    async with httpx.AsyncClient(
+        base_url="https://server.example",
+        auth=ControlPlaneAuth(),
+        transport=httpx.MockTransport(refresh),
+    ) as authenticated:
+        app = create_runner_app(
+            process_manager=manager,
+            server_client=Server(),
         )
-    if mode in ("valid", "colocated-child"):
+        async with _runner_client(app) as client:
+            response = await client.post(
+                "/v1/sessions",
+                json=build_runner_session_init_payload(conversation, server_version="test"),
+            )
+    if mode in ("valid", "colocated-child", "authenticated-client"):
         assert response.status_code == 201, response.text
         assert response.json()["inference_config_verified"] is True
         assert verification_calls[0][0].startswith("/v1/inference/workspaces/")

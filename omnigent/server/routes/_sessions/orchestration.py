@@ -3455,6 +3455,12 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
+    from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+    # This child requires a runner without its ancestor’s process-wide provider map.
+    if child_conv.labels.get(SEPARATE_INFERENCE_RUNNER_LABEL) == "1":
+        return None
+
     # Walk the ancestor chain (immediate parent first, then root) to find a
     # live runner.  A single hop covers the common case; two hops cover nested
     # sub-agents where the immediate parent's runner is also stale but the root
@@ -10605,6 +10611,7 @@ async def _create_session_from_existing_agent(
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
+    separate_inference_runner = False
     inherited_runner_id: str | None = None
     if body.parent_session_id is not None:
         parent_conv = _parent_for_routing
@@ -10620,6 +10627,44 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+
+    if inherited_runner_id is not None and selection_spec is not None:
+        assert _parent_for_routing is not None
+        from omnigent.runner.routing import routing_host_id
+        from omnigent.server.routes._host_launch import (
+            executor_has_explicit_auth,
+            inherited_runner_workspace,
+        )
+
+        registry = getattr(request.app.state, "host_registry", None)
+        parent_host_id = await asyncio.to_thread(
+            routing_host_id, _parent_for_routing, conversation_store
+        )
+        parent_conn = registry.get(parent_host_id) if registry and parent_host_id else None
+        if (
+            registry is not None
+            and parent_conn is not None
+            and parent_host_id is not None
+            and "server-inference-v1" in parent_conn.hello.capabilities
+            and registry.server_inference_harnesses
+            and executor_has_explicit_auth(selection_spec.executor)
+            and not _parent_for_routing.inference_snapshot
+        ):
+            # Dedicated host binding also keeps child recovery off the parent's runner.
+            separate_inference_runner = True
+            inherited_runner_id = None
+            body = body.model_copy(
+                update={
+                    "host_id": body.host_id or parent_host_id,
+                    "workspace": body.workspace
+                    or await asyncio.to_thread(
+                        inherited_runner_workspace,
+                        _parent_for_routing,
+                        conversation_store,
+                        parent_host_id,
+                    ),
+                }
+            )
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must
@@ -10791,6 +10836,10 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if separate_inference_runner:
+        from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+        initial_labels[SEPARATE_INFERENCE_RUNNER_LABEL] = "1"
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,

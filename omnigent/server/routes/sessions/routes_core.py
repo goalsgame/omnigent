@@ -605,6 +605,10 @@ def register_core_routes(
                 conversation=conversation,
             )
         conn = target.conn
+        if harness in (None, "auto") and agent_store is not None and agent_cache is not None:
+            from omnigent.server.routes.hosts import _resolve_agent_harness
+
+            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
         agent_has_auth = (
             await agent_has_explicit_auth(target.conv, agent_store, agent_cache)
             if host_registry.server_inference_eligible(conn, harness)
@@ -924,7 +928,7 @@ def register_core_routes(
         # tracker entry registered here (see post_event). Config
         # problems and malformed repo workspaces still fail the POST
         # synchronously.
-        launch_host_id = body.host_id
+        launch_host_id = body.host_id or resp.host_id
         if body.host_type == "managed" and resp.runner_id is None:
             await _schedule_managed_launch(
                 request,

@@ -192,6 +192,7 @@ async def verify_transient_runner_inference_config(
         response = await server_client.post(
             parts.path + "/token",
             headers={"Authorization": "Bearer " + credential["grant"]},
+            auth=None,
             timeout=10,
         )
         response.raise_for_status()
