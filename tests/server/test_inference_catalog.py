@@ -744,6 +744,10 @@ async def test_pi_tier_aliases_normalize_protocol_reasoning_and_limits(monkeypat
     target = state.sandbox_config.default
     target.model_discovery.clear()
     target.host_config["providers"]["bifrost"]["openai"]["models"] = {"fast": "gateway/fast"}
+    target.host_config["providers"]["bifrost"]["anthropic"] = {
+        "base_url": "https://inference.example/anthropic",
+        "api_key_ref": "env:POD_INFERENCE_KEY",
+    }
     binding = target.host_config["inference"]["harnesses"]["pi-native"]
     binding.update(
         model_apis={"fast": "openai-completions"},
@@ -785,6 +789,10 @@ async def test_conflicting_metadata_for_collapsed_tier_aliases_is_rejected(
     target = state.sandbox_config.default
     target.model_discovery.clear()
     target.host_config["providers"]["bifrost"]["openai"]["models"] = {"fast": "gateway/fast"}
+    target.host_config["providers"]["bifrost"]["anthropic"] = {
+        "base_url": "https://inference.example/anthropic",
+        "api_key_ref": "env:POD_INFERENCE_KEY",
+    }
     target.host_config["inference"]["harnesses"]["pi-native"][metadata_key] = {
         "fast": first,
         "gateway/fast": second,
@@ -820,3 +828,26 @@ async def test_live_discovery_honors_explicit_pi_model_protocol(monkeypatch, mod
     assert snapshot["catalog"]["status"] == "ready"
     assert [row["id"] for row in snapshot["catalog"]["models"]] == [model]
     assert snapshot["catalog"]["default_model"] == model
+
+
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize(
+    "api,family,missing",
+    [
+        ("anthropic-messages", "openai", "anthropic"),
+        ("openai-completions", "anthropic", "openai"),
+    ],
+)
+async def test_explicit_protocol_requires_matching_provider_endpoint(live, api, family, missing):
+    state = _state(allowed=("model",), default="model", harness="pi-native")
+    target = state.sandbox_config.default
+    raw = target.host_config
+    provider = raw["providers"]["bifrost"]
+    endpoint = provider.pop("openai")
+    endpoint.pop("wire_api")
+    provider[family] = endpoint
+    raw["inference"]["harnesses"]["pi-native"]["model_apis"] = {"model": api}
+    if not live:
+        target.model_discovery.clear()
+    with pytest.raises(OmnigentError, match=f"requires a {missing} endpoint"):
+        await SandboxInferenceService(state).prepare("agent_sandbox", "pi-native", "alice")

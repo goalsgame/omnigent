@@ -162,6 +162,11 @@ For managed sandboxes, set `inference_proxy.managed_sandboxes: true` to expose
 the proxy model catalog before launch. Sandboxes must also opt in with
 `OMNIGENT_SERVER_INFERENCE=1` and omit direct provider bindings from their host
 configuration. Otherwise their configured
-provider credentials continue to take precedence. A server and runner upgrade is
+provider credentials continue to take precedence, including non-default SDK
+providers and global SDK authentication. Proxy-backed sessions retain a
+server-authored policy reference; model changes and forks are checked against
+the server catalog without copying upstream credentials to the workspace.
+Start a new session to switch a proxy-backed session to another agent.
+A server and runner upgrade is
 required when introducing per-model protocols or limits; relaunch existing
 runners to obtain the updated binding. Retain workspace volumes during upgrades.

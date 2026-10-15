@@ -10548,6 +10548,7 @@ async def _create_session_from_existing_agent(
         )
 
     inference_snapshot = None
+    inference_policy_labels: dict[str, str] = {}
     selection_spec = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
@@ -10594,7 +10595,11 @@ async def _create_session_from_existing_agent(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if selection_spec is not None:
-            inference_snapshot, model_override = await prepare_create_inference(
+            (
+                inference_snapshot,
+                model_override,
+                inference_policy_labels,
+            ) = await prepare_create_inference(
                 request,
                 body,
                 selection_spec,
@@ -10825,6 +10830,7 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    initial_labels.update(inference_policy_labels)
     if separate_inference_runner:
         from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
 

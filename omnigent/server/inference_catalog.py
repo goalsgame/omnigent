@@ -284,6 +284,12 @@ class SandboxInferenceService:
             # An unconnected Unity reference remains unusable, never late-bound.
             if not entry.families:
                 continue
+            for api in saved.get("model_apis", {}).values():
+                required_family = "anthropic" if api == "anthropic-messages" else "openai"
+                if required_family not in entry.families:
+                    raise _invalid(
+                        f"Model protocol {api!r} requires a {required_family} endpoint."
+                    )
             if saved.get("model_allowlist") is not None:
                 saved["model_allowlist"] = list(
                     dict.fromkeys(
@@ -420,6 +426,12 @@ class SandboxInferenceService:
                 result.update(configured=False, status="unconfigured")
                 return result
             provider = load_providers(config)[binding.provider]
+            for api in (binding.model_apis or {}).values():
+                required_family = "anthropic" if api == "anthropic-messages" else "openai"
+                if required_family not in provider.families:
+                    raise _invalid(
+                        f"Model protocol {api!r} requires a {required_family} endpoint."
+                    )
             workspace = snapshot.get("connections", {}).get(provider.name)
             result["provider_label"] = config["providers"][provider.name].get("display_name") or (
                 "Unity Gateway" if workspace else provider.display_name or provider.name
