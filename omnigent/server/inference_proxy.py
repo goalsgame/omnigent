@@ -174,7 +174,7 @@ class InferenceProxyConfig:
                 },
             }
         )
-        return cls(
+        config = cls(
             url.rstrip("/"),
             hmac.new(key.encode(), b"omnigent-inference-signing-v1", hashlib.sha256).hexdigest(),
             tuple(models),
@@ -186,6 +186,12 @@ class InferenceProxyConfig:
             model_reasoning=dict(raw.get("model_reasoning", {})),
             **limits,
         )
+        config.validate_harnesses()
+        return config
+
+    def validate_harnesses(self) -> None:
+        if any(not self.model_apis(harness) for harness in self.harnesses):
+            raise ValueError("Each enabled inference harness requires a compatible model")
 
 
 class InferenceProxy:
@@ -199,6 +205,7 @@ class InferenceProxy:
         transport: httpx.AsyncBaseTransport | None = None,
         machine_allowed: Callable[[str], bool] | None = None,
     ):
+        config.validate_harnesses()
         self.config = config
         self.conversations = conversations
         self.hosts = hosts

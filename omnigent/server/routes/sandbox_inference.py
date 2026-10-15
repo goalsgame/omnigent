@@ -152,7 +152,7 @@ async def prepare_create_inference(
             body.sandbox_provider,
             harness,
             agent_auth=spec.executor.auth,
-            profile=spec.executor.profile,
+            profile=spec.executor.profile or spec.executor.config.get("profile"),
         )
         if proxy_catalog is not None:
             if body.inference_configuration_revision is not None:
@@ -259,7 +259,7 @@ def create_sandbox_inference_router(
             ).spec
             harness = actual_harness(spec, harness)
             auth = spec.executor.auth
-            profile = spec.executor.profile
+            profile = spec.executor.profile or spec.executor.config.get("profile")
         try:
             proxy_catalog = managed_proxy_catalog(
                 request, provider, harness, agent_auth=auth, profile=profile

@@ -126,7 +126,7 @@ async def env(
     config = ManagedSandboxConfig(
         provider="agent_sandbox",
         server_url="http://test",
-        launcher_factory=lambda: None,
+        launcher_factory=lambda: SimpleNamespace(capabilities=SimpleNamespace(multi_repo=True)),
         token_ttl_s=100,
         host_config=catalog.runtime_config,
     )
@@ -857,3 +857,48 @@ async def test_managed_proxy_preserves_default_provider_without_inference_bindin
     assert created.status_code == 201, created.text
     saved = env.store.get_conversation(created.json()["id"])
     assert saved is not None and saved.model_override == "gateway/fast"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_info_advertises_model_discovery_for_managed_proxy(env: _Env, enabled):
+    from dataclasses import replace
+
+    _enable_managed_proxy(env)
+    proxy = env.app.state.inference_proxy
+    proxy.config = replace(proxy.config, managed_sandboxes=enabled)
+    response = await env.client.get("/v1/info")
+    assert response.status_code == 200, response.text
+    caps = response.json()["sandbox_provider_capabilities"]["agent_sandbox"]
+    assert caps.get("inference_models", False) is enabled
+    env.launch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_managed_proxy_preserves_agent_profiles_in_preview_and_create(env: _Env, legacy):
+    _enable_managed_proxy(env)
+    executor = {"type": "omnigent", "config": {"harness": "pi-native"}}
+    if legacy:
+        executor["config"]["profile"] = "personal-profile"
+    else:
+        executor["profile"] = "personal-profile"
+    agent = await create_test_agent(env.client, executor=executor, include_llm=False)
+    response = await env.client.get(
+        "/v1/sandbox-providers/agent_sandbox/harnesses/pi-native/model-options",
+        params={"agent_id": agent["id"]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["provider_label"] == "Bifrost"
+    created = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+            "model_override": "personal-model",
+        },
+    )
+    assert created.status_code == 201, created.text
+    saved = env.store.get_conversation(created.json()["id"])
+    assert saved is not None and saved.model_override == "personal-model"
+    assert saved.inference_snapshot is not None
+    assert env.catalog.calls

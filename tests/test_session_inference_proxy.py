@@ -1450,3 +1450,22 @@ def test_reasoning_metadata_requires_allowed_models_and_booleans(routed, value):
     raw["model_reasoning"] = value
     with pytest.raises(ValueError):
         InferenceProxyConfig.parse(raw)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_incompatible_harness_is_rejected_during_configuration(routed, explicit):
+    from omnigent.server.inference_proxy import InferenceProxyConfig
+
+    raw = _multi_upstream_raw()
+    raw["models"] = ["reasoning-model"]
+    raw["upstreams"] = {"claude": raw["upstreams"]["claude"]}
+    raw["model_routes"] = {"reasoning-model": raw["model_routes"]["reasoning-model"]}
+    raw["model_reasoning"] = {"reasoning-model": True}
+    if explicit:
+        raw["harnesses"] = ["pi-native", "openai-agents"]
+    else:
+        raw.pop("harnesses")
+    with pytest.raises(ValueError, match="compatible model"):
+        InferenceProxyConfig.parse(raw)
+    raw["harnesses"] = ["pi-native"]
+    assert InferenceProxyConfig.parse(raw) is not None
