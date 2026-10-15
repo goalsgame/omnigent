@@ -45,7 +45,9 @@ executor profiles and saved direct bindings retain their direct routing. Runner
 launches needing server authentication receive the proxy binding; already-running
 runners must be relaunched. CLI `/clear` and `/new` stop an opted-in daemon
 runner; the next send launches a fresh process in the same host workspace with
-credentials bound to the new session. The host
+credentials bound to the new session. REPL forks also obtain their own runner;
+switching to a host-bound session reuses its valid binding or launches a fresh
+runner when it is unbound. The host
 stores the inference refresh capability in its data directory with private file
 permissions on POSIX and inherited account permissions on Windows. Protect that
 account and directory: the capability permits inference spending for its session.

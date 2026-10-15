@@ -1389,6 +1389,8 @@ class _SessionsChatReplAdapter:
         self._session_start_notified = False
         self._bound_runner_id: str | None = None
         self._rotation_placement: tuple[str, str] | None = None
+        self._server_inference_placement: tuple[str, str] | None = None
+        self._pending_host_placement: tuple[str, str] | None = None
         # Push-based event callback. The pump calls this for every
         # event — always, regardless of whether send() is active.
         # Set by run_repl() to the rendering callback.
@@ -1670,6 +1672,18 @@ class _SessionsChatReplAdapter:
         if session.agent_name:
             self._agent_name = session.agent_name
         self._bound_runner_id = session.runner_id
+        from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+        host_id = getattr(session, "host_id", None)
+        workspace = getattr(session, "workspace", None)
+        labels = getattr(session, "labels", {})
+        placement = (host_id, workspace) if host_id and workspace else None
+        self._pending_host_placement = placement if session.runner_id is None else None
+        if self._runner_recover is None:
+            if placement is not None and labels.get(INFERENCE_HOST_POLICY_LABEL) == host_id:
+                self._server_inference_placement = placement
+            elif session.runner_id is not None or placement is not None:
+                self._server_inference_placement = None
         # Don't clobber a runner if it is revived after timeout
         if self._runner_recover is None and session.runner_id:
             self._runner_id = session.runner_id
@@ -1910,6 +1924,24 @@ class _SessionsChatReplAdapter:
         async with self._bind_lock:
             if self._session_id is None:
                 raise RuntimeError("Cannot bind runner before a session exists")
+            placement = self._pending_host_placement or (
+                self._server_inference_placement if self._bound_runner_id is None else None
+            )
+            if placement is not None and self._runner_recover is None:
+                from omnigent.chat import set_session_host
+                from omnigent.cli_auth import databricks_request_headers
+
+                host_id, workspace = placement
+                set_session_host(self._session_id, host_id)
+                launched = await self._client.sessions.launch_runner(
+                    self._session_id,
+                    host_id=host_id,
+                    workspace=workspace,
+                    headers=databricks_request_headers(self._client._base_url, host_id=host_id),
+                )
+                self._hydrate_from_session_snapshot(launched)
+                if launched.runner_id is None:
+                    raise RuntimeError("Host launch did not bind a runner to this session")
             if self._runner_id is None:
                 if self._session_bundle is None:
                     # Remote target: we tried to adopt one of the server's
@@ -2129,6 +2161,7 @@ class _SessionsChatReplAdapter:
         self._interactive_child = False
         old_session_id = self._session_id
         if old_session_id is not None and old_session_id != new_session_id:
+            await self._stop_inference_runner_for_transition()
             await self._unbind_runner_soft(old_session_id)
         if self._stream_task is not None:
             self._stream_task.cancel()
@@ -2880,20 +2913,7 @@ class _SessionsChatReplAdapter:
         """
         return
 
-    async def start_new_conversation(self) -> None:
-        """
-        Tear down the current session so the next ``send()`` POSTs a fresh one.
-
-        Used by ``/clear`` and ``/new``. Unbinds the runner from the
-        old session (1:1 session↔runner invariant), cancels the SSE
-        pump, and clears local state. Session creation stays lazy —
-        the next :meth:`send` takes :meth:`_ensure_session`'s create
-        branch. Idempotent when no session is established. The unbind
-        is soft-failed on old servers (see :meth:`_unbind_runner_soft`).
-        Opted-in daemon runners stop before unbinding; the next create asks
-        their host for a fresh runner with new session-specific credentials.
-        """
-        rotation = None
+    async def _stop_inference_runner_for_transition(self) -> tuple[str, str] | None:
         if (
             self._session_id is not None
             and not self._attach_only
@@ -2912,7 +2932,24 @@ class _SessionsChatReplAdapter:
                 await self._client.sessions.post_event(
                     self._session_id, {"type": "stop_session", "data": {}}
                 )
-                rotation = snapshot.host_id, snapshot.workspace
+                return snapshot.host_id, snapshot.workspace
+
+        return None
+
+    async def start_new_conversation(self) -> None:
+        """
+        Tear down the current session so the next ``send()`` POSTs a fresh one.
+
+        Used by ``/clear`` and ``/new``. Unbinds the runner from the
+        old session (1:1 session↔runner invariant), cancels the SSE
+        pump, and clears local state. Session creation stays lazy —
+        the next :meth:`send` takes :meth:`_ensure_session`'s create
+        branch. Idempotent when no session is established. The unbind
+        is soft-failed on old servers (see :meth:`_unbind_runner_soft`).
+        Opted-in daemon runners stop before unbinding; the next create asks
+        their host for a fresh runner with new session-specific credentials.
+        """
+        rotation = await self._stop_inference_runner_for_transition()
 
         # A fresh session is owned, not observed — clear any read-only-view
         # suppression / interactive-child co-drive from a sub-agent dive so the

@@ -101,3 +101,68 @@ async def test_failed_rotation_stop_preserves_current_session():
     assert adapter.session_id == "old" and adapter._runner_id == "runner"
     assert adapter._rotation_placement is None
     client.sessions.unbind_runner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_has_host", [False, True])
+async def test_fork_or_unbound_host_session_gets_own_runner(monkeypatch, target_has_host):
+    source = Session(
+        id="source",
+        agent_id="agent",
+        status="idle",
+        created_at=0,
+        runner_id="source-runner",
+        host_id="source-host",
+        workspace="/source",
+        labels={INFERENCE_HOST_POLICY_LABEL: "source-host"},
+    )
+    host_id = "target-host" if target_has_host else "source-host"
+    workspace = "/target" if target_has_host else "/source"
+    target = Session(
+        id="fork",
+        agent_id="agent",
+        status="idle",
+        created_at=1,
+        host_id=host_id if target_has_host else None,
+        workspace=workspace if target_has_host else None,
+    )
+    bound = Session(
+        id="fork",
+        agent_id="agent",
+        status="idle",
+        created_at=1,
+        runner_id="fork-runner",
+        host_id=host_id,
+        workspace=workspace,
+        labels={INFERENCE_HOST_POLICY_LABEL: host_id},
+    )
+    client = SimpleNamespace(
+        _base_url="https://server.example",
+        sessions=SimpleNamespace(
+            get=AsyncMock(return_value=target),
+            launch_runner=AsyncMock(return_value=bound),
+            bind_runner=AsyncMock(),
+        ),
+    )
+    adapter = _SessionsChatReplAdapter(
+        client, "agent", session_id="source", runner_id="source-runner"
+    )
+    adapter._hydrate_from_session_snapshot(source)
+    adapter._stream_pump = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.cli_auth.databricks_request_headers",
+        lambda base, *, host_id: {"X-Test-Host": host_id},
+    )
+    adapter.switch_session("fork")
+    try:
+        assert await adapter._ensure_session() == "fork"
+        client.sessions.launch_runner.assert_awaited_once_with(
+            "fork",
+            host_id=host_id,
+            workspace=workspace,
+            headers={"X-Test-Host": host_id},
+        )
+        assert adapter._runner_id == "fork-runner"
+        client.sessions.bind_runner.assert_not_awaited()
+    finally:
+        await adapter.aclose()

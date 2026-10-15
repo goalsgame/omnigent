@@ -723,6 +723,33 @@ class SessionsNamespace:
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
+    async def launch_runner(
+        self,
+        session_id: str,
+        *,
+        host_id: str,
+        workspace: str,
+        headers: dict[str, str] | None = None,
+    ) -> Session:
+        """Launch a session's own runner on an external host.
+
+        :param session_id: Existing unbound session to run.
+        :param host_id: Host owned by the caller.
+        :param workspace: Absolute directory on that host.
+        :param headers: Optional per-request routing headers for the host's replica.
+        :returns: The host-bound session snapshot.
+        """
+        from urllib.parse import quote
+
+        response = await self._http.post(
+            f"{self._base}/v1/hosts/{quote(host_id, safe='')}/runners",
+            json={"session_id": session_id, "workspace": workspace},
+            headers=headers,
+            timeout=60.0,
+        )
+        raise_for_status(response.status_code, response_body(response))
+        return await self.get(session_id)
+
     async def unbind_runner(self, session_id: str) -> Session:
         """
         Clear a session's runner binding.

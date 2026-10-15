@@ -65,9 +65,11 @@ def _certificate(root: Path) -> None:
 
 
 async def _verify_repl_rotation(base, cert, session_id, runner_id, bundle, mock_url):
+    from types import SimpleNamespace
+
     from omnigent_client import OmnigentClient
 
-    from omnigent.repl._repl import _SessionsChatReplAdapter
+    from omnigent.repl._repl import _cmd_fork, _SessionsChatReplAdapter
 
     async with OmnigentClient(base_url=base) as sdk:
         # Trust this test's ephemeral CA on the SDK transport as on the sync client.
@@ -82,32 +84,50 @@ async def _verify_repl_rotation(base, cert, session_id, runner_id, bundle, mock_
             runner_id=runner_id,
             session_bundle=bundle,
         )
+        preserved_sources = []
+
+        async def complete_turn(marker):
+            configure_mock_llm(mock_url, [{"text": marker}])
+            async with asyncio.timeout(90):
+                async for _ in adapter.send("Reply after changing conversations."):
+                    pass
+                while True:
+                    snapshot = await sdk.sessions.get(adapter.session_id)
+                    assert snapshot.status != "failed", snapshot.last_task_error
+                    if marker in json.dumps(snapshot.items):
+                        return
+                    await asyncio.sleep(0.1)
+
         try:
-            for command in ("clear", "new"):
+            for command in ("clear", "new", "fork"):
                 previous_id = adapter.session_id
                 previous_runner = adapter._runner_id
-                await adapter.start_new_conversation()
-                assert adapter._runner_id is None
-                marker = "REPL_ROTATION_" + command.upper()
-                configure_mock_llm(mock_url, [{"text": marker}])
-                async with asyncio.timeout(90):
-                    async for _ in adapter.send("Reply after rotating the conversation."):
-                        pass
-                    while True:
-                        snapshot = await sdk.sessions.get(adapter.session_id)
-                        assert snapshot.status != "failed", snapshot.last_task_error
-                        if marker in json.dumps(snapshot.items):
-                            break
-                        await asyncio.sleep(0.1)
+                if command == "fork":
+                    await _cmd_fork(
+                        "",
+                        adapter,
+                        sdk,
+                        SimpleNamespace(output=lambda value: None),
+                        SimpleNamespace(muted="dim"),
+                    )
+                    preserved_sources.append(previous_id)
+                else:
+                    await adapter.start_new_conversation()
+                    assert adapter._runner_id is None
+                await complete_turn("REPL_ROTATION_" + command.upper())
                 assert adapter.session_id != previous_id
                 assert adapter._runner_id and adapter._runner_id != previous_runner
-                assert (await sdk.sessions.get(previous_id)).runner_id is None
+                previous = await sdk.sessions.get(previous_id)
+                assert previous.runner_id == (previous_runner if command == "fork" else None)
+            fork_id = adapter.session_id
+            await adapter.switch_to_session(preserved_sources[-1])
+            await complete_turn("REPL_SWITCH_SOURCE_OK")
+            await adapter.switch_to_session(fork_id)
+            await complete_turn("REPL_SWITCH_FORK_OK")
         finally:
             await adapter.aclose()
-            if adapter.session_id:
-                await sdk.sessions.post_event(
-                    adapter.session_id, {"type": "stop_session", "data": {}}
-                )
+            for sid in {*preserved_sources, adapter.session_id} - {None}:
+                await sdk.sessions.post_event(sid, {"type": "stop_session", "data": {}})
 
 
 @pytest.mark.parametrize("workspace", [0, 42])
