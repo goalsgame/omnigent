@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -134,3 +135,58 @@ def test_unsupported_clone_options_fail_before_execution(home, monkeypatch):
             {},
             "lores://lore.test/game",
         )
+
+
+@pytest.mark.parametrize("existing_empty", [False, True])
+def test_manifest_write_failure_can_retry_without_published_checkout(
+    home, monkeypatch, existing_empty
+):
+    target = home / "workspace/game"
+    if existing_empty:
+        target.mkdir(parents=True)
+    manifest = lore._manifest(target)
+    original_write = lore._write_json
+    fail = True
+    clones = []
+
+    def write(path, value):
+        if fail:
+            raise OSError("disk full")
+        return original_write(path, value)
+
+    def clone(args, **kwargs):
+        destination = Path(args[-1])
+        (destination / ".lore").mkdir(parents=True)
+        (destination / "file.txt").write_text("cloned")
+        clones.append(destination)
+        return lore.subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(lore, "_write_json", write)
+    monkeypatch.setattr(lore, "_binary", lambda: sys.executable)
+    monkeypatch.setattr(lore.subprocess, "run", clone)
+    with pytest.raises(OSError, match="disk full"):
+        lore.prepare(
+            "https://server.test",
+            "host",
+            "lores://lore.test/game",
+            target,
+            "main",
+            credential_payload={"token": "ephemeral"},
+        )
+    assert not (target / ".lore").exists()
+    assert not manifest.exists()
+    assert not list(target.parent.glob(".omnigent-lore-*"))
+    if existing_empty:
+        assert target.is_dir() and not any(target.iterdir())
+    fail = False
+    lore.prepare(
+        "https://server.test",
+        "host",
+        "lores://lore.test/game",
+        target,
+        "main",
+        credential_payload={"token": "ephemeral"},
+    )
+    assert (target / "file.txt").read_text() == "cloned"
+    assert manifest.exists()
+    assert len(clones) == 2

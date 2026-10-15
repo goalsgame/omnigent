@@ -304,10 +304,10 @@ def prepare(
             )
         if not (staging / "clone" / ".lore").is_dir():
             raise LoreCheckoutError("Lore clone did not create repository metadata")
+        _write_json(manifest, {"path": str(target), "remote": remote, "ref": ref})
         if target.exists():
             target.rmdir()
         (staging / "clone").rename(target)
-    _write_json(manifest, {"path": str(target), "remote": remote, "ref": ref})
 
 
 def _clone(args: list[str], config: dict, remote: str) -> int:
