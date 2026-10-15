@@ -1338,3 +1338,79 @@ def test_instrument_httpx_client_injects_over_custom_transport(
         f"{_RESP_HEX!r} after instrument_client — the server->runner forward "
         "would not stay in the originating trace."
     )
+
+
+def test_host_inference_grant_never_reaches_span_attributes(
+    in_memory_exporter: InMemorySpanExporter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import copy
+    import json
+
+    from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
+
+    monkeypatch.setattr(telemetry, "_capture_content", True)
+    grant = "synthetic-refresh-capability-keep-off-spans"
+    config = {
+        "server_inference": {
+            "url": "https://server.example/v1/inference/sessions/session",
+            "grant": grant,
+            "harness": "openai-agents",
+            "models": ["model-a"],
+        },
+        "providers": [{"api_key": "nested-provider-secret"}],
+    }
+    original = copy.deepcopy(config)
+    frame = HostLaunchRunnerFrame(
+        request_id="request",
+        binding_token="runner-binding-secret",
+        workspace="/workspace",
+        session_id="session",
+        harness="openai-agents",
+        inference_config=config,
+    )
+    with otel_trace.get_tracer("test").start_as_current_span("host-launch"):
+        wire = encode_host_frame(frame)
+    spans = in_memory_exporter.get_finished_spans()
+    captured = spans[0].attributes["omnigent.message.payload"]
+    for secret in (grant, "runner-binding-secret", "nested-provider-secret"):
+        assert secret not in str(spans[0].attributes)
+    payload = json.loads(captured)
+    assert payload["inference_config"]["server_inference"]["grant"] == "[redacted]"
+    assert payload["inference_config"]["providers"][0]["api_key"] == "[redacted]"
+    assert json.loads(wire)["inference_config"] == original
+    assert config == original
+
+
+def test_payload_redaction_bounds_recursive_structures() -> None:
+    import json
+
+    payload = {"grant": "must-not-leak"}
+    payload["cycle"] = payload
+    payload["other_cycle"] = payload
+    payload["list_cycle"] = [payload]
+    redacted = telemetry._redact_payload(payload)
+    assert "must-not-leak" not in json.dumps(redacted)
+    assert redacted["grant"] == "[redacted]"
+    assert redacted["cycle"] == "[redacted]"
+    assert redacted["other_cycle"] == "[redacted]"
+    assert redacted["list_cycle"] == ["[redacted]"]
+    assert payload["grant"] == "must-not-leak"
+
+
+def test_nested_numeric_payload_keys_do_not_break_redaction() -> None:
+    import json
+
+    payload = {"data": {1: {"token": "nested-secret", "value": "public"}}}
+    redacted = json.loads(telemetry._payload_to_attribute(payload))
+    assert redacted["data"]["1"] == {"token": "[redacted]", "value": "public"}
+    assert payload["data"][1]["token"] == "nested-secret"
+
+
+def test_payload_redaction_preserves_shared_noncyclic_values() -> None:
+    shared = {"token": "secret", "value": "public"}
+    redacted = telemetry._redact_payload({"left": shared, "right": shared})
+    assert redacted == {
+        "left": {"token": "[redacted]", "value": "public"},
+        "right": {"token": "[redacted]", "value": "public"},
+    }
+    assert shared == {"token": "secret", "value": "public"}

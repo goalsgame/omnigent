@@ -18,7 +18,7 @@ import sys
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
+from typing import TYPE_CHECKING, NotRequired, Protocol, TextIO, TypeAlias, TypedDict
 
 from omnigent_client import (
     BlockContext,
@@ -136,6 +136,11 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
         next_exc = current.__cause__ or current.__context__
         current = next_exc if isinstance(next_exc, BaseException) else None
     return False
+
+
+class _SessionCreatePlacement(TypedDict):
+    workspace: str
+    host_id: NotRequired[str]
 
 
 class _SessionSnapshot(Protocol):
@@ -1383,6 +1388,11 @@ class _SessionsChatReplAdapter:
         self._on_session_start = on_session_start
         self._session_start_notified = False
         self._bound_runner_id: str | None = None
+        self._rotation_placement: tuple[str, str] | None = None
+        self._server_inference_placement: tuple[str, str] | None = None
+        self._pending_host_placement: tuple[str, str] | None = None
+        self._routing_host_id: str | None = None
+        self._routing_hosts: dict[str, tuple[str, str]] = {}
         # Push-based event callback. The pump calls this for every
         # event — always, regardless of whether send() is active.
         # Set by run_repl() to the rendering callback.
@@ -1645,6 +1655,17 @@ class _SessionsChatReplAdapter:
             raise RuntimeError("No active conversation to compact")
         await self._client.sessions.compact(self._session_id)
 
+    def _pin_current_session_host(self, host_id: str | None) -> None:
+        from omnigent.chat import _DatabricksTokenAuth, set_session_host
+
+        if self._session_id is None:
+            return
+        set_session_host(self._session_id, host_id)
+        self._routing_host_id = host_id
+        auth = getattr(getattr(self._client, "_http", None), "auth", None)
+        if isinstance(auth, _DatabricksTokenAuth):
+            auth.pin_session(self._session_id)
+
     def _hydrate_from_session_snapshot(self, session: _SessionSnapshot) -> None:
         """
         Copy mutable session fields from a sessions API snapshot.
@@ -1656,6 +1677,11 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if (
+            self._session_id is not None
+            and getattr(session, "id", self._session_id) != self._session_id
+        ):
+            return
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1663,7 +1689,37 @@ class _SessionsChatReplAdapter:
         # or unresolved agent row).
         if session.agent_name:
             self._agent_name = session.agent_name
+        shares_runner = (
+            session.runner_id is not None and session.runner_id == self._bound_runner_id
+        )
         self._bound_runner_id = session.runner_id
+        from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+        host_id = getattr(session, "host_id", None)
+        session_id = self._session_id
+        cached_route = self._routing_hosts.get(session_id) if session_id is not None else None
+        routing_host = host_id or getattr(session, "routing_host_id", None)
+        if routing_host is None and shares_runner:
+            routing_host = self._routing_host_id
+        if routing_host is None and cached_route is not None:
+            cached_runner, cached_host = cached_route
+            if cached_runner == session.runner_id:
+                routing_host = cached_host
+        if session_id is not None and routing_host is not None and session.runner_id is not None:
+            self._routing_hosts[session_id] = (session.runner_id, routing_host)
+        elif session_id is not None:
+            self._routing_hosts.pop(session_id, None)
+        self._pin_current_session_host(routing_host)
+        workspace = getattr(session, "workspace", None)
+        labels = getattr(session, "labels", {})
+        placement = (host_id, workspace) if host_id and workspace else None
+        self._pending_host_placement = placement if session.runner_id is None else None
+        if self._runner_recover is None:
+            if placement is not None and labels.get(INFERENCE_HOST_POLICY_LABEL) == host_id:
+                self._server_inference_placement = placement
+            elif session.runner_id is not None or placement is not None:
+                if not (host_id is None and shares_runner and routing_host is not None):
+                    self._server_inference_placement = None
         # Don't clobber a runner if it is revived after timeout
         if self._runner_recover is None and session.runner_id:
             self._runner_id = session.runner_id
@@ -1727,6 +1783,12 @@ class _SessionsChatReplAdapter:
             assert self._session_id is not None
             return self._session_id
 
+    def _create_placement_kwargs(self) -> _SessionCreatePlacement:
+        if self._rotation_placement is not None:
+            host_id, workspace = self._rotation_placement
+            return {"host_id": host_id, "workspace": workspace}
+        return {"workspace": os.getcwd()}
+
     async def _create_session_from_registered_agent(self, *, pending_debug: bool) -> None:
         """
         Create a session bound to an agent already registered server-side.
@@ -1749,18 +1811,26 @@ class _SessionsChatReplAdapter:
         # Skip the name lookup only when nothing needs it: we already know
         # the id, and a bound runner means we don't need the harness either.
         agent: RegisteredAgent | None = None
-        if self._agent_id is None or self._runner_id is None:
+        if self._agent_id is None or (
+            self._runner_id is None and self._rotation_placement is None
+        ):
             agent = await self._client.sessions.resolve_agent(self._agent_name)
         agent_id = self._agent_id or (agent.id if agent is not None else None)
         if agent_id is None:
             raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
-        if self._runner_id is None:
+        fresh_host_placement: tuple[str, str] | None = None
+        if self._runner_id is None and self._rotation_placement is None:
             from omnigent.harness_aliases import canonicalize_harness
 
             self._runner_id = await self._client.sessions.resolve_online_runner(
                 harness=agent.harness if agent is not None else None,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
+            if self._runner_id is None:
+                fresh_host_placement = await self._client.sessions.resolve_online_host(
+                    harness=agent.harness if agent is not None else None,
+                    canonicalize=lambda name: canonicalize_harness(name) or name,
+                )
             if pending_debug:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
@@ -1773,10 +1843,13 @@ class _SessionsChatReplAdapter:
         session = await self._client.sessions.create_from_agent_id(
             agent_id,
             reasoning_effort=self._reasoning_effort,
-            workspace=os.getcwd(),
+            **self._create_placement_kwargs(),
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        if fresh_host_placement is not None:
+            self._pending_host_placement = fresh_host_placement
+        self._rotation_placement = None
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -1808,15 +1881,13 @@ class _SessionsChatReplAdapter:
             self._session_bundle,
             filename=self._session_bundle_filename,
             reasoning_effort=self._reasoning_effort,
-            # Record the user's terminal cwd so the Web UI can show
-            # "running locally in <workspace>" for CLI sessions. Doesn't
-            # drive any behavior — CLI sessions don't bind to a host_id,
-            # so the ck_conversations_workspace_required_for_host
-            # constraint isn't active.
-            workspace=os.getcwd(),
+            # Preserve the host workspace when rotating session-bound inference;
+            # other CLI creates record the terminal's current directory.
+            **self._create_placement_kwargs(),
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        self._rotation_placement = None
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -1877,8 +1948,10 @@ class _SessionsChatReplAdapter:
 
     async def _bind_runner_if_needed(self) -> None:
         """
-        Patch this session to the current registered runner.
+        Ensure this session has an appropriate runner before dispatch.
 
+        Unbound host sessions and proxy-backed forks launch their own runner.
+        Direct sessions bind the current registered runner through PATCH.
         The sessions API has one dispatch precondition: a session
         must be bound to an online runner before a turn is posted.
         ``PATCH /v1/sessions/{id}`` is last-write-wins, so resume
@@ -1897,6 +1970,23 @@ class _SessionsChatReplAdapter:
         async with self._bind_lock:
             if self._session_id is None:
                 raise RuntimeError("Cannot bind runner before a session exists")
+            placement = self._pending_host_placement or (
+                self._server_inference_placement if self._bound_runner_id is None else None
+            )
+            if placement is not None and self._runner_recover is None:
+                from omnigent.cli_auth import databricks_request_headers
+
+                host_id, workspace = placement
+                self._pin_current_session_host(host_id)
+                launched = await self._client.sessions.launch_runner(
+                    self._session_id,
+                    host_id=host_id,
+                    workspace=workspace,
+                    headers=databricks_request_headers(self._client._base_url, host_id=host_id),
+                )
+                self._hydrate_from_session_snapshot(launched)
+                if launched.runner_id is None:
+                    raise RuntimeError("Host launch did not bind a runner to this session")
             if self._runner_id is None:
                 if self._session_bundle is None:
                     # Remote target: we tried to adopt one of the server's
@@ -2093,8 +2183,9 @@ class _SessionsChatReplAdapter:
         """
         Re-point the adapter at a different existing session.
 
-        Unbinds the runner from the prior session so the 1:1
-        session↔runner invariant holds, cancels the SSE pump bound to
+        Stops and detaches an owned proxy-backed runner, preserving observed
+        sessions. Unbinds owned direct runners so the 1:1 session↔runner
+        invariant holds, cancels the SSE pump bound to
         the old session id, hydrates the new session snapshot, PATCHes
         the runner binding onto the new session, and restarts the
         pump. Called by ``/switch``.
@@ -2112,11 +2203,17 @@ class _SessionsChatReplAdapter:
         # co-drive) left over from diving into a sub-agent — otherwise the bind
         # below (and every later bind) no-ops and the switched-to session can
         # never dispatch a turn.
+        old_session_id = self._session_id
+        if (
+            old_session_id is not None
+            and old_session_id != new_session_id
+            and not self._readonly_view
+            and not self._attach_only
+        ):
+            await self._stop_inference_runner_for_transition()
+            await self._unbind_runner_soft(old_session_id)
         self._readonly_view = False
         self._interactive_child = False
-        old_session_id = self._session_id
-        if old_session_id is not None and old_session_id != new_session_id:
-            await self._unbind_runner_soft(old_session_id)
         if self._stream_task is not None:
             self._stream_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2867,6 +2964,36 @@ class _SessionsChatReplAdapter:
         """
         return
 
+    async def _stop_inference_runner_for_transition(self) -> tuple[str, str] | None:
+        """Stop an owned, opted-in daemon runner before changing sessions."""
+        session_id = self._session_id
+        if (
+            session_id is not None
+            and not self._attach_only
+            and not self._readonly_view
+            and self._runner_recover is None
+        ):
+            from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+            snapshot = await self._client.sessions.get(session_id)
+            if self._session_id != session_id:
+                raise RuntimeError("Session changed during transition; retry the command")
+            self._hydrate_from_session_snapshot(snapshot)
+            if (
+                snapshot.host_id
+                and snapshot.workspace
+                and snapshot.labels.get(INFERENCE_HOST_POLICY_LABEL) == snapshot.host_id
+            ):
+                # Stop while the old binding still identifies its owned process.
+                await self._client.sessions.post_event(
+                    session_id, {"type": "stop_session", "data": {}}
+                )
+                if self._session_id != session_id:
+                    raise RuntimeError("Session changed during transition; retry the command")
+                return snapshot.host_id, snapshot.workspace
+
+        return None
+
     async def start_new_conversation(self) -> None:
         """
         Tear down the current session so the next ``send()`` POSTs a fresh one.
@@ -2877,15 +3004,24 @@ class _SessionsChatReplAdapter:
         the next :meth:`send` takes :meth:`_ensure_session`'s create
         branch. Idempotent when no session is established. The unbind
         is soft-failed on old servers (see :meth:`_unbind_runner_soft`).
+        Opted-in daemon runners stop before unbinding; the next create asks
+        their host for a fresh runner with new session-specific credentials.
         """
+        observing = self._readonly_view or self._attach_only
+        old_session_id = self._session_id
+        rotation = await self._stop_inference_runner_for_transition()
+
         # A fresh session is owned, not observed — clear any read-only-view
         # suppression / interactive-child co-drive from a sub-agent dive so the
         # new session can bind.
+        if old_session_id is not None:
+            if not observing:
+                await self._unbind_runner_soft(old_session_id)
+            self._rotation_placement = rotation
         self._readonly_view = False
         self._interactive_child = False
-        old_session_id = self._session_id
-        if old_session_id is not None:
-            await self._unbind_runner_soft(old_session_id)
+        if rotation is not None:
+            self._runner_id = None
         if self._stream_task is not None:
             self._stream_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

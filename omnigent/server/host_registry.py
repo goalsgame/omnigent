@@ -404,6 +404,7 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
+    reported_harnesses: dict | None = None
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -498,9 +499,66 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        self.server_inference_harnesses: tuple[str, ...] = ()
+        self.inference_config_resolver: (
+            Callable[[Any, str, str | None, str, str | None, str | None], dict[str, Any] | None]
+            | None
+        ) = None
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def inference_readiness(self, capabilities: list[str], reported: dict | None) -> dict | None:
+        """Supply server authentication only when an opted-in host has the harness."""
+        if "server-inference-v1" not in capabilities or reported is None:
+            return reported
+        result = dict(reported)
+        for harness in self.server_inference_harnesses:
+            if result.get(harness) in (True, "needs-auth"):
+                result[harness] = True
+        return result
+
+    def server_inference_eligible(self, conn: HostConnection, harness: str | None) -> bool:
+        """Whether this connection and harness opt into configured server inference."""
+        return (
+            "server-inference-v1" in conn.hello.capabilities
+            and harness in self.server_inference_harnesses
+        )
+
+    def needs_server_inference(self, conn: HostConnection, harness: str | None) -> bool:
+        """Use server auth only for installed harnesses lacking personal credentials."""
+        return (
+            self.server_inference_eligible(conn, harness)
+            and (conn.reported_harnesses or {}).get(harness) == "needs-auth"
+        )
+
+    def runner_inference_config(
+        self,
+        conversation: Any,
+        runner_id: str,
+        harness: str | None,
+        *,
+        host_id: str | None = None,
+        agent_has_auth: bool = False,
+    ) -> dict[str, Any] | None:
+        """Preserve direct bindings, supplying server auth only when needed."""
+        if conversation.inference_snapshot:
+            return conversation.inference_snapshot["runtime_config"]
+        if agent_has_auth:
+            return None
+        host_id = host_id or conversation.host_id
+        conn = self.get(host_id) if host_id else None
+        if (
+            self.inference_config_resolver is not None
+            and conn is not None
+            and self.needs_server_inference(conn, harness)
+        ):
+            config = self.inference_config_resolver(
+                conversation, runner_id, harness, host_id, conn.owner, conn.account_generation
+            )
+            if config is not None:
+                return config
+        return None
 
     def register(
         self,
@@ -542,6 +600,12 @@ class HostRegistry:
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         host_id = _canonical_host_id(host_id)
         now = time.time()
+        reported_harnesses = (
+            dict(hello.configured_harnesses) if hello.configured_harnesses is not None else None
+        )
+        hello.configured_harnesses = self.inference_readiness(
+            hello.capabilities, reported_harnesses
+        )
         conn = HostConnection(
             workspace_id=ws_id,
             host_id=host_id,
@@ -553,6 +617,7 @@ class HostRegistry:
             connected_at=now,
             last_frame_at=now,
             registered_with_managed_token=registered_with_managed_token,
+            reported_harnesses=reported_harnesses,
         )
         with self._lock:
             key = (ws_id, host_id)

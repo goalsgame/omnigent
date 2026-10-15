@@ -141,18 +141,36 @@ def _redact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     with ``"[redacted]"``. Non-secret values pass through unchanged.
 
     :param payload: The decoded frame / message dict.
-    :returns: A shallow copy safe to serialize onto a span.
+    :returns: A recursively redacted copy safe to serialize onto a span.
     """
-    redacted: dict[str, Any] = {}
-    for key, value in payload.items():
-        lowered = key.lower()
-        if lowered in ("traceparent", "tracestate"):
-            continue
-        if any(token in lowered for token in _REDACT_KEY_SUBSTRINGS):
-            redacted[key] = "[redacted]"
-        else:
-            redacted[key] = value
-    return redacted
+
+    visiting: set[int] = set()
+
+    def redact(value: Any, depth: int) -> Any:
+        if depth > 32 or id(value) in visiting:
+            return "[redacted]"
+        if not isinstance(value, (Mapping, list, tuple)):
+            return value
+        visiting.add(id(value))
+        try:
+            if isinstance(value, Mapping):
+                result = {}
+                for key, nested in value.items():
+                    lowered = str(key).lower()
+                    if lowered in ("traceparent", "tracestate"):
+                        continue
+                    if lowered == "grant" or any(
+                        token in lowered for token in _REDACT_KEY_SUBSTRINGS
+                    ):
+                        result[key] = "[redacted]"
+                    else:
+                        result[key] = redact(nested, depth + 1)
+                return result
+            return [redact(nested, depth + 1) for nested in value]
+        finally:
+            visiting.remove(id(value))
+
+    return redact(payload, 0)
 
 
 def _payload_to_attribute(payload: Mapping[str, Any]) -> str:

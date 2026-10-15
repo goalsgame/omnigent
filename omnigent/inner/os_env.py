@@ -1611,9 +1611,12 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _shell_argv(shell_path: str, command: str) -> list[str]:
+def _shell_argv(shell_path: str, command: str) -> list[str] | str:
     shell_name = Path(shell_path).name.lower()
     if shell_name in ("cmd.exe", "cmd"):
+        if IS_WINDOWS:
+            # cmd parses shell syntax, not the CRT escaping Python applies to argv lists.
+            return subprocess.list2cmdline([shell_path]) + ' /d /s /c "' + command + '"'
         return [shell_path, "/c", command]
     if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
         return [shell_path, "-NoProfile", "-Command", command]

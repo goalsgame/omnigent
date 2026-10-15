@@ -1797,6 +1797,9 @@ def create_app(
         try:
             yield
         finally:
+            inference_proxy = getattr(app_inst.state, "inference_proxy", None)
+            if inference_proxy is not None:
+                await inference_proxy.aclose()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -3893,6 +3896,19 @@ def create_app(
                 return owner
         return None
 
+    def _resolve_runner_placement(runner_id: str) -> tuple[str, str] | None:
+        from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+        if conversation_store is not None:
+            for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+                if (
+                    conv.host_id
+                    and conv.workspace
+                    and conv.labels.get(INFERENCE_HOST_POLICY_LABEL) == conv.host_id
+                ):
+                    return conv.host_id, conv.workspace
+        return None
+
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
         create_runner_tunnel_router(
@@ -3903,6 +3919,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            resolve_runner_placement=_resolve_runner_placement,
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
@@ -3978,6 +3995,27 @@ def create_app(
     openrouter_wif_broker = (
         OpenRouterWIFBroker(openrouter_wif_config) if openrouter_wif_config else None
     )
+
+    from omnigent.server.inference_proxy import InferenceProxy, InferenceProxyConfig
+
+    inference_proxy_config = InferenceProxyConfig.parse(
+        resolved_server_config.get("inference_proxy")
+    )
+    app.state.inference_proxy = None
+    if inference_proxy_config is not None:
+        if host_store is None or openrouter_wif_broker is None or host_registry is None:
+            raise ValueError("inference_proxy requires hosts and openrouter_wif")
+        inference_proxy = InferenceProxy(
+            inference_proxy_config,
+            conversation_store,
+            host_store,
+            openrouter_wif_broker,
+            machine_allowed=machine_verifier.principal_allowed if machine_verifier else None,
+        )
+        app.state.inference_proxy = inference_proxy
+        host_registry.inference_config_resolver = inference_proxy.launch_config
+        host_registry.server_inference_harnesses = inference_proxy_config.harnesses
+        app.include_router(inference_proxy.router(), prefix="/v1", tags=["inference"])
 
     # Host tunnel + REST endpoints (DAEMON_API.md). Mounted only when a
     # host_store is configured: the routers call host_store on every

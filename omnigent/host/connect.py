@@ -946,8 +946,10 @@ def _build_runner_env(
     return env
 
 
-def _write_runner_inference_config(session_id: str, inference_config: dict[str, object]) -> Path:
-    """Materialize an immutable inference revision without changing host settings."""
+def _write_runner_inference_config(
+    session_id: str, inference_config: dict[str, object], *, owned_files: list[Path] | None = None
+) -> Path:
+    """Materialize a private, runner-owned revision without changing host settings."""
     import hashlib
     import tempfile
 
@@ -958,15 +960,16 @@ def _write_runner_inference_config(session_id: str, inference_config: dict[str, 
     revision = hashlib.sha256(payload.encode()).hexdigest()
     directory = data_dir() / "session-inference" / session_key
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = directory / f"{revision}.json"
-    fd, temp_name = tempfile.mkstemp(prefix=".config-", dir=directory)
+    fd, filename = tempfile.mkstemp(prefix=revision + "-", suffix=".json", dir=directory)
+    path = Path(filename)
+    if owned_files is not None:
+        owned_files.append(path)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
-        os.replace(temp_name, path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temp_name)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -1089,6 +1092,7 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+    inference_files: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1456,7 +1460,8 @@ class HostProcess:
         """
         dead = [rid for rid, handle in self._runners.items() if handle.proc.poll() is not None]
         for rid in dead:
-            self._runners.pop(rid)
+            handle = self._runners.pop(rid)
+            self._cleanup_inference_files(handle.inference_files)
         if dead:
             self._trigger_maintenance("runner_exited_during_reconnect")
         return list(self._runners.keys())
@@ -1832,6 +1837,14 @@ class HostProcess:
             "URL and that the server is up to date, then retry."
         )
 
+    @staticmethod
+    def _cleanup_inference_files(paths: Iterable[Path]) -> None:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                _logger.warning("Cannot remove a runner inference file")
+
     async def _handle_launch(self, frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
         # Attribution must not move token validation ahead of the launch preflight.
         log_runner_id = (
@@ -1847,12 +1860,25 @@ class HostProcess:
                     harness=frame.harness,
                 ),
             )
-            return await self._handle_launch_impl(frame)
+            inference_files: list[Path] = []
+            retained = False
+            try:
+                result = await self._handle_launch_impl(frame, inference_files=inference_files)
+                handle = self._runners.get(result.runner_id) if result.runner_id else None
+                if result.status == "launched" and handle is not None:
+                    handle.inference_files = tuple(inference_files)
+                    retained = True
+                return result
+            finally:
+                if not retained:
+                    self._cleanup_inference_files(inference_files)
 
     @startup_timed("host.launch_runner", session_argument="frame")
     async def _handle_launch_impl(
         self,
         frame: HostLaunchRunnerFrame,
+        *,
+        inference_files: list[Path] | None = None,
     ) -> HostLaunchRunnerResultFrame:
         """Handle a launch_runner request from the server.
 
@@ -1866,6 +1892,7 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -1874,7 +1901,36 @@ class HostProcess:
         #
         # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
         # CLI, which inline would stall the keepalive pong and every other frame.
+        def discard_artifact(task):
+            if not task.cancelled():
+                task.exception()
+            self._cleanup_inference_files(inference_files or ())
+
         from omnigent.inference_config import binding_for_harness
+
+        if frame.inference_config and "server_inference" in frame.inference_config:
+            from dataclasses import replace
+
+            from omnigent.host.inference_proxy import prepare
+            from omnigent.process_logging import data_dir
+
+            try:
+                preparation = asyncio.create_task(
+                    asyncio.to_thread(
+                        prepare,
+                        frame.inference_config,
+                        data_dir() / "inference-grants",
+                        credential_files=inference_files,
+                    )
+                )
+                try:
+                    config = await asyncio.shield(preparation)
+                except asyncio.CancelledError:
+                    preparation.add_done_callback(discard_artifact)
+                    raise
+                frame = replace(frame, inference_config=config)
+            except (OSError, ValueError):
+                return self._launch_failed(frame, "Cannot configure server inference")
 
         has_binding = (
             frame.harness is not None
@@ -1930,11 +1986,19 @@ class HostProcess:
         )
         if frame.inference_config is not None:
             try:
-                inference_path = await asyncio.to_thread(
-                    _write_runner_inference_config,
-                    frame.session_id or runner_id,
-                    frame.inference_config,
+                write_config = asyncio.create_task(
+                    asyncio.to_thread(
+                        _write_runner_inference_config,
+                        frame.session_id or runner_id,
+                        frame.inference_config,
+                        owned_files=inference_files,
+                    )
                 )
+                try:
+                    inference_path = await asyncio.shield(write_config)
+                except asyncio.CancelledError:
+                    write_config.add_done_callback(discard_artifact)
+                    raise
             except OSError as exc:
                 return self._launch_failed(
                     frame, f"Cannot install session inference config: {exc}"
@@ -2020,6 +2084,7 @@ class HostProcess:
             ]
             for rid, handle in superseded:
                 self._runners.pop(rid, None)
+                self._cleanup_inference_files(handle.inference_files)
                 handle.stop_requested = True
                 self._spawn_superseded_stop(rid, handle, frame.session_id)
         self._runners[runner_id] = _RunnerHandle(
@@ -2246,6 +2311,7 @@ class HostProcess:
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
+        self._cleanup_inference_files(handle.inference_files)
         handle.stop_requested = True
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
@@ -2425,6 +2491,7 @@ class HostProcess:
             # an intentional termination, not a crash to report.
             return
         self._runners.pop(runner_id)
+        self._cleanup_inference_files(handle.inference_files)
         self._trigger_maintenance("runner_exited")
         if handle.proc.returncode == 0:
             never_connected = handle.connect_marker is not None and not await asyncio.to_thread(
@@ -4324,6 +4391,8 @@ class HostProcess:
                 handle.proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 handle.proc.kill()
+            finally:
+                self._cleanup_inference_files(handle.inference_files)
         self._runners.clear()
 
     async def _connect_and_serve(self) -> None:
@@ -4564,7 +4633,12 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
-            capabilities=list(HOST_CAPABILITIES),
+            capabilities=list(HOST_CAPABILITIES)
+            + (
+                ["server-inference-v1"]
+                if os.environ.get("OMNIGENT_SERVER_INFERENCE") == "1"
+                else []
+            ),
         )
         try:
             encoded_hello = encode_host_frame(hello)

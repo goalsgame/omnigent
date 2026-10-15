@@ -3843,3 +3843,56 @@ def test_generic_gateway_secondary_preserves_thinking(
     assert launch.args[4:] == expected
     settings = json.loads((tmp_path / "pi-agent/settings.json").read_text())
     assert settings["defaultThinkingLevel"] == "medium"
+
+
+@pytest.mark.parametrize("windows_command", [False, True])
+def test_server_inference_binding_renders_pi_chat_models_and_refresh_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows_command: bool,
+) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    from omnigent.host import inference_proxy
+    from omnigent.host.inference_proxy import prepare
+
+    if windows_command:
+        monkeypatch.setattr(
+            inference_proxy, "sys", SimpleNamespace(platform="win32", executable=sys.executable)
+        )
+        monkeypatch.setattr(
+            inference_proxy,
+            "_system_powershell",
+            lambda: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        )
+
+    url = "https://server.example/v1/inference/sessions/session"
+    config = prepare(
+        {
+            "server_inference": {
+                "url": url,
+                "grant": "g" * 64,
+                "harness": "pi-native",
+                "models": ["model-a", "model-b"],
+            }
+        },
+        tmp_path / "grants",
+    )
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.model == "model-a"
+    assert provider.api == "openai-completions"
+    rendered = provider.to_models_config()["providers"][provider.provider_id]
+    assert rendered["baseUrl"] == url
+    assert rendered["api"] == "openai-completions"
+    assert rendered["apiKey"].startswith("!")
+    command = rendered["apiKey"][1:]
+    if " -EncodedCommand " in command:
+        import base64
+
+        command = base64.b64decode(command.rsplit(" ", 1)[1]).decode("utf-16-le")
+    assert "omnigent.host.inference_proxy" in command
+    assert str(next((tmp_path / "grants").glob("*.json"))) in command
+    assert [model["id"] for model in rendered["models"]] == ["model-a", "model-b"]
+    assert "g" * 64 not in str(rendered)

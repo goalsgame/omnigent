@@ -626,7 +626,15 @@ async def _resolve_agent_harness(
     if agent is None or agent.bundle_location is None:
         return None
     loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
-    return canonicalize_harness(loaded.spec.executor.harness_kind)
+    executor = loaded.spec.executor
+    if conv.sub_agent_name:
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+        if sub is not None:
+            executor = sub.executor
+    harness = executor.config.get("harness") or executor.type
+    return canonicalize_harness(harness) or harness
 
 
 def create_hosts_router(
@@ -792,6 +800,13 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        proxy = getattr(request.app.state, "inference_proxy", None)
+        canonical = canonicalize_harness(harness) or harness
+        if proxy is not None and host_registry.needs_server_inference(conn, canonical):
+            return HostModelOptionsResponse(
+                models=[{"id": model, "name": model} for model in proxy.config.models],
+                routable_models=list(proxy.config.models),
+            )
         _require_harness_setup_support(conn, "pre-launch model listing")
 
         result = await _proxy_model_options(
@@ -906,10 +921,19 @@ def create_hosts_router(
                 raise HTTPException(status_code=400, detail=exc.message) from exc
 
         # Resolve the harness before creating host-side state.
-        harness: str | None = None
-        if agent_store is not None and agent_cache is not None:
+        harness = target.conv.harness_override
+        if harness == "auto":
+            harness = None
+        if harness is None and agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 
+        from omnigent.server.routes._host_launch import agent_has_explicit_auth
+
+        agent_has_auth = (
+            await agent_has_explicit_auth(target.conv, agent_store, agent_cache)
+            if host_registry.server_inference_eligible(conn, harness)
+            else False
+        )
         git_branch: str | None = None
         worktree = None
 
@@ -1105,6 +1129,9 @@ def create_hosts_router(
                 stage="runner_launch",
             ),
         )
+        from omnigent.server.routes._host_launch import remember_inference_host_policy
+
+        await remember_inference_host_policy(target.conv, conn, host_registry, conversation_store)
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -1117,9 +1144,13 @@ def create_hosts_router(
                 session_id=body.session_id,
                 harness=harness,
                 inference_config=(
-                    target.conv.inference_snapshot["runtime_config"]
-                    if target.conv.inference_snapshot
-                    else None
+                    host_registry.runner_inference_config(
+                        target.conv,
+                        runner_id,
+                        harness,
+                        host_id=host_id,
+                        agent_has_auth=agent_has_auth,
+                    )
                 ),
             )
         )

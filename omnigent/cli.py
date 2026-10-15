@@ -3592,11 +3592,12 @@ def _build_host_daemon_env(
         HOST_TOKEN_ENV_VAR,
     )
 
-    identity_env_vars = frozenset(
+    host_env_vars = frozenset(
         {
             HOST_ID_ENV_VAR,
             HOST_NAME_ENV_VAR,
             HOST_TOKEN_ENV_VAR,
+            "OMNIGENT_SERVER_INFERENCE",
         }
     )
 
@@ -3608,7 +3609,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
-            or key in identity_env_vars
+            or key in host_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3622,7 +3623,7 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
-            or key in identity_env_vars
+            or key in host_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later

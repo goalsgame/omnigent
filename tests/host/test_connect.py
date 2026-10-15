@@ -8716,3 +8716,148 @@ def test_run_host_process_preserves_preloaded_zygote(monkeypatch, tmp_path):
         runner_zygote=zygote,
     )
     assert seen == [zygote]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lifecycle", ["failed", "stop", "exit", "reconnect", "shutdown", "superseded"]
+)
+async def test_server_inference_grants_follow_runner_lifecycle(tmp_path, monkeypatch, lifecycle):
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    monkeypatch.setattr("omnigent.process_logging.data_dir", lambda: tmp_path)
+    monkeypatch.setattr("omnigent.onboarding.harness_install.missing_harness_cli", lambda _: None)
+    proc = Mock(pid=123, returncode=0)
+    proc.poll.return_value = None
+    spawn = Mock(return_value=(proc, tmp_path / "runner.log"))
+    if lifecycle == "failed":
+        spawn.side_effect = OSError("test spawn failure")
+    monkeypatch.setattr(host, "_spawn_runner_proc", spawn)
+    original_watch = host._watch_runner
+
+    async def wait_forever(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host, "_watch_runner", wait_forever)
+    monkeypatch.setattr(host, "_watch_runner_connect", wait_forever)
+    monkeypatch.setattr(host, "_stop_runner_and_trigger", AsyncMock())
+    monkeypatch.setattr(host, "_report_runner_exit", AsyncMock())
+    frame = HostLaunchRunnerFrame(
+        request_id="grant-launch",
+        binding_token="grant-runner-token",
+        workspace=str(tmp_path),
+        session_id="grant-session",
+        harness="openai-agents",
+        inference_config={
+            "server_inference": {
+                "url": "https://server.example/v1/inference/sessions/grant-session",
+                "grant": "g" * 64,
+                "harness": "openai-agents",
+                "models": ["model-a"],
+            }
+        },
+    )
+    try:
+        result = await host._handle_launch(frame)
+        grants = tmp_path / "inference-grants"
+        if lifecycle == "failed":
+            assert result.status == "failed"
+            assert not list(grants.iterdir())
+            assert not list((tmp_path / "session-inference").rglob("*.json"))
+            return
+        assert result.status == "launched"
+        handle = host._runners[result.runner_id]
+        original_grant, original_config = handle.inference_files
+        assert original_grant.exists()
+        assert original_config.exists()
+        assert json.loads(original_config.read_text())["providers"]["server-inference"]
+        if lifecycle == "stop":
+            await host._handle_stop(
+                HostStopRunnerFrame(request_id="stop", runner_id=result.runner_id)
+            )
+        elif lifecycle == "exit":
+            proc.poll.return_value = 0
+            await original_watch(result.runner_id)
+        elif lifecycle == "reconnect":
+            proc.poll.return_value = 0
+            assert host._alive_runner_ids() == []
+        elif lifecycle == "shutdown":
+            host._cleanup_runners()
+        else:
+            # Repeating a grant must allocate a distinct file for the replacement.
+            from dataclasses import replace
+
+            replacement = await host._handle_launch(replace(frame, request_id="replacement"))
+            assert replacement.status == "launched"
+            new_grant = host._runners[replacement.runner_id].inference_files[0]
+            assert new_grant != original_grant
+            assert new_grant.exists()
+        assert not original_grant.exists()
+        assert not original_config.exists()
+    finally:
+        _cleanup_host(host)
+        for task in host._runner_stop_tasks:
+            task.cancel()
+    assert not list((tmp_path / "inference-grants").iterdir())
+    assert not list((tmp_path / "session-inference").rglob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["grant", "config"])
+async def test_cancelled_grant_preparation_removes_late_written_file(tmp_path, monkeypatch, stage):
+    from omnigent.host import connect as host_connect
+    from omnigent.host import inference_proxy
+
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    monkeypatch.setattr("omnigent.onboarding.harness_install.missing_harness_cli", lambda _: None)
+    monkeypatch.setattr("omnigent.process_logging.data_dir", lambda: tmp_path)
+    entered, finish, written = threading.Event(), threading.Event(), threading.Event()
+    operation_module = inference_proxy if stage == "grant" else host_connect
+    operation_name = "prepare" if stage == "grant" else "_write_runner_inference_config"
+    original_prepare = getattr(operation_module, operation_name)
+
+    def slow_prepare(*args, **kwargs):
+        entered.set()
+        assert finish.wait(5)
+        try:
+            return original_prepare(*args, **kwargs)
+        finally:
+            written.set()
+
+    monkeypatch.setattr(operation_module, operation_name, slow_prepare)
+    frame = HostLaunchRunnerFrame(
+        request_id="cancel-grant",
+        binding_token="cancel-grant-token",
+        workspace=str(tmp_path),
+        session_id="session",
+        harness="openai-agents",
+        inference_config={
+            "server_inference": {
+                "url": "https://server.example/v1/inference/sessions/session",
+                "grant": "g" * 64,
+                "harness": "openai-agents",
+                "models": ["model-a"],
+            }
+        },
+    )
+    launch = asyncio.create_task(host._handle_launch(frame))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        launch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+    finally:
+        finish.set()
+    assert await asyncio.to_thread(written.wait, 5)
+    async with asyncio.timeout(5):
+        grants = tmp_path / "inference-grants"
+        while (
+            not grants.exists()
+            or list(grants.iterdir())
+            or list((tmp_path / "session-inference").rglob("*.json"))
+        ):
+            await asyncio.sleep(0.01)
+    assert not host._runners

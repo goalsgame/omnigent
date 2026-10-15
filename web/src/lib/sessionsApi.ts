@@ -889,7 +889,8 @@ export async function forkSession(
 
 /**
  * Fork a generic side chat in the parent's current working directory.
- * Reuse the parent's live runner, relaunching the parent first if it has
+ * Use the fork's independent runner when supplied by the server; otherwise
+ * reuse the parent's live runner, relaunching the parent first if it has
  * stopped. In-process sessions use normal server dispatch. Codex uses its
  * native `/side` fork instead.
  *
@@ -917,7 +918,7 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
     throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
   const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
-  if (runnerId) {
+  if (runnerId && !fork.runnerId) {
     await updateSession(fork.id, { runnerId });
   }
   return { childSessionId: fork.id };

@@ -3455,6 +3455,15 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
+    from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+    # Host-bound children recover on their own host, never an ancestor’s runner.
+    if (
+        child_conv.host_id is not None
+        or child_conv.labels.get(SEPARATE_INFERENCE_RUNNER_LABEL) == "1"
+    ):
+        return None
+
     # Walk the ancestor chain (immediate parent first, then root) to find a
     # live runner.  A single hop covers the common case; two hops cover nested
     # sub-agents where the immediate parent's runner is also stale but the root
@@ -10605,6 +10614,7 @@ async def _create_session_from_existing_agent(
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
+    separate_inference_runner = False
     inherited_runner_id: str | None = None
     if body.parent_session_id is not None:
         parent_conv = _parent_for_routing
@@ -10620,6 +10630,30 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+
+    # A requested sandbox has its own runner and repository workspace.
+    if body.host_type == "managed":
+        inherited_runner_id = None
+
+    from omnigent.server.routes._host_launch import independent_inference_child_host
+
+    independent_host = await independent_inference_child_host(
+        _parent_for_routing,
+        inherited_runner_id,
+        getattr(request.app.state, "host_registry", None),
+        conversation_store,
+        host_store=getattr(request.app.state, "host_store", None),
+        user_id=user_id,
+    )
+    if independent_host is not None:
+        separate_inference_runner = True
+        inherited_runner_id = None
+        body = body.model_copy(
+            update={
+                "host_id": body.host_id or independent_host[0],
+                "workspace": body.workspace or independent_host[1],
+            }
+        )
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must
@@ -10791,6 +10825,10 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if separate_inference_runner:
+        from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+        initial_labels[SEPARATE_INFERENCE_RUNNER_LABEL] = "1"
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
@@ -12513,6 +12551,11 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+    )
+    from omnigent.runner.routing import routing_host_id
+
+    response.routing_host_id = await asyncio.to_thread(
+        routing_host_id, conv, conv_store, require_shared_runner=True
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error

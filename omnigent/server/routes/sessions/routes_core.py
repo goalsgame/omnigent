@@ -587,7 +587,10 @@ def register_core_routes(
             encode_host_frame,
         )
         from omnigent.runner.identity import token_bound_runner_id
-        from omnigent.server.routes._host_launch import resolve_host_launch
+        from omnigent.server.routes._host_launch import (
+            agent_has_explicit_auth,
+            resolve_host_launch,
+        )
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -602,6 +605,15 @@ def register_core_routes(
                 conversation=conversation,
             )
         conn = target.conn
+        if harness in (None, "auto") and agent_store is not None and agent_cache is not None:
+            from omnigent.server.routes.hosts import _resolve_agent_harness
+
+            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+        agent_has_auth = (
+            await agent_has_explicit_auth(target.conv, agent_store, agent_cache)
+            if host_registry.server_inference_eligible(conn, harness)
+            else False
+        )
         await host_registry.admit_launch(conn, session_id)
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
@@ -628,6 +640,9 @@ def register_core_routes(
                 stage="runner_launch",
             ),
         )
+        from omnigent.server.routes._host_launch import remember_inference_host_policy
+
+        await remember_inference_host_policy(target.conv, conn, host_registry, conversation_store)
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -648,9 +663,12 @@ def register_core_routes(
                 # host-side check.
                 harness=harness,
                 inference_config=(
-                    target.conv.inference_snapshot["runtime_config"]
-                    if target.conv.inference_snapshot
-                    else None
+                    host_registry.runner_inference_config(
+                        target.conv,
+                        runner_id,
+                        harness,
+                        agent_has_auth=agent_has_auth,
+                    )
                 ),
             )
         )
@@ -913,7 +931,7 @@ def register_core_routes(
         # tracker entry registered here (see post_event). Config
         # problems and malformed repo workspaces still fail the POST
         # synchronously.
-        launch_host_id = body.host_id
+        launch_host_id = body.host_id or resp.host_id
         if body.host_type == "managed" and resp.runner_id is None:
             await _schedule_managed_launch(
                 request,
@@ -951,6 +969,8 @@ def register_core_routes(
                     _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
+                if conv is not None:
+                    resp.labels = dict(conv.labels)
 
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
@@ -1050,6 +1070,34 @@ def register_core_routes(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
 
+        # A requested sandbox must not share its parent's runner or local workspace.
+        if parsed_metadata.host_type == "managed":
+            inherited_runner_id = None
+
+        from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+        from omnigent.server.routes._host_launch import independent_inference_child_host
+
+        independent_host = await independent_inference_child_host(
+            parent_conv,
+            inherited_runner_id,
+            getattr(request.app.state, "host_registry", None),
+            conversation_store,
+            host_store=getattr(request.app.state, "host_store", None),
+            user_id=user_id,
+        )
+        if independent_host is not None:
+            inherited_runner_id = None
+            parsed_metadata = parsed_metadata.model_copy(
+                update={
+                    "host_id": parsed_metadata.host_id or independent_host[0],
+                    "workspace": parsed_metadata.workspace or independent_host[1],
+                    "labels": {
+                        **(parsed_metadata.labels or {}),
+                        SEPARATE_INFERENCE_RUNNER_LABEL: "1",
+                    },
+                }
+            )
+
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
         # (mirroring the JSON path — a bad workspace never produces a
@@ -1140,8 +1188,8 @@ def register_core_routes(
         # just-uploaded session-scoped agent (same background launch as
         # the JSON path). The managed runner fetches the uploaded bundle
         # over its tunnel like any session-scoped agent, so no separate
-        # bundle delivery is needed. A sub-agent child (inherited runner)
-        # is never itself managed — it co-locates on the parent's runner.
+        # bundle delivery is needed. Explicit managed children receive their
+        # own sandbox; other children can co-locate on the parent's runner.
         if parsed_metadata.host_type == "managed" and inherited_runner_id is None:
             await _schedule_managed_launch(
                 request,
@@ -2659,6 +2707,16 @@ def register_core_routes(
                     extra=debug_event("session_runner_unbound", session_id=session_id),
                 )
             else:
+                from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+                if (
+                    conv.labels.get(SEPARATE_INFERENCE_RUNNER_LABEL) == "1"
+                    and body.runner_id.strip() != conv.runner_id
+                ):
+                    raise OmnigentError(
+                        "This session requires its own runner; relaunch it on its host",
+                        code=ErrorCode.CONFLICT,
+                    )
                 from omnigent.server.routes import sessions as _sf
 
                 if (
@@ -3515,7 +3573,16 @@ def register_core_routes(
         # labels from the fork; otherwise the copied label would shadow the
         # freshly chosen mode. Only on an explicit pick: an untouched picker
         # sends no launch args and the label carries over as before.
-        dropped_label_keys_set: set[str] = set()
+        from omnigent.inference_config import (
+            INFERENCE_HOST_POLICY_LABEL,
+            SEPARATE_INFERENCE_RUNNER_LABEL,
+        )
+
+        # Physical placement belongs to this fork's own launch, not its source.
+        dropped_label_keys_set: set[str] = {
+            INFERENCE_HOST_POLICY_LABEL,
+            SEPARATE_INFERENCE_RUNNER_LABEL,
+        }
         if launch_args_set:
             dropped_label_keys_set |= {
                 _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -3546,7 +3613,37 @@ def register_core_routes(
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
 
-        # Side chats use the source for shared-runner routing and stay hidden
+        independent_side_host = None
+        if body.side_chat and body.host_type != "managed":
+            from omnigent.server.routes._host_launch import (
+                independent_inference_child_host,
+            )
+
+            independent_side_host = await independent_inference_child_host(
+                source,
+                source.runner_id,
+                getattr(request.app.state, "host_registry", None),
+                conversation_store,
+                host_store=getattr(request.app.state, "host_store", None),
+                user_id=user_id,
+            )
+            if independent_side_host is not None:
+                from omnigent.server.routes._sessions.helpers import _validate_session_workspace
+
+                side_workspace = await _validate_session_workspace(
+                    user_id=user_id,
+                    host_id=independent_side_host[0],
+                    workspace=independent_side_host[1],
+                    agent=base_agent,
+                    agent_cache=agent_cache,
+                    request=request,
+                )
+                independent_side_host = independent_side_host[0], side_workspace
+                from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+                extra_labels[SEPARATE_INFERENCE_RUNNER_LABEL] = "1"
+
+        # Side chats retain source ancestry for routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
@@ -3820,6 +3917,26 @@ def register_core_routes(
         # real-time path bypasses the list-endpoint's side-chat filter).
         if not body.side_chat:
             _announce_session_added(user_id, new_conv.id)
+
+        if independent_side_host is not None:
+            new_conv = await asyncio.to_thread(
+                conversation_store.set_host_id,
+                new_conv.id,
+                independent_side_host[0],
+                independent_side_host[1],
+            )
+            await _bind_and_launch_on_caller_host(
+                request,
+                user_id=user_id,
+                session_id=new_conv.id,
+                host_id=independent_side_host[0],
+                workspace=independent_side_host[1],
+                harness=new_conv.harness_override,
+                conversation=new_conv,
+            )
+            new_conv = await asyncio.to_thread(conversation_store.get_conversation, new_conv.id)
+            if new_conv is None:
+                raise _session_not_found()
 
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
