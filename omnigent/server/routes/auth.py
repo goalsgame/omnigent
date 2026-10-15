@@ -649,18 +649,26 @@ def create_auth_router(
             else None
         )
 
-        broker = getattr(request.app.state, "mcp_identity_broker", None)
-        if broker is not None:
+        brokers = [
+            broker
+            for broker in (
+                getattr(request.app.state, "mcp_identity_broker", None),
+                getattr(request.app.state, "lore_identity_broker", None),
+            )
+            if broker is not None
+        ]
+        if brokers:
             from omnigent.server.oidc_mcp import DelegationUnavailable
 
             subject = claims.get("sub") if claims else None
             access_token = token_json.get("access_token")
             if not isinstance(subject, str) or not isinstance(access_token, str):
-                return fail(403, "MCP delegation requires a verified OIDC identity")
+                return fail(403, "Identity delegation requires a verified OIDC identity")
             try:
-                await asyncio.to_thread(broker.capture, email, subject, access_token)
+                for broker in brokers:
+                    await asyncio.to_thread(broker.capture, email, subject, access_token)
             except DelegationUnavailable:
-                return fail(503, "MCP identity delegation unavailable; please retry sign-in")
+                return fail(503, "Identity delegation unavailable; please retry sign-in")
 
         # A native sign-in gets a one-time code at its redirect URI;
         # the session is minted when the app exchanges it with its verifier.

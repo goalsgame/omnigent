@@ -1814,6 +1814,8 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            for broker in delegation_brokers:
+                await asyncio.to_thread(broker.client.close)
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1895,10 +1897,35 @@ def create_app(
         )
         app.include_router(create_mcp_identity_router(host_store, mcp_broker), prefix="/v1")
     app.state.mcp_identity_broker = mcp_broker
-    if mcp_broker is not None:
+    from omnigent.server.lore import LoreConfig, LoreDelegationBroker
+
+    lore_config = LoreConfig.parse(resolved_server_config.get("oidc_lore"))
+    lore_broker = None
+    if lore_config is not None:
+        from omnigent.stores.credential_store import CredentialStore, build_secret_cipher
+
+        oidc = getattr(auth_provider, "_oidc_config", None)
+        cipher = build_secret_cipher()
+        if (
+            not isinstance(auth_provider, UnifiedAuthProvider)
+            or oidc is None
+            or cipher is None
+            or host_store is None
+            or permission_store is None
+        ):
+            raise RuntimeError("oidc_lore requires OIDC, credential encryption and managed hosts")
+        lore_broker = LoreDelegationBroker(
+            lore_config,
+            oidc,
+            CredentialStore(permission_store.storage_location, cipher),
+            auth_provider,
+        )
+    app.state.lore_identity_broker = lore_broker
+    delegation_brokers = [broker for broker in (mcp_broker, lore_broker) if broker is not None]
+    if delegation_brokers:
 
         @app.middleware("http")
-        async def capture_mcp_identity(request: Request, call_next):
+        async def capture_delegated_identity(request: Request, call_next):
             from omnigent.server.oidc_mcp import DelegationUnavailable
 
             path = request.url.path.removeprefix(resolved_base_path)
@@ -1908,11 +1935,16 @@ def create_app(
                 and (path == "/v1/sessions" or path.startswith("/v1/sessions/"))
                 and bearer.lower().startswith("bearer ")
             ):
+                broker = None
                 try:
-                    await asyncio.to_thread(mcp_broker.capture_bearer, bearer[7:])
+                    for broker in delegation_brokers:
+                        await asyncio.to_thread(broker.capture_bearer, bearer[7:])
                 except DelegationUnavailable:
                     return JSONResponse(
-                        {"detail": "MCP identity delegation unavailable; renew your IdP session"},
+                        {
+                            "detail": ("Lore" if broker is lore_broker else "MCP")
+                            + " identity delegation unavailable; renew your IdP session"
+                        },
                         status_code=403,
                         headers={"Cache-Control": "no-store"},
                     )

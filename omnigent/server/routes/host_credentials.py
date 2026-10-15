@@ -72,6 +72,7 @@ def create_host_credentials_router(
         request: Request,
         response: Response,
         x_omnigent_host_token: str | None = Header(default=None),
+        remote: str | None = None,
     ) -> dict[str, object]:
         """Return the session owner's *provider* credential for *host_id*.
 
@@ -93,6 +94,27 @@ def create_host_credentials_router(
         )
         if managed is None:
             raise HTTPException(status_code=401, detail="unauthenticated")
+        if provider == "lore":
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            broker = getattr(request.app.state, "lore_identity_broker", None)
+            if broker is None:
+                raise HTTPException(404, "Lore access is not configured")
+            if remote not in broker.lore_config.repositories:
+                raise HTTPException(403, "Lore repository is not configured")
+            try:
+                token = await asyncio.to_thread(broker.credential, managed.user_id)
+            except DelegationUnavailable:
+                raise HTTPException(
+                    403, "Lore identity unavailable; sign in again or renew delegation"
+                ) from None
+            except Exception:  # noqa: BLE001 - no provider details in responses
+                raise HTTPException(503, "Lore credentials temporarily unavailable") from None
+            return {
+                "connected": True,
+                "token": token,
+                "view": broker.lore_config.repositories[remote],
+            }
         if provider == "openrouter" and openrouter_wif_broker is not None:
             try:
                 credential = await openrouter_wif_broker.credential()

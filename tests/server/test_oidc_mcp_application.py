@@ -29,8 +29,8 @@ from tests.server.test_oidc_machine_auth import (
 __all__ = ["human", "machine_config", "oidc", "signing_key", "verifier"]
 
 
-@pytest.fixture
-def delegation_app(db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier):
+@pytest.fixture(params=["oidc_mcp", "oidc_lore"])
+def delegation_app(request, db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier):
     monkeypatch.setattr(
         "omnigent.stores.credential_store.build_secret_cipher", lambda: _FakeCipher()
     )
@@ -48,17 +48,29 @@ def delegation_app(db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, ver
             "oidc", oidc_config=oidc, human_verifier=human, machine_verifier=verifier
         ),
         server_config={
-            "oidc_mcp": {
-                "upstream_url": "https://tools.example.test/mcp",
+            request.param: {
+                "upstream_url": "https://tools.example.test",
                 "audience": "tools-api",
                 "scope": "openid tools-api",
                 "machine_client_id": "machine-exchange",
                 "machine_client_secret_env": "TEST_MCP_CLIENT_SECRET",
+                **(
+                    {
+                        "repositories": {"lores://tools.example.test/game": {}},
+                        "machine_principals": [PRINCIPAL],
+                    }
+                    if request.param == "oidc_lore"
+                    else {}
+                ),
             }
         },
     )
+    app.state.test_identity_broker = getattr(
+        app.state,
+        "lore_identity_broker" if request.param == "oidc_lore" else "mcp_identity_broker",
+    )
     yield app
-    app.state.mcp_identity_broker.client.close()
+    app.state.test_identity_broker.client.close()
 
 
 @pytest.mark.asyncio
@@ -93,7 +105,7 @@ async def test_session_post_captures_idp_owner(
             },
         )
 
-    broker = delegation_app.state.mcp_identity_broker
+    broker = delegation_app.state.test_identity_broker
     broker.client.close()
     broker.client = httpx.Client(transport=httpx.MockTransport(exchange))
     async with httpx.AsyncClient(
@@ -101,11 +113,12 @@ async def test_session_post_captures_idp_owner(
     ) as client:
         response = await client.post(path, headers={"Authorization": f"Bearer {token}"}, json={})
     assert len(exchanges) == 1
-    grant = broker.store.get(owner, "oidc_mcp", with_secret=True)
+    grant = broker.store.get(owner, broker.provider, with_secret=True)
     if unavailable:
         assert response.status_code == 403
         assert response.json() == {
-            "detail": "MCP identity delegation unavailable; renew your IdP session"
+            "detail": ("Lore" if broker.provider == "oidc_lore" else "MCP")
+            + " identity delegation unavailable; renew your IdP session"
         }
         assert response.headers["cache-control"] == "no-store"
         assert grant is None
@@ -116,7 +129,7 @@ async def test_session_post_captures_idp_owner(
         assert grant.metadata == {"issuer": oidc.issuer, "subject": subject}
         assert grant.secret["refresh_token"] == "server-only-refresh"
         other_owner = "person@example.test" if machine else PRINCIPAL
-        assert broker.store.get(other_owner, "oidc_mcp") is None
+        assert broker.store.get(other_owner, broker.provider) is None
 
 
 @pytest.mark.asyncio
@@ -128,7 +141,7 @@ async def test_non_session_writes_do_not_exchange(delegation_app, signing_key, m
         exchanges.append(request)
         return httpx.Response(400)
 
-    broker = delegation_app.state.mcp_identity_broker
+    broker = delegation_app.state.test_identity_broker
     broker.client.close()
     broker.client = httpx.Client(transport=httpx.MockTransport(exchange))
     async with httpx.AsyncClient(
@@ -138,4 +151,4 @@ async def test_non_session_writes_do_not_exchange(delegation_app, signing_key, m
             method, path, headers={"Authorization": f"Bearer {human_token(signing_key)}"}
         )
     assert exchanges == []
-    assert broker.store.get("person@example.test", "oidc_mcp") is None
+    assert broker.store.get("person@example.test", broker.provider) is None

@@ -1454,21 +1454,23 @@ def test_start_session_managed_remembers_host_over_sandbox_default(
 
 
 @pytest.mark.parametrize("viewport_width", [1440, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize("scheme", ["https", "lores"])
 def test_start_session_managed_repository_uses_workspace_bar(
     seeded_session: tuple[str, str],
     viewport_width: int,
+    scheme: str,
 ) -> None:
     """The managed repository picker lives in the responsive workspace bar."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(
-        _drive_managed_repository_workspace_bar(base_url, session_id, viewport_width)
+        _drive_managed_repository_workspace_bar(base_url, session_id, viewport_width, scheme)
     )
 
 
 async def _drive_managed_repository_workspace_bar(
-    base_url: str, session_id: str, viewport_width: int
+    base_url: str, session_id: str, viewport_width: int, scheme: str
 ) -> None:
-    repo_url = "https://github.com/omnigent-ai/a-very-long-sandbox-repository-name.git"
+    repo_url = f"{scheme}://vcs.example.test/a-very-long-sandbox-repository-name.git"
     repo_name = "a-very-long-sandbox-repository-name"
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()

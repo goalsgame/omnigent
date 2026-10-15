@@ -637,7 +637,7 @@ def test_warm_preload_caches_versions_without_reading_credentials(
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("exit_code", [81, 85, 42])
+@pytest.mark.parametrize("exit_code", [81, 85, 86, 87, 88, 89, 42])
 def test_preparation_exposes_only_allowlisted_error_codes(
     activation_dir: Path,
     exit_code: int,
@@ -666,6 +666,10 @@ def test_preparation_exposes_only_allowlisted_error_codes(
     assert result.get("error_code") == {
         81: "github_checkout_unconnected",
         85: "github_checkout_machine_unavailable",
+        86: "lore_access_unavailable",
+        87: "lore_checkout_failed",
+        88: "lore_workspace_conflict",
+        89: "lore_client_unavailable",
     }.get(exit_code)
     assert "credential-sentinel" not in json.dumps(result)
     assert _TOKEN not in json.dumps(result)

@@ -5154,7 +5154,9 @@ def _serve_host_until_exit(
         configure_host_git,
         start_host_gh_refresh,
     )
+    from omnigent.lore_checkout import configure as configure_host_lore
 
+    configure_host_lore(server_url, identity.host_id)
     configure_host_git(server_url, identity.host_id)
     # gh CLI ignores git's credential.helper for its own API calls, so also
     # materialize the owner's brokered token into gh's hosts.yml, then keep it

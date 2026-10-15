@@ -320,7 +320,10 @@ def test_public_pkce_login_fulfills_cli_ticket(provider_client):
 
 @pytest.mark.parametrize("surface", ["browser", "cli", "native"])
 @pytest.mark.parametrize("unavailable", [False, True])
-def test_login_captures_mcp_identity_before_issuing_session(provider_client, surface, unavailable):
+@pytest.mark.parametrize("provider", ["mcp", "lore"])
+def test_login_captures_mcp_identity_before_issuing_session(
+    provider_client, surface, unavailable, provider
+):
     from types import SimpleNamespace
 
     from omnigent.server.oidc_mcp import DelegationUnavailable
@@ -333,7 +336,7 @@ def test_login_captures_mcp_identity_before_issuing_session(provider_client, sur
         if unavailable:
             raise DelegationUnavailable("fixture provider unavailable")
 
-    client.app.state.mcp_identity_broker = SimpleNamespace(capture=capture)
+    setattr(client.app.state, f"{provider}_identity_broker", SimpleNamespace(capture=capture))
     login_params = {}
     if surface == "cli":
         ticket = client.post("/auth/cli-login").json()["ticket"]
