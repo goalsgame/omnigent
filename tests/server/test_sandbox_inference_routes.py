@@ -809,6 +809,7 @@ async def test_managed_proxy_catalog_filters_protocols_without_direct_snapshot(
         {"model_override": "not-allowed"},
         {"inference_configuration_revision": "old-direct-revision"},
         {"cost_control_mode_override": "on"},
+        {"subagent_routing_override": "on"},
     ],
 )
 async def test_managed_proxy_rejects_invalid_launch_before_persistence(env: _Env, overrides):
@@ -1102,3 +1103,132 @@ async def test_managed_proxy_bundle_policy_and_same_agent_fork(env: _Env):
         f"/v1/sessions/{fork.id}", json={"model_override": "not-listed", "silent": True}
     )
     assert rejected.status_code == 400, rejected.text
+
+
+async def _proxy_session(env: _Env, harness: str = "pi-native", **overrides):
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    response = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            **overrides,
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+async def test_proxy_policy_pins_resolved_default_provider(env: _Env):
+    from dataclasses import replace
+
+    _enable_managed_proxy(env)
+    session_id = await _proxy_session(env)
+    saved = env.store.get_conversation(session_id)
+    assert (
+        json.loads(saved.labels["omnigent.sandbox.inference_policy"])["provider"]
+        == "agent_sandbox"
+    )
+    original = env.app.state.sandbox_config.default
+    env.app.state.sandbox_config = ManagedSandboxDeployment(
+        configs=(
+            replace(original, provider="modal", host_config={}),
+            original,
+        )
+    )
+    changed = await env.client.patch(
+        f"/v1/sessions/{session_id}", json={"model_override": "claude-model", "silent": True}
+    )
+    assert changed.status_code == 200, changed.text
+    forked = await env.client.post(f"/v1/sessions/{session_id}/fork", json={})
+    assert forked.status_code == 201, forked.text
+
+
+@pytest.mark.parametrize("harness", ["openai-agents", "pi-native"])
+async def test_proxy_session_snapshot_exposes_catalog_without_runner(env: _Env, harness):
+    _enable_managed_proxy(env)
+    session_id = await _proxy_session(env, harness)
+    snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    body = snapshot.json()
+    assert body["inference_configured"] is True
+    assert body["inference_error"] is None
+    assert [row["id"] for row in body["model_options"]] == (
+        ["code-model"] if harness == "openai-agents" else ["code-model", "claude-model"]
+    )
+    env.app.state.inference_proxy = None
+    snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["inference_configured"] is True
+    assert snapshot.json()["model_options"] == []
+    assert snapshot.json()["inference_error"]
+
+
+@pytest.mark.parametrize("multipart", [False, True])
+@pytest.mark.parametrize("personal", [False, True])
+async def test_proxy_child_inherits_policy_unless_personally_authenticated(
+    env: _Env, multipart, personal
+):
+    _enable_managed_proxy(env)
+    session_id = await _proxy_session(env)
+    executor = {"type": "omnigent", "config": {"harness": "openai-agents"}}
+    if personal:
+        executor["auth"] = {"type": "provider", "name": "personal"}
+    agent = await create_test_agent(env.client, executor=executor, include_llm=False)
+
+    async def create(model):
+        if multipart:
+            selected = {**executor, "model": model}
+            return await env.client.post(
+                "/v1/sessions",
+                data={
+                    "metadata": json.dumps(
+                        {
+                            "parent_session_id": session_id,
+                        }
+                    )
+                },
+                files={
+                    "bundle": (
+                        "child.tar.gz",
+                        build_agent_bundle(
+                            "child",
+                            executor=selected,
+                            include_llm=False,
+                        ),
+                        "application/gzip",
+                    )
+                },
+            )
+        return await env.client.post(
+            "/v1/sessions",
+            json={
+                "parent_session_id": session_id,
+                "agent_id": agent["id"],
+                "model_override": model,
+            },
+        )
+
+    before = env.persisted()
+    response = await create("private-model")
+    if not personal:
+        assert response.status_code == 400, response.text
+        assert env.persisted() == before
+        response = await create("code-model")
+    assert response.status_code == 201, response.text
+    child_id = response.json()["session_id" if multipart else "id"]
+    child = env.store.get_conversation(child_id)
+    assert child.inference_snapshot is None
+    label = child.labels.get("omnigent.sandbox.inference_policy")
+    if personal:
+        assert label is None
+    else:
+        assert json.loads(label) == {"provider": "agent_sandbox", "harness": "openai-agents"}
+        changed = await env.client.patch(
+            f"/v1/sessions/{child_id}", json={"model_override": "claude-model", "silent": True}
+        )
+        assert changed.status_code == 400, changed.text

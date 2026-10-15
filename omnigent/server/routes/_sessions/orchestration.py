@@ -12472,11 +12472,25 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    from omnigent.server.routes.sandbox_inference import configured_snapshot, inference_service
+    from omnigent.server.routes.sandbox_inference import (
+        configured_snapshot,
+        inference_service,
+        proxy_policy,
+        proxy_policy_catalog,
+    )
 
-    inference_configured = configured_snapshot(conv.inference_snapshot)
+    saved_proxy_policy = proxy_policy(conv)
+    inference_configured = (
+        configured_snapshot(conv.inference_snapshot) or saved_proxy_policy is not None
+    )
     inference_error = None
-    if inference_configured and conv.inference_snapshot is not None:
+    if saved_proxy_policy is not None:
+        catalog = proxy_policy_catalog(request, saved_proxy_policy)
+        model_options = catalog["models"]
+        inference_error = catalog.get("error")
+        if not conv.reported_model:
+            llm_model = conv.model_override or catalog.get("default_model")
+    elif inference_configured and conv.inference_snapshot is not None:
         catalog = (
             await inference_service(request).catalog(conv.inference_snapshot)
             if request is not None
