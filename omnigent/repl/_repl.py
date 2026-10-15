@@ -1818,6 +1818,7 @@ class _SessionsChatReplAdapter:
         agent_id = self._agent_id or (agent.id if agent is not None else None)
         if agent_id is None:
             raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        fresh_host_placement: tuple[str, str] | None = None
         if self._runner_id is None and self._rotation_placement is None:
             from omnigent.harness_aliases import canonicalize_harness
 
@@ -1825,6 +1826,11 @@ class _SessionsChatReplAdapter:
                 harness=agent.harness if agent is not None else None,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
+            if self._runner_id is None:
+                fresh_host_placement = await self._client.sessions.resolve_online_host(
+                    harness=agent.harness if agent is not None else None,
+                    canonicalize=lambda name: canonicalize_harness(name) or name,
+                )
             if pending_debug:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
@@ -1841,6 +1847,8 @@ class _SessionsChatReplAdapter:
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        if fresh_host_placement is not None:
+            self._pending_host_placement = fresh_host_placement
         self._rotation_placement = None
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:

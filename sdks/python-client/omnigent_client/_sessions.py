@@ -601,6 +601,8 @@ class SessionsNamespace:
         for item in data if isinstance(data, list) else []:
             if not isinstance(item, dict) or not item.get("online"):
                 continue
+            if item.get("reusable") is False:
+                continue
             runner_id = item.get("runner_id")
             if not isinstance(runner_id, str) or not runner_id:
                 continue
@@ -616,6 +618,44 @@ class SessionsNamespace:
             if wanted & names:
                 return runner_id
         return unknown_harness
+
+    async def resolve_online_host(
+        self,
+        *,
+        harness: str | None = None,
+        canonicalize: Callable[[str], str] | None = None,
+    ) -> tuple[str, str] | None:
+        """Find owned placement for a fresh launch when online runners are isolated."""
+        resp = await self._http.get(f"{self._base}/v1/runners")
+        raise_for_status(resp.status_code, response_body(resp))
+        data = require_json_object(resp, "GET /v1/runners").get("data", [])
+        wanted = canonicalize(harness) if harness and canonicalize else harness
+        for item in data if isinstance(data, list) else []:
+            if (
+                not isinstance(item, dict)
+                or not item.get("online")
+                or item.get("reusable") is not False
+            ):
+                continue
+            host, workspace = item.get("host_id"), item.get("workspace")
+            if (
+                not isinstance(host, str)
+                or not host
+                or not isinstance(workspace, str)
+                or not workspace
+            ):
+                continue
+            advertised = item.get("harnesses")
+            if wanted is not None and isinstance(advertised, list):
+                names = {
+                    canonicalize(name) if canonicalize else name
+                    for name in advertised
+                    if isinstance(name, str)
+                }
+                if wanted not in names:
+                    continue
+            return host, workspace
+        return None
 
     async def list(
         self,

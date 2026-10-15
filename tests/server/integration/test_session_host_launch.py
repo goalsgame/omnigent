@@ -4800,6 +4800,17 @@ async def test_registered_create_then_repl_fork_without_source_refresh(client, a
     agent = await create_test_agent(
         client, executor={"type": "omnigent", "config": {"harness": "openai-agents"}}
     )
+    import uuid
+
+    agent_store = SqlAlchemyAgentStore(app.state.agent_store.storage_location)
+    uploaded = await asyncio.to_thread(agent_store.get, agent["id"])
+    registered = await asyncio.to_thread(
+        agent_store.create,
+        uuid.uuid4().hex,
+        "registered-proxy",
+        uploaded.bundle_location,
+    )
+    agent = {"id": registered.id, "name": registered.name}
     sdk = OmnigentClient(base_url=str(client.base_url))
     await sdk._http.aclose()
     sdk._http = client
@@ -4841,6 +4852,22 @@ async def test_registered_create_then_repl_fork_without_source_refresh(client, a
         assert source_frame.binding_token != fork_frame.binding_token
         snapshot = await sdk.sessions.get(adapter.session_id)
         assert snapshot.labels[INFERENCE_HOST_POLICY_LABEL] == _HOST_ID
+        app.state.tunnel_registry.register(
+            source_runner, _NoopRunnerWS(), _runner_hello(), owner="alice@example.com"
+        )
+        assert await sdk.sessions.resolve_online_runner(harness="openai-agents") is None
+        fresh = _SessionsChatReplAdapter(sdk, agent["name"])
+        fresh._agent_id = agent["id"]
+        try:
+            responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+            await fresh._create_session_from_registered_agent(pending_debug=False)
+            await fresh._bind_runner_if_needed()
+            fresh_frame = await responder
+            assert fresh._runner_id and fresh._runner_id != source_runner
+            assert fresh_frame.workspace == _WORKSPACE
+            assert fresh_frame.binding_token != source_frame.binding_token
+        finally:
+            await fresh.aclose()
     finally:
         await adapter.aclose()
 
@@ -4873,3 +4900,25 @@ async def test_hostless_child_snapshot_resolves_relocated_parent_host(client, db
     assert relocated.status_code == 200, relocated.text
     assert relocated.json()["host_id"] is None
     assert relocated.json()["routing_host_id"] == "b" * 32
+
+
+async def test_hostless_child_snapshot_omits_unrelated_parent_host(client, db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    parent = await asyncio.to_thread(
+        store.create_conversation,
+        agent_id=agent["id"],
+        host_id="c" * 32,
+        workspace=_WORKSPACE,
+        runner_id="parent-runner",
+    )
+    child = await asyncio.to_thread(
+        store.create_conversation,
+        agent_id=agent["id"],
+        parent_conversation_id=parent.id,
+        runner_id="independent-runner",
+        kind="sub_agent",
+    )
+    response = await client.get(f"/v1/sessions/{child.id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["routing_host_id"] is None
