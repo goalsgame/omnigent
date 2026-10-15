@@ -1071,8 +1071,6 @@ def register_core_routes(
         independent_host = await independent_inference_child_host(
             parent_conv,
             inherited_runner_id,
-            spec,
-            None,
             getattr(request.app.state, "host_registry", None),
             conversation_store,
         )

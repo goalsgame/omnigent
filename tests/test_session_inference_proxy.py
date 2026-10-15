@@ -855,7 +855,8 @@ async def test_proxy_reuses_client_closes_responses_and_does_not_retain_cookies(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", [None, "unrelated", "runner", "owner", "archived", "cycle"])
-async def test_attestation_accepts_only_actual_same_runner_ancestor(setup, mutation):
+@pytest.mark.parametrize("side_chat", [False, True])
+async def test_attestation_accepts_only_actual_same_runner_ancestor(setup, mutation, side_chat):
     from omnigent.entities import Conversation
 
     service, app, binding, host, _ = setup
@@ -880,13 +881,23 @@ async def test_attestation_accepts_only_actual_same_runner_ancestor(setup, mutat
             runner_id=binding.runner_id,
         )
         parent_id = sid
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+
+    if side_chat:
+        rows["grandchild"].kind = "default"
+        rows["grandchild"].parent_conversation_id = None
+        rows["grandchild"].root_conversation_id = "grandchild"
+        rows["grandchild"].labels = {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "child"}
     service.conversations.get_conversation = rows.get
     service.conversations.get_session_owner_authority = lambda sid, owner_only: SimpleNamespace(
         user_id="bob" if mutation == "owner" and sid == "grandchild" else "alice",
         generation="generation",
     )
     if mutation == "unrelated":
-        rows["grandchild"].parent_conversation_id = "root"
+        if side_chat:
+            rows["grandchild"].labels[SIDE_CHAT_SOURCE_LABEL_KEY] = "root"
+        else:
+            rows["grandchild"].parent_conversation_id = "root"
     if mutation == "runner":
         rows["grandchild"].runner_id = "different"
     if mutation == "archived":

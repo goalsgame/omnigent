@@ -278,6 +278,11 @@ class InferenceProxy:
 
     def _verify_runner_lineage(self, binding: Any, target_id: str) -> None:
         """Require the target and its ancestor binding to share runner and ownership."""
+        from omnigent.stores.conversation_store import (
+            SIDE_CHAT_LABEL_KEY,
+            SIDE_CHAT_SOURCE_LABEL_KEY,
+        )
+
         target = self.conversations.get_conversation(target_id)
         if target is None or target.archived or target.runner_id != binding.runner_id:
             raise HTTPException(401, "Invalid inference lineage")
@@ -290,11 +295,23 @@ class InferenceProxy:
         for _ in range(32):
             if current.id == binding.id:
                 return
-            if current.id in visited or not current.parent_conversation_id:
+            if current.id in visited:
                 break
             visited.add(current.id)
-            ancestor = self.conversations.get_conversation(current.parent_conversation_id)
-            if ancestor is None or ancestor.archived or ancestor.runner_id != binding.runner_id:
+            ancestor_id = (
+                current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+                if current.kind == "default" and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+                else current.parent_conversation_id
+            )
+            if not ancestor_id:
+                break
+            ancestor = self.conversations.get_conversation(ancestor_id)
+            if (
+                ancestor is None
+                or ancestor.archived
+                or ancestor.runner_id != binding.runner_id
+                or self._owner_authority(ancestor) != binding_owner
+            ):
                 break
             current = ancestor
         raise HTTPException(401, "Invalid inference lineage")

@@ -10633,8 +10633,6 @@ async def _create_session_from_existing_agent(
     independent_host = await independent_inference_child_host(
         _parent_for_routing,
         inherited_runner_id,
-        selection_spec,
-        harness_override,
         getattr(request.app.state, "host_registry", None),
         conversation_store,
     )

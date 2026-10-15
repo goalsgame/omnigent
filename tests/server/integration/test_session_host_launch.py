@@ -4298,6 +4298,9 @@ async def test_authenticated_child_gets_own_runner_on_proxy_host(
         ("claude-sdk", "openai-agents", False),
         ("openai-agents", "pi-native", False),
         ("openai-agents", "openai-agents", True),
+        ("claude-sdk", "openai-agents-sdk", False),
+        ("openai-agents", "native-pi", False),
+        ("openai-agents", "claude-sdk", False),
     ],
 )
 async def test_json_and_uploaded_children_get_required_inference_runner(
@@ -4387,11 +4390,15 @@ async def test_json_and_uploaded_children_get_required_inference_runner(
     assert child.status_code == 201, child.text
     frame = await responder
     assert frame.binding_token != parent_frame.binding_token
-    assert frame.harness == child_harness
-    if child_auth:
+    from omnigent.harness_aliases import canonicalize_harness
+
+    assert frame.harness == canonicalize_harness(child_harness)
+    if child_auth or child_harness == "claude-sdk":
         assert frame.inference_config is None
     else:
-        assert frame.inference_config["server_inference"]["harness"] == child_harness
+        assert frame.inference_config["server_inference"]["harness"] == canonicalize_harness(
+            child_harness
+        )
     sid = child.json().get("id") or child.json()["session_id"]
     conv = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).get_conversation, sid)
     assert conv.labels[SEPARATE_INFERENCE_RUNNER_LABEL] == "1"

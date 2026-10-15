@@ -31,7 +31,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
-from omnigent.spec import AgentSpec, ExecutorSpec
+from omnigent.spec import ExecutorSpec
 from omnigent.stores import ConversationStore
 from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
@@ -220,27 +220,19 @@ def resolve_host_launch(
 async def independent_inference_child_host(
     parent: Conversation | None,
     inherited_runner_id: str | None,
-    spec: AgentSpec | None,
-    harness_override: str | None,
     registry: HostRegistry | None,
     store: ConversationStore,
 ) -> tuple[str, str | None] | None:
-    """Give authenticated children their own process on server-inference hosts."""
-    from omnigent.models.model_catalog import spec_harness
+    """Keep each child’s process-wide provider configuration independent."""
     from omnigent.runner.routing import routing_host_id
 
-    if parent is None or inherited_runner_id is None or spec is None or registry is None:
+    if parent is None or inherited_runner_id is None or registry is None:
         return None
     if parent.inference_snapshot or not registry.server_inference_harnesses:
         return None
     host_id = await asyncio.to_thread(routing_host_id, parent, store)
     conn = registry.get(host_id) if host_id else None
     if conn is None or "server-inference-v1" not in conn.hello.capabilities:
-        return None
-    harness = harness_override if harness_override not in (None, "auto") else spec_harness(spec)
-    if not executor_has_explicit_auth(spec.executor) and not registry.needs_server_inference(
-        conn, harness
-    ):
         return None
     assert host_id is not None
     workspace = await asyncio.to_thread(inherited_runner_workspace, parent, store, host_id)

@@ -221,6 +221,30 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 assert "server-only-provider" not in "".join(
                     path.read_text() for path in host_root.rglob("*.json")
                 )
+                # Follow the generic /side UI path: fork, reuse the source runner, then turn.
+                fork = client.post(
+                    f"/v1/sessions/{session_id}/fork",
+                    json={
+                        "title": "Side chat",
+                        "side_chat": True,
+                    },
+                )
+                fork.raise_for_status()
+                side_id = fork.json()["id"]
+                bound = client.patch(f"/v1/sessions/{side_id}", json={"runner_id": runner_id})
+                bound.raise_for_status()
+                side_initialized = client.post(f"/v1/_e2e/sessions/{side_id}/initialize").json()
+                assert side_initialized["status"] == 201, side_initialized
+                assert side_initialized["payload"]["inference_config_verified"] is True
+                configure_mock_llm(isolated_mock_llm_server_url, [{"text": "PROXY_SIDE_CHAT_OK"}])
+                side_response = send_user_message_to_session(
+                    client, session_id=side_id, content="Reply from this side chat."
+                )
+                side_result = poll_session_until_terminal(
+                    client, session_id=side_id, response_id=side_response, timeout=120
+                )
+                assert side_result["status"] == "completed", side_result
+                assert "PROXY_SIDE_CHAT_OK" in final_assistant_text(side_result)
                 client.post(f"/v1/sessions/{session_id}/stop")
         finally:
             for process in reversed(processes):
