@@ -95,6 +95,17 @@ def _wire(provider: ProviderEntry, harness: str, model: str | None = None) -> Mo
     return ModelWireAPI.OPENAI_CHAT if protocol == "chat" else ModelWireAPI.OPENAI_RESPONSES
 
 
+def _binding_wire(
+    provider: ProviderEntry, harness: str, model: str, binding: HarnessInferenceBinding
+) -> ModelWireAPI:
+    api = binding.model_apis.get(model)
+    if api == "anthropic-messages":
+        return ModelWireAPI.ANTHROPIC_MESSAGES
+    if api == "openai-completions":
+        return ModelWireAPI.OPENAI_CHAT
+    return _wire(provider, harness, model)
+
+
 def _configured_wires(provider: ProviderEntry) -> set[ModelWireAPI]:
     wires = set()
     if "anthropic" in provider.families:
@@ -445,7 +456,8 @@ class SandboxInferenceService:
                     or (
                         bool(_configured_wires(provider) & entry.metadata.wire_apis)
                         if canonicalize_harness(normalize_inference_harness(harness)) == "acp"
-                        else _wire(provider, harness, entry.id) in entry.metadata.wire_apis
+                        else _binding_wire(provider, harness, entry.id, binding)
+                        in entry.metadata.wire_apis
                     )
                 )
                 and entry.metadata.supports(ModelCapability.TOOL_USE) is not False

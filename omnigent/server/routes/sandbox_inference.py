@@ -168,7 +168,10 @@ async def prepare_create_inference(
                     "Automatic provider routing is unavailable for server inference",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            return None, selected_catalog_model(proxy_catalog, model_override)
+            selected = (
+                model_override if model_override is not None else (spec.executor.model or None)
+            )
+            return None, selected_catalog_model(proxy_catalog, selected)
         snapshot = await inference_service(request).prepare(
             body.sandbox_provider, harness, user_id, agent_auth=spec.executor.auth
         )

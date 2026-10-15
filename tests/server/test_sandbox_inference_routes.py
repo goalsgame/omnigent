@@ -930,3 +930,42 @@ async def test_managed_proxy_preserves_unrelated_native_harnesses(env: _Env, har
     saved = env.store.get_conversation(created.json()["id"])
     assert saved is not None and saved.model_override is None
     assert env.catalog.calls
+
+
+@pytest.mark.parametrize(
+    ("pinned", "override", "expected"),
+    [
+        ("claude-model", None, "claude-model"),
+        ("claude-model", "code-model", "code-model"),
+        ("not-allowed", None, None),
+        ("not-allowed", "code-model", "code-model"),
+    ],
+)
+async def test_managed_proxy_honors_pinned_model_unless_explicitly_overridden(
+    env: _Env, pinned, override, expected
+):
+    _enable_managed_proxy(env)
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "model": pinned, "config": {"harness": "pi-native"}},
+        include_llm=False,
+    )
+    before = env.persisted()
+    response = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+            "model_override": override,
+        },
+    )
+    if expected is None:
+        assert response.status_code == 400, response.text
+        assert env.persisted() == before
+        env.launch.assert_not_awaited()
+    else:
+        assert response.status_code == 201, response.text
+        saved = env.store.get_conversation(response.json()["id"])
+        assert saved is not None and saved.model_override == expected
+        assert saved.inference_snapshot is None

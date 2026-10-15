@@ -791,3 +791,32 @@ async def test_conflicting_metadata_for_collapsed_tier_aliases_is_rejected(
     }
     with pytest.raises(OmnigentError, match="Conflicting"):
         await SandboxInferenceService(state).prepare("agent_sandbox", "pi-native", "alice")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "api", "wire"),
+    [
+        ("opaque-model", "anthropic-messages", ModelWireAPI.ANTHROPIC_MESSAGES),
+        ("claude-looking-alias", "openai-completions", ModelWireAPI.OPENAI_CHAT),
+    ],
+)
+async def test_live_discovery_honors_explicit_pi_model_protocol(monkeypatch, model, api, wire):
+    state = _state(allowed=(model,), default=model, harness="pi-native")
+    raw = state.sandbox_config.default.host_config
+    raw["providers"]["bifrost"]["anthropic"] = {
+        "base_url": "https://inference.example/anthropic",
+        "api_key_ref": "env:POD_INFERENCE_KEY",
+    }
+    raw["inference"]["harnesses"]["pi-native"]["model_apis"] = {model: api}
+    entries = (ModelEntry(model, "other", ModelMetadata(wire_apis=frozenset({wire}))),)
+    monkeypatch.setattr(
+        model_catalog,
+        "_listing_for_provider",
+        lambda *_args, **_kwargs: ModelListing("gateway", True, entries, ""),
+    )
+    snapshot = await SandboxInferenceService(state).prepare("agent_sandbox", "pi-native", "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "ready"
+    assert [row["id"] for row in snapshot["catalog"]["models"]] == [model]
+    assert snapshot["catalog"]["default_model"] == model
