@@ -4784,3 +4784,62 @@ async def test_inference_placement_labels_cannot_be_forged_or_cleared(client, ap
             f"/v1/sessions/{created.json()['id']}", json={"labels": {label: value}}
         )
         assert patched.status_code == 400, patched.text
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+async def test_registered_create_then_repl_fork_without_source_refresh(client, app, monkeypatch):
+    from types import SimpleNamespace
+
+    from omnigent_client import OmnigentClient
+
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+    from omnigent.repl._repl import _cmd_fork, _SessionsChatReplAdapter
+
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "openai-agents"}}
+    )
+    sdk = OmnigentClient(base_url=str(client.base_url))
+    await sdk._http.aclose()
+    sdk._http = client
+    sdk.sessions._http = client
+    adapter = _SessionsChatReplAdapter(sdk, "agent")
+    adapter._agent_id = agent["id"]
+    adapter._rotation_placement = (_HOST_ID, _WORKSPACE)
+    adapter._stream_pump = AsyncMock()
+    source_id = None
+    original_get = sdk.sessions.get
+
+    async def no_source_refresh(session_id, **kwargs):
+        assert session_id != source_id, "create response must suffice without a source GET"
+        return await original_get(session_id, **kwargs)
+
+    monkeypatch.setattr(sdk.sessions, "get", no_source_refresh)
+    try:
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        await adapter._create_session_from_registered_agent(pending_debug=False)
+        source_frame = await responder
+        source_id = adapter.session_id
+        source_runner = adapter._runner_id
+        await _cmd_fork(
+            "",
+            adapter,
+            sdk,
+            SimpleNamespace(output=lambda value: None),
+            SimpleNamespace(muted="dim"),
+        )
+        assert adapter.session_id != source_id
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        async with asyncio.timeout(budget(3.0)):
+            await adapter._ensure_session()
+            fork_frame = await responder
+        assert adapter._runner_id != source_runner
+        assert fork_frame.workspace == _WORKSPACE
+        assert source_frame.inference_config["server_inference"]
+        assert fork_frame.inference_config["server_inference"]
+        assert source_frame.binding_token != fork_frame.binding_token
+        snapshot = await sdk.sessions.get(adapter.session_id)
+        assert snapshot.labels[INFERENCE_HOST_POLICY_LABEL] == _HOST_ID
+    finally:
+        await adapter.aclose()
