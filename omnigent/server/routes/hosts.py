@@ -633,11 +633,7 @@ async def _resolve_agent_harness(
         sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
         if sub is not None:
             executor = sub.executor
-    harness = (
-        executor.config.get("harness")
-        or loaded.spec.executor.config.get("harness")
-        or executor.type
-    )
+    harness = executor.config.get("harness") or executor.type
     return canonicalize_harness(harness) or harness
 
 

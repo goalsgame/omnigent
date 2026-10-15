@@ -956,3 +956,74 @@ async def test_inherited_owner_binding_revokes_when_root_authority_changes(setup
             config["url"] + "/token", headers={"Authorization": "Bearer " + config["grant"]}
         )
         assert revoked.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_asgi_disconnect_cancels_upstream_header_wait_and_releases_capacity(setup):
+    import asyncio
+    import json
+
+    from asgiref.testing import ApplicationCommunicator
+
+    service, app, conv, _, _ = setup
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    first = True
+
+    class Provider(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            nonlocal first
+            if first:
+                first = False
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return httpx.Response(200, content=b"done")
+
+    service.transport = Provider()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "https",
+            "path": "/v1/inference/sessions/session/responses",
+            "raw_path": b"/v1/inference/sessions/session/responses",
+            "query_string": b"",
+            "root_path": "",
+            "server": ("server.example", 443),
+            "client": ("127.0.0.1", 1234),
+            "headers": [
+                (b"authorization", ("Bearer " + token).encode()),
+                (b"content-type", b"application/json"),
+            ],
+        }
+        comm = ApplicationCommunicator(app, scope)
+        await comm.send_input(
+            {
+                "type": "http.request",
+                "body": json.dumps({"model": "model-a"}).encode(),
+                "more_body": False,
+            }
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            assert service.active_requests == 1
+            await comm.send_input({"type": "http.disconnect"})
+            await asyncio.wait_for(cancelled.wait(), 2)
+            await comm.wait(timeout=2)
+            assert service.active_requests == 0
+            assert not service.active_sessions
+            response = await client.post(
+                "/v1/inference/sessions/session/responses",
+                json={"model": "model-a"},
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert response.status_code == 200, response.text
+        finally:
+            await comm.wait(timeout=2)

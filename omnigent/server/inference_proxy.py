@@ -471,7 +471,7 @@ class InferenceProxy:
                 raise HTTPException(429, "Inference capacity exhausted")
             self.active_requests += 1
             self.active_sessions.add(session_key)
-            upstream = None
+            upstream: httpx.Response | None = None
             released = False
 
             async def cleanup():
@@ -515,24 +515,49 @@ class InferenceProxy:
                         raise HTTPException(400, "Only stateless inference is supported")
                     payload["store"] = False
                 client = self._upstream_client()
-                credential = await self.broker.credential()
-                await self.authorize(session_id, access, workspace_id=workspace)
-                upstream = await client.send(
-                    client.build_request(
-                        "POST",
-                        "https://openrouter.ai/api/v1/" + endpoint,
-                        json=payload,
-                        headers={
-                            "Authorization": "Bearer " + str(credential["token"]),
-                            "Content-Type": "application/json",
-                            "Accept-Encoding": "identity",
-                        },
-                    ),
-                    stream=True,
-                )
-                if upstream.status_code != 200:
+
+                async def setup_upstream():
+                    nonlocal upstream
+                    credential = await self.broker.credential()
+                    await self.authorize(session_id, access, workspace_id=workspace)
+                    upstream = await client.send(
+                        client.build_request(
+                            "POST",
+                            "https://openrouter.ai/api/v1/" + endpoint,
+                            json=payload,
+                            headers={
+                                "Authorization": "Bearer " + str(credential["token"]),
+                                "Content-Type": "application/json",
+                                "Accept-Encoding": "identity",
+                            },
+                        ),
+                        stream=True,
+                    )
+
+                async def disconnected():
+                    while True:
+                        if (await request.receive())["type"] == "http.disconnect":
+                            return
+
+                preparing = asyncio.create_task(setup_upstream())
+                watching = asyncio.create_task(disconnected())
+                try:
+                    done, _ = await asyncio.wait(
+                        (preparing, watching), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if watching in done:
+                        raise HTTPException(499, "Inference client disconnected")
+                    await preparing
+                finally:
+                    for task in (preparing, watching):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(preparing, watching, return_exceptions=True)
+                assert upstream is not None
+                response = upstream
+                if response.status_code != 200:
                     raise HTTPException(
-                        429 if upstream.status_code == 429 else 502,
+                        429 if response.status_code == 429 else 502,
                         "Inference provider rejected the request",
                     )
             except BaseException as exc:
@@ -543,7 +568,7 @@ class InferenceProxy:
 
             async def chunks():
                 try:
-                    async for chunk in upstream.aiter_bytes():
+                    async for chunk in response.aiter_bytes():
                         yield chunk
                 finally:
                     await cleanup()
@@ -557,7 +582,7 @@ class InferenceProxy:
 
             return InferenceResponse(
                 chunks(),
-                media_type=upstream.headers.get("content-type", "application/json"),
+                media_type=response.headers.get("content-type", "application/json"),
                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
             )
 

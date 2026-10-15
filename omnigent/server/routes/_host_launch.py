@@ -232,6 +232,10 @@ async def independent_inference_child_host(
         return None
     host_id = await asyncio.to_thread(routing_host_id, parent, store)
     conn = registry.get(host_id) if host_id else None
+    if host_id is not None and conn is None:
+        raise HTTPException(
+            409, "Parent host is reconnecting; retry child creation once connected"
+        )
     if conn is None or "server-inference-v1" not in conn.hello.capabilities:
         return None
     assert host_id is not None

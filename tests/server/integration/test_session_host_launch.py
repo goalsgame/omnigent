@@ -4177,6 +4177,8 @@ async def test_server_lifespan_closes_inference_pool(app):
     [
         ("claude-sdk", "openai-agents"),
         ("openai-agents", "claude-sdk"),
+        ("claude-sdk", "agents_sdk"),
+        ("openai-agents", "claude_sdk"),
     ],
 )
 @pytest.mark.parametrize("child_auth", [False, True])
@@ -4186,12 +4188,20 @@ async def test_explicit_subagent_launch_uses_child_harness(
     client.headers["X-Forwarded-Email"] = "alice@example.com"
     comm = await _connect_host(app, inference=True)
     child_executor = {"type": "omnigent", "config": {"harness": child_harness}}
+    if child_harness in ("agents_sdk", "claude_sdk"):
+        child_executor = {"type": child_harness}
     if child_auth:
         child_executor["auth"] = {"type": "api_key", "api_key": "$CHILD_TEST_API_KEY"}
     agent = await create_test_agent(
         client,
         executor={"type": "omnigent", "config": {"harness": root_harness}},
-        sub_agents=[{"name": "worker", "executor": child_executor}],
+        sub_agents=[
+            {
+                "name": "worker",
+                "executor": child_executor,
+                **({"llm": None} if child_harness in ("agents_sdk", "claude_sdk") else {}),
+            }
+        ],
     )
     parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert parent.status_code == 201, parent.text
@@ -4216,9 +4226,12 @@ async def test_explicit_subagent_launch_uses_child_harness(
     )
     frame = await responder
     assert response.status_code == 200, response.text
-    assert frame.harness == child_harness
-    if child_harness == "openai-agents" and not child_auth:
-        assert frame.inference_config["server_inference"]["harness"] == child_harness
+    from omnigent.harness_aliases import canonicalize_harness
+
+    expected = canonicalize_harness(child_harness)
+    assert frame.harness == expected
+    if expected == "openai-agents" and not child_auth:
+        assert frame.inference_config["server_inference"]["harness"] == expected
     else:
         assert frame.inference_config is None
 
@@ -4421,3 +4434,49 @@ async def test_json_and_uploaded_children_get_required_inference_runner(
     conv = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).get_conversation, sid)
     assert conv.labels[SEPARATE_INFERENCE_RUNNER_LABEL] == "1"
     assert conv.host_id == _HOST_ID and conv.workspace == _WORKSPACE
+
+
+@pytest.mark.parametrize("app", ["proxy"], indirect=True)
+@pytest.mark.parametrize("upload", [False, True])
+async def test_reconnect_gap_does_not_create_child_on_shared_proxy_runner(
+    client, app, db_uri, upload, monkeypatch
+):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    executor = {"type": "omnigent", "config": {"harness": "openai-agents"}}
+    child_executor = {**executor, "auth": {"type": "api_key", "api_key": "$CHILD_TEST_API_KEY"}}
+    agent = await create_test_agent(
+        client, executor=executor, sub_agents=[{"name": "worker", "executor": child_executor}]
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    assert parent.status_code == 201, parent.text
+    await responder
+    with monkeypatch.context() as patch:
+        patch.setattr(app.state.host_registry, "get", lambda *args, **kwargs: None)
+        if upload:
+            response = await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps({"parent_session_id": parent.json()["id"]})},
+                files={
+                    "bundle": (
+                        "agent.tar.gz",
+                        build_agent_bundle(name="gap-worker", executor=child_executor),
+                        "application/gzip",
+                    )
+                },
+            )
+        else:
+            response = await client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": agent["id"],
+                    "parent_session_id": parent.json()["id"],
+                    "sub_agent_name": "worker",
+                },
+            )
+    assert response.status_code == 409, response.text
+    assert "reconnecting" in response.text

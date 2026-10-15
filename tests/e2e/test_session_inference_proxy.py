@@ -108,6 +108,8 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     )
     host_env = {
         **env,
+        "HOME": str(host_root),
+        "USERPROFILE": str(host_root),
         "OMNIGENT_CONFIG": str(host_config),
         "OMNIGENT_CONFIG_HOME": str(host_root),
         "OMNIGENT_DATA_DIR": str(host_root),
