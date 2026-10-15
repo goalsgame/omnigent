@@ -222,6 +222,9 @@ async def independent_inference_child_host(
     inherited_runner_id: str | None,
     registry: HostRegistry | None,
     store: ConversationStore,
+    *,
+    host_store: HostStore | None,
+    user_id: str | None,
 ) -> tuple[str, str | None] | None:
     """Keep each child’s process-wide provider configuration independent."""
     from omnigent.runner.routing import routing_host_id
@@ -233,6 +236,11 @@ async def independent_inference_child_host(
     host_id = await asyncio.to_thread(routing_host_id, parent, store)
     conn = registry.get(host_id) if host_id else None
     if host_id is not None and conn is None:
+        if host_store is not None:
+            host = await asyncio.to_thread(
+                resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+            )
+            raise host_absent_error(host)
         raise HTTPException(
             409, "Parent host is reconnecting; retry child creation once connected"
         )

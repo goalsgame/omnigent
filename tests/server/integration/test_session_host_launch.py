@@ -4182,8 +4182,9 @@ async def test_server_lifespan_closes_inference_pool(app):
     ],
 )
 @pytest.mark.parametrize("child_auth", [False, True])
+@pytest.mark.parametrize("launch_path", ["inline", "explicit", "relaunch"])
 async def test_explicit_subagent_launch_uses_child_harness(
-    client, app, db_uri, root_harness, child_harness, child_auth
+    client, app, db_uri, root_harness, child_harness, child_auth, launch_path
 ):
     client.headers["X-Forwarded-Email"] = "alice@example.com"
     comm = await _connect_host(app, inference=True)
@@ -4205,27 +4206,57 @@ async def test_explicit_subagent_launch_uses_child_harness(
     )
     parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert parent.status_code == 201, parent.text
-    child = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent["id"],
-            "parent_session_id": parent.json()["id"],
-            "sub_agent_name": "worker",
-        },
-    )
+    child_body = {
+        "agent_id": agent["id"],
+        "parent_session_id": parent.json()["id"],
+        "sub_agent_name": "worker",
+    }
+    if launch_path == "inline":
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(
+                        configured_harnesses={"openai-agents": "needs-auth", "claude-sdk": True},
+                    )
+                ),
+            }
+        )
+        async with asyncio.timeout(budget(2.0)):
+            while (
+                app.state.host_registry.get(_HOST_ID).reported_harnesses.get("claude-sdk")
+                is not True
+            ):
+                await asyncio.sleep(0.01)
+        child_body.update(host_id=_HOST_ID, workspace=_WORKSPACE)
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    child = await client.post("/v1/sessions", json=child_body)
     assert child.status_code == 201, child.text
     conv = await asyncio.to_thread(
         SqlAlchemyConversationStore(db_uri).get_conversation, child.json()["id"]
     )
     assert conv.sub_agent_name == "worker"
     assert conv.harness_override is None
-    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-    response = await client.post(
-        f"/v1/hosts/{_HOST_ID}/runners",
-        json={"session_id": child.json()["id"], "workspace": _WORKSPACE},
-    )
+    if launch_path != "inline":
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": child.json()["id"], "workspace": _WORKSPACE},
+        )
+        assert response.status_code == 200, response.text
     frame = await responder
-    assert response.status_code == 200, response.text
+    if launch_path == "relaunch":
+        from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+
+        store = SqlAlchemyConversationStore(db_uri)
+        sid = child.json()["id"]
+        await asyncio.to_thread(store.clear_runner_id, sid)
+        conv = await asyncio.to_thread(store.get_conversation, sid)
+        registry = app.state.host_registry
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        attempt = await _launch_runner_on_host_impl(conv, store, registry, registry.get(_HOST_ID))
+        frame = await responder
+        assert attempt.runner_id
     from omnigent.harness_aliases import canonicalize_harness
 
     expected = canonicalize_harness(child_harness)
@@ -4438,8 +4469,9 @@ async def test_json_and_uploaded_children_get_required_inference_runner(
 
 @pytest.mark.parametrize("app", ["proxy"], indirect=True)
 @pytest.mark.parametrize("upload", [False, True])
+@pytest.mark.parametrize("sharded", [False, True])
 async def test_reconnect_gap_does_not_create_child_on_shared_proxy_runner(
-    client, app, db_uri, upload, monkeypatch
+    client, app, db_uri, upload, monkeypatch, sharded
 ):
     client.headers["X-Forwarded-Email"] = "alice@example.com"
     comm = await _connect_host(app, inference=True)
@@ -4456,6 +4488,9 @@ async def test_reconnect_gap_does_not_create_child_on_shared_proxy_runner(
     assert parent.status_code == 201, parent.text
     await responder
     with monkeypatch.context() as patch:
+        patch.setattr(
+            "omnigent.server.routes._host_launch._deployment_is_sharded", lambda: sharded
+        )
         patch.setattr(app.state.host_registry, "get", lambda *args, **kwargs: None)
         if upload:
             response = await client.post(
@@ -4478,5 +4513,5 @@ async def test_reconnect_gap_does_not_create_child_on_shared_proxy_runner(
                     "sub_agent_name": "worker",
                 },
             )
-    assert response.status_code == 409, response.text
-    assert "reconnecting" in response.text
+    assert response.status_code == (400 if sharded else 409), response.text
+    assert ("wrong_replica" if sharded else "offline") in response.text

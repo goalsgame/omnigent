@@ -10635,6 +10635,8 @@ async def _create_session_from_existing_agent(
         inherited_runner_id,
         getattr(request.app.state, "host_registry", None),
         conversation_store,
+        host_store=getattr(request.app.state, "host_store", None),
+        user_id=user_id,
     )
     if independent_host is not None:
         separate_inference_runner = True

@@ -1944,21 +1944,14 @@ def _resolve_harness_impl(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
         executor = loaded.spec.executor
-        # For a bundled-agent head sub-agent, report the HEAD's own harness,
-        # not the bundle brain's — `harness` is this session's provider family
-        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
-        # brain harness when the head declares none or can't be matched.
+        # A selected child uses its own executor configuration and type.
         if conv.sub_agent_name:
             from omnigent.runtime.workflow import _find_spec_by_name
 
             sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
-        harness = (
-            executor.config.get("harness")
-            or loaded.spec.executor.config.get("harness")
-            or executor.type
-        )
+        harness = executor.config.get("harness") or executor.type
         return canonicalize_harness(harness) or harness
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
     except (
