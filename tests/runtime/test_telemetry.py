@@ -1386,9 +1386,14 @@ def test_payload_redaction_bounds_recursive_structures() -> None:
 
     payload = {"grant": "must-not-leak"}
     payload["cycle"] = payload
+    payload["other_cycle"] = payload
+    payload["list_cycle"] = [payload]
     redacted = telemetry._redact_payload(payload)
     assert "must-not-leak" not in json.dumps(redacted)
     assert redacted["grant"] == "[redacted]"
+    assert redacted["cycle"] == "[redacted]"
+    assert redacted["other_cycle"] == "[redacted]"
+    assert redacted["list_cycle"] == ["[redacted]"]
     assert payload["grant"] == "must-not-leak"
 
 
@@ -1399,3 +1404,13 @@ def test_nested_numeric_payload_keys_do_not_break_redaction() -> None:
     redacted = json.loads(telemetry._payload_to_attribute(payload))
     assert redacted["data"]["1"] == {"token": "[redacted]", "value": "public"}
     assert payload["data"][1]["token"] == "nested-secret"
+
+
+def test_payload_redaction_preserves_shared_noncyclic_values() -> None:
+    shared = {"token": "secret", "value": "public"}
+    redacted = telemetry._redact_payload({"left": shared, "right": shared})
+    assert redacted == {
+        "left": {"token": "[redacted]", "value": "public"},
+        "right": {"token": "[redacted]", "value": "public"},
+    }
+    assert shared == {"token": "secret", "value": "public"}
