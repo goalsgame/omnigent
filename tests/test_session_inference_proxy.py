@@ -645,6 +645,8 @@ def test_windows_refresh_command_keeps_metacharacters_out_of_cmd(monkeypatch):
     from omnigent.host import inference_proxy
 
     monkeypatch.setattr(inference_proxy.sys, "platform", "win32")
+    powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    monkeypatch.setattr(inference_proxy, "_system_powershell", lambda: powershell)
     args = [
         r"C:\Python & %PATH% (tools)!\python.exe",
         "-m",
@@ -652,7 +654,7 @@ def test_windows_refresh_command_keeps_metacharacters_out_of_cmd(monkeypatch):
         r"C:\Omni & %TEMP% ! (data)'s\grant.json",
     ]
     command = inference_proxy._refresh_command(args)
-    prefix = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "
+    prefix = '"' + powershell + '" -NoLogo -NoProfile -NonInteractive -EncodedCommand '
     assert command.startswith(prefix)
     script = base64.b64decode(command.removeprefix(prefix)).decode("utf-16-le")
     assert script == (
@@ -1071,3 +1073,65 @@ def test_refresh_command_does_not_import_workspace_modules(tmp_path, shadow):
     assert result.returncode == 1
     assert result.stdout == ""
     assert result.stderr.strip() == "Session inference authentication unavailable"
+
+
+@pytest.mark.parametrize("directory", [r"C:\Windows\System32", r"C:\Windows (system)\System32"])
+def test_powershell_path_uses_windows_system_directory(monkeypatch, directory):
+    import ctypes
+    from pathlib import PureWindowsPath
+
+    from omnigent.host.inference_proxy import _system_powershell
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def system_directory(buffer, size):
+        buffer.value = directory
+        return len(directory)
+
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(GetSystemDirectoryW=system_directory)),
+        raising=False,
+    )
+    monkeypatch.setenv("SystemRoot", r"C:\untrusted-workspace")
+    expected = PureWindowsPath(directory) / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    assert _system_powershell() == str(expected)
+
+
+@pytest.mark.parametrize("directory", ["relative", r"C:\%SHADOW%", r"C:\!SHADOW!", 'C:"shadow'])
+def test_powershell_path_rejects_unsafe_system_directory(monkeypatch, directory):
+    import ctypes
+
+    from omnigent.host.inference_proxy import _system_powershell
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def system_directory(buffer, size):
+        buffer.value = directory
+        return len(directory)
+
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(GetSystemDirectoryW=system_directory)),
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="Unsafe Windows system directory"):
+        _system_powershell()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Executes native Windows executable lookup")
+def test_windows_refresh_ignores_workspace_powershell_executable(tmp_path):
+    import shutil
+    import subprocess
+
+    from omnigent.host.inference_proxy import _refresh_command
+
+    shutil.copy2(sys.executable, tmp_path / "powershell.exe")
+    command = _refresh_command([sys.executable, "-P", "-c", "print('trusted-system-shell')"])
+    result = subprocess.run(
+        command, shell=True, cwd=tmp_path, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "trusted-system-shell"

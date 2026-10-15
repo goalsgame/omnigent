@@ -9,7 +9,7 @@ import os
 import shlex
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
 import httpx
@@ -33,14 +33,36 @@ def _valid_url(url: object) -> bool:
     )
 
 
+def _system_powershell() -> str:
+    import ctypes
+
+    directory = ctypes.create_unicode_buffer(32768)
+    if sys.platform == "win32":
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(directory, len(directory))
+    else:
+        raise OSError("PowerShell lookup requires Windows")
+    if not 0 < length < len(directory):
+        raise OSError("Windows system directory unavailable")
+    path = PureWindowsPath(directory.value) / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    # cmd expands percent variables and may enable delayed bang expansion inside quotes.
+    if not path.is_absolute() or any(c in str(path) for c in '"%!^\r\n'):
+        raise ValueError("Unsafe Windows system directory")
+    return str(path)
+
+
 def _refresh_command(args: list[str]) -> str:
     if sys.platform != "win32":
         return shlex.join(args)
-    # cmd sees only ASCII base64; PowerShell treats every path as a literal.
+    # Encode Python arguments so cmd cannot expand their path metacharacters.
     literals = ["'" + arg.replace("'", "''") + "'" for arg in args]
     script = "$ErrorActionPreference='Stop'; & " + " ".join(literals) + "; exit $LASTEXITCODE"
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    return "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encoded
+    return (
+        '"'
+        + _system_powershell()
+        + '" -NoLogo -NoProfile -NonInteractive -EncodedCommand '
+        + encoded
+    )
 
 
 def _validate_target(proxy: dict) -> None:
