@@ -431,6 +431,9 @@ async def test_remote_child_view_preserves_only_confirmed_shared_host(monkeypatc
             if sid == "parent" or shared_runner
             else "other-runner",
             "host_id": location["host"] if sid == "parent" else None,
+            "routing_host_id": location["host"]
+            if shared_runner and location["host"] != "remote-host"
+            else None,
             "workspace": "/remote" if sid == "parent" else None,
         }
 
@@ -464,6 +467,11 @@ async def test_remote_child_view_preserves_only_confirmed_shared_host(monkeypatc
             adapter._hydrate_from_session_snapshot(await client.sessions.get("child"))
             if shared_runner:
                 await client.sessions.post_event("child", {"type": "message", "data": {}})
+                location.update(host="relocated-host", runner="relocated-runner")
+                # Refresh the child directly, without first fetching its parent.
+                adapter._hydrate_from_session_snapshot(await client.sessions.get("child"))
+                await client.sessions.post_event("child", {"type": "message", "data": {}})
+                assert chat.get_session_host("child") == "relocated-host"
                 location.update(host="moved-host", runner="replacement-runner")
                 await adapter.view_session("parent", read_only=False)
                 await adapter.view_session("child", read_only=True, interactive=True)
@@ -476,3 +484,28 @@ async def test_remote_child_view_preserves_only_confirmed_shared_host(monkeypatc
         finally:
             await adapter.aclose()
     assert requests[0].headers[OMNIGENT_SLICE_KEY_HEADER] == "remote-host"
+
+
+def test_replaced_hostless_runner_invalidates_cached_route(monkeypatch):
+    from dataclasses import replace
+
+    from omnigent import chat
+
+    monkeypatch.setattr(chat, "_session_hosts", {})
+    adapter = _SessionsChatReplAdapter(SimpleNamespace(), "agent", session_id="child")
+    child = Session(
+        id="child",
+        agent_id="agent",
+        status="idle",
+        created_at=0,
+        runner_id="old-runner",
+        routing_host_id="old-host",
+    )
+    adapter._hydrate_from_session_snapshot(child)
+    adapter._hydrate_from_session_snapshot(replace(child, routing_host_id=None))
+    assert chat.get_session_host("child") == "old-host"
+    adapter._hydrate_from_session_snapshot(
+        replace(child, runner_id="replacement-runner", routing_host_id=None)
+    )
+    assert chat.get_session_host("child") is None
+    assert "child" not in adapter._routing_hosts

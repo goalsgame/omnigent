@@ -146,6 +146,7 @@ class Session:
         ``"runner_abc123"``. ``None`` until the client binds one.
     :param host_id: Host bound to the session, or ``None`` before placement.
     :param workspace: Canonical directory on that host, or ``None``.
+    :param routing_host_id: Effective request-routing host, including shared runners.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
     :param items: Committed conversation items in chronological
@@ -205,6 +206,7 @@ class Session:
     archived: bool = False
     host_id: str | None = None
     workspace: str | None = None
+    routing_host_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -233,6 +235,7 @@ class Session:
             runner_id=raw.get("runner_id"),
             host_id=raw.get("host_id"),
             workspace=raw.get("workspace"),
+            routing_host_id=raw.get("routing_host_id"),
             reasoning_effort=raw.get("reasoning_effort"),
             items=items_raw if isinstance(items_raw, list) else [],
             llm_model=raw.get("llm_model"),

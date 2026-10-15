@@ -12552,6 +12552,9 @@ async def _get_session_snapshot(
         agent_store=agent_store,
         agent_cache=agent_cache,
     )
+    from omnigent.runner.routing import routing_host_id
+
+    response.routing_host_id = await asyncio.to_thread(routing_host_id, conv, conv_store)
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage

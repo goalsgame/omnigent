@@ -1972,6 +1972,8 @@ class SessionResponse(BaseModel):
     :param host_id: Host that launched (or should launch) the
         runner for this session, e.g. ``"host_a1b2c3d4..."``.
         ``None`` for CLI-initiated sessions.
+    :param routing_host_id: Effective host for request routing, including inherited
+        shared-runner placement. Distinct from the physical host binding.
     :param runner_online: Strict runner liveness — ``True`` iff a
         runner tunnel is currently registered for this session.
         This is the sole reachability signal: ``True`` means the
@@ -2202,6 +2204,7 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    routing_host_id: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False

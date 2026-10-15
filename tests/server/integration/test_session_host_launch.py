@@ -4843,3 +4843,33 @@ async def test_registered_create_then_repl_fork_without_source_refresh(client, a
         assert snapshot.labels[INFERENCE_HOST_POLICY_LABEL] == _HOST_ID
     finally:
         await adapter.aclose()
+
+
+async def test_hostless_child_snapshot_resolves_relocated_parent_host(client, db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    parent = await asyncio.to_thread(
+        store.create_conversation,
+        agent_id=agent["id"],
+        host_id="a" * 32,
+        workspace=_WORKSPACE,
+        runner_id="original-runner",
+    )
+    child = await asyncio.to_thread(
+        store.create_conversation,
+        agent_id=agent["id"],
+        parent_conversation_id=parent.id,
+        runner_id="original-runner",
+        kind="sub_agent",
+    )
+    first = await client.get(f"/v1/sessions/{child.id}")
+    assert first.status_code == 200, first.text
+    assert first.json()["host_id"] is None
+    assert first.json()["routing_host_id"] == "a" * 32
+    await asyncio.to_thread(store.set_host_id, parent.id, "b" * 32, _WORKSPACE)
+    await asyncio.to_thread(store.replace_runner_id, parent.id, "replacement-runner")
+    await asyncio.to_thread(store.replace_runner_id, child.id, "replacement-runner")
+    relocated = await client.get(f"/v1/sessions/{child.id}")
+    assert relocated.status_code == 200, relocated.text
+    assert relocated.json()["host_id"] is None
+    assert relocated.json()["routing_host_id"] == "b" * 32

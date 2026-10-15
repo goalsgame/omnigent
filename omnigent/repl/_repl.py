@@ -1392,6 +1392,7 @@ class _SessionsChatReplAdapter:
         self._server_inference_placement: tuple[str, str] | None = None
         self._pending_host_placement: tuple[str, str] | None = None
         self._routing_host_id: str | None = None
+        self._routing_hosts: dict[str, tuple[str, str]] = {}
         # Push-based event callback. The pump calls this for every
         # event — always, regardless of whether send() is active.
         # Set by run_repl() to the rendering callback.
@@ -1692,13 +1693,22 @@ class _SessionsChatReplAdapter:
             session.runner_id is not None and session.runner_id == self._bound_runner_id
         )
         self._bound_runner_id = session.runner_id
-        from omnigent.chat import get_session_host
         from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
 
         host_id = getattr(session, "host_id", None)
-        routing_host = host_id or (self._routing_host_id if shares_runner else None)
-        if routing_host is None and session.runner_id is not None and self._session_id is not None:
-            routing_host = get_session_host(self._session_id)
+        session_id = self._session_id
+        cached_route = self._routing_hosts.get(session_id) if session_id is not None else None
+        routing_host = host_id or getattr(session, "routing_host_id", None)
+        if routing_host is None and shares_runner:
+            routing_host = self._routing_host_id
+        if routing_host is None and cached_route is not None:
+            cached_runner, cached_host = cached_route
+            if cached_runner == session.runner_id:
+                routing_host = cached_host
+        if session_id is not None and routing_host is not None and session.runner_id is not None:
+            self._routing_hosts[session_id] = (session.runner_id, routing_host)
+        elif session_id is not None:
+            self._routing_hosts.pop(session_id, None)
         self._pin_current_session_host(routing_host)
         workspace = getattr(session, "workspace", None)
         labels = getattr(session, "labels", {})
