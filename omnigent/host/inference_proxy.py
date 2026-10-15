@@ -89,7 +89,7 @@ def prepare(config: dict, directory: Path, *, credential_files: list[Path] | Non
 def runtime_config(proxy: dict, credential: Path) -> dict:
     _validate_target(proxy)
     url = proxy["url"]
-    args = [sys.executable, "-m", "omnigent.host.inference_proxy", str(credential)]
+    args = [sys.executable, "-P", "-m", "omnigent.host.inference_proxy", str(credential)]
     command = _refresh_command(args)
     return {
         "providers": {

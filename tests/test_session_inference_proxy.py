@@ -1027,3 +1027,47 @@ async def test_asgi_disconnect_cancels_upstream_header_wait_and_releases_capacit
             assert response.status_code == 200, response.text
         finally:
             await comm.wait(timeout=2)
+
+
+@pytest.mark.parametrize("shadow", ["omnigent.py", "omnigent/__init__.py", "httpx.py"])
+def test_refresh_command_does_not_import_workspace_modules(tmp_path, shadow):
+    import json
+    import os
+    import subprocess
+
+    from omnigent.host.inference_proxy import runtime_config
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = tmp_path / "shadow-executed"
+    module = workspace / shadow
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_text(
+        "from pathlib import Path\nPath(" + repr(str(marker)) + ").write_text('executed')\n"
+        "raise RuntimeError('workspace code ran during authentication')\n"
+    )
+    credential = tmp_path / "grant.json"
+    # Fail before networking, after the legitimate helper and its dependencies import.
+    credential.write_text(json.dumps({"url": "http://invalid", "grant": "g" * 64}))
+    command = runtime_config(
+        {
+            "url": "https://server.example/v1/inference/sessions/session",
+            "harness": "openai-agents",
+            "models": ["model-a"],
+        },
+        credential,
+    )["providers"]["server-inference"]["openai"]["auth_command"]
+    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONSAFEPATH"}}
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert not marker.exists(), result.stderr
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "Session inference authentication unavailable"

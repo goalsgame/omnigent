@@ -70,6 +70,8 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     workspace: int,
 ) -> None:
     root = Path(__file__).resolve().parents[2]
+    # Authentication must never import dependencies from the runner workspace.
+    (tmp_path / "httpx.py").write_text("raise RuntimeError('workspace module imported')\n")
     _certificate(tmp_path)
     # Trust the ephemeral CA in child processes only, including commands that
     # deliberately ignore ambient proxy/TLS environment configuration.
