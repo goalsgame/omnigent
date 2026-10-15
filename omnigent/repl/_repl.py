@@ -1653,6 +1653,16 @@ class _SessionsChatReplAdapter:
             raise RuntimeError("No active conversation to compact")
         await self._client.sessions.compact(self._session_id)
 
+    def _pin_current_session_host(self, host_id: str | None) -> None:
+        from omnigent.chat import _DatabricksTokenAuth, set_session_host
+
+        if self._session_id is None:
+            return
+        set_session_host(self._session_id, host_id)
+        auth = getattr(getattr(self._client, "_http", None), "auth", None)
+        if isinstance(auth, _DatabricksTokenAuth):
+            auth.pin_session(self._session_id)
+
     def _hydrate_from_session_snapshot(self, session: _SessionSnapshot) -> None:
         """
         Copy mutable session fields from a sessions API snapshot.
@@ -1664,6 +1674,11 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if (
+            self._session_id is not None
+            and getattr(session, "id", self._session_id) != self._session_id
+        ):
+            return
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1675,6 +1690,7 @@ class _SessionsChatReplAdapter:
         from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
 
         host_id = getattr(session, "host_id", None)
+        self._pin_current_session_host(host_id)
         workspace = getattr(session, "workspace", None)
         labels = getattr(session, "labels", {})
         placement = (host_id, workspace) if host_id and workspace else None
@@ -1930,11 +1946,10 @@ class _SessionsChatReplAdapter:
                 self._server_inference_placement if self._bound_runner_id is None else None
             )
             if placement is not None and self._runner_recover is None:
-                from omnigent.chat import set_session_host
                 from omnigent.cli_auth import databricks_request_headers
 
                 host_id, workspace = placement
-                set_session_host(self._session_id, host_id)
+                self._pin_current_session_host(host_id)
                 launched = await self._client.sessions.launch_runner(
                     self._session_id,
                     host_id=host_id,

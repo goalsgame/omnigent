@@ -254,3 +254,81 @@ async def test_new_from_observed_proxy_session_uses_own_runner_without_detaching
         client.sessions.launch_runner.assert_awaited_once()
     finally:
         await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cross_host_launch_repoints_real_auth_and_ignores_stale_snapshot(monkeypatch):
+    import httpx
+    from omnigent_client import OmnigentClient
+
+    from omnigent import chat
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+
+    base = "https://workspace.example/api/2.0/omnigent"
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "synthetic-token")
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setattr(chat, "_session_hosts", {})
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda url: None)
+    monkeypatch.setattr("omnigent.telemetry.request_headers.telemetry_request_headers", dict)
+    source = Session(
+        id="source",
+        agent_id="agent",
+        status="idle",
+        created_at=0,
+        runner_id="runner-a",
+        host_id="host-a",
+        workspace="/a",
+        labels={INFERENCE_HOST_POLICY_LABEL: "host-a"},
+    )
+    target_body = {
+        "id": "target",
+        "agent_id": "agent",
+        "status": "idle",
+        "created_at": 0,
+        "host_id": "host-b",
+        "workspace": "/b",
+        "runner_id": None,
+        "labels": {INFERENCE_HOST_POLICY_LABEL: "host-b"},
+    }
+    launched = False
+    requests = []
+
+    def handler(request):
+        nonlocal launched
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer synthetic-token"
+        if request.method == "POST" and request.url.path.endswith("/hosts/host-b/runners"):
+            assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == "host-b"
+            launched = True
+            return httpx.Response(200, json={"runner_id": "runner-b"})
+        if launched:
+            assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == "host-b"
+        if request.method == "POST":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            200, json={**target_body, "runner_id": "runner-b" if launched else None}
+        )
+
+    auth = chat._DatabricksTokenAuth(base, session_id="source")
+    async with OmnigentClient(base_url=base, auth=auth) as client:
+        await client._http._transport.aclose()
+        client._http._transport = httpx.MockTransport(handler)
+        client._http._mounts.clear()
+        adapter = _SessionsChatReplAdapter(
+            client, "agent", session_id="source", runner_id="runner-a"
+        )
+        adapter._hydrate_from_session_snapshot(source)
+        adapter._stream_pump = AsyncMock()
+        adapter.switch_session("target")
+        try:
+            await adapter._ensure_session()
+            assert launched and adapter._runner_id == "runner-b"
+            await client.sessions.post_event("target", {"type": "message", "data": {}})
+            # A late source refresh cannot overwrite the target's routing or binding.
+            adapter._hydrate_from_session_snapshot(source)
+            assert adapter._runner_id == "runner-b"
+            await client.sessions.post_event("target", {"type": "message", "data": {}})
+        finally:
+            await adapter.aclose()
+    assert requests[0].headers[OMNIGENT_SLICE_KEY_HEADER] == "host-a"
+    assert all(request.headers[OMNIGENT_SLICE_KEY_HEADER] == "host-b" for request in requests[1:])
