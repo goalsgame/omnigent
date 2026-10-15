@@ -929,7 +929,8 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  * Return true when ``url`` is acceptable as a sandbox repository URL.
  *
  * Mirrors the server's accepted forms (``parse_repo_workspace``):
- * ``https://<host>/<path>`` or scp-style ``git@<host>:<path>``. The
+ * ``https://<host>/<path>``, ``lores://<host>/<path>`` or scp-style
+ * ``git@<host>:<path>``. The
  * server is the authority — this only gates the submit button so an
  * obviously unusable value gets inline feedback instead of a 422.
  *
@@ -938,7 +939,7 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  */
 export function isValidSandboxRepoUrl(url: string): boolean {
   const t = url.trim();
-  return /^https:\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
+  return /^(?:https|lores):\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
 }
 
 /**

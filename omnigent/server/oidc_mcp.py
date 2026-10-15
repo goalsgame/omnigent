@@ -33,12 +33,12 @@ class MCPDelegationConfig:
     machine_scope: str | None = None
 
     @classmethod
-    def parse(cls, value: object) -> MCPDelegationConfig | None:
+    def parse(cls, value: object, *, section: str = "oidc_mcp") -> MCPDelegationConfig | None:
         """Load trusted operator configuration, including environment-expanded credentials."""
         if value is None:
             return None
         if not isinstance(value, dict):
-            raise ValueError("oidc_mcp must be a mapping")
+            raise ValueError(f"{section} must be a mapping")
         import os
 
         for key in (
@@ -49,12 +49,12 @@ class MCPDelegationConfig:
             "machine_client_secret_env",
         ):
             if not isinstance(value.get(key), str) or not value[key].strip():
-                raise ValueError(f"oidc_mcp.{key} must be a non-empty string")
+                raise ValueError(f"{section}.{key} must be a non-empty string")
         for key in ("machine_scope",):
             if value.get(key) is not None and (
                 not isinstance(value[key], str) or not value[key].strip()
             ):
-                raise ValueError(f"oidc_mcp.{key} must be a non-empty string")
+                raise ValueError(f"{section}.{key} must be a non-empty string")
         result = cls(
             machine_scope=value.get("machine_scope"),
             upstream_url=str(value.get("upstream_url", "")),
@@ -83,7 +83,7 @@ class MCPDelegationConfig:
             )
         ):
             raise ValueError(
-                "oidc_mcp requires an HTTPS upstream, audience, scope "
+                f"{section} requires an HTTPS upstream, audience, scope "
                 "and machine client credentials"
             )
         return result
@@ -99,10 +99,13 @@ class MCPDelegationBroker:
         store: CredentialStore,
         auth: UnifiedAuthProvider,
         client: httpx.Client | None = None,
+        *,
+        provider: str = _PROVIDER,
     ) -> None:
         if oidc.provider_type != "oidc" or not oidc.jwks_uri or not oidc.client_secret:
-            raise ValueError("oidc_mcp requires a confidential OIDC login client with JWKS")
+            raise ValueError(f"{provider} requires a confidential OIDC login client with JWKS")
         self.config, self.oidc, self.store, self.auth = config, oidc, store, auth
+        self.provider = provider
         self.client = client or httpx.Client(timeout=15, follow_redirects=False, trust_env=False)
         self.jwks = _BoundedJWKClient(oidc.jwks_uri)
 
@@ -168,7 +171,7 @@ class MCPDelegationBroker:
             raise DelegationUnavailable("MCP delegation requires a renewable IdP session")
         self.store.upsert(
             owner,
-            _PROVIDER,
+            self.provider,
             secret=tokens,
             metadata={"issuer": self.oidc.issuer, "subject": subject},
         )
@@ -202,7 +205,7 @@ class MCPDelegationBroker:
             tokens["refresh_token"] = tokens["refresh_token"] or refresh_token
             return tokens
 
-        connection = self.store.refresh_locked(owner, _PROVIDER, refresh)
+        connection = self.store.refresh_locked(owner, self.provider, refresh)
         if connection is None or connection.secret is None:
             raise DelegationUnavailable("No MCP identity; sign in again or renew API delegation")
         self._client_credentials(owner)
@@ -224,7 +227,7 @@ class MCPDelegationBroker:
         if claims is None or not isinstance(claims.get("sub"), str):
             raise DelegationUnavailable("Invalid MCP delegation identity")
         subject = str(claims["sub"])
-        current = self.store.get(owner, _PROVIDER)
+        current = self.store.get(owner, self.provider)
         if current is not None and current.metadata == {
             "issuer": self.oidc.issuer,
             "subject": claims["sub"],

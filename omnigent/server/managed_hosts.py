@@ -851,9 +851,9 @@ def is_repo_workspace(workspace: str) -> bool:
 
     :param workspace: The raw request workspace, e.g.
         ``"https://github.com/org/repo"`` or ``"/Users/me/repo"``.
-    :returns: ``True`` for the ``https://`` / ``git@`` URL forms.
+    :returns: ``True`` for the ``https://`` / ``git@`` / ``lores://`` URL forms.
     """
-    return workspace.startswith(("https://", "git@"))
+    return workspace.startswith(("https://", "git@", "lores://"))
 
 
 def _validate_clone_branch(fragment: str) -> str:
@@ -918,7 +918,7 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
     Grammar (Docker build-context style)::
 
         <repo>[#<branch>]
-        <repo> := https://<host>/<path>  |  git@<host>:<path>
+        <repo> := https://<host>/<path> | git@<host>:<path> | lores://<host>/<path>
 
     The fragment splits on the FIRST ``#``; branches containing ``#``
     are not supported in this form. Fails loud on anything malformed
@@ -952,8 +952,8 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
         "a repository URL must not embed credentials (user:token@host) — "
         "connect the account instead of putting a token in the URL"
     )
-    if url.startswith("https://"):
-        rest = url[len("https://") :]
+    if url.startswith(("https://", "lores://")):
+        rest = url.split("://", 1)[1]
         if "@" in rest:
             raise ValueError(_cred_msg)
         host, slash, path = rest.partition("/")
@@ -974,8 +974,12 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
     else:
         raise ValueError(
             f"'{url}' is not a supported repository URL — use "
-            "'https://<host>/<org>/<repo>' or 'git@<host>:<org>/<repo>'"
+            "'https://<host>/<org>/<repo>', 'lores://<host>/<repo>' or 'git@<host>:<org>/<repo>'"
         )
+    if url.startswith("lores://"):
+        from omnigent.lore_urls import lore_remote
+
+        lore_remote(url)
     branch = _validate_clone_branch(fragment) if sep else None
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
 
@@ -3662,6 +3666,11 @@ def _apply_git_clone_options(
     options: GitCloneOptions,
 ) -> Sequence[RepoWorkspace]:
     """Apply admin clone policy before provisioning or replacing any sandbox."""
+    if any(repo.url.startswith("lores://") for repo in repos) and launcher.provider not in (
+        "kubernetes",
+        "agent_sandbox",
+    ):
+        raise HTTPException(400, "Lore checkouts require the Kubernetes or Agent Sandbox provider")
     if options == GitCloneOptions():
         return repos
     if not launcher.capabilities.git_clone_options:
@@ -3672,7 +3681,10 @@ def _apply_git_clone_options(
                 "options; remove the block or use a provider that supports them"
             ),
         )
-    return [replace(repo, git_clone=options) for repo in repos]
+    return [
+        replace(repo, git_clone=options) if not repo.url.startswith("lores://") else repo
+        for repo in repos
+    ]
 
 
 async def _start_sandbox_host(

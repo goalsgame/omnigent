@@ -687,6 +687,8 @@ describe("sandbox repository helpers", () => {
   it.each<[string, boolean]>([
     ["https://github.com/org/repo", true],
     ["https://github.com/org/repo.git", true],
+    ["lores://lore.example.test/game", true],
+    ["lores://lore.example.test", false],
     ["git@github.com:org/repo.git", true],
     // Bare shorthand and paths are not API surface.
     ["org/repo", false],

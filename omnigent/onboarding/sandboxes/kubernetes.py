@@ -601,6 +601,25 @@ def _render_workspace_prep_command(
             staging_names.append(staging)
         for repo, dirname, staging in zip(repos, dirnames, staging_names, strict=True):
             clone_dir = f"{workspace}/{dirname}"
+            if repo.url.startswith("lores://"):
+                args = [
+                    "python3",
+                    "-I",
+                    "-m",
+                    "omnigent.lore_checkout",
+                    "--server",
+                    server_url,
+                    "--host-id",
+                    host_id,
+                    "--remote",
+                    repo.url,
+                    "--target",
+                    clone_dir,
+                ]
+                if repo.branch:
+                    args += ["--ref", repo.branch]
+                script += shlex.join(args) + "\n"
+                continue
             staging_dir = f"{workspace}/{staging}"
             clone = shlex.join(
                 [
