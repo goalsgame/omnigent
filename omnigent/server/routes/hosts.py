@@ -804,8 +804,10 @@ def create_hosts_router(
         canonical = canonicalize_harness(harness) or harness
         if proxy is not None and host_registry.needs_server_inference(conn, canonical):
             return HostModelOptionsResponse(
-                models=[{"id": model, "name": model} for model in proxy.config.models],
-                routable_models=list(proxy.config.models),
+                models=[
+                    {"id": model, "name": model} for model in proxy.config.model_apis(canonical)
+                ],
+                routable_models=list(proxy.config.model_apis(canonical)),
             )
         _require_harness_setup_support(conn, "pre-launch model listing")
 

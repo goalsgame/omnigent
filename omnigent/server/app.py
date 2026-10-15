@@ -4003,8 +4003,8 @@ def create_app(
     )
     app.state.inference_proxy = None
     if inference_proxy_config is not None:
-        if host_store is None or openrouter_wif_broker is None or host_registry is None:
-            raise ValueError("inference_proxy requires hosts and openrouter_wif")
+        if host_store is None or host_registry is None:
+            raise ValueError("inference_proxy requires hosts")
         inference_proxy = InferenceProxy(
             inference_proxy_config,
             conversation_store,

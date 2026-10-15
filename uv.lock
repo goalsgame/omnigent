@@ -3415,7 +3415,7 @@ vault = [
     { name = "hvac" },
 ]
 vertex = [
-    { name = "google-auth" },
+    { name = "google-auth", extra = ["requests"] },
 ]
 
 [package.dev-dependencies]
@@ -3499,7 +3499,7 @@ requires-dist = [
     { name = "ftfy", specifier = ">=6.0" },
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1,<2" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },
-    { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
+    { name = "google-auth", extras = ["requests"], marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
     { name = "google-cloud-kms", marker = "extra == 'gcp-kms'", specifier = ">=3.0,<4" },
     { name = "google-crc32c", marker = "extra == 'gcp-kms'", specifier = ">=1.6,<2" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = ">=0.4.0" },

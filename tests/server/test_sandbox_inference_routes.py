@@ -736,3 +736,107 @@ async def test_same_harness_fork_validates_model_against_saved_policy(
         assert fork is not None and original is not None
         assert fork.model_override == expected
         assert fork.inference_snapshot == original.inference_snapshot
+
+
+def _enable_managed_proxy(env: _Env, *, direct: bool = False) -> None:
+    from omnigent.server.inference_proxy import InferenceProxyConfig
+    from omnigent.server.inference_upstreams import InferenceRoute, InferenceUpstream
+
+    if not direct:
+        env.app.state.sandbox_config.default.host_config.clear()
+    env.app.state.inference_proxy = SimpleNamespace(
+        config=InferenceProxyConfig(
+            public_url="https://server.example",
+            signing_key="test-signing-key",
+            models=("code-model", "claude-model"),
+            harnesses=("pi-native", "openai-agents"),
+            upstreams={
+                "router": InferenceUpstream("openrouter", "https://openrouter.ai/api/v1"),
+                "native": InferenceUpstream(
+                    "vertex-anthropic",
+                    "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global",
+                ),
+            },
+            model_routes={
+                "code-model": InferenceRoute("router", "provider/code"),
+                "claude-model": InferenceRoute("native", "claude-model"),
+            },
+            managed_sandboxes=True,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("harness", "expected"),
+    [("pi-native", ["code-model", "claude-model"]), ("openai-agents", ["code-model"])],
+)
+async def test_managed_proxy_catalog_filters_protocols_without_direct_snapshot(
+    env: _Env, harness: str, expected: list[str]
+):
+    _enable_managed_proxy(env)
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    preview = await env.client.get(
+        f"/v1/sandbox-providers/agent_sandbox/harnesses/{harness}/model-options",
+        params={"agent_id": agent["id"]},
+    )
+    assert preview.status_code == 200, preview.text
+    assert [m["id"] for m in preview.json()["models"]] == expected
+    assert preview.json()["configuration_revision"] is None
+    env.launch.assert_not_awaited()
+    created = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+        },
+    )
+    assert created.status_code == 201, created.text
+    saved = env.store.get_conversation(created.json()["id"])
+    assert saved is not None
+    assert saved.model_override == "code-model"
+    assert saved.inference_snapshot is None
+    assert env.catalog.calls == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model_override": "not-allowed"},
+        {"inference_configuration_revision": "old-direct-revision"},
+        {"cost_control_mode_override": "on"},
+    ],
+)
+async def test_managed_proxy_rejects_invalid_launch_before_persistence(env: _Env, overrides):
+    _enable_managed_proxy(env)
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": "pi-native"}},
+        include_llm=False,
+    )
+    before = env.persisted()
+    response = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+            **overrides,
+        },
+    )
+    assert response.status_code in (400, 409), response.text
+    assert env.persisted() == before
+    env.launch.assert_not_awaited()
+
+
+async def test_managed_proxy_preserves_explicit_direct_configuration(env: _Env):
+    _enable_managed_proxy(env, direct=True)
+    response = await _json_create(env)
+    assert response.status_code == 201, response.text
+    saved = env.store.get_conversation(response.json()["id"])
+    assert saved is not None and saved.inference_snapshot is not None
+    assert saved.model_override == "gateway/main"

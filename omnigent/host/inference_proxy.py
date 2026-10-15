@@ -74,13 +74,41 @@ def _validate_target(proxy: dict) -> None:
         or any(not isinstance(model, str) or not model for model in proxy["models"])
     ):
         raise ValueError("Invalid inference harness or model list")
+    from omnigent.inference_config import parse_inference_config
+
+    if "model_limits" in proxy:
+        parse_inference_config(
+            {
+                "providers": {"proxy": {}},
+                "inference": {
+                    "harnesses": {
+                        proxy["harness"]: {
+                            "provider": "proxy",
+                            "model_allowlist": proxy["models"],
+                            "model_limits": proxy["model_limits"],
+                        }
+                    }
+                },
+            }
+        )
+    apis = proxy.get("model_apis", {})
+    if (
+        not isinstance(apis, dict)
+        or (apis and (proxy["harness"] != "pi-native" or set(apis) != set(proxy["models"])))
+        or any(api not in ("openai-completions", "anthropic-messages") for api in apis.values())
+    ):
+        raise ValueError("Invalid inference model API mapping")
 
 
 def prepare(config: dict, directory: Path, *, credential_files: list[Path] | None = None) -> dict:
     proxy = config.get("server_inference")
     if proxy is None:
         return config
-    if not isinstance(proxy, dict) or set(proxy) != {"url", "grant", "models", "harness"}:
+    if (
+        not isinstance(proxy, dict)
+        or set(proxy) - {"url", "grant", "models", "harness", "model_apis", "model_limits"}
+        or not {"url", "grant", "models", "harness"} <= set(proxy)
+    ):
         raise ValueError("Invalid server inference configuration")
     _validate_target(proxy)
     url = proxy["url"]
@@ -104,6 +132,7 @@ def prepare(config: dict, directory: Path, *, credential_files: list[Path] | Non
         "harness": proxy["harness"],
         "models": proxy["models"],
         "credential_file": str(credential),
+        **{key: proxy[key] for key in ("model_apis", "model_limits") if key in proxy},
     }
     return result
 
@@ -113,10 +142,13 @@ def runtime_config(proxy: dict, credential: Path) -> dict:
     url = proxy["url"]
     args = [sys.executable, "-P", "-m", "omnigent.host.inference_proxy", str(credential)]
     command = _refresh_command(args)
+    apis = proxy.get("model_apis", {})
+    anthropic = {"base_url": url, "auth_command": command, "auth_refresh_interval_ms": 60000}
     return {
         "providers": {
             "server-inference": {
                 "kind": "gateway",
+                **({"anthropic": anthropic} if "anthropic-messages" in apis.values() else {}),
                 "openai": {
                     "base_url": url,
                     "auth_command": command,
@@ -131,6 +163,8 @@ def runtime_config(proxy: dict, credential: Path) -> dict:
                     "provider": "server-inference",
                     "model_allowlist": proxy["models"],
                     "default_model": proxy["models"][0],
+                    **({"model_apis": apis} if apis else {}),
+                    **({"model_limits": proxy["model_limits"]} if "model_limits" in proxy else {}),
                 }
             }
         },

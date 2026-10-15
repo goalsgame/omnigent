@@ -48,11 +48,54 @@ def configured_snapshot(snapshot: dict[str, Any] | None) -> bool:
     )
 
 
+def managed_proxy_catalog(
+    request: Request,
+    provider: str | None,
+    harness: str,
+    *,
+    agent_auth: object = None,
+    profile: str | None = None,
+) -> dict[str, Any] | None:
+    """Preview proxy models without creating a direct-provider session snapshot."""
+    proxy = getattr(request.app.state, "inference_proxy", None)
+    deployment = getattr(request.app.state, "sandbox_config", None)
+    target = deployment.for_provider(provider) if deployment is not None else None
+    if (
+        proxy is None
+        or not proxy.config.managed_sandboxes
+        or target is None
+        or target.provider not in ("agent_sandbox", "kubernetes")
+        or agent_auth is not None
+        or profile
+        or parse_inference_config(target.host_config or {})
+    ):
+        return None
+    harness = normalize_inference_harness(harness)
+    models = list(proxy.config.model_apis(harness)) if harness in proxy.config.harnesses else []
+    return {
+        "configured": True,
+        "configuration_revision": None,
+        "provider_label": "Server inference",
+        "default_model": models[0] if models else None,
+        "status": "ready" if models else "empty",
+        "models": [
+            {"id": model, "model": model, "displayName": model, "isDefault": i == 0}
+            for i, model in enumerate(models)
+        ],
+    }
+
+
 def managed_inference_configured(request: Request, provider: str | None) -> bool:
     """Whether a managed target requires an identifiable harness before creation."""
     deployment = getattr(request.app.state, "sandbox_config", None)
     target = deployment.for_provider(provider) if deployment is not None else None
-    return bool(target and parse_inference_config(target.host_config or {}))
+    return bool(
+        target
+        and (
+            parse_inference_config(target.host_config or {})
+            or managed_proxy_catalog(request, provider, "auto")
+        )
+    )
 
 
 def selected_catalog_model(catalog: dict[str, Any], model: str | None) -> str:
@@ -101,6 +144,27 @@ async def prepare_create_inference(
             snapshot = copy.deepcopy(parent.inference_snapshot)
             snapshot["harness"] = harness
     if snapshot is None and body.host_type == "managed":
+        proxy_catalog = managed_proxy_catalog(
+            request,
+            body.sandbox_provider,
+            harness,
+            agent_auth=spec.executor.auth,
+            profile=spec.executor.profile,
+        )
+        if proxy_catalog is not None:
+            if body.inference_configuration_revision is not None:
+                raise HTTPException(
+                    409, "Harness configuration changed. Refresh the model choices."
+                )
+            if (
+                getattr(body, "cost_control_mode_override", None) == "on"
+                or harness_override == "auto"
+            ):
+                raise OmnigentError(
+                    "Automatic provider routing is unavailable for server inference",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            return None, selected_catalog_model(proxy_catalog, model_override)
         snapshot = await inference_service(request).prepare(
             body.sandbox_provider, harness, user_id, agent_auth=spec.executor.auth
         )
@@ -168,6 +232,7 @@ def create_sandbox_inference_router(
     ) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
         auth = None
+        profile = None
         if agent_id is not None:
             # Clients read a missing agent's 404 from ``detail``; keep that shape.
             if await asyncio.to_thread(agent_store.get, agent_id) is None:
@@ -191,7 +256,13 @@ def create_sandbox_inference_router(
             ).spec
             harness = actual_harness(spec, harness)
             auth = spec.executor.auth
+            profile = spec.executor.profile
         try:
+            proxy_catalog = managed_proxy_catalog(
+                request, provider, harness, agent_auth=auth, profile=profile
+            )
+            if proxy_catalog is not None:
+                return proxy_catalog
             snapshot = await inference_service(request).prepare(
                 provider, harness, user_id, agent_auth=auth
             )

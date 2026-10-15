@@ -1,8 +1,8 @@
 # Server inference for connected hosts
 
-An optional OpenRouter proxy lets connected hosts run supported harnesses without
-receiving provider credentials. The server uses its configured `openrouter_wif`
-broker. Hosts receive a session-specific inference refresh capability through
+An optional inference proxy lets connected hosts run supported harnesses without
+receiving provider credentials. The default upstream uses the configured
+`openrouter_wif` broker. Hosts receive a session-specific inference refresh capability through
 their authenticated host connection and exchange it for five-minute access tokens.
 
 Configure the server alongside `openrouter_wif`:
@@ -76,8 +76,8 @@ control-plane operations. Provider credentials remain on the server. Proxy URLs
 carry a signed workspace/session selector, verified before workspace-scoped
 authorization lookups. Access tokens must match the selected workspace.
 
-The proxy forwards only `POST chat/completions` and `POST responses` to a fixed
-OpenRouter endpoint. It permits only configured models, strips incoming headers,
+The proxy forwards only `POST chat/completions`, `POST responses` and native
+`POST v1/messages` to operator-configured upstreams. It permits only configured models, strips incoming headers,
 disables redirects, limits request size, and enforces one concurrent request per
 session plus the configured total per server replica. Capacity is reserved before
 reading the request body and released on upload failure, cancellation or response
@@ -100,3 +100,64 @@ an enabled harness and an allowed model, with no local provider credentials. Ask
 it for a short response and then a tool action. Verify both complete, then cancel
 a streaming turn and verify another turn succeeds. Confirm an unsupported model
 is rejected and an archived session cannot refresh its inference credential.
+
+## Multiple upstreams
+
+Without `upstreams` and `model_routes`, inference uses the existing OpenRouter
+WIF broker. To route models independently, configure both mappings. Every allowed
+model must have exactly one explicit route; there is no fallback after a provider
+rejects a request. Public model IDs are aliases and need not match provider IDs.
+
+```yaml
+inference_proxy:
+  public_url: https://omnigent.example.com
+  signing_key_env: OMNIGENT_INFERENCE_SIGNING_KEY
+  models: [code-model, reasoning-model, fast-model]
+  harnesses: [pi-native, openai-agents]
+  upstreams:
+    router:
+      kind: openrouter
+    claude:
+      kind: vertex-anthropic
+      project: example-project
+      location: eu
+    gemini:
+      kind: vertex-openai
+      project: example-project
+      location: europe-west1
+  model_routes:
+    code-model: {upstream: router, model: provider/model-id}
+    reasoning-model: {upstream: claude, model: claude-model-id}
+    fast-model: {upstream: gemini, model: google/gemini-model-id}
+  model_limits:
+    reasoning-model: {context_window: 200000, max_output_tokens: 64000}
+```
+
+Install the server with the `vertex` extra. Vertex upstreams use Application
+Default Credentials, including GKE Workload Identity, and refresh access tokens
+on the backend. Grant the server identity `aiplatform.endpoints.predict` and
+`serviceusage.services.use` in each target project, enable the Vertex AI API,
+and enable required partner models in Model Garden. Model availability and IDs
+depend on the selected location. Google endpoints are derived from project and
+location; an ADC token cannot be sent to an operator-supplied URL. OpenRouter
+upstreams require `openrouter_wif`; Vertex-only configurations do not.
+
+Pi receives the per-model protocol and limits in its signed session binding.
+Native Claude messages, tools, images, thinking and SSE pass through; the backend
+adapts only Vertex's URL, model placement and `anthropic_version`. OpenAI Agents
+receives only OpenAI-compatible routes; Vertex's OpenAI endpoint accepts chat
+completions, not Responses. Unsupported protocol/model pairs fail before fetching
+upstream credentials. Select model limits supported by the actual endpoint.
+
+Other OpenAI-compatible providers use `kind: openai`, an HTTPS `base_url`, and
+`api_key_env` naming a server environment variable. Literal credentials are not
+accepted. Clients cannot select URLs, projects or upstream credentials. Configure
+provider budgets and quotas separately; Omnigent's limits remain per replica.
+
+For managed sandboxes, set `inference_proxy.managed_sandboxes: true` to expose
+the proxy model catalog before launch. Sandboxes must also opt in with
+`OMNIGENT_SERVER_INFERENCE=1` and omit direct provider bindings from their host
+configuration. Otherwise their configured
+provider credentials continue to take precedence. A server and runner upgrade is
+required when introducing per-model protocols or limits; relaunch existing
+runners to obtain the updated binding. Retain workspace volumes during upgrades.

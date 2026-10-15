@@ -7,11 +7,13 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import math
 import os
+import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,11 +25,18 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import JSONResponse, StreamingResponse
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.server.inference_upstreams import (
+    GoogleInferenceCredential,
+    InferenceRoute,
+    InferenceUpstream,
+    parse_upstreams,
+)
 from omnigent.stores.host_store import host_is_live
 
 _AUDIENCE = "omnigent-session-inference"
 _WORKSPACE_AUDIENCE = "omnigent-inference-workspace"
 _TTL = 300
+_logger = logging.getLogger(__name__)
 
 
 def _reject_json_constant(_value: str) -> None:
@@ -50,6 +59,28 @@ class InferenceProxyConfig:
     max_request_bytes: int = 8 * 1024 * 1024
     max_concurrent_requests: int = 32
 
+    upstreams: dict[str, InferenceUpstream] = field(default_factory=dict)
+    model_routes: dict[str, InferenceRoute] = field(default_factory=dict)
+    model_limits: dict[str, dict[str, int]] = field(default_factory=dict)
+    managed_sandboxes: bool = False
+
+    @property
+    def needs_openrouter(self) -> bool:
+        return not self.upstreams or any(u.kind == "openrouter" for u in self.upstreams.values())
+
+    def upstream_for(self, model: str) -> tuple[InferenceUpstream, str]:
+        if not self.upstreams:
+            return InferenceUpstream("openrouter", "https://openrouter.ai/api/v1"), model
+        route = self.model_routes[model]
+        return self.upstreams[route.upstream], route.model
+
+    def model_apis(self, harness: str) -> dict[str, str]:
+        return {
+            model: self.upstream_for(model)[0].api
+            for model in self.models
+            if harness == "pi-native" or self.upstream_for(model)[0].api != "anthropic-messages"
+        }
+
     @classmethod
     def parse(cls, raw: object) -> InferenceProxyConfig | None:
         if raw is None:
@@ -61,6 +92,10 @@ class InferenceProxyConfig:
             "harnesses",
             "max_request_bytes",
             "max_concurrent_requests",
+            "upstreams",
+            "model_routes",
+            "model_limits",
+            "managed_sandboxes",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ValueError("Invalid inference_proxy configuration")
@@ -116,11 +151,35 @@ class InferenceProxyConfig:
             if type(value) is not int or value <= 0:
                 raise ValueError(f"inference_proxy.{name} must be a positive integer")
             limits[name] = value
+        if type(raw.get("managed_sandboxes", False)) is not bool:
+            raise ValueError("inference_proxy.managed_sandboxes must be a boolean")
+        upstreams, routes = parse_upstreams(raw, tuple(models))
+        limits_raw = raw.get("model_limits", {})
+        from omnigent.inference_config import parse_inference_config
+
+        parse_inference_config(
+            {
+                "providers": {"proxy": {}},
+                "inference": {
+                    "harnesses": {
+                        "pi-native": {
+                            "provider": "proxy",
+                            "model_allowlist": models,
+                            "model_limits": limits_raw,
+                        }
+                    }
+                },
+            }
+        )
         return cls(
             url.rstrip("/"),
             hmac.new(key.encode(), b"omnigent-inference-signing-v1", hashlib.sha256).hexdigest(),
             tuple(models),
             tuple(harnesses),
+            upstreams=upstreams,
+            model_routes=routes,
+            managed_sandboxes=raw.get("managed_sandboxes", False),
+            model_limits={model: dict(limits) for model, limits in limits_raw.items()},
             **limits,
         )
 
@@ -140,6 +199,14 @@ class InferenceProxy:
         self.conversations = conversations
         self.hosts = hosts
         self.broker = broker
+        if config.needs_openrouter and broker is None:
+            raise ValueError("OpenRouter inference requires openrouter_wif")
+        if any(u.kind.startswith("vertex-") for u in config.upstreams.values()):
+            try:
+                import google.auth.transport.requests  # noqa: F401
+            except ImportError:
+                raise ValueError("Vertex inference requires omnigent[vertex]") from None
+        self.google_credential = GoogleInferenceCredential()
         self.transport = transport
         self.machine_allowed = machine_allowed
         self.active_requests = 0
@@ -185,6 +252,15 @@ class InferenceProxy:
             self.config.signing_key.encode(), message.encode(), hashlib.sha256
         ).hexdigest()
 
+    def _protocol_metadata(self, harness: str) -> dict[str, Any]:
+        apis = self.config.model_apis(harness)
+        if harness != "pi-native":
+            return {}
+        return {
+            **({"model_apis": apis} if "anthropic-messages" in apis.values() else {}),
+            **({"model_limits": self.config.model_limits} if self.config.model_limits else {}),
+        }
+
     def _workspace_route(self, session_id: str, runner_id: str, harness: str) -> str:
         import jwt
 
@@ -196,7 +272,8 @@ class InferenceProxy:
                 "runner": runner_id,
                 "origin": self.config.public_url,
                 "harness": harness,
-                "models": list(self.config.models),
+                "models": list(self.config.model_apis(harness)),
+                **self._protocol_metadata(harness),
             },
             self.config.signing_key,
             algorithm="HS256",
@@ -233,6 +310,8 @@ class InferenceProxy:
     ) -> dict[str, Any] | None:
         if harness not in self.config.harnesses or not owner:
             return None
+        if not self.config.model_apis(harness):
+            raise ValueError("No compatible inference models for this harness")
         path = (
             "/v1/inference/workspaces/"
             + self._workspace_route(conversation.id, runner_id, harness)
@@ -243,8 +322,9 @@ class InferenceProxy:
             "server_inference": {
                 "url": self.config.public_url + path,
                 "grant": self._grant(conversation.id, runner_id, host_id, owner, generation),
-                "models": list(self.config.models),
+                "models": list(self.config.model_apis(harness)),
                 "harness": harness,
+                **self._protocol_metadata(harness),
             }
         }
 
@@ -422,6 +502,11 @@ class InferenceProxy:
                         "runner_id": conv.runner_id,
                         "models": claims["models"],
                         "harness": claims["harness"],
+                        **{
+                            key: claims[key]
+                            for key in ("model_apis", "model_limits")
+                            if key in claims
+                        },
                         "grant_hash": binding,
                         **(
                             {"runner_session_id": runner_session_id}
@@ -456,7 +541,12 @@ class InferenceProxy:
         async def inference(
             request: Request, session_id: str, endpoint: str, workspace_route: str | None = None
         ) -> StreamingResponse:
-            if endpoint not in ("chat/completions", "responses") or request.url.query:
+            if endpoint not in ("chat/completions", "responses", "v1/messages") or (
+                request.url.query
+                and not (
+                    endpoint == "v1/messages" and request.scope.get("query_string") == b"beta=true"
+                )
+            ):
                 raise HTTPException(404, "Unsupported inference endpoint")
             workspace = self._request_workspace(session_id, workspace_route)
             access = bearer(request)
@@ -514,21 +604,50 @@ class InferenceProxy:
                     ):
                         raise HTTPException(400, "Only stateless inference is supported")
                     payload["store"] = False
+                selected, target_model = self.config.upstream_for(payload["model"])
+                try:
+                    target_url, upstream_payload = selected.request(
+                        endpoint, payload, target_model
+                    )
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from None
+                provider_headers = {}
+                if selected.kind == "vertex-anthropic" and "anthropic-beta" in request.headers:
+                    beta = request.headers["anthropic-beta"]
+                    if len(beta) > 2048 or re.fullmatch(r"[A-Za-z0-9_, -]+", beta) is None:
+                        raise HTTPException(400, "Invalid Anthropic beta features")
+                    provider_headers["anthropic-beta"] = beta
                 client = self._upstream_client()
 
                 async def setup_upstream():
                     nonlocal upstream
-                    credential = await self.broker.credential()
+                    try:
+                        if selected.kind == "openrouter":
+                            credential = await self.broker.credential()
+                            upstream_token = str(credential["token"])
+                        elif selected.kind.startswith("vertex-"):
+                            upstream_token = await self.google_credential.credential()
+                        else:
+                            upstream_token = os.environ.get(selected.api_key_env or "", "")
+                            if (
+                                not upstream_token
+                                or not upstream_token.isascii()
+                                or any(c.isspace() for c in upstream_token)
+                            ):
+                                raise ValueError("Upstream credential unavailable")
+                    except Exception:  # noqa: BLE001 — authentication errors may contain credentials
+                        raise HTTPException(502, "Inference authentication unavailable") from None
                     await self.authorize(session_id, access, workspace_id=workspace)
                     upstream = await client.send(
                         client.build_request(
                             "POST",
-                            "https://openrouter.ai/api/v1/" + endpoint,
-                            json=payload,
+                            target_url,
+                            json=upstream_payload,
                             headers={
-                                "Authorization": "Bearer " + str(credential["token"]),
+                                "Authorization": "Bearer " + upstream_token,
                                 "Content-Type": "application/json",
                                 "Accept-Encoding": "identity",
+                                **provider_headers,
                             },
                         ),
                         stream=True,
@@ -558,6 +677,15 @@ class InferenceProxy:
                     raise HTTPException(499, "Inference client disconnected")
                 assert upstream is not None
                 response = upstream
+                _logger.info(
+                    "Inference upstream=%s kind=%s model=%r status=%d",
+                    self.config.model_routes[payload["model"]].upstream
+                    if self.config.model_routes
+                    else "openrouter",
+                    selected.kind,
+                    payload["model"],
+                    response.status_code,
+                )
                 if response.status_code != 200:
                     raise HTTPException(
                         429 if response.status_code == 429 else 502,
