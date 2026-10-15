@@ -18,7 +18,7 @@ import sys
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
+from typing import TYPE_CHECKING, NotRequired, Protocol, TextIO, TypeAlias, TypedDict
 
 from omnigent_client import (
     BlockContext,
@@ -136,6 +136,11 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
         next_exc = current.__cause__ or current.__context__
         current = next_exc if isinstance(next_exc, BaseException) else None
     return False
+
+
+class _SessionCreatePlacement(TypedDict):
+    workspace: str
+    host_id: NotRequired[str]
 
 
 class _SessionSnapshot(Protocol):
@@ -1383,6 +1388,7 @@ class _SessionsChatReplAdapter:
         self._on_session_start = on_session_start
         self._session_start_notified = False
         self._bound_runner_id: str | None = None
+        self._rotation_placement: tuple[str, str] | None = None
         # Push-based event callback. The pump calls this for every
         # event — always, regardless of whether send() is active.
         # Set by run_repl() to the rendering callback.
@@ -1727,6 +1733,12 @@ class _SessionsChatReplAdapter:
             assert self._session_id is not None
             return self._session_id
 
+    def _create_placement_kwargs(self) -> _SessionCreatePlacement:
+        if self._rotation_placement is not None:
+            host_id, workspace = self._rotation_placement
+            return {"host_id": host_id, "workspace": workspace}
+        return {"workspace": os.getcwd()}
+
     async def _create_session_from_registered_agent(self, *, pending_debug: bool) -> None:
         """
         Create a session bound to an agent already registered server-side.
@@ -1749,12 +1761,14 @@ class _SessionsChatReplAdapter:
         # Skip the name lookup only when nothing needs it: we already know
         # the id, and a bound runner means we don't need the harness either.
         agent: RegisteredAgent | None = None
-        if self._agent_id is None or self._runner_id is None:
+        if self._agent_id is None or (
+            self._runner_id is None and self._rotation_placement is None
+        ):
             agent = await self._client.sessions.resolve_agent(self._agent_name)
         agent_id = self._agent_id or (agent.id if agent is not None else None)
         if agent_id is None:
             raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
-        if self._runner_id is None:
+        if self._runner_id is None and self._rotation_placement is None:
             from omnigent.harness_aliases import canonicalize_harness
 
             self._runner_id = await self._client.sessions.resolve_online_runner(
@@ -1773,10 +1787,11 @@ class _SessionsChatReplAdapter:
         session = await self._client.sessions.create_from_agent_id(
             agent_id,
             reasoning_effort=self._reasoning_effort,
-            workspace=os.getcwd(),
+            **self._create_placement_kwargs(),
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        self._rotation_placement = None
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -1808,15 +1823,13 @@ class _SessionsChatReplAdapter:
             self._session_bundle,
             filename=self._session_bundle_filename,
             reasoning_effort=self._reasoning_effort,
-            # Record the user's terminal cwd so the Web UI can show
-            # "running locally in <workspace>" for CLI sessions. Doesn't
-            # drive any behavior — CLI sessions don't bind to a host_id,
-            # so the ck_conversations_workspace_required_for_host
-            # constraint isn't active.
-            workspace=os.getcwd(),
+            # Preserve the host workspace when rotating session-bound inference;
+            # other CLI creates record the terminal's current directory.
+            **self._create_placement_kwargs(),
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        self._rotation_placement = None
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -2877,7 +2890,30 @@ class _SessionsChatReplAdapter:
         the next :meth:`send` takes :meth:`_ensure_session`'s create
         branch. Idempotent when no session is established. The unbind
         is soft-failed on old servers (see :meth:`_unbind_runner_soft`).
+        Opted-in daemon runners stop before unbinding; the next create asks
+        their host for a fresh runner with new session-specific credentials.
         """
+        rotation = None
+        if (
+            self._session_id is not None
+            and not self._attach_only
+            and not self._readonly_view
+            and self._runner_recover is None
+        ):
+            from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+            snapshot = await self._client.sessions.get(self._session_id)
+            if (
+                snapshot.host_id
+                and snapshot.workspace
+                and snapshot.labels.get(INFERENCE_HOST_POLICY_LABEL) == snapshot.host_id
+            ):
+                # Stop while the old binding still identifies its owned process.
+                await self._client.sessions.post_event(
+                    self._session_id, {"type": "stop_session", "data": {}}
+                )
+                rotation = snapshot.host_id, snapshot.workspace
+
         # A fresh session is owned, not observed — clear any read-only-view
         # suppression / interactive-child co-drive from a sub-agent dive so the
         # new session can bind.
@@ -2886,6 +2922,9 @@ class _SessionsChatReplAdapter:
         old_session_id = self._session_id
         if old_session_id is not None:
             await self._unbind_runner_soft(old_session_id)
+            self._rotation_placement = rotation
+        if rotation is not None:
+            self._runner_id = None
         if self._stream_task is not None:
             self._stream_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

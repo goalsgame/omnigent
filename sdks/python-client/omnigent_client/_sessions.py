@@ -144,6 +144,8 @@ class Session:
         when no labels have been written.
     :param runner_id: Runner currently bound to this session, e.g.
         ``"runner_abc123"``. ``None`` until the client binds one.
+    :param host_id: Host bound to the session, or ``None`` before placement.
+    :param workspace: Canonical directory on that host, or ``None``.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
     :param items: Committed conversation items in chronological
@@ -201,6 +203,8 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    host_id: str | None = None
+    workspace: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -227,6 +231,8 @@ class Session:
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
+            host_id=raw.get("host_id"),
+            workspace=raw.get("workspace"),
             reasoning_effort=raw.get("reasoning_effort"),
             items=items_raw if isinstance(items_raw, list) else [],
             llm_model=raw.get("llm_model"),
@@ -381,6 +387,7 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_id: str | None = None,
         host_type: str = "external",
         sandbox_provider: str | None = None,
     ) -> Session:
@@ -402,6 +409,7 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param host_id: External host to launch a fresh runner on; requires ``workspace``.
         :param workspace: Optional starting workspace. For an external
             host (the default), an absolute cwd to record on the session,
             e.g. ``"/Users/corey/projects/myapp"`` — CLI-launched sessions
@@ -427,6 +435,8 @@ class SessionsNamespace:
             metadata["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             metadata["workspace"] = workspace
+        if host_id is not None:
+            metadata["host_id"] = host_id
         if host_type != "external":
             metadata["host_type"] = host_type
         if sandbox_provider is not None:
@@ -449,6 +459,7 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_id: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -467,6 +478,7 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param host_id: External host to launch a fresh runner on; requires ``workspace``.
         :param workspace: Optional absolute starting cwd to record on
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :returns: The newly created :class:`Session` snapshot.
@@ -482,6 +494,8 @@ class SessionsNamespace:
             body["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             body["workspace"] = workspace
+        if host_id is not None:
+            body["host_id"] = host_id
         resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")

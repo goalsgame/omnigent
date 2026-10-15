@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import ipaddress
+import json
 import os
 import ssl
 import subprocess
@@ -60,6 +62,52 @@ def _certificate(root: Path) -> None:
     )
     (root / "key.pem").chmod(0o600)
     (root / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+
+async def _verify_repl_rotation(base, cert, session_id, runner_id, bundle, mock_url):
+    from omnigent_client import OmnigentClient
+
+    from omnigent.repl._repl import _SessionsChatReplAdapter
+
+    async with OmnigentClient(base_url=base) as sdk:
+        # Trust this test's ephemeral CA on the SDK transport as on the sync client.
+        await sdk._http._transport.aclose()
+        sdk._http._transport = httpx.AsyncHTTPTransport(
+            verify=ssl.create_default_context(cafile=str(cert))
+        )
+        adapter = _SessionsChatReplAdapter(
+            sdk,
+            "proxy-agent",
+            session_id=session_id,
+            runner_id=runner_id,
+            session_bundle=bundle,
+        )
+        try:
+            for command in ("clear", "new"):
+                previous_id = adapter.session_id
+                previous_runner = adapter._runner_id
+                await adapter.start_new_conversation()
+                assert adapter._runner_id is None
+                marker = "REPL_ROTATION_" + command.upper()
+                configure_mock_llm(mock_url, [{"text": marker}])
+                async with asyncio.timeout(90):
+                    async for _ in adapter.send("Reply after rotating the conversation."):
+                        pass
+                    while True:
+                        snapshot = await sdk.sessions.get(adapter.session_id)
+                        assert snapshot.status != "failed", snapshot.last_task_error
+                        if marker in json.dumps(snapshot.items):
+                            break
+                        await asyncio.sleep(0.1)
+                assert adapter.session_id != previous_id
+                assert adapter._runner_id and adapter._runner_id != previous_runner
+                assert (await sdk.sessions.get(previous_id)).runner_id is None
+        finally:
+            await adapter.aclose()
+            if adapter.session_id:
+                await sdk.sessions.post_event(
+                    adapter.session_id, {"type": "stop_session", "data": {}}
+                )
 
 
 @pytest.mark.parametrize("workspace", [0, 42])
@@ -289,6 +337,18 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 assert "CHILD_FROM_SIDE_OK" in final_assistant_text(child_result)
                 client.post(f"/v1/sessions/{child_id}/stop")
                 client.post(f"/v1/sessions/{side_id}/stop")
+                from omnigent.chat import _bundle_agent
+
+                asyncio.run(
+                    _verify_repl_rotation(
+                        base,
+                        tmp_path / "cert.pem",
+                        session_id,
+                        runner_id,
+                        _bundle_agent(agent),
+                        isolated_mock_llm_server_url,
+                    )
+                )
                 client.post(f"/v1/sessions/{session_id}/stop")
         finally:
             for process in reversed(processes):

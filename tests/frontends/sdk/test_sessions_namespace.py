@@ -1468,3 +1468,31 @@ async def test_list_preserves_host_id_on_rows() -> None:
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"
+
+
+@pytest.mark.asyncio
+async def test_registered_create_forwards_host_placement_and_decodes_binding():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert json.loads(request.content) == {
+            "agent_id": "agent",
+            "host_id": "host",
+            "workspace": "/host/workspace",
+        }
+        return httpx.Response(
+            201,
+            json={
+                **_session_response_body(),
+                "host_id": "host",
+                "workspace": "/host/workspace",
+                "runner_id": "fresh-runner",
+            },
+        )
+
+    sessions, client = _make_namespace(handler)
+    async with client:
+        result = await sessions.create_from_agent_id(
+            "agent", host_id="host", workspace="/host/workspace"
+        )
+    assert result.host_id == "host" and result.workspace == "/host/workspace"
+    assert result.runner_id == "fresh-runner"
