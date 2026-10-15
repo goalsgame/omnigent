@@ -2,6 +2,9 @@
 
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -40,6 +43,7 @@ def test_local_host_configuration_is_unchanged(home, monkeypatch):
 
 
 def test_retained_checkout_never_fetches_or_overwrites(home, monkeypatch):
+    monkeypatch.setattr(lore, "_binary", lambda: sys.executable)
     target = home / "workspace/game"
     (target / ".lore").mkdir(parents=True)
     (target / "work.txt").write_text("unsaved")
@@ -190,3 +194,83 @@ def test_manifest_write_failure_can_retry_without_published_checkout(
     assert (target / "file.txt").read_text() == "cloned"
     assert manifest.exists()
     assert len(clones) == 2
+
+
+def test_missing_client_wake_preserves_retained_edits(home, monkeypatch):
+    target = home / "workspace/game"
+    (target / ".lore").mkdir(parents=True)
+    (target / "work.txt").write_text("unsaved")
+    lore._write_json(
+        lore._manifest(target),
+        {"path": str(target), "remote": "lores://lore.test/game", "ref": "main@latest"},
+    )
+    monkeypatch.setenv("PATH", str(home / "missing-bin"))
+    monkeypatch.setattr(lore, "credential", lambda *args: pytest.fail("Unexpected fetch"))
+    with pytest.raises(lore.LoreClientUnavailable) as exc:
+        lore.prepare("https://server.test", "host", "lores://lore.test/game", target, "main")
+    assert exc.value.exit_code == 89
+    assert (target / "work.txt").read_text() == "unsaved"
+    assert (target / ".lore").is_dir()
+
+
+@pytest.mark.parametrize("same_remote", [False, True])
+def test_competing_clones_keep_published_checkout_registration(home, monkeypatch, same_remote):
+    target = home / "workspace/game"
+    first_remote = "lores://lore.test/first"
+    second_remote = first_remote if same_remote else "lores://lore.test/second"
+    cloning = threading.Event()
+    competing = threading.Event()
+    release = threading.Event()
+    original_lock = lore._checkout_lock
+    clones = []
+
+    @contextmanager
+    def lock(manifest):
+        if cloning.is_set():
+            competing.set()
+        with original_lock(manifest):
+            yield
+
+    def clone(args, **kwargs):
+        clones.append(args[-2])
+        cloning.set()
+        assert release.wait(10)
+        destination = Path(args[-1])
+        (destination / ".lore").mkdir(parents=True)
+        (destination / "file.txt").write_text(args[-2])
+        return lore.subprocess.CompletedProcess(args, 0)
+
+    def prepare(remote):
+        lore.prepare(
+            "https://server.test",
+            "host",
+            remote,
+            target,
+            "main",
+            credential_payload={"token": "ephemeral"},
+        )
+
+    monkeypatch.setattr(lore, "_checkout_lock", lock)
+    monkeypatch.setattr(lore, "_binary", lambda: sys.executable)
+    monkeypatch.setattr(lore.subprocess, "run", clone)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(prepare, first_remote)
+        try:
+            assert cloning.wait(10)
+            second = pool.submit(prepare, second_remote)
+            assert competing.wait(10)
+        finally:
+            release.set()
+        first.result(timeout=10)
+        if same_remote:
+            second.result(timeout=10)
+        else:
+            with pytest.raises(lore.LoreWorkspaceConflict):
+                second.result(timeout=10)
+    assert clones == [first_remote]
+    assert (target / "file.txt").read_text() == first_remote
+    assert first_remote in lore._manifest(target).read_text()
+    prepare(first_remote)
+    if not same_remote:
+        with pytest.raises(lore.LoreWorkspaceConflict):
+            prepare(second_remote)

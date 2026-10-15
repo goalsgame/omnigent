@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
@@ -249,6 +251,18 @@ def _manifest(target: Path) -> Path:
     return _home() / "checkouts" / (key + ".json")
 
 
+@contextmanager
+def _checkout_lock(manifest: Path) -> Iterator[None]:
+    # Lock files remain in place so waiting processes always share the same inode.
+    import fcntl
+
+    manifest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(manifest.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def prepare(
     server: str,
     host_id: str,
@@ -270,44 +284,48 @@ def prepare(
     manifest = _manifest(target)
     if ref and not exact_revision and "@" not in ref and not re.fullmatch(r"[0-9a-fA-F]{64}", ref):
         ref += "@latest"
-    if target.exists() and any(target.iterdir()):
-        stored = json.loads(manifest.read_text()) if manifest.exists() else {}
-        if (
-            stored != {"path": str(target), "remote": remote, "ref": ref}
-            or not (target / ".lore").is_dir()
-        ):
-            raise LoreWorkspaceConflict(
-                "Workspace is not the retained Lore checkout; refusing to overwrite it"
-            )
-        return
-    binary = _binary()
-    payload = (
-        credential_payload
-        if credential_payload is not None
-        else credential(server, host_id, remote)
-    )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".omnigent-lore-", dir=target.parent) as temporary:
-        staging = Path(temporary)
-        args = [binary, "--identity-token", payload["token"], "clone"]
-        if ref:
-            args += ["--revision", ref]
-        if payload.get("view"):
-            view = staging / "view.txt"
-            view.write_text(payload["view"], encoding="utf-8")
-            args += ["--view", str(view)]
-        args += [remote, str(staging / "clone")]
-        result = subprocess.run(args, capture_output=True, text=True)
-        if result.returncode:
-            raise LoreCheckoutError(
-                "Lore clone failed; verify access, revision, view and available disk space"
-            )
-        if not (staging / "clone" / ".lore").is_dir():
-            raise LoreCheckoutError("Lore clone did not create repository metadata")
-        _write_json(manifest, {"path": str(target), "remote": remote, "ref": ref})
-        if target.exists():
-            target.rmdir()
-        (staging / "clone").rename(target)
+    with _checkout_lock(manifest):
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise LoreWorkspaceConflict("Refusing to replace a symlink or non-directory workspace")
+        if target.exists() and any(target.iterdir()):
+            stored = json.loads(manifest.read_text()) if manifest.exists() else {}
+            if (
+                stored != {"path": str(target), "remote": remote, "ref": ref}
+                or not (target / ".lore").is_dir()
+            ):
+                raise LoreWorkspaceConflict(
+                    "Workspace is not the retained Lore checkout; refusing to overwrite it"
+                )
+            _binary()
+            return
+        binary = _binary()
+        payload = (
+            credential_payload
+            if credential_payload is not None
+            else credential(server, host_id, remote)
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".omnigent-lore-", dir=target.parent) as temporary:
+            staging = Path(temporary)
+            args = [binary, "--identity-token", payload["token"], "clone"]
+            if ref:
+                args += ["--revision", ref]
+            if payload.get("view"):
+                view = staging / "view.txt"
+                view.write_text(payload["view"], encoding="utf-8")
+                args += ["--view", str(view)]
+            args += [remote, str(staging / "clone")]
+            result = subprocess.run(args, capture_output=True, text=True)
+            if result.returncode:
+                raise LoreCheckoutError(
+                    "Lore clone failed; verify access, revision, view and available disk space"
+                )
+            if not (staging / "clone" / ".lore").is_dir():
+                raise LoreCheckoutError("Lore clone did not create repository metadata")
+            _write_json(manifest, {"path": str(target), "remote": remote, "ref": ref})
+            if target.exists():
+                target.rmdir()
+            (staging / "clone").rename(target)
 
 
 def _clone(args: list[str], config: dict, remote: str) -> int:
