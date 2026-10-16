@@ -6134,6 +6134,9 @@ async def _launch_runner_on_host_locked(
         from omnigent.server.routes._host_launch import remember_inference_host_policy
 
         await remember_inference_host_policy(conv, host_conn, host_registry, conversation_store)
+        from omnigent.db.backend_work_fence import check_backend_work
+
+        await asyncio.to_thread(check_backend_work)
         request_id = secrets.token_hex(8)
         launch_future: asyncio.Future[dict[str, str | None]] = (
             asyncio.get_running_loop().create_future()

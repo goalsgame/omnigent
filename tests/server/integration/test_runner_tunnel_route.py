@@ -2437,3 +2437,177 @@ async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
     await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
     await ws.close(code=4000)
     await asyncio.wait_for(sender, timeout=5)  # returns instead of raising
+
+
+def _replicated_runner_route(db_uri, *, host_bound=False):
+    from ipaddress import ip_network
+    from types import SimpleNamespace
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.host_store import HostStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    hosts, registry = HostRegistry(), TunnelRegistry()
+    conversations = SqlAlchemyConversationStore(db_uri)
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        conversations,
+        hosts,
+    )
+    if host_bound:
+        hid = "51dc949aba31e24ca8f047d6fba31a0d"
+        HostStore(db_uri).upsert_on_connect(hid, "host", "local")
+        hosts.register(
+            hid,
+            SimpleNamespace(),
+            HostHelloFrame(version="test", name="host", frame_protocol_version=1),
+            owner=None,
+        )
+        conv = conversations.create_conversation(host_id=hid, workspace="/test")
+        conversations.replace_runner_id(conv.id, _RUNNER_ID)
+        coordinator.store.claim("host", hid)
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, replication=coordinator), prefix="/v1"
+    )
+    return TunnelRouteApp(app, registry), coordinator
+
+
+@pytest.mark.parametrize("host_bound", [False, True])
+async def test_superseded_runner_hello_cannot_replace_healthy_socket(db_uri, host_bound):
+    route, coordinator = _replicated_runner_route(db_uri, host_bound=host_bound)
+    received, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_app(scope, receive, send):
+        async def delayed_receive():
+            message = await receive()
+            if scope.get("delay_hello") and message["type"] == "websocket.receive":
+                received.set()
+                await release.wait()
+            return message
+
+        await route.app(scope, delayed_receive, send)
+
+    old = ApplicationCommunicator(
+        delayed_app, {**_websocket_scope(_TUNNEL_PATH), "delay_hello": True}
+    )
+    new = None
+    try:
+        await old.send_input({"type": "websocket.connect"})
+        assert (await old.receive_output(timeout=budget(2)))["type"] == "websocket.accept"
+        await old.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="old", frame_protocol_version=1, connection_id="superseded"
+                    )
+                ),
+            }
+        )
+        await asyncio.wait_for(received.wait(), timeout=budget(2))
+        new = await _connect_route(route.app, _TUNNEL_PATH)
+        await _send_hello(new, route.registry, connection_id="replacement")
+        healthy = route.registry.get(_RUNNER_ID)
+        assert healthy.hello.connection_id == "replacement"
+        release.set()
+        await old.wait(timeout=budget(2))
+        assert route.registry.get(_RUNNER_ID) is healthy
+    finally:
+        release.set()
+        for comm in (old, new):
+            if comm is not None and not comm.future.done():
+                await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+                await comm.wait(timeout=budget(2))
+        await coordinator.aclose()
+        assert not coordinator._runner_connections
+
+
+@pytest.mark.parametrize("transfer", [False, True])
+async def test_accepted_batch_retains_lease_after_disconnect_and_fences_transferred_writes(
+    db_uri, transfer
+):
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    route, coordinator = _replicated_runner_route(db_uri)
+    conv = coordinator.conversations.create_conversation(title="original")
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    async def ingest(**kwargs):
+        batch = kwargs["batch"]
+
+        def write():
+            started.set()
+            assert release.wait(timeout=budget(10))
+            try:
+                coordinator.conversations.update_conversation(conv.id, title="accepted")
+            finally:
+                finished.set()
+
+        await asyncio.to_thread(write)
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(2)))["text"]), EventReadyFrame
+        )
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    EventBatchFrame(
+                        id="accepted",
+                        session_id=conv.id,
+                        events=[{"type": "external_output_text_delta", "data": {}}],
+                    )
+                ),
+            }
+        )
+        assert await asyncio.to_thread(started.wait, budget(2))
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2))
+        lease = coordinator.store.get("runner", _RUNNER_ID)
+        assert lease is not None
+        assert route.app.state.runner_event_ingest_slots._value == 15
+        if transfer:
+            coordinator.store.release(lease)
+            other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+            assert other.claim("runner", _RUNNER_ID).replica_id == "replacement"
+        release.set()
+        assert await asyncio.to_thread(finished.wait, budget(2))
+        while route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0):
+            await asyncio.sleep(0.01)
+        await asyncio.gather(*coordinator._cleanup)
+        assert coordinator.conversations.get_conversation(conv.id).title == (
+            "original" if transfer else "accepted"
+        )
+        if not transfer:
+            assert coordinator.store.get("runner", _RUNNER_ID) is None
+    finally:
+        release.set()
+        if not comm.future.done():
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(2))
+        await coordinator.aclose()

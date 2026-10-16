@@ -172,6 +172,19 @@ async def create_session_launch_task(
         raise
 
 
+def create_connection_task(coroutine: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    """Retain admitted ownership while accepted connection work drains."""
+    task = create_managed_launch_task(coroutine)
+    retain_managed_task(task)
+    return task
+
+
+@dataclass(frozen=True)
+class _RunnerAdmission:
+    route: BackendRoute
+    nonce: str
+
+
 @dataclass
 class _OwnedResource:
     route: BackendRoute
@@ -204,6 +217,7 @@ class ReplicaCoordinator:
         self.config = config
         self.database_uri = database_uri
         self._task_fences: dict[asyncio.Task[None], BackendWorkFence] = {}
+        self._runner_connections: dict[tuple[int, str], tuple[str, WebSocket]] = {}
         self.store = BackendRouteStore(
             database_uri, uuid.uuid4().hex, config.endpoint, ttl=config.lease_seconds
         )
@@ -324,6 +338,31 @@ class ReplicaCoordinator:
                 and entry is not None
                 and entry.route.token == route.token
                 and entry.route.connection_token == route.connection_token
+            )
+
+    @asynccontextmanager
+    async def runner_registration(self, ws: WebSocket, runner_id: str) -> AsyncIterator[bool]:
+        """Serialize runner registry insertion with its admitted socket generation."""
+        admission = ws.scope.get("omnigent.runner_admission")
+        if not isinstance(admission, _RunnerAdmission):
+            yield False
+            return
+        admitted = admission.route
+        async with self._resource_lock(admitted.kind, admitted.resource_id):
+            route = await asyncio.to_thread(self.store.get, admitted.kind, admitted.resource_id)
+            current = self._runner_connections.get((admitted.workspace_id, runner_id))
+            entry = self._owned.get((admitted.workspace_id, admitted.kind, admitted.resource_id))
+            yield (
+                current is not None
+                and current[0] == admission.nonce
+                and current[1] is ws
+                and route is not None
+                and self.local(route)
+                and route.token == admitted.token
+                and route.connection_token == admitted.connection_token
+                and entry is not None
+                and entry.route.token == admitted.token
+                and any(socket is ws for socket in entry.connections.values())
             )
 
     async def report_host(self, host_id: str) -> None:
@@ -491,6 +530,17 @@ class ReplicaCoordinator:
                 if not host_id or self.hosts.get(host_id) is not None:
                     reference = self._reference(route, ws)
                     await reference.__aenter__()
+                    if kind == "runner":
+                        admission = _RunnerAdmission(route, uuid.uuid4().hex)
+                        key = (route.workspace_id, resource_id)
+                        previous = self._runner_connections.get(key)
+                        self._runner_connections[key] = (admission.nonce, ws)
+                        ws.scope["omnigent.runner_admission"] = admission
+                        if previous is not None and previous[1] is not ws:
+                            with suppress(Exception):
+                                await previous[1].close(
+                                    code=1001, reason="backend connection replaced"
+                                )
         if reference is None:
             if route is not None and not self.local(route) and not ws.scope.get("omnigent.peer"):
                 await self.transport.forward_websocket(ws, route)
@@ -505,12 +555,20 @@ class ReplicaCoordinator:
             return
         try:
             assert route is not None
-            if kind == "host":
-                with backend_fence_scope(resource_id, route.connection_token or route.token):
+            with replication_scope(self):
+                if kind == "host":
+                    with backend_fence_scope(resource_id, route.connection_token or route.token):
+                        yield True
+                else:
+                    # Accepted ingestion gets an independent retained work fence;
+                    # disconnect reconciliation keeps its normal task context.
                     yield True
-            else:
-                yield True
         finally:
+            if kind == "runner":
+                key = (route.workspace_id, resource_id)
+                current = self._runner_connections.get(key)
+                if current is not None and current[1] is ws:
+                    self._runner_connections.pop(key, None)
             await reference.__aexit__(None, None, None)
 
     async def _renew_loop(self) -> None:

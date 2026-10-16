@@ -46,9 +46,14 @@ its connection lease is released, so reconnects cannot be mistaken for host
 launches. Managed launch tasks retain placement after their HTTP request returns,
 including newly created sessions that have no host binding yet.
 
-Losing ownership cancels retained launches and local mutations. Their writes
+Accepted runner event batches retain their admitted resource generation while
+draining after disconnect. Standalone and host-bound runner handshakes check their
+socket generation before registry insertion.
+
+Losing ownership cancels retained launches, event ingestion and local mutations. Their writes
 validate current leases inside metadata transactions, and provider calls check
-ownership before and after execution. Nested mutations retain their parent fences.
+ownership before and after execution. Nested mutations retain their parent fences. Host launch and worktree commands
+validate ownership immediately before dispatch.
 An external operation already in flight cannot be recalled; stale work must not
 start another operation or commit new state. Session deletion keeps runner cleanup
 on the runner owner and delegates worktree cleanup to the host owner, repeating

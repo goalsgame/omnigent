@@ -675,3 +675,82 @@ async def test_bind_existing_subdirectory_preserves_inherited_cleanup_root(
         assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == expected
     assert conv.workspace == (workspace if launch_status == "launched" else None)
     assert cap.create == []
+
+
+@pytest.mark.parametrize("operation", ["create", "dedicated", "relaunch"])
+async def test_launch_command_rejects_ownership_loss_after_binding_commit(
+    app, client, db_uri, register_host, monkeypatch, operation
+):
+    from ipaddress import ip_network
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.db.backend_work_fence import work_fence_scope
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator, replication_scope
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_locked
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    cap = register_host()
+    sid = await _bare_session(client, "fenced-launch-agent")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    if operation == "relaunch":
+        conversations.set_host_id(sid, _HOST_ID, _SOURCE_REPO)
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        conversations,
+        app.state.host_registry,
+    )
+    other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+    method = {
+        "create": "set_runner_id",
+        "dedicated": "set_host_id",
+        "relaunch": "replace_runner_id",
+    }[operation]
+    persist = getattr(SqlAlchemyConversationStore, method)
+    committed = []
+
+    def persisted_then_transferred(self, *args, **kwargs):
+        result = persist(self, *args, **kwargs)
+        if not committed:
+            committed.append(args[0])
+            with work_fence_scope(None):
+                coordinator.store.release(coordinator.store.get("host", _HOST_ID))
+                other.claim("host", _HOST_ID)
+        return result
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, method, persisted_then_transferred)
+    try:
+        with replication_scope(coordinator):
+            async with coordinator.request_placement(_HOST_ID):
+                if operation == "create":
+                    conv = conversations.get_conversation(sid)
+                    response = await client.post(
+                        "/v1/sessions",
+                        json={
+                            "agent_id": conv.agent_id,
+                            "host_id": _HOST_ID,
+                            "workspace": _SOURCE_REPO,
+                        },
+                    )
+                    assert response.status_code == 499, response.text
+                elif operation == "dedicated":
+                    response = await _launch(client, sid)
+                    assert response.status_code == 499, response.text
+                else:
+                    with pytest.raises(asyncio.CancelledError):
+                        await _launch_runner_on_host_locked(
+                            conversations.get_conversation(sid),
+                            conversations,
+                            app.state.host_registry,
+                            app.state.host_registry.get(_HOST_ID),
+                        )
+                assert committed
+                assert cap.launch == []
+                assert not app.state.host_registry.get(_HOST_ID).pending_launches
+                assert other.get("host", _HOST_ID).replica_id == "replacement"
+    finally:
+        await coordinator.aclose()

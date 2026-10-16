@@ -48,7 +48,7 @@ from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelR
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
-from omnigent.server.replication import ReplicaCoordinator
+from omnigent.server.replication import ReplicaCoordinator, create_connection_task
 from omnigent.server.routes._auth_helpers import require_user
 
 _logger = logging.getLogger(__name__)
@@ -550,7 +550,14 @@ def create_runner_tunnel_router(
             #    (and an unauthenticated non-loopback peer already
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
-            session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            async with contextlib.AsyncExitStack() as registration:
+                if replication is not None:
+                    current = await registration.enter_async_context(
+                        replication.runner_registration(ws, runner_id)
+                    )
+                    if not current:
+                        return
+                session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
             session.diagnostics.settings.update(
                 tunnel_side="server",
                 app_ping_interval_s=PING_INTERVAL_S,
@@ -917,7 +924,7 @@ async def _receive_loop(
                     continue
                 await slots.acquire()
                 runner_active[runner_id] = runner_active.get(runner_id, 0) + 1
-                task = asyncio.create_task(process(resp_frame))
+                task = create_connection_task(process(resp_frame))
                 active.add(task)
                 task.add_done_callback(finished)
                 continue
