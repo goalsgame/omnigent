@@ -192,3 +192,43 @@ def test_vertex_request_restores_metadata_before_forwarding():
         body["messages"][0]["tool_calls"][0]["extra_content"]["google"]["thought_signature"]
         == "opaque"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize(
+    "metadata", [{}, {"extra_content": None}, {"extra_content": {"google": None}}]
+)
+async def test_plain_text_with_null_tool_calls_is_preserved(streaming, metadata):
+    message = {"role": "assistant", "content": "hello", "tool_calls": None, **metadata}
+    body = {"choices": [{"index": 0, "delta" if streaming else "message": message}]}
+    wire = "data: " + json.dumps(body) + "\n\n" if streaming else json.dumps(body)
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream" if streaming else "application/json"},
+        stream=Chunks(wire.encode()),
+    )
+    output = b"".join([part async for part in vertex_response_bytes(response)])
+    assert output == wire.encode()
+
+
+@pytest.mark.asyncio
+async def test_null_replay_details_accept_message_signature():
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "hello",
+                    "tool_calls": None,
+                    "reasoning_details": None,
+                    "extra_content": {"google": {"thought_signature": "opaque"}},
+                }
+            }
+        ]
+    }
+    response = httpx.Response(
+        200, headers={"content-type": "application/json"}, stream=Chunks(json.dumps(body).encode())
+    )
+    output = json.loads(b"".join([part async for part in vertex_response_bytes(response)]))
+    assert output["choices"][0]["message"]["reasoning_details"][0]["data"] == "opaque"

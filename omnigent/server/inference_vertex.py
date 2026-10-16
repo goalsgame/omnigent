@@ -64,28 +64,33 @@ class _ReplayMetadata:
         self.calls: dict[tuple[int, int], dict[str, str]] = {}
 
     def annotate(self, body: dict[str, Any]) -> None:
-        for choice in body.get("choices", []):
+        for choice in body.get("choices") or []:
             part = choice.get("delta", choice.get("message"))
             if not isinstance(part, dict):
                 continue
             details = []
-            signature = part.get("extra_content", {}).get("google", {}).get("thought_signature")
+            signature = self._signature(part)
             if isinstance(signature, str) and signature:
                 details.append(self._detail(signature, None))
-            for index, call in enumerate(part.get("tool_calls", [])):
+            for index, call in enumerate(part.get("tool_calls") or []):
                 key = (choice.get("index", 0), call.get("index", index))
                 state = self.calls.setdefault(key, {})
                 if call.get("id"):
                     state["id"] = call["id"]
-                signature = (
-                    call.get("extra_content", {}).get("google", {}).get("thought_signature")
-                )
+                signature = self._signature(call)
                 if isinstance(signature, str) and signature:
                     state["signature"] = signature
                 if state.get("id") and state.get("signature"):
                     details.append(self._detail(state.pop("signature"), state["id"]))
             if details:
-                part.setdefault("reasoning_details", []).extend(details)
+                part["reasoning_details"] = [*(part.get("reasoning_details") or []), *details]
+
+    @staticmethod
+    def _signature(part: dict[str, Any]) -> str | None:
+        extra = part.get("extra_content")
+        google = extra.get("google") if isinstance(extra, dict) else None
+        signature = google.get("thought_signature") if isinstance(google, dict) else None
+        return signature if isinstance(signature, str) else None
 
     @staticmethod
     def _detail(signature: str, call_id: str | None) -> dict[str, Any]:
