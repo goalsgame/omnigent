@@ -94,7 +94,7 @@ class ReplicaRoutingMiddleware:
                     return None
             elif self.coordinator.conversations.get_session_owner(session_id) != user:
                 return None
-        if conv.runner_id and self.coordinator.store.get("runner", conv.runner_id) is not None:
+        if conv.runner_id and self.coordinator.store.is_standalone_runner(conv.runner_id):
             return ("runner", conv.runner_id)
         host = routing_host_id(conv, self.coordinator.conversations)
         return ("host", host) if host else ("session", session_id)
@@ -135,6 +135,16 @@ class ReplicaRoutingMiddleware:
         if host:
             return await asyncio.to_thread(self.coordinator.store.get, "host", host)
         return None
+
+    async def _session_host_route(self, session_id: str) -> BackendRoute | None:
+        try:
+            canonical = uuid_to_bytes(session_id).hex()
+        except InvalidUuidError:
+            return None
+        conv = await asyncio.to_thread(self.coordinator.conversations.get_conversation, canonical)
+        if conv is None or conv.host_id is None:
+            return None
+        return await asyncio.to_thread(self.coordinator.store.get, "host", conv.host_id)
 
     async def _target(self, kind: str, resource_id: str) -> BackendRoute | None:
         if kind == "sessions":
@@ -288,7 +298,7 @@ class ReplicaRoutingMiddleware:
                 if route is None and scope["type"] == "http" and path == "/v1/skills":
                     query = Request(scope).query_params
                     if query.get("session_id"):
-                        route = await self._target("sessions", query["session_id"])
+                        route = await self._session_host_route(query["session_id"])
                     elif query.get("host_id"):
                         route = await self._target("hosts", query["host_id"])
                 match = _RESOURCE.match(path)

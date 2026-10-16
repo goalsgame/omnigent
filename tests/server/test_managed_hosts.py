@@ -49,7 +49,6 @@ from omnigent.server.managed_hosts import (
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedHostLaunch,
-    ManagedLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,

@@ -102,6 +102,16 @@ class BackendRouteStore:
             )
             return _route(row) if row is not None else None
 
+    def is_standalone_runner(self, runner_id: str) -> bool:
+        """A runner-owned lease records origin even after the socket disconnects."""
+        with self._session("resolve_runner_origin") as session:
+            return (
+                session.scalar(
+                    select(SqlBackendRoute.resource_id).where(self._key("runner", runner_id))
+                )
+                is not None
+            )
+
     def peer_routes(self) -> list[BackendRoute]:
         """One fresh routing proof per other replica in the current workspace."""
         with self._session("discover_backend_peers") as session:
@@ -208,17 +218,21 @@ class BackendRouteStore:
         return run_write_transaction(self._session, "renew_resource_owner", write)
 
     def release(self, route: BackendRoute) -> bool:
-        """Remove only this generation; late disconnects cannot clear a new owner."""
+        """Release routing for this generation, retaining standalone runner identity."""
 
         def write(session: Session) -> bool:
+            if route.kind == "runner":
+                # Keep the authenticated standalone origin separate from liveness.
+                statement = update(SqlBackendRoute).values(expires_at=0, reported_metadata=None)
+            else:
+                statement = delete(SqlBackendRoute)
             result = session.execute(
-                delete(SqlBackendRoute)
-                .where(
+                statement.where(
                     self._key(route.kind, route.resource_id),
                     SqlBackendRoute.replica_id == self.replica_id,
                     SqlBackendRoute.token == route.token,
-                )
-                .returning(SqlBackendRoute.token)
+                    SqlBackendRoute.expires_at != 0,
+                ).returning(SqlBackendRoute.token)
             )
             return result.scalar_one_or_none() is not None
 

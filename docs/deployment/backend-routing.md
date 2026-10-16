@@ -38,7 +38,8 @@ grant access to sessions. A request can make at most one peer hop.
 
 Leases expire unless renewed. Generation tokens fence delayed disconnects and
 heartbeats after reconnection. Runner connections attached to a host remain on
-that host's backend. Managed launch tasks retain placement after their HTTP
+that host's backend. Standalone runner identity remains recorded after its
+connection lease is released, so reconnects cannot be mistaken for host launches. Managed launch tasks retain placement after their HTTP
 request returns, including newly created sessions that have no host binding yet.
 Losing ownership cancels retained launch tasks. Background launch writes validate
 the current lease inside metadata transactions, and provider calls check ownership

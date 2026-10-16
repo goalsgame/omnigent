@@ -238,6 +238,8 @@ class ReplicaCoordinator:
     def _runner_host(self, runner_id: str) -> str | None:
         from omnigent.runner.routing import routing_host_id
 
+        if self.store.is_standalone_runner(runner_id):
+            return None
         for conv in self.conversations.list_conversations_by_runner_id(runner_id):
             if host_id := routing_host_id(conv, self.conversations):
                 return host_id

@@ -222,6 +222,7 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_u
     hid = "2c167be5bad7438196cd12a3be5fce08"
     conv = a.conversations.create_conversation(host_id=hid, workspace="/source")
     calls = []
+    restarted = None
 
     def endpoint(name, replica):
         async def serve(scope, receive, send):
@@ -290,6 +291,37 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_u
             assert inventory.status_code == 200
             assert inventory.json() == {"data": [{"runner_id": "new-runner", "online": True}]}
             assert all(name == "b" for name, _ in calls)
+            skills = await client.get("/v1/skills", params={"session_id": conv.id})
+            assert skills.status_code == 200
+            assert skills.json() == {"backend": "a"}
+            # An offline runner still permits host-backed workspace reads.
+            b.store.release(b.store.get("runner", "new-runner"))
+            fallback = await client.get(f"/v1/sessions/{conv.id}/resources/github")
+            assert fallback.status_code == 200 and fallback.json() == {"backend": "a"}
+        # Both old sockets/leases are gone, and the original host is offline.
+        assert a.store.get("host", hid) is None
+        assert b.store.get("runner", "new-runner") is None
+        assert b.store.is_standalone_runner("new-runner")
+        await b.aclose()
+        restarted = coordinator(db_uri, 8002)
+        apps[8002] = ReplicaRoutingMiddleware(endpoint("b", restarted), restarted, None)
+        from types import SimpleNamespace
+
+        async with restarted.connection(
+            SimpleNamespace(scope={}), "runner", "new-runner"
+        ) as local:
+            assert local
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=apps[8001]), base_url="https://public.example"
+            ) as client:
+                status = await client.get("/v1/runners/new-runner/status")
+                assert status.status_code == 200 and status.json() == {"backend": "b"}
+                session = await client.get(f"/v1/sessions/{conv.id}")
+                assert session.status_code == 200 and session.json() == {"backend": "b"}
+                inventory = await client.get("/v1/runners")
+                assert inventory.json() == {"data": [{"runner_id": "new-runner", "online": True}]}
     finally:
         await a.aclose()
         await b.aclose()
+        if restarted is not None:
+            await restarted.aclose()
