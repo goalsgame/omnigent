@@ -1851,6 +1851,9 @@ def create_app(
                 await asyncio.to_thread(mcp_broker.client.close)
             if replication is not None:
                 await replication.aclose()
+            from omnigent.server.managed_hosts import drain_provision_cleanup
+
+            await drain_provision_cleanup()
 
     from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
 

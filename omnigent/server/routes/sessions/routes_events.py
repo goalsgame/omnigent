@@ -3169,20 +3169,22 @@ def register_events_routes(
 
                 if await cleanup_remote_session_worktree(request, conv.id, conv.host_id):
                     return
+            from omnigent.server.replication import reserve_managed_placement
             from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
-            await _remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=conv.workspace,
-                branch=conv.git_branch,
-                delete_branch=True,
-                host_registry=getattr(request.app.state, "host_registry", None),
-                reason="session-delete",
-                expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
-                conversation_store=conversation_store,
-                exclude_conversation_id=conv.id,
-                fail_if_unavailable=True,
-            )
+            async with reserve_managed_placement(conv.host_id):
+                await _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=True,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    reason="session-delete",
+                    expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=conv.id,
+                    fail_if_unavailable=True,
+                )
 
     @router.delete("/sessions/{session_id}/resources/worktree")
     async def cleanup_session_worktree(request: Request, session_id: str) -> dict[str, str]:

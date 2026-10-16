@@ -8892,7 +8892,9 @@ def _ensure_runner_relay(
     # heartbeat-only relay readiness tests that never emit persistable frames.
     relay_store = cast(ConversationStore, conversation_store)
     with runner_log_scope(session_id, runner_id):
-        task = asyncio.create_task(
+        from omnigent.server.replication import create_runner_relay_task
+
+        task = create_runner_relay_task(
             _relay_runner_stream(
                 session_id,
                 runner_client,
@@ -8900,8 +8902,9 @@ def _ensure_runner_relay(
                 ready,
                 runner_id=runner_id,
             ),
-            name=f"runner-relay-{session_id}",
+            runner_id,
         )
+        task.set_name(f"runner-relay-{session_id}")
     # A heartbeat-only stream may never repeat the pre-handoff idle edge.
     # Retain only immutable status metadata for this relay's lifetime.
     status_snapshot = (

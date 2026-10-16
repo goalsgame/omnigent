@@ -310,6 +310,9 @@ async def _proxy_create_dir(
         ``error`` (string or ``None``).
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
+    from omnigent.db.backend_work_fence import check_backend_work
+
+    await asyncio.to_thread(check_backend_work)
     request_id = secrets.token_hex(8)
     loop = asyncio.get_running_loop()
     future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -370,6 +373,9 @@ async def _proxy_install_harness(
         ``None``).
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
+    from omnigent.db.backend_work_fence import check_backend_work
+
+    await asyncio.to_thread(check_backend_work)
     request_id = secrets.token_hex(8)
     loop = asyncio.get_running_loop()
     future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -431,6 +437,9 @@ async def _proxy_store_secret(
         ``gateway_inference`` / ``error``.
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
+    from omnigent.db.backend_work_fence import check_backend_work
+
+    await asyncio.to_thread(check_backend_work)
     request_id = frame.request_id
     loop = asyncio.get_running_loop()
     future: asyncio.Future[dict[str, Any]] = loop.create_future()

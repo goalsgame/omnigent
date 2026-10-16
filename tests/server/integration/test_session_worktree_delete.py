@@ -905,7 +905,14 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
 
 @pytest.mark.parametrize(
     ("co_located", "loss"),
-    [(False, None), (True, None), (False, "runner"), (True, "runner"), (False, "host")],
+    [
+        (False, None),
+        (True, None),
+        (False, "runner"),
+        (True, "runner"),
+        (False, "host"),
+        (True, "host"),
+    ],
 )
 async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
     app, db_uri, monkeypatch, co_located, loss
@@ -952,8 +959,8 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
         async def lose_while_listing(**kwargs):
             result = await original_list(**kwargs)
             with work_fence_scope(None):
-                a.store.release(a.store.get("host", _HOST_ID))
-                b.store.claim("host", _HOST_ID)
+                host_owner.store.release(host_owner.store.get("host", _HOST_ID))
+                (a if co_located else b).store.claim("host", _HOST_ID)
             return result
 
         monkeypatch.setattr(_host_worktree, "list_worktrees_on_host", lose_while_listing)
@@ -1025,7 +1032,7 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
                         "DELETE", f"/v1/sessions/{sid}?delete_branch=true", json={"ignored": True}
                     )
                     if loss is not None:
-                        if loss == "host":
+                        if loss == "host" and not co_located:
                             failed = await operation
                             assert failed.status_code == 499, failed.text
                         else:
@@ -1034,10 +1041,13 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
                         assert captured == []
                         assert runner_calls == [("DELETE", f"/v1/sessions/{sid}")]
                         if loss == "host":
-                            assert b.store.get("host", _HOST_ID).replica_id == b.store.replica_id
+                            assert (
+                                b.store.get("host", _HOST_ID).replica_id
+                                == (a if co_located else b).store.replica_id
+                            )
                         assert conversations.get_conversation(sid) is not None
                         expected = [("b", "DELETE", f"/v1/sessions/{sid}")]
-                        if loss == "host":
+                        if loss == "host" and not co_located:
                             expected.append(
                                 ("a", "DELETE", f"/v1/sessions/{sid}/resources/worktree")
                             )

@@ -902,3 +902,79 @@ async def test_retained_launch_reconnect_rotates_socket_before_delayed_readiness
             *(task for task in (launch, write) if task is not None), return_exceptions=True
         )
         await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command", ["create_dir", "install", "store_secret", "file_write", "stop"]
+)
+async def test_host_mutations_cannot_enqueue_after_ownership_loss(db_uri, command):
+    from types import SimpleNamespace
+
+    from omnigent.db.backend_work_fence import work_fence_scope
+    from omnigent.host.frames import HostHelloFrame, HostStoreSecretFrame
+    from omnigent.server.routes._host_filesystem import write_workspace_from_host
+    from omnigent.server.routes._sessions.helpers import _stop_session_host_runner
+    from omnigent.server.routes.hosts import (
+        _proxy_create_dir,
+        _proxy_install_harness,
+        _proxy_store_secret,
+    )
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    hosts = HostRegistry()
+    conn = hosts.register(
+        "example",
+        SimpleNamespace(),
+        HostHelloFrame(version="test", name="host", frame_protocol_version=1),
+        owner=None,
+    )
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        hosts,
+    )
+    other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+    try:
+        async with coordinator.request_placement("example") as route:
+            with work_fence_scope(None):
+                coordinator.store.release(route)
+                other.claim("host", "example")
+            if command == "create_dir":
+                call = _proxy_create_dir(host_registry=hosts, host_conn=conn, path="/tmp/owned")
+            elif command == "install":
+                call = _proxy_install_harness(host_registry=hosts, host_conn=conn, harness="pi")
+            elif command == "store_secret":
+                call = _proxy_store_secret(
+                    host_registry=hosts,
+                    host_conn=conn,
+                    frame=HostStoreSecretFrame(
+                        request_id="unused", harness="pi", kind="adopt", env_var="TEST_NOT_USED"
+                    ),
+                )
+            elif command == "file_write":
+                call = write_workspace_from_host(
+                    host_registry=hosts,
+                    host_conn=conn,
+                    op="github_set_preference",
+                    workspace="/tmp/owned",
+                    session_id="unused",
+                    params={},
+                )
+            else:
+                call = _stop_session_host_runner("unused", "example", "runner", hosts)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(call, timeout=0.5)
+            assert conn.outbound_queue.empty()
+            assert not any(
+                (
+                    conn.pending_create_dirs,
+                    conn.pending_installs,
+                    conn.pending_secret_writes,
+                    conn.pending_fs_requests,
+                    conn.pending_stops,
+                )
+            )
+    finally:
+        await coordinator.aclose()

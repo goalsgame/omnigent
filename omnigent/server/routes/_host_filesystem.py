@@ -161,6 +161,9 @@ async def write_workspace_from_host(
         response).
     :raises HostFsUnavailableError: On connection loss or timeout.
     """
+    from omnigent.db.backend_work_fence import check_backend_work
+
+    await asyncio.to_thread(check_backend_work)
     request_id = secrets.token_hex(8)
     frame = encode_host_frame(
         HostFsWriteFrame(

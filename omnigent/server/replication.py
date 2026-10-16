@@ -179,6 +179,41 @@ def create_connection_task(coroutine: Coroutine[Any, Any, None]) -> asyncio.Task
     return task
 
 
+def create_runner_relay_task(
+    coroutine: Coroutine[Any, Any, None], runner_id: str
+) -> asyncio.Task[None]:
+    """Give a relay its own placement lifetime, including read-only callers."""
+    coordinator = _current.get()
+    if coordinator is None:
+        return create_connection_task(coroutine)
+
+    async def owned() -> None:
+        try:
+            route = await coordinator.runner_route(runner_id)
+            if route is None:
+                host_id = await asyncio.to_thread(coordinator._runner_host, runner_id)
+                kind, resource = ("host", host_id) if host_id else ("runner", runner_id)
+            else:
+                kind, resource = route.kind, route.resource_id
+            async with coordinator.request_resource(kind, resource) as reserved:
+                if not coordinator.local(reserved):
+                    raise HTTPException(503, "Runner backend is reconnecting; retry shortly")
+                await coroutine
+        finally:
+            coroutine.close()
+
+    # Relay placement belongs to its current runner, independently of a
+    # caller's temporary bootstrap-session or mutation reservation.
+    previous = _held.set(None)
+    try:
+        with work_fence_scope(None):
+            task = create_managed_launch_task(owned())
+    finally:
+        _held.reset(previous)
+    task.add_done_callback(lambda _done: coroutine.close())
+    return task
+
+
 @dataclass(frozen=True)
 class _RunnerAdmission:
     route: BackendRoute

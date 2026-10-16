@@ -173,7 +173,9 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
@@ -182,7 +184,7 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 from fastapi import HTTPException
 
-from omnigent.db.backend_work_fence import fenced_to_thread
+from omnigent.db.backend_work_fence import check_backend_work, fenced_to_thread, work_fence_scope
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.onboarding.sandboxes.base import SandboxGoneError
@@ -200,6 +202,78 @@ if TYPE_CHECKING:
     from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
+
+# custom-lint: disable-next=workspace-scoped-cache -- cleanup task lifetimes
+_provision_cleanup_tasks: set[asyncio.Task[None]] = set()
+
+_termination_attempts: ContextVar[set[tuple[str | None, str]] | None] = ContextVar(
+    "sandbox_termination_attempts", default=None
+)
+
+
+async def drain_provision_cleanup() -> None:
+    """Finish late allocation cleanup during server shutdown."""
+    while _provision_cleanup_tasks:
+        await asyncio.gather(*list(_provision_cleanup_tasks), return_exceptions=True)
+
+
+@asynccontextmanager
+async def _supervised_provision(
+    launcher: SandboxHostLauncher, name: str, *, host_id: str, host_store: HostStore
+) -> AsyncIterator[str]:
+    """Keep allocation results available when cancellation interrupts provisioning."""
+
+    def provision() -> str:
+        check_backend_work()
+        return launcher.provision(name)
+
+    allocation: asyncio.Task[str] | None = None
+
+    async def cleanup() -> None:
+        if allocation is None:
+            return
+        try:
+            sandbox_id = await allocation
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001 -- no allocation id was returned
+            return
+        if (launcher.provider, sandbox_id) in attempted:
+            return
+        # Only an unrecorded allocation may be cleaned up outside its lost lease.
+        # A newer owner may already have retained the returned id.
+        with work_fence_scope(None):
+            try:
+                current = await asyncio.to_thread(host_store.get_host, host_id)
+            except Exception:
+                _logger.exception(
+                    "Could not inspect canceled allocation %s for host %s", sandbox_id, host_id
+                )
+                return
+            if (
+                current is not None
+                and current.sandbox_provider == launcher.provider
+                and sandbox_id in (current.sandbox_id, current.terminating_sandbox_id)
+            ):
+                return
+            await _terminate_sandbox_best_effort(
+                launcher, sandbox_id, host_id=host_id, provider=launcher.provider
+            )
+
+    attempted: set[tuple[str | None, str]] = set()
+    tracking = _termination_attempts.set(attempted)
+    try:
+        with startup_span("server.provision_worker", host_id=host_id):
+            allocation = asyncio.create_task(asyncio.to_thread(provision))
+            sandbox_id = await asyncio.shield(allocation)
+            await asyncio.to_thread(check_backend_work)
+        yield sandbox_id
+    except BaseException:
+        task = asyncio.create_task(cleanup())
+        _provision_cleanup_tasks.add(task)
+        task.add_done_callback(_provision_cleanup_tasks.discard)
+        raise
+    finally:
+        _termination_attempts.reset(tracking)
+
 
 # Providers the YAML `sandbox:` section accepts. Parsing accepts all
 # known providers so a deployment can stage config ahead of support
@@ -3539,25 +3613,25 @@ async def launch_managed_host(
             await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         with startup_span("server.prepare_launcher"):
             await fenced_to_thread(launcher.prepare)
-        with startup_span("server.provision_worker", host_id=host_id):
-            sandbox_id = await fenced_to_thread(launcher.provision, host_name)
+        async with _supervised_provision(
+            launcher, host_name, host_id=host_id, host_store=host_store
+        ) as sandbox_id:
+            workspace = await _register_and_start_host(
+                launcher=launcher,
+                config=entry,
+                host_store=host_store,
+                host_id=host_id,
+                host_name=host_name,
+                owner=owner,
+                sandbox_id=sandbox_id,
+                repos=repos,
+                agent_name=agent_name,
+                on_stage=on_stage,
+            )
     except click.ClickException as exc:
         raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox launch failed: {exc.message}",
+            status_code=502, detail=f"managed sandbox launch failed: {exc.message}"
         ) from exc
-    workspace = await _register_and_start_host(
-        launcher=launcher,
-        config=entry,
-        host_store=host_store,
-        host_id=host_id,
-        host_name=host_name,
-        owner=owner,
-        sandbox_id=sandbox_id,
-        repos=repos,
-        agent_name=agent_name,
-        on_stage=on_stage,
-    )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
 
@@ -3634,30 +3708,31 @@ async def relaunch_managed_host(
             await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         with startup_span("server.prepare_launcher"):
             await fenced_to_thread(launcher.prepare)
-        sandbox_id = await fenced_to_thread(launcher.provision, host.name)
+        async with _supervised_provision(
+            launcher, host.name, host_id=host.host_id, host_store=host_store
+        ) as sandbox_id:
+            try:
+                workspace = await _register_and_start_host(
+                    launcher=launcher,
+                    config=entry,
+                    host_store=host_store,
+                    host_id=host.host_id,
+                    host_name=host.name,
+                    owner=host.user_id,
+                    sandbox_id=sandbox_id,
+                    repos=repos,
+                    agent_name=agent_name,
+                    on_stage=on_stage,
+                    keep_host_on_failure=True,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
+                ) from exc
     except click.ClickException as exc:
         raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox relaunch failed: {exc.message}",
-        ) from exc
-    try:
-        workspace = await _register_and_start_host(
-            launcher=launcher,
-            config=entry,
-            host_store=host_store,
-            host_id=host.host_id,
-            host_name=host.name,
-            owner=host.user_id,
-            sandbox_id=sandbox_id,
-            repos=repos,
-            agent_name=agent_name,
-            on_stage=on_stage,
-            keep_host_on_failure=True,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
+            status_code=502, detail=f"managed sandbox relaunch failed: {exc.message}"
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
@@ -4246,8 +4321,14 @@ async def _terminate_sandbox_best_effort(
         return False
     try:
         await fenced_to_thread(launcher.terminate, sandbox_id)
+        attempted = _termination_attempts.get()
+        if attempted is not None:
+            attempted.add((provider, sandbox_id))
         return True
     except Exception:  # noqa: BLE001 — provider cleanup must remain best-effort.
+        attempted = _termination_attempts.get()
+        if attempted is not None:
+            attempted.add((provider, sandbox_id))
         _logger.warning(
             "Failed to terminate managed sandbox %s (provider=%s) for host %s",
             sandbox_id,
