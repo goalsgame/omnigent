@@ -33,6 +33,11 @@ def backend_fence_scope(host_id: str, token: str) -> Iterator[None]:
         _fence.reset(handle)
 
 
+def current_backend_fence() -> BackendFence | None:
+    """Return the socket generation bound to the current host handler."""
+    return _fence.get()
+
+
 def host_fence_valid(session: Session, host_id: str, *, require_live: bool = True) -> bool:
     """Lock placement before host writes; this is additional to account authorization."""
     fence = _fence.get()

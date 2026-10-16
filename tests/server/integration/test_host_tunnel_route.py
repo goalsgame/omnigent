@@ -1779,3 +1779,61 @@ async def test_malformed_mcp_tools_reply_returns_502(
     assert response.json() == {"detail": "host MCP tools lookup failed"}
     assert not conn.pending_mcp_tools
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_superseded_host_upsert_cannot_replace_registered_socket(db_uri, monkeypatch):
+    """A committed old upsert may return after the replacement is healthy."""
+    from ipaddress import ip_network
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    monkeypatch.setattr("omnigent.server.routes.host_tunnel.PING_INTERVAL_S", 0.02)
+    registry, store = HostRegistry(), HostStore(db_uri)
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        registry,
+    )
+    committed, release = threading.Event(), threading.Event()
+    original_upsert = store.upsert_on_connect
+
+    def delayed_upsert(**kwargs):
+        host = original_upsert(**kwargs)
+        if kwargs["name"] == "superseded":
+            committed.set()
+            assert release.wait(timeout=budget(10))
+        return host
+
+    monkeypatch.setattr(store, "upsert_on_connect", delayed_upsert)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, store, replication=coordinator), prefix="/v1"
+    )
+    old = new = None
+    try:
+        old = await _connect_route(app, _TUNNEL_PATH)
+        await old.send_input({"type": "websocket.receive", "text": _make_hello("superseded")})
+        assert await asyncio.to_thread(committed.wait, budget(2))
+        new = await _connect_route(app, _TUNNEL_PATH)
+        await _send_hello_and_wait(new, registry, name="replacement")
+        healthy = registry.get(_HOST_ID)
+        assert healthy is not None and healthy.hello.name == "replacement"
+        release.set()
+        await old.wait(timeout=budget(2))
+        assert registry.get(_HOST_ID) is healthy
+        await _receive_ping_and_pong(new)
+        assert store.get_host(_HOST_ID).status == "online"
+    finally:
+        release.set()
+        for communicator in (old, new):
+            if communicator is not None and not communicator.future.done():
+                await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+                await communicator.wait(timeout=budget(2))
+        await coordinator.aclose()

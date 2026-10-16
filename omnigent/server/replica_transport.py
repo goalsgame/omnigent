@@ -304,7 +304,7 @@ class PeerTransport:
                 additional_headers=[
                     (key.decode("latin1"), value.decode("latin1")) for key, value in headers
                 ],
-                subprotocols=ws.scope.get("subprotocols", []),
+                subprotocols=ws.scope.get("subprotocols") or None,
                 open_timeout=5,
                 max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
                 ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
@@ -342,7 +342,10 @@ class PeerTransport:
                     await asyncio.gather(*tasks, return_exceptions=True)
                 if ws.client_state.name != "DISCONNECTED":
                     code = peer.close_code or 1011
-                    await ws.close(code=code if code not in (1005, 1006, 1015) else 1011)
+                    await ws.close(
+                        code=code if code not in (1005, 1006, 1015) else 1011,
+                        reason=peer.close_reason or "",
+                    )
         except InvalidStatus as exc:
             if not accepted:
                 await ws.send_denial_response(
@@ -359,6 +362,14 @@ class PeerTransport:
                         status_code=503,
                     )
                 )
-        except (ConnectionClosed, WebSocketDisconnect):
+        except ConnectionClosed as exc:
+            if accepted and ws.client_state.name != "DISCONNECTED":
+                close = exc.rcvd
+                code = close.code if close is not None else 1012
+                reason = close.reason if close is not None else ""
+                await ws.close(
+                    code=code if code not in (1005, 1006, 1015) else 1012, reason=reason
+                )
+        except WebSocketDisconnect:
             if accepted and ws.client_state.name != "DISCONNECTED":
                 await ws.close(code=1012)

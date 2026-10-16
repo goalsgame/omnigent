@@ -220,6 +220,8 @@ class ReplicaRoutingMiddleware:
                 ("parent_session_id", "sessions"),
             ):
                 resource_id = payload.get(field)
+                if field == "runner_id" and isinstance(resource_id, str):
+                    resource_id = resource_id.strip()
                 if isinstance(resource_id, str) and resource_id:
                     route = await self._target(kind, resource_id)
                     break

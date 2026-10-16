@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocket
 
-from omnigent.db.backend_fence import backend_fence_scope
+from omnigent.db.backend_fence import backend_fence_scope, current_backend_fence
 from omnigent.db.backend_work_fence import BackendWorkFence, guarded_work, work_fence_scope
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.replica_transport import PeerTransport, ReplicationConfig
@@ -285,6 +285,25 @@ class ReplicaCoordinator:
             "gateway_inference": self.hosts.gateway_inference(host_id),
             "interactive_shells": self.hosts.interactive_shells(host_id),
         }
+
+    @asynccontextmanager
+    async def host_registration(self, host_id: str) -> AsyncIterator[bool]:
+        """Serialize registry insertion with local socket replacement."""
+        async with self._resource_lock("host", host_id):
+            fence = current_backend_fence()
+            route = await asyncio.to_thread(self.store.get, "host", host_id)
+            entry = self._owned.get((current_workspace_id(), "host", host_id))
+            yield (
+                fence is not None
+                and fence.workspace_id == current_workspace_id()
+                and fence.host_id == host_id
+                and route is not None
+                and self.local(route)
+                and (route.connection_token or route.token) == fence.token
+                and entry is not None
+                and entry.route.token == route.token
+                and entry.route.connection_token == route.connection_token
+            )
 
     async def report_host(self, host_id: str) -> None:
         entry = self._owned.get((current_workspace_id(), "host", host_id))

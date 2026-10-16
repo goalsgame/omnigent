@@ -217,7 +217,10 @@ async def test_host_dependent_endpoints_forward_to_owner(db_uri, endpoint):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ingress", [8001, 8002])
-async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_uri, ingress):
+@pytest.mark.parametrize("runner_id", ["new-runner", " new-runner "])
+async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(
+    db_uri, ingress, runner_id
+):
     a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
     hid = "2c167be5bad7438196cd12a3be5fce08"
     conv = a.conversations.create_conversation(host_id=hid, workspace="/source")
@@ -239,7 +242,7 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_u
             else:
                 if request.method == "PATCH":
                     body = await request.json()
-                    replica.conversations.replace_runner_id(conv.id, body["runner_id"])
+                    replica.conversations.replace_runner_id(conv.id, body["runner_id"].strip())
                 else:
                     body = await request.body()
                 calls.append((name, body))
@@ -270,12 +273,10 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_u
                 transport=httpx.ASGITransport(app=apps[ingress]), base_url="https://public.example"
             ) as client,
         ):
-            response = await client.patch(
-                f"/v1/sessions/{conv.id}", json={"runner_id": "new-runner"}
-            )
+            response = await client.patch(f"/v1/sessions/{conv.id}", json={"runner_id": runner_id})
             assert response.status_code == 200
             assert response.json() == {"backend": "b"}
-            assert calls == [("b", {"runner_id": "new-runner"})]
+            assert calls == [("b", {"runner_id": runner_id})]
             bound = a.conversations.get_conversation(conv.id)
             assert bound.runner_id == "new-runner" and bound.host_id == hid
             assert (await a.runner_route("new-runner")).replica_id == b.store.replica_id

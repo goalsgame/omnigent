@@ -182,3 +182,40 @@ async def test_peer_disconnect_before_headers_is_retryable_without_replay(config
             assert calls == ["POST"]
     finally:
         await peer.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [1000, 4001, 4002, 4004, 4500])
+async def test_forwarded_peer_close_preserves_fatal_code_and_reason(config, code):
+    from asgiref.testing import ApplicationCommunicator
+    from starlette.websockets import WebSocket
+    from websockets.asyncio.server import serve
+
+    peer = PeerTransport(config)
+
+    async def reject(socket):
+        await socket.close(code=code, reason="protocol rejected")
+
+    try:
+        async with serve(reject, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            route = BackendRoute(
+                0, "runner", "example", "b", f"http://127.0.0.1:{port}", "nonce", 999999
+            )
+
+            async def ingress(scope, receive, send):
+                await peer.forward_websocket(WebSocket(scope, receive, send), route)
+
+            ws_scope = {**scope(), "type": "websocket", "scheme": "ws", "subprotocols": []}
+            client = ApplicationCommunicator(ingress, ws_scope)
+            await client.send_input({"type": "websocket.connect"})
+            assert (await client.receive_output(timeout=2))["type"] == "websocket.accept"
+            close = await client.receive_output(timeout=2)
+            assert close == {
+                "type": "websocket.close",
+                "code": code,
+                "reason": "protocol rejected",
+            }
+            await client.wait(timeout=2)
+    finally:
+        await peer.aclose()

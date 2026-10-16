@@ -362,19 +362,26 @@ def create_host_tunnel_router(
                 bind_account_authority(tunnel_owner, persisted_host.account_generation)
 
             stage = "registry"
-            conn = host_registry.register(
-                host_id,
-                ws,
-                frame,
-                owner=tunnel_owner,
-                # A resolved launch token is proof this is a server-provisioned
-                # sandbox, not a user machine reconnecting on a managed host id.
-                registered_with_managed_token=managed_token is not None,
-            )
-            # Delivered on the handshake, never persisted: a replica that just
-            # started learns the host's gateway backing here, so a server
-            # restart converges as soon as each host reconnects.
-            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            async with contextlib.AsyncExitStack() as registration:
+                if replication is not None:
+                    current = await registration.enter_async_context(
+                        replication.host_registration(host_id)
+                    )
+                    if not current:
+                        return
+                conn = host_registry.register(
+                    host_id,
+                    ws,
+                    frame,
+                    owner=tunnel_owner,
+                    # A resolved launch token is proof this is a server-provisioned
+                    # sandbox, not a user machine reconnecting on a managed host id.
+                    registered_with_managed_token=managed_token is not None,
+                )
+                # Delivered on the handshake, never persisted: a replica that just
+                # started learns the host's gateway backing here, so a server
+                # restart converges as soon as each host reconnects.
+                host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if replication is not None:
                 await replication.report_host(host_id)
             stage = "connected"
