@@ -712,6 +712,21 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+class SqlBackendRoute(OmnigentBase):
+    """Fenced, expiring ownership of a live backend resource."""
+
+    __tablename__ = "omnigent_backend_routes"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    resource_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    replica_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(512), nullable=False)
+    token: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False, index=True)
+    reported_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.

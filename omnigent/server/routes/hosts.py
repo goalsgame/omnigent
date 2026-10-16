@@ -61,6 +61,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.replication import ReplicaCoordinator
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
 from omnigent.server.routes._workspace_validation import (
@@ -647,6 +648,7 @@ def create_hosts_router(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
+    replication: ReplicaCoordinator | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -699,6 +701,11 @@ def create_hosts_router(
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
         now = now_epoch()
+        reports = (
+            await asyncio.to_thread(replication.store.host_metadata, [h.host_id for h in hosts])
+            if replication is not None
+            else {}
+        )
         result: list[dict[str, Any]] = []
         for host in hosts:
             # Status comes from the DB, not host_registry. The registry
@@ -727,8 +734,16 @@ def create_hosts_router(
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
                     # gateway-backed".
-                    "gateway_inference": host_registry.gateway_inference(host.host_id),
-                    "interactive_shells": host_registry.interactive_shells(host.host_id),
+                    "gateway_inference": (
+                        host_registry.gateway_inference(host.host_id)
+                        if host_registry.get(host.host_id) is not None
+                        else reports.get(host.host_id, {}).get("gateway_inference")
+                    ),
+                    "interactive_shells": (
+                        host_registry.interactive_shells(host.host_id)
+                        if host_registry.get(host.host_id) is not None
+                        else reports.get(host.host_id, {}).get("interactive_shells")
+                    ),
                 }
             )
         return {"hosts": result}

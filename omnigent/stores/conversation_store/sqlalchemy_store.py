@@ -1156,6 +1156,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
+                from omnigent.db.backend_placement import insert_initial_session_placement
+
+                insert_initial_session_placement(meta_sess, new_id)
                 meta = SqlConversationMetadata(
                     id=new_id,
                     kind=encoded_kind,
@@ -5039,6 +5042,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         def insert_metadata(
             meta_sess: Session,
         ) -> SqlConversationMetadata:
+            from omnigent.db.backend_placement import insert_initial_session_placement
+
+            insert_initial_session_placement(meta_sess, new_conv_id)
             fork_meta = SqlConversationMetadata(
                 id=new_conv_id,
                 kind=encoded_default_kind,

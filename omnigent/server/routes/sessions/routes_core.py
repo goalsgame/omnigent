@@ -523,7 +523,11 @@ def register_core_routes(
                 agent_id=agent_id,
             )
         )
+        from omnigent.server.replication import retain_created_session_task, retain_managed_task
+
         _managed_launch_tasks.add(launch_task)
+        retain_managed_task(launch_task)
+        await retain_created_session_task(session_id, launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
 
     async def _bind_and_launch_on_caller_host(

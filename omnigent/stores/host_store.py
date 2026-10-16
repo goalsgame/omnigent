@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account, session_account_owner_query
+from omnigent.db.backend_fence import host_fence_valid
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
@@ -318,6 +319,8 @@ class HostStore:
 
         def write(session: Session) -> Host:
             generation = require_active_account(session, user_id)
+            if not host_fence_valid(session, host_id):
+                raise OmnigentError("Host connection was superseded", code=ErrorCode.CONFLICT)
             if managed_token is not None:
                 result = cast(
                     CursorResult[tuple[object]],
@@ -618,6 +621,8 @@ class HostStore:
         updated_at = now_epoch()
 
         def write(session: Session) -> None:
+            if not host_fence_valid(session, host_id, require_live=False):
+                return
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -645,6 +650,8 @@ class HostStore:
         updated_at = now_epoch()
 
         def write(session: Session) -> None:
+            if not host_fence_valid(session, host_id):
+                return
             session.execute(
                 update(SqlHost)
                 .where(
@@ -681,6 +688,8 @@ class HostStore:
         updated_at = now_epoch()
 
         def write(session: Session) -> None:
+            if not host_fence_valid(session, host_id):
+                return
             session.execute(
                 update(SqlHost)
                 .where(

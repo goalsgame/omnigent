@@ -1,0 +1,225 @@
+"""Shared resource placement and fencing for active backend replicas."""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from collections.abc import Callable
+
+from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import Session
+
+from omnigent.db.db_models import SqlBackendRoute, current_workspace_id
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    run_write_transaction,
+)
+from omnigent.entities.backend_route import BackendRoute
+
+
+def _metadata(raw: str | None) -> dict[str, object] | None:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
+    except (ValueError, RecursionError):
+        return None
+
+
+def _route(row: SqlBackendRoute) -> BackendRoute:
+    return BackendRoute(
+        row.workspace_id,
+        row.kind,
+        row.resource_id,
+        row.replica_id,
+        row.endpoint,
+        row.token,
+        row.expires_at,
+        _metadata(row.reported_metadata),
+    )
+
+
+class BackendRouteStore:
+    """Atomic placement claims backed by shared PostgreSQL (SQLite for local use).
+
+    Replicas need unique process-lifetime IDs. An existing live remote owner
+    keeps its resource; a reconnect to the same replica replaces the fencing
+    token. Expired ownership can be reclaimed by another replica.
+    """
+
+    def __init__(
+        self,
+        database_uri: str,
+        replica_id: str,
+        endpoint: str,
+        *,
+        ttl: float = 90,
+        now: Callable[[], float] = time.time,
+    ) -> None:
+        if not replica_id or len(replica_id) > 64:
+            raise ValueError("replica_id must contain 1–64 characters")
+        if not endpoint or len(endpoint) > 512:
+            raise ValueError("replica endpoint must contain 1–512 characters")
+        if not 15 <= ttl <= 300:
+            raise ValueError("backend route TTL must be between 15 and 300 seconds")
+        engine = get_or_create_engine(database_uri)
+        if engine.dialect.name not in ("postgresql", "sqlite"):
+            raise ValueError("backend replication requires PostgreSQL or SQLite")
+        self._insert = sqlite_insert if engine.dialect.name == "sqlite" else pg_insert
+        self._session = make_named_managed_session_maker(
+            engine,
+            query_name_prefix="omnigent.backend_routes",
+            immediate=True,
+        )
+        self.replica_id = replica_id
+        self.endpoint = endpoint
+        self.ttl = ttl
+        self._now = now
+
+    @staticmethod
+    def _key(kind: str, resource_id: str):
+        if not kind or len(kind) > 32 or not resource_id or len(resource_id) > 128:
+            raise ValueError("invalid backend routing resource")
+        return and_(
+            SqlBackendRoute.workspace_id == current_workspace_id(),
+            SqlBackendRoute.kind == kind,
+            SqlBackendRoute.resource_id == resource_id,
+        )
+
+    def get(self, kind: str, resource_id: str) -> BackendRoute | None:
+        """Return fresh placement in this workspace, without disclosing other tenants."""
+        with self._session("resolve_resource_owner") as session:
+            row = session.scalar(
+                select(SqlBackendRoute).where(
+                    self._key(kind, resource_id),
+                    SqlBackendRoute.expires_at > self._now(),
+                )
+            )
+            return _route(row) if row is not None else None
+
+    def peer_routes(self) -> list[BackendRoute]:
+        """One fresh routing proof per other replica in the current workspace."""
+        with self._session("discover_backend_peers") as session:
+            rows = session.scalars(
+                select(SqlBackendRoute).where(
+                    SqlBackendRoute.workspace_id == current_workspace_id(),
+                    SqlBackendRoute.expires_at > self._now(),
+                    SqlBackendRoute.replica_id != self.replica_id,
+                )
+            )
+            peers: dict[str, BackendRoute] = {}
+            for row in rows:
+                peers.setdefault(row.endpoint, _route(row))
+            return list(peers.values())
+
+    def host_metadata(self, host_ids: list[str]) -> dict[str, dict[str, object]]:
+        if not host_ids:
+            return {}
+        with self._session("read_connected_host_metadata") as session:
+            rows = session.scalars(
+                select(SqlBackendRoute).where(
+                    SqlBackendRoute.workspace_id == current_workspace_id(),
+                    SqlBackendRoute.kind == "host",
+                    SqlBackendRoute.resource_id.in_(host_ids),
+                    SqlBackendRoute.expires_at > self._now(),
+                    SqlBackendRoute.reported_metadata.is_not(None),
+                )
+            )
+            return {
+                row.resource_id: value
+                for row in rows
+                if (value := _metadata(row.reported_metadata)) is not None
+            }
+
+    def claim(self, kind: str, resource_id: str) -> BackendRoute:
+        """Claim a vacant/expired resource, or return its live remote owner."""
+        key = self._key(kind, resource_id)
+        now = self._now()
+        values = {
+            "workspace_id": current_workspace_id(),
+            "kind": kind,
+            "resource_id": resource_id,
+            "replica_id": self.replica_id,
+            "endpoint": self.endpoint,
+            "token": uuid.uuid4().hex,
+            "expires_at": now + self.ttl,
+            "reported_metadata": None,
+        }
+
+        def write(session: Session) -> BackendRoute:
+            statement = self._insert(SqlBackendRoute).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=["workspace_id", "kind", "resource_id"],
+                set_={
+                    name: values[name]
+                    for name in (
+                        "replica_id",
+                        "endpoint",
+                        "token",
+                        "expires_at",
+                        "reported_metadata",
+                    )
+                },
+                where=or_(
+                    SqlBackendRoute.expires_at <= now,
+                    SqlBackendRoute.replica_id == self.replica_id,
+                    SqlBackendRoute.endpoint == self.endpoint,
+                ),
+            )
+            session.execute(statement)
+            row = session.scalar(select(SqlBackendRoute).where(key))
+            assert row is not None
+            return _route(row)
+
+        return run_write_transaction(self._session, "claim_resource_owner", write)
+
+    def renew(self, route: BackendRoute, reported: dict[str, object] | None = None) -> bool:
+        """Extend only a still-live, matching generation; never resurrect a lost lease."""
+        now = self._now()
+
+        def write(session: Session) -> bool:
+            result = session.execute(
+                update(SqlBackendRoute)
+                .where(
+                    self._key(route.kind, route.resource_id),
+                    SqlBackendRoute.replica_id == self.replica_id,
+                    SqlBackendRoute.token == route.token,
+                    SqlBackendRoute.expires_at > now,
+                )
+                .values(
+                    **(
+                        {"expires_at": now + self.ttl}
+                        if reported is None
+                        else {
+                            "expires_at": now + self.ttl,
+                            "reported_metadata": json.dumps(reported),
+                        }
+                    )
+                )
+                .returning(SqlBackendRoute.token)
+            )
+            return result.scalar_one_or_none() is not None
+
+        return run_write_transaction(self._session, "renew_resource_owner", write)
+
+    def release(self, route: BackendRoute) -> bool:
+        """Remove only this generation; late disconnects cannot clear a new owner."""
+
+        def write(session: Session) -> bool:
+            result = session.execute(
+                delete(SqlBackendRoute)
+                .where(
+                    self._key(route.kind, route.resource_id),
+                    SqlBackendRoute.replica_id == self.replica_id,
+                    SqlBackendRoute.token == route.token,
+                )
+                .returning(SqlBackendRoute.token)
+            )
+            return result.scalar_one_or_none() is not None
+
+        return run_write_transaction(self._session, "release_resource_owner", write)

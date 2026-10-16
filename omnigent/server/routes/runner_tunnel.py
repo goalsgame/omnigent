@@ -48,6 +48,7 @@ from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelR
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.replication import ReplicaCoordinator
 from omnigent.server.routes._auth_helpers import require_user
 
 _logger = logging.getLogger(__name__)
@@ -188,6 +189,7 @@ def create_runner_tunnel_router(
     on_runner_disconnect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
     on_runner_connect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
     auth_provider: AuthProvider | None = None,
+    replication: ReplicaCoordinator | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     resolve_runner_placement: Callable[[str], tuple[str, str] | None] | None = None,
@@ -276,6 +278,10 @@ def create_runner_tunnel_router(
             # Scope listing to the caller's own runners.
             if user_id is not None and session.owner is not None and session.owner != user_id:
                 continue
+            if replication is not None:
+                placement = await replication.runner_route(runner_id)
+                if placement is None or not replication.local(placement):
+                    continue
             item: dict[str, object] = {
                 "runner_id": runner_id,
                 "online": True,
@@ -286,7 +292,9 @@ def create_runner_tunnel_router(
                 if placement is not None:
                     item.update(reusable=False, host_id=placement[0], workspace=placement[1])
             data.append(item)
-        return {"data": data}
+        if replication is not None:
+            data.extend(await replication.remote_runners(request))
+        return {"data": list({row["runner_id"]: row for row in data}.values())}
 
     @router.get("/runners/{runner_id}/status")
     async def runner_status(request: Request, runner_id: str) -> dict[str, str | bool]:
@@ -480,6 +488,14 @@ def create_runner_tunnel_router(
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
 
+        if replication is not None:
+            async with replication.connection(ws, "runner", runner_id) as local:
+                if local:
+                    await _serve_connected(ws, runner_id, tunnel_owner)
+        else:
+            await _serve_connected(ws, runner_id, tunnel_owner)
+
+    async def _serve_connected(ws: WebSocket, runner_id: str, tunnel_owner: str | None) -> None:
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None

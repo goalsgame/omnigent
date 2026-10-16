@@ -4762,7 +4762,10 @@ def _kick_managed_relaunch(
             agent_id=conv.agent_id,
         )
     )
+    from omnigent.server.replication import retain_managed_task
+
     _managed_launch_tasks.add(relaunch_task)
+    retain_managed_task(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
 
 
@@ -4855,7 +4858,10 @@ def _kick_managed_wake_impl(
             agent_id=conv.agent_id,
         )
     )
+    from omnigent.server.replication import retain_managed_task
+
     _managed_launch_tasks.add(wake_task)
+    retain_managed_task(wake_task)
     wake_task.add_done_callback(_managed_launch_tasks.discard)
 
 

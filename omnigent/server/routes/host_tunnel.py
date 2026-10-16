@@ -77,6 +77,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.replication import ReplicaCoordinator
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
@@ -133,6 +134,7 @@ def create_host_tunnel_router(
     host_store: HostStore,
     *,
     auth_provider: AuthProvider | None = None,
+    replication: ReplicaCoordinator | None = None,
     on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
@@ -306,6 +308,16 @@ def create_host_tunnel_router(
                 )
                 return
 
+        if replication is not None:
+            async with replication.connection(ws, "host", host_id) as local:
+                if local:
+                    await _serve_connected(ws, host_id, tunnel_owner, managed_token)
+        else:
+            await _serve_connected(ws, host_id, tunnel_owner, managed_token)
+
+    async def _serve_connected(
+        ws: WebSocket, host_id: str, tunnel_owner: str, managed_token: str | None
+    ) -> None:
         await ws.accept()
         conn: HostConnection | None = None
         host_persisted = False
@@ -363,6 +375,8 @@ def create_host_tunnel_router(
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            if replication is not None:
+                await replication.report_host(host_id)
             stage = "connected"
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
