@@ -135,3 +135,59 @@ def test_old_host_heartbeat_and_disconnect_cannot_overwrite_new_connection(db_ur
     with backend_fence_scope(host_id, old.token):
         hosts.heartbeat(host_id)
     assert hosts.get_host(host_id).status == "offline"
+
+
+def test_renew_waiting_for_database_lock_cannot_resurrect_expired_lease(db_uri, replicas):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    from sqlalchemy import event, select, text
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlBackendRoute
+    from omnigent.db.utils import get_or_create_engine
+
+    a, _, clock = replicas
+    route = a.claim("host", "locked")
+    engine = get_or_create_engine(db_uri)
+    waiting = threading.Event()
+    worker_id = []
+
+    def before_execute(_connection, _cursor, statement, _params, _context, _many):
+        if (
+            worker_id
+            and threading.get_ident() == worker_id[0]
+            and ("BEGIN IMMEDIATE" in statement.upper() or "omnigent_backend_routes" in statement)
+        ):
+            waiting.set()
+
+    def renew():
+        worker_id.append(threading.get_ident())
+        return a.renew(route)
+
+    event.listen(engine, "before_cursor_execute", before_execute)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with Session(engine) as blocker:
+                if engine.dialect.name == "sqlite":
+                    blocker.execute(text("BEGIN IMMEDIATE"))
+                else:
+                    blocker.execute(
+                        select(SqlBackendRoute)
+                        .where(
+                            SqlBackendRoute.workspace_id == 0,
+                            SqlBackendRoute.kind == "host",
+                            SqlBackendRoute.resource_id == "locked",
+                        )
+                        .with_for_update()
+                    )
+                future = executor.submit(renew)
+                assert waiting.wait(timeout=5)
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=0.1)
+                clock[0] += a.ttl + 1
+                blocker.commit()
+            assert future.result(timeout=5) is False
+        assert a.get("host", "locked") is None
+    finally:
+        event.remove(engine, "before_cursor_execute", before_execute)

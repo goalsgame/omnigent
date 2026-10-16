@@ -292,10 +292,15 @@ class ReplicaCoordinator:
             await asyncio.to_thread(self.store.renew, entry.route, self._host_report(host_id))
 
     @asynccontextmanager
-    async def _reference(self, route: BackendRoute, ws: WebSocket | None) -> AsyncIterator[None]:
+    async def _reference(
+        self, route: BackendRoute, ws: WebSocket | None, *, continuous: bool = False
+    ) -> AsyncIterator[None]:
         key = (route.workspace_id, route.kind, route.resource_id)
         reference = uuid.uuid4().hex
         entry = self._owned.get(key)
+        if entry is not None and entry.route.token != route.token and not continuous:
+            await self._retire_owned(key, entry)
+            entry = None
         if entry is None:
             entry = _OwnedResource(route)
             self._owned[key] = entry
@@ -305,7 +310,7 @@ class ReplicaCoordinator:
             entry.route = route
             for task in entry.tasks.values():
                 fence = self._task_fences.get(task)
-                if fence is not None:
+                if fence is not None and not fence.lost:
                     fence.routes[key] = route
             for previous in list(entry.connections.values()):
                 if previous is not None:
@@ -410,6 +415,7 @@ class ReplicaCoordinator:
             await asyncio.to_thread(self._runner_host, resource_id) if kind == "runner" else None
         )
         async with self._resource_lock("host" if host_id else kind, host_id or resource_id):
+            continuous = False
             if host_id:
                 route = await asyncio.to_thread(self.store.get, "host", host_id)
             else:
@@ -424,12 +430,17 @@ class ReplicaCoordinator:
                     else None
                 )
                 if route is None or not self.local(route):
-                    route = await asyncio.to_thread(self.store.claim, kind, resource_id)
+                    route, continuous = await asyncio.to_thread(
+                        self.store.claim_connection,
+                        kind,
+                        resource_id,
+                        entry.route if entry is not None else None,
+                    )
             reference = None
             if route is not None and self.local(route):
                 # Runners must wait for their host's control tunnel to register.
                 if not host_id or self.hosts.get(host_id) is not None:
-                    reference = self._reference(route, ws)
+                    reference = self._reference(route, ws, continuous=continuous)
                     await reference.__aenter__()
         if reference is None:
             if route is not None and not self.local(route) and not ws.scope.get("omnigent.peer"):
@@ -476,13 +487,17 @@ class ReplicaCoordinator:
                 if renewed:
                     entry.route = replace(current, expires_at=started + self.store.ttl)
                     continue
-                self._owned.pop(key, None)
-                for task in set(entry.tasks.values()):
-                    fence = self._task_fences.get(task)
-                    if fence is not None:
-                        fence.lost = True
-                    task.cancel("backend ownership changed")
-                for ws in list(entry.connections.values()):
-                    if ws is not None:
-                        with suppress(Exception):
-                            await ws.close(code=1012, reason="backend ownership changed")
+                await self._retire_owned(key, entry)
+
+    async def _retire_owned(self, key: tuple[int, str, str], entry: _OwnedResource) -> None:
+        if self._owned.get(key) is entry:
+            self._owned.pop(key, None)
+        for task in set(entry.tasks.values()):
+            fence = self._task_fences.get(task)
+            if fence is not None:
+                fence.lost = True
+            task.cancel("backend ownership changed")
+        for ws in list(entry.connections.values()):
+            if ws is not None:
+                with suppress(Exception):
+                    await ws.close(code=1012, reason="backend ownership changed")

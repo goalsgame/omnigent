@@ -148,20 +148,43 @@ class BackendRouteStore:
 
     def claim(self, kind: str, resource_id: str) -> BackendRoute:
         """Claim a vacant/expired resource, or return its live remote owner."""
-        key = self._key(kind, resource_id)
-        now = self._now()
-        values = {
-            "workspace_id": current_workspace_id(),
-            "kind": kind,
-            "resource_id": resource_id,
-            "replica_id": self.replica_id,
-            "endpoint": self.endpoint,
-            "token": uuid.uuid4().hex,
-            "expires_at": now + self.ttl,
-            "reported_metadata": None,
-        }
+        return self._claim(kind, resource_id, None)[0]
 
-        def write(session: Session) -> BackendRoute:
+    def claim_connection(
+        self, kind: str, resource_id: str, previous: BackendRoute | None
+    ) -> tuple[BackendRoute, bool]:
+        """Rotate a connection and prove continuity under the same row lock."""
+        return self._claim(kind, resource_id, previous)
+
+    def _claim(
+        self, kind: str, resource_id: str, previous: BackendRoute | None
+    ) -> tuple[BackendRoute, bool]:
+        key = self._key(kind, resource_id)
+
+        def write(session: Session) -> tuple[BackendRoute, bool]:
+            prior = session.scalar(select(SqlBackendRoute).where(key).with_for_update())
+            now = self._now()
+            continuous = (
+                previous is not None
+                and prior is not None
+                and previous.workspace_id == current_workspace_id()
+                and previous.kind == kind
+                and previous.resource_id == resource_id
+                and prior.token == previous.token
+                and prior.replica_id == self.replica_id
+                and prior.endpoint == self.endpoint
+                and prior.expires_at > now
+            )
+            values = {
+                "workspace_id": current_workspace_id(),
+                "kind": kind,
+                "resource_id": resource_id,
+                "replica_id": self.replica_id,
+                "endpoint": self.endpoint,
+                "token": uuid.uuid4().hex,
+                "expires_at": now + self.ttl,
+                "reported_metadata": None,
+            }
             statement = self._insert(SqlBackendRoute).values(**values)
             statement = statement.on_conflict_do_update(
                 index_elements=["workspace_id", "kind", "resource_id"],
@@ -182,38 +205,35 @@ class BackendRouteStore:
                 ),
             )
             session.execute(statement)
-            row = session.scalar(select(SqlBackendRoute).where(key))
+            row = session.scalar(
+                select(SqlBackendRoute).where(key).execution_options(populate_existing=True)
+            )
             assert row is not None
-            return _route(row)
+            return _route(row), continuous
 
         return run_write_transaction(self._session, "claim_resource_owner", write)
 
     def renew(self, route: BackendRoute, reported: dict[str, object] | None = None) -> bool:
         """Extend only a still-live, matching generation; never resurrect a lost lease."""
-        now = self._now()
 
         def write(session: Session) -> bool:
-            result = session.execute(
-                update(SqlBackendRoute)
+            row = session.scalar(
+                select(SqlBackendRoute)
                 .where(
                     self._key(route.kind, route.resource_id),
                     SqlBackendRoute.replica_id == self.replica_id,
                     SqlBackendRoute.token == route.token,
-                    SqlBackendRoute.expires_at > now,
                 )
-                .values(
-                    **(
-                        {"expires_at": now + self.ttl}
-                        if reported is None
-                        else {
-                            "expires_at": now + self.ttl,
-                            "reported_metadata": json.dumps(reported),
-                        }
-                    )
-                )
-                .returning(SqlBackendRoute.token)
+                .with_for_update()
             )
-            return result.scalar_one_or_none() is not None
+            # Evaluate time after waiting for the row lock, not before it.
+            now = self._now()
+            if row is None or row.expires_at <= now:
+                return False
+            row.expires_at = now + self.ttl
+            if reported is not None:
+                row.reported_metadata = json.dumps(reported)
+            return True
 
         return run_write_transaction(self._session, "renew_resource_owner", write)
 

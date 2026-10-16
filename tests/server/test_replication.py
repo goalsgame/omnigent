@@ -522,3 +522,137 @@ async def test_canceled_launch_settles_tracker_and_allows_retry(db_uri, monkeypa
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admission", ["request", "connection"])
+@pytest.mark.parametrize("intervening_owner", [False, True])
+async def test_expired_generation_cannot_regain_launch_tasks_before_heartbeat(
+    db_uri, admission, intervening_owner
+):
+    import time
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from sqlalchemy import update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlBackendRoute
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.server.replication import create_managed_launch_task
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    other = BackendRouteStore(db_uri, "other", "http://127.0.0.1:8002")
+    started, gate = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def launch():
+        started.set()
+        await gate.wait()
+        calls.append("old launch resumed")
+        await asyncio.to_thread(coordinator.conversations.create_conversation)
+
+    task = None
+    try:
+        with replication_scope(coordinator):
+            async with coordinator.request_placement("example") as old:
+                task = create_managed_launch_task(launch())
+                retain_managed_task(task)
+        await started.wait()
+        fence = coordinator._task_fences[task]
+        expired = time.time() - 1
+        with Session(get_or_create_engine(db_uri)) as session:
+            session.execute(
+                update(SqlBackendRoute)
+                .where(
+                    SqlBackendRoute.workspace_id == 0,
+                    SqlBackendRoute.kind == "host",
+                    SqlBackendRoute.resource_id == "example",
+                )
+                .values(expires_at=expired)
+            )
+            session.commit()
+        coordinator._owned[(0, "host", "example")].route = replace(old, expires_at=expired)
+        if intervening_owner:
+            replacement = other.claim("host", "example")
+            assert replacement.replica_id == "other"
+            other.release(replacement)
+        # No renewal tick has run. Reacquisition itself must retire old work.
+        context = (
+            coordinator.request_placement("example")
+            if admission == "request"
+            else coordinator.connection(SimpleNamespace(scope={}), "host", "example")
+        )
+        async with context:
+            new = coordinator.store.get("host", "example")
+            assert new is not None and new.token != old.token
+            gate.set()
+            result = (await asyncio.gather(task, return_exceptions=True))[0]
+            assert isinstance(result, asyncio.CancelledError)
+            assert fence.lost
+            assert calls == []
+            assert coordinator.store.get("host", "example").token == new.token
+    finally:
+        gate.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_reconnect_proves_continuity_before_transferring_launch(db_uri):
+    from types import SimpleNamespace
+
+    from omnigent.server.replication import create_managed_launch_task
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    started, gate = asyncio.Event(), asyncio.Event()
+    closed = []
+
+    async def close(**kwargs):
+        closed.append(kwargs)
+
+    async def launch():
+        started.set()
+        await gate.wait()
+        await asyncio.to_thread(coordinator.conversations.create_conversation, title="continuous")
+
+    task = None
+    try:
+        with replication_scope(coordinator):
+            async with coordinator.connection(
+                SimpleNamespace(scope={}, close=close), "host", "example"
+            ):
+                old = coordinator.store.get("host", "example")
+                task = create_managed_launch_task(launch())
+                retain_managed_task(task)
+                await started.wait()
+                async with coordinator.connection(
+                    SimpleNamespace(scope={}, close=close), "host", "example"
+                ):
+                    new = coordinator.store.get("host", "example")
+                    assert new.token != old.token
+                    assert (
+                        coordinator._task_fences[task].routes[(0, "host", "example")].token
+                        == new.token
+                    )
+                    gate.set()
+                    await task
+                    assert closed
+        assert coordinator.conversations.list_conversations().data[0].title == "continuous"
+    finally:
+        gate.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await coordinator.aclose()
