@@ -1494,11 +1494,12 @@ def _apply_bind_auth_defaults(host: str) -> None:
             click.echo(f"  ⚠ {_exposure}", err=True)
 
 
-def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)
+def _create_artifact_store(location: str, *, store_uri: str | None = None) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)
     """
     Create an artifact store based on the location URI scheme.
 
-    ``dbfs:/Volumes/...`` URIs use
+    An optional ``store_uri`` selects remote GCS or S3 storage while
+    ``location`` remains the local cache directory. ``dbfs:/Volumes/...`` URIs use
     :class:`DatabricksVolumesArtifactStore` (requires
     ``databricks-sdk``). All other locations use
     :class:`LocalArtifactStore`.
@@ -1506,8 +1507,20 @@ def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any] 
     :param location: Artifact storage location, e.g.
         ``"./artifacts"`` for local or
         ``"dbfs:/Volumes/cat/schema/vol"`` for UC Volumes.
+    :param store_uri: Optional remote ``gs://`` or ``s3://`` URI.
     :returns: An :class:`ArtifactStore` instance.
     """
+    if store_uri:
+        if store_uri.startswith("gs://"):
+            from omnigent.stores.artifact_store.gcs import GCSArtifactStore
+
+            return GCSArtifactStore(store_uri)
+        if store_uri.startswith("s3://"):
+            from omnigent.stores.artifact_store.s3 import S3ArtifactStore
+
+            return S3ArtifactStore(store_uri)
+        raise ValueError("artifact_store_uri must use gs:// or s3://")
+
     if location.startswith("dbfs:/Volumes/"):
         from omnigent.stores.artifact_store.databricks_volumes import (
             DatabricksVolumesArtifactStore,
@@ -4468,7 +4481,10 @@ def server(
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
-    artifact_store = _create_artifact_store(art_loc)
+    artifact_store = _create_artifact_store(
+        art_loc,
+        store_uri=cfg.get("artifact_store_uri") or os.environ.get("OMNIGENT_ARTIFACT_URI"),
+    )
 
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).

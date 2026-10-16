@@ -125,7 +125,7 @@ def test_run_migrations_preserves_sqlite_startup(tmp_path: Path) -> None:
 # ── artifact-store resolution + selection ────────────────────────────────
 # OMNIGENT_ARTIFACT_URI=s3://… selects the remote S3ArtifactStore (durable on an
 # ephemeral/multi-replica deploy); anything else falls back to local. The URI is
-# validated up front (must be s3://), mirroring how DATABASE_URL picks the DB.
+# validated up front (s3:// or gs://), mirroring how DATABASE_URL picks the DB.
 
 
 @pytest.fixture
@@ -144,27 +144,28 @@ def _entrypoint_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
 
 
-def test_resolve_config_captures_s3_artifact_uri(
-    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from deploy.docker.entrypoint import _resolve_config
-
-    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "s3://my-bucket/artifacts")
-    assert _resolve_config().artifact_store_uri == "s3://my-bucket/artifacts"
-
-
 def test_resolve_config_defaults_to_no_remote_store(_entrypoint_env: None) -> None:
     from deploy.docker.entrypoint import _resolve_config
 
     assert _resolve_config().artifact_store_uri is None
 
 
-def test_resolve_config_rejects_non_s3_artifact_uri(
+@pytest.mark.parametrize("uri", ["s3://my-bucket/artifacts", "gs://my-bucket/artifacts"])
+def test_resolve_config_captures_remote_artifact_uri(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, uri: str
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", uri)
+    assert _resolve_config().artifact_store_uri == uri
+
+
+def test_resolve_config_rejects_unknown_artifact_uri(
     _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from deploy.docker.entrypoint import _resolve_config
 
-    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "gs://my-bucket")
+    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "https://my-bucket")
     with pytest.raises(RuntimeError, match="s3://"):
         _resolve_config()
 
