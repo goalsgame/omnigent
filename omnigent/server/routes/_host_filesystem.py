@@ -162,54 +162,57 @@ async def write_workspace_from_host(
     :raises HostFsUnavailableError: On connection loss or timeout.
     """
     from omnigent.db.backend_work_fence import check_backend_work
+    from omnigent.server.replication import reserve_managed_placement
 
     await asyncio.to_thread(check_backend_work)
-    request_id = secrets.token_hex(8)
-    frame = encode_host_frame(
-        HostFsWriteFrame(
-            request_id=request_id,
-            op=op,
-            workspace=workspace,
-            session_id=session_id,
-            params=params,
+    async with reserve_managed_placement(host_conn.host_id):
+        await asyncio.to_thread(check_backend_work)
+        request_id = secrets.token_hex(8)
+        frame = encode_host_frame(
+            HostFsWriteFrame(
+                request_id=request_id,
+                op=op,
+                workspace=workspace,
+                session_id=session_id,
+                params=params,
+            )
         )
-    )
-    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-    host_conn.pending_fs_requests[request_id] = future
-    try:
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        host_conn.pending_fs_requests[request_id] = future
         try:
-            host_registry.send_text(host_conn, frame)
-        except ConnectionError as exc:
-            raise HostFsUnavailableError(
-                f"host '{host_conn.host_id}' connection lost during fs write"
-            ) from exc
-        try:
-            result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            _logger.warning(
-                "host '%s' did not answer fs write op %r within %.0fs",
-                host_conn.host_id,
-                op,
-                _FS_TIMEOUT_S,
-            )
-            raise HostFsUnavailableError(
-                f"host '{host_conn.host_id}' did not respond to fs write within "
-                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"
-            ) from exc
-    finally:
-        host_conn.pending_fs_requests.pop(request_id, None)
+            try:
+                host_registry.send_text(host_conn, frame)
+            except ConnectionError as exc:
+                raise HostFsUnavailableError(
+                    f"host '{host_conn.host_id}' connection lost during fs write"
+                ) from exc
+            try:
+                result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+            except asyncio.TimeoutError as exc:
+                _logger.warning(
+                    "host '%s' did not answer fs write op %r within %.0fs",
+                    host_conn.host_id,
+                    op,
+                    _FS_TIMEOUT_S,
+                )
+                raise HostFsUnavailableError(
+                    f"host '{host_conn.host_id}' did not respond to fs write within "
+                    f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"
+                ) from exc
+        finally:
+            host_conn.pending_fs_requests.pop(request_id, None)
 
-    if result.get("status") == "ok":
-        payload = result.get("payload")
-        if not isinstance(payload, dict):
-            raise HostFsUnavailableError(
-                f"host '{host_conn.host_id}' returned an incomplete fs write result"
-            )
-        return payload
+        if result.get("status") == "ok":
+            payload = result.get("payload")
+            if not isinstance(payload, dict):
+                raise HostFsUnavailableError(
+                    f"host '{host_conn.host_id}' returned an incomplete fs write result"
+                )
+            return payload
 
-    status = result.get("error_status")
-    code = result.get("error_code") or "fs_write_failed"
-    message = result.get("error") or "host filesystem write failed"
-    if not isinstance(status, int):
-        status = 500
-    raise HostFsError(status, str(code), str(message))
+        status = result.get("error_status")
+        code = result.get("error_code") or "fs_write_failed"
+        message = result.get("error") or "host filesystem write failed"
+        if not isinstance(status, int):
+            status = 500
+        raise HostFsError(status, str(code), str(message))

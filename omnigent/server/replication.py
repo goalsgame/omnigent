@@ -212,6 +212,26 @@ def create_connection_task(coroutine: Coroutine[Any, Any, None]) -> asyncio.Task
     return task
 
 
+def create_runner_recovery_task(
+    coroutine: Coroutine[Any, Any, None], ws: WebSocket
+) -> asyncio.Task[None]:
+    """Keep recovery on the admitted socket generation, independently of disconnect cleanup."""
+    task = create_managed_launch_task(coroutine)
+    coordinator = _current.get()
+    if coordinator is not None:
+        fence = coordinator._task_fences[task]
+        admission = ws.scope.get("omnigent.runner_admission")
+        if not isinstance(admission, _RunnerAdmission):
+            fence.lost = True
+        else:
+            route = admission.route
+            key = (route.workspace_id, route.kind, route.resource_id)
+            fence.routes = {key: route}
+            fence.connection_tokens[key] = route.connection_token or route.token
+        coordinator.retain_task(task)
+    return task
+
+
 def create_runner_relay_task(
     coroutine: Coroutine[Any, Any, None], runner_id: str
 ) -> asyncio.Task[None]:
@@ -573,7 +593,7 @@ class ReplicaCoordinator:
     async def reserve(self, host_id: str) -> AsyncIterator[None]:
         async with self.request_placement(host_id) as route:
             if not self.local(route):
-                raise RuntimeError("managed host is owned by another backend")
+                raise HTTPException(503, "Session host is reconnecting; retry shortly")
             task = asyncio.current_task()
             if task is not None and task in self._task_fences:
                 self.retain_task(task)

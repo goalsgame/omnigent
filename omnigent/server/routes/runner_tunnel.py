@@ -615,12 +615,13 @@ def create_runner_tunnel_router(
                     await registry.send_text(session, encode_frame(EventReadyFrame()))
 
                 if on_runner_connect is not None:
-                    owned.append(
-                        asyncio.create_task(
-                            _run_connect_hook(on_runner_connect, session),
-                            name=f"tunnel-recovery:{runner_id}",
-                        )
+                    from omnigent.server.replication import create_runner_recovery_task
+
+                    recovery = create_runner_recovery_task(
+                        _run_connect_hook(on_runner_connect, session), ws
                     )
+                    recovery.set_name(f"tunnel-recovery:{runner_id}")
+                    owned.append(recovery)
 
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},

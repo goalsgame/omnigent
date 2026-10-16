@@ -2439,7 +2439,7 @@ async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
     await asyncio.wait_for(sender, timeout=5)  # returns instead of raising
 
 
-def _replicated_runner_route(db_uri, *, host_bound=False):
+def _replicated_runner_route(db_uri, *, host_bound=False, on_connect=None):
     from ipaddress import ip_network
     from types import SimpleNamespace
 
@@ -2476,7 +2476,10 @@ def _replicated_runner_route(db_uri, *, host_bound=False):
         coordinator.store.claim("host", hid)
     app = FastAPI()
     app.include_router(
-        create_runner_tunnel_router(registry, replication=coordinator), prefix="/v1"
+        create_runner_tunnel_router(
+            registry, replication=coordinator, on_runner_connect=on_connect
+        ),
+        prefix="/v1",
     )
     return TunnelRouteApp(app, registry), coordinator
 
@@ -2610,4 +2613,69 @@ async def test_accepted_batch_retains_lease_after_disconnect_and_fences_transfer
         if not comm.future.done():
             await comm.send_input({"type": "websocket.disconnect", "code": 1000})
             await comm.wait(timeout=budget(2))
+        await coordinator.aclose()
+
+
+@pytest.mark.parametrize("host_bound", [False, True])
+@pytest.mark.parametrize("transfer", [False, True])
+@pytest.mark.parametrize("write", ["error", "binding"])
+async def test_recovery_worker_rejects_lease_transfer(db_uri, host_bound, transfer, write):
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    failures = []
+
+    def persist():
+        started.set()
+        assert release.wait(timeout=budget(10))
+        try:
+            if write == "error":
+                coordinator.conversations.delete_label(conv.id, "last_task_error")
+            else:
+                coordinator.conversations.replace_runner_id(conv.id, "stale-child-runner")
+        except asyncio.CancelledError:
+            failures.append("fenced")
+            raise
+        finally:
+            finished.set()
+
+    async def recover(runner_id, connection):
+        await asyncio.to_thread(persist)
+
+    route, coordinator = _replicated_runner_route(
+        db_uri, host_bound=host_bound, on_connect=recover
+    )
+    conv = coordinator.conversations.create_conversation(runner_id="new-owner-runner")
+    coordinator.conversations.set_labels(conv.id, {"last_task_error": "new-owner-error"})
+    comm = None
+    try:
+        comm = await _connect_route(route.app, _TUNNEL_PATH)
+        await _send_hello(comm, route.registry, connection_id="recovery")
+        assert await asyncio.to_thread(started.wait, budget(5))
+        resource = (
+            ("host", "51dc949aba31e24ca8f047d6fba31a0d") if host_bound else ("runner", _RUNNER_ID)
+        )
+        if transfer:
+            old = coordinator.store.get(*resource)
+            coordinator.store.release(old)
+            other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+            other.claim(*resource)
+            # Canceling the hook cannot cancel the already running SQL worker.
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(5))
+        release.set()
+        assert await asyncio.to_thread(finished.wait, budget(5))
+        current = coordinator.conversations.get_conversation(conv.id)
+        assert failures == (["fenced"] if transfer else [])
+        assert current.labels.get("last_task_error") == (
+            None if write == "error" and not transfer else "new-owner-error"
+        )
+        assert current.runner_id == (
+            "stale-child-runner" if write == "binding" and not transfer else "new-owner-runner"
+        )
+    finally:
+        release.set()
+        if comm is not None and not comm.future.done():
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(5))
         await coordinator.aclose()
