@@ -3937,7 +3937,9 @@ const message = {role: "assistant", responseId: "reply-1",
   assert.equal(calls[1].headers.authorization, "Bearer local-one");
   configureRelay(12346, "local-two");
   rejectRelay = true;
-  await assert.rejects(handlers.message_end({message: {...message, responseId: "reply-2"}}, ctx), /HTTP 401/);
+  await assert.rejects(
+    handlers.message_end({message: {...message, responseId: "reply-2"}}, ctx), /HTTP 401/
+  );
   assert.equal(calls.length, 3, "relay failures must not fall back to stale server credentials");
   assert.equal(calls[2].url, "http://127.0.0.1:12346/events");
   assert.equal(calls[2].headers.authorization, "Bearer local-two");

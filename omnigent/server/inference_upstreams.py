@@ -112,7 +112,11 @@ class InferenceUpstream:
         if self.kind == "vertex-openai":
             if endpoint != "chat/completions":
                 raise ValueError("Vertex OpenAI upstream supports chat completions only")
-            return f"{self.base_url}/endpoints/openapi/{endpoint}", body
+            from omnigent.server.inference_vertex import restore_thought_signatures
+
+            return f"{self.base_url}/endpoints/openapi/{endpoint}", restore_thought_signatures(
+                body
+            )
         return f"{self.base_url}/{endpoint}", body
 
 

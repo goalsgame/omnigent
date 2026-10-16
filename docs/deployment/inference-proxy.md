@@ -174,3 +174,11 @@ proxy-backed session to another agent.
 A server and runner upgrade is
 required when introducing per-model protocols or limits; relaunch existing
 runners to obtain the updated binding. Retain workspace volumes during upgrades.
+
+Vertex Gemini tool calls carry opaque thought signatures. The proxy retains native
+`extra_content.google.thought_signature` fields and also exposes them as
+`reasoning.encrypted` replay metadata for OpenAI-compatible clients such as Pi.
+Clients must retain the replay metadata in assistant history, including after
+compaction and sleep/wake; missing signatures can cause Vertex to reject tool
+follow-up requests. The proxy restores signatures to the matching tool call
+without caching them on the server or changing OpenRouter responses.
