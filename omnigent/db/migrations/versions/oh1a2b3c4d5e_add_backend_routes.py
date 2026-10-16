@@ -22,6 +22,7 @@ def upgrade() -> None:
         sa.Column("replica_id", sa.String(64), nullable=False),
         sa.Column("endpoint", sa.String(512), nullable=False),
         sa.Column("token", sa.String(64), nullable=False),
+        sa.Column("connection_token", sa.String(64), nullable=True),
         sa.Column("expires_at", sa.Float(), nullable=False),
         sa.Column("reported_metadata", sa.Text(), nullable=True),
     )

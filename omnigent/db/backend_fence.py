@@ -51,6 +51,6 @@ def host_fence_valid(session: Session, host_id: str, *, require_live: bool = Tru
     )
     return (
         row is not None
-        and row.token == fence.token
+        and (row.connection_token or row.token) == fence.token
         and (not require_live or row.expires_at > time.time())
     )

@@ -13,3 +13,4 @@ class BackendRoute:
     token: str
     expires_at: float
     metadata: dict[str, object] | None = None
+    connection_token: str | None = None

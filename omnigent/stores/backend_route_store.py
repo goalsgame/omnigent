@@ -41,6 +41,7 @@ def _route(row: SqlBackendRoute) -> BackendRoute:
         row.token,
         row.expires_at,
         _metadata(row.reported_metadata),
+        row.connection_token or row.token,
     )
 
 
@@ -175,13 +176,15 @@ class BackendRouteStore:
                 and prior.endpoint == self.endpoint
                 and prior.expires_at > now
             )
+            lease_token = prior.token if continuous and prior is not None else uuid.uuid4().hex
             values = {
                 "workspace_id": current_workspace_id(),
                 "kind": kind,
                 "resource_id": resource_id,
                 "replica_id": self.replica_id,
                 "endpoint": self.endpoint,
-                "token": uuid.uuid4().hex,
+                "token": lease_token,
+                "connection_token": uuid.uuid4().hex if continuous else lease_token,
                 "expires_at": now + self.ttl,
                 "reported_metadata": None,
             }
@@ -194,6 +197,7 @@ class BackendRouteStore:
                         "replica_id",
                         "endpoint",
                         "token",
+                        "connection_token",
                         "expires_at",
                         "reported_metadata",
                     )
@@ -231,7 +235,9 @@ class BackendRouteStore:
             if row is None or row.expires_at <= now:
                 return False
             row.expires_at = now + self.ttl
-            if reported is not None:
+            if reported is not None and (row.connection_token or row.token) == (
+                route.connection_token or route.token
+            ):
                 row.reported_metadata = json.dumps(reported)
             return True
 

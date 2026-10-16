@@ -36,8 +36,10 @@ retains its original credentials and origin and passes through ordinary route
 authorization again. Peer signatures authenticate routing context; they do not
 grant access to sessions. A request can make at most one peer hop.
 
-Leases expire unless renewed. Generation tokens fence delayed disconnects and
-heartbeats after reconnection. Runner connections attached to a host remain on
+Leases expire unless renewed. Resource generations fence launch work; separate
+connection generations fence delayed host disconnects and heartbeats. A verified
+live reconnect preserves the resource generation, so in-flight launch validation
+does not race with replacement of its socket. Runner connections attached to a host remain on
 that host's backend. Standalone runner identity remains recorded after its
 connection lease is released, so reconnects cannot be mistaken for host launches. Managed launch tasks retain placement after their HTTP
 request returns, including newly created sessions that have no host binding yet.

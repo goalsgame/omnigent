@@ -723,6 +723,7 @@ class SqlBackendRoute(OmnigentBase):
     replica_id: Mapped[str] = mapped_column(String(64), nullable=False)
     endpoint: Mapped[str] = mapped_column(String(512), nullable=False)
     token: Mapped[str] = mapped_column(String(64), nullable=False)
+    connection_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     expires_at: Mapped[float] = mapped_column(Float, nullable=False, index=True)
     reported_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 

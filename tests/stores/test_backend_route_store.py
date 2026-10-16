@@ -191,3 +191,30 @@ def test_renew_waiting_for_database_lock_cannot_resurrect_expired_lease(db_uri, 
         assert a.get("host", "locked") is None
     finally:
         event.remove(engine, "before_cursor_execute", before_execute)
+
+
+def test_live_reconnect_fences_old_socket_without_revoking_launch_lease(db_uri):
+    from omnigent.db.account_authority import account_checks_scope
+    from omnigent.db.backend_fence import backend_fence_scope
+    from omnigent.stores.host_store import HostStore
+
+    store = BackendRouteStore(db_uri, "backend", "http://127.0.0.1:8001")
+    hosts = HostStore(db_uri)
+    hid = "0e508b33891c40098b0ff214c993fd98"
+    old = store.claim("host", hid)
+    with account_checks_scope(False), backend_fence_scope(hid, old.connection_token):
+        hosts.upsert_on_connect(hid, "host", "alice")
+    new, continuous = store.claim_connection("host", hid, old)
+    assert continuous and new.token == old.token
+    assert new.connection_token != old.connection_token
+    with backend_fence_scope(hid, new.connection_token):
+        hosts.update_harness_readiness(hid, {"pi": True})
+    with backend_fence_scope(hid, old.connection_token):
+        hosts.update_harness_readiness(hid, {"pi": False})
+        hosts.set_offline(hid)
+    assert hosts.get_host(hid).status == "online"
+    assert hosts.get_host(hid).configured_harnesses == {"pi": True}
+    assert store.renew(old, {"version": "stale"})
+    assert store.host_metadata([hid]) == {}
+    assert store.renew(new, {"version": "current"})
+    assert store.host_metadata([hid])[hid]["version"] == "current"

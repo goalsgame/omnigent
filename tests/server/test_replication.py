@@ -642,7 +642,8 @@ async def test_live_reconnect_proves_continuity_before_transferring_launch(db_ur
                     SimpleNamespace(scope={}, close=close), "host", "example"
                 ):
                     new = coordinator.store.get("host", "example")
-                    assert new.token != old.token
+                    assert new.token == old.token
+                    assert new.connection_token != old.connection_token
                     assert (
                         coordinator._task_fences[task].routes[(0, "host", "example")].token
                         == new.token
@@ -655,4 +656,110 @@ async def test_live_reconnect_proves_continuity_before_transferring_launch(db_ur
         gate.set()
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
+        await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", ["after-commit", "old-snapshot"])
+async def test_launch_validation_across_live_socket_handover(db_uri, monkeypatch, window):
+    from contextlib import asynccontextmanager
+    from threading import Event
+    from types import SimpleNamespace
+
+    from omnigent.db.backend_work_fence import check_backend_work, work_fence_scope
+    from omnigent.server.replication import create_managed_launch_task
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    launch_started, launch_gate = asyncio.Event(), asyncio.Event()
+    committed, handover_gate, connected, socket_gate = (asyncio.Event() for _ in range(4))
+    snapshot_ready, snapshot_gate = Event(), Event()
+
+    async def close(**kwargs):
+        pass
+
+    old_ws, new_ws = SimpleNamespace(scope={}, close=close), SimpleNamespace(scope={}, close=close)
+    original_reference = coordinator._reference
+
+    @asynccontextmanager
+    async def paused_handover(route, ws):
+        if ws is new_ws:
+            committed.set()
+            await handover_gate.wait()
+        async with original_reference(route, ws):
+            yield
+
+    monkeypatch.setattr(coordinator, "_reference", paused_handover)
+
+    class SnapshotRoutes(dict):
+        def items(self):
+            snapshot = list(super().items())
+            snapshot_ready.set()
+            assert snapshot_gate.wait(timeout=5)
+            return snapshot
+
+    async def launch():
+        launch_started.set()
+        await launch_gate.wait()
+        await asyncio.to_thread(coordinator.conversations.create_conversation, title="healthy")
+
+    async def reconnect():
+        async with coordinator.connection(new_ws, "host", "example"):
+            connected.set()
+            await socket_gate.wait()
+
+    task = validation = reconnecting = None
+    try:
+        with replication_scope(coordinator):
+            async with coordinator.connection(old_ws, "host", "example"):
+                old = coordinator.store.get("host", "example")
+                task = create_managed_launch_task(launch())
+                retain_managed_task(task)
+                await launch_started.wait()
+                fence = coordinator._task_fences[task]
+
+                def check():
+                    with work_fence_scope(fence):
+                        check_backend_work()
+
+                if window == "old-snapshot":
+                    fence.routes = SnapshotRoutes(fence.routes)
+                    validation = asyncio.create_task(asyncio.to_thread(check))
+                    assert await asyncio.to_thread(snapshot_ready.wait, 5)
+                reconnecting = asyncio.create_task(reconnect())
+                await asyncio.wait_for(committed.wait(), timeout=5)
+                # The database committed; the coordinator still holds its old route.
+                current = coordinator.store.get("host", "example")
+                assert current.token == old.token
+                assert current.connection_token != old.connection_token
+                assert (
+                    coordinator._owned[(0, "host", "example")].route.connection_token
+                    == old.connection_token
+                )
+                if window == "after-commit":
+                    validation = asyncio.create_task(asyncio.to_thread(check))
+                snapshot_gate.set()
+                await validation
+                assert not fence.lost
+                handover_gate.set()
+                await asyncio.wait_for(connected.wait(), timeout=5)
+                launch_gate.set()
+                await task
+                socket_gate.set()
+                await reconnecting
+        assert coordinator.conversations.list_conversations().data[0].title == "healthy"
+    finally:
+        snapshot_gate.set()
+        launch_gate.set()
+        handover_gate.set()
+        socket_gate.set()
+        pending = [t for t in (task, validation, reconnecting) if t is not None]
+        for t in pending:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         await coordinator.aclose()

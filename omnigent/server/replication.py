@@ -292,26 +292,20 @@ class ReplicaCoordinator:
             await asyncio.to_thread(self.store.renew, entry.route, self._host_report(host_id))
 
     @asynccontextmanager
-    async def _reference(
-        self, route: BackendRoute, ws: WebSocket | None, *, continuous: bool = False
-    ) -> AsyncIterator[None]:
+    async def _reference(self, route: BackendRoute, ws: WebSocket | None) -> AsyncIterator[None]:
         key = (route.workspace_id, route.kind, route.resource_id)
         reference = uuid.uuid4().hex
         entry = self._owned.get(key)
-        if entry is not None and entry.route.token != route.token and not continuous:
+        if entry is not None and entry.route.token != route.token:
             await self._retire_owned(key, entry)
             entry = None
         if entry is None:
             entry = _OwnedResource(route)
             self._owned[key] = entry
-        elif entry.route.token != route.token:
+        elif entry.route.connection_token != route.connection_token:
             # Claiming a new connection generation also retires every old socket,
             # even if the replacement later fails its protocol handshake.
             entry.route = route
-            for task in entry.tasks.values():
-                fence = self._task_fences.get(task)
-                if fence is not None and not fence.lost:
-                    fence.routes[key] = route
             for previous in list(entry.connections.values()):
                 if previous is not None:
                     with suppress(Exception):
@@ -415,7 +409,6 @@ class ReplicaCoordinator:
             await asyncio.to_thread(self._runner_host, resource_id) if kind == "runner" else None
         )
         async with self._resource_lock("host" if host_id else kind, host_id or resource_id):
-            continuous = False
             if host_id:
                 route = await asyncio.to_thread(self.store.get, "host", host_id)
             else:
@@ -430,7 +423,7 @@ class ReplicaCoordinator:
                     else None
                 )
                 if route is None or not self.local(route):
-                    route, continuous = await asyncio.to_thread(
+                    route, _continuous = await asyncio.to_thread(
                         self.store.claim_connection,
                         kind,
                         resource_id,
@@ -440,7 +433,7 @@ class ReplicaCoordinator:
             if route is not None and self.local(route):
                 # Runners must wait for their host's control tunnel to register.
                 if not host_id or self.hosts.get(host_id) is not None:
-                    reference = self._reference(route, ws, continuous=continuous)
+                    reference = self._reference(route, ws)
                     await reference.__aenter__()
         if reference is None:
             if route is not None and not self.local(route) and not ws.scope.get("omnigent.peer"):
@@ -457,7 +450,7 @@ class ReplicaCoordinator:
         try:
             assert route is not None
             if kind == "host":
-                with backend_fence_scope(resource_id, route.token):
+                with backend_fence_scope(resource_id, route.connection_token or route.token):
                     yield True
             else:
                 yield True
@@ -485,7 +478,10 @@ class ReplicaCoordinator:
                 if self._owned.get(key) is not entry or entry.route.token != current.token:
                     continue
                 if renewed:
-                    entry.route = replace(current, expires_at=started + self.store.ttl)
+                    entry.route = replace(
+                        entry.route,
+                        expires_at=max(entry.route.expires_at, started + self.store.ttl),
+                    )
                     continue
                 await self._retire_owned(key, entry)
 
