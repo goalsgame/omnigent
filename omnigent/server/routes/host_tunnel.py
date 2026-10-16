@@ -704,7 +704,10 @@ async def _receive_loop(
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:
-                    await on_host_update(host_id, conn.owner)
+                    from omnigent.server.replication import host_event_scope
+
+                    async with host_event_scope(host_id):
+                        await on_host_update(host_id, conn.owner)
                 except Exception:
                     _logger.exception("on_host_update callback failed for %s", host_id)
             continue
@@ -740,7 +743,10 @@ async def _receive_loop(
                 # Only failure signal for a runner that crashed before connecting
                 # its tunnel; the callback resolves bound sessions and logs the event.
                 try:
-                    await on_runner_exited(host_id, frame.runner_id, frame.error)
+                    from omnigent.server.replication import host_event_scope
+
+                    async with host_event_scope(host_id):
+                        await on_runner_exited(host_id, frame.runner_id, frame.error)
                 except Exception:
                     # One failed report must not tear down the tunnel for every runner.
                     _logger.exception(

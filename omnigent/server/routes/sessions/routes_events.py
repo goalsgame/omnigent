@@ -3197,18 +3197,9 @@ def register_events_routes(
         request: Request, session_id: str, delete_branch: bool = True
     ) -> dict[str, str]:
         """Clean the saved host worktree; archive cleanup retains its branch."""
-        if delete_branch:
-            conv, _ = await _owned_delete_session(request, session_id)
-        else:
-            user_id = _require_user(request, auth_provider)
-            await _require_access(
-                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-            )
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
-            if not conv.archived:
-                return {"status": "skipped"}
+        conv, _ = await _owned_delete_session(request, session_id)
+        if not delete_branch and not conv.archived:
+            return {"status": "skipped"}
         await _cleanup_worktree(request, conv, local_only=True, delete_branch=delete_branch)
         return {"status": "ok"}
 

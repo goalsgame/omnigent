@@ -25,9 +25,11 @@ class BackendWorkFence:
     routes: dict[tuple[int, str, str], BackendRoute] = field(default_factory=dict)
     lost: bool = False
     parent: BackendWorkFence | None = None
+    connection_tokens: dict[tuple[int, str, str], str] = field(default_factory=dict)
 
     def check(self, session: Session) -> None:
         routes = dict(self.routes)
+        connections: dict[tuple[int, str, str], str] = {}
         ancestor: BackendWorkFence | None = self
         while ancestor is not None:
             if ancestor.lost:
@@ -38,6 +40,11 @@ class BackendWorkFence:
                     self.lost = True
                     raise asyncio.CancelledError("backend ownership changed within a request")
                 routes[key] = route
+            for key, token in ancestor.connection_tokens.items():
+                if key in connections and connections[key] != token:
+                    self.lost = True
+                    raise asyncio.CancelledError("backend connection changed within a request")
+                connections[key] = token
             ancestor = ancestor.parent
         for key, route in sorted(routes.items()):
             row = session.scalar(
@@ -49,7 +56,12 @@ class BackendWorkFence:
                 )
                 .with_for_update()
             )
-            if row is None or row.token != route.token or row.expires_at <= time.time():
+            if (
+                row is None
+                or row.token != route.token
+                or row.expires_at <= time.time()
+                or (key in connections and (row.connection_token or row.token) != connections[key])
+            ):
                 self.lost = True
                 raise asyncio.CancelledError("backend ownership lost")
 

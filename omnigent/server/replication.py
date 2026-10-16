@@ -55,6 +55,35 @@ def replication_scope(coordinator: ReplicaCoordinator | None) -> Iterator[None]:
 
 
 @asynccontextmanager
+async def host_event_scope(host_id: str) -> AsyncIterator[None]:
+    """Fence host callback writes without fencing generation-conditional disconnect cleanup."""
+    coordinator = _current.get()
+    socket = current_backend_fence()
+    if coordinator is None or socket is None:
+        yield
+        return
+    route = await asyncio.to_thread(coordinator.store.get, "host", host_id)
+    if (
+        route is None
+        or not coordinator.local(route)
+        or socket.workspace_id != route.workspace_id
+        or socket.host_id != host_id
+        or socket.token != (route.connection_token or route.token)
+    ):
+        raise asyncio.CancelledError("backend host connection changed")
+    key = (route.workspace_id, route.kind, route.resource_id)
+    fence = BackendWorkFence(
+        coordinator.database_uri,
+        {key: route},
+        parent=current_work_fence(),
+        connection_tokens={key: socket.token},
+    )
+    with work_fence_scope(fence):
+        await asyncio.to_thread(check_backend_work)
+        yield
+
+
+@asynccontextmanager
 async def reserve_managed_placement(host_id: str) -> AsyncIterator[None]:
     """Keep a provisioning host on the replica waiting for its launch to finish."""
     coordinator = _current.get()

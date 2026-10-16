@@ -656,11 +656,15 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     async def _wait_until_ready() -> None:
         while True:
             host = store.get_host(_HOST_ID)
-            if host is not None and host.configured_harnesses == {"pi": True}:
+            if (
+                host is not None
+                and host.configured_harnesses == {"pi": True}
+                and updates == [_HOST_ID]
+            ):
                 return
             await asyncio.sleep(0.01)
 
-    await asyncio.wait_for(_wait_until_ready(), timeout=budget(0.5))
+    await asyncio.wait_for(_wait_until_ready(), timeout=budget(2.0))
 
     conn = registry.get(_HOST_ID)
     assert conn is not None
@@ -1836,4 +1840,97 @@ async def test_superseded_host_upsert_cannot_replace_registered_socket(db_uri, m
             if communicator is not None and not communicator.future.done():
                 await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
                 await communicator.wait(timeout=budget(2))
+        await coordinator.aclose()
+
+
+@pytest.mark.parametrize("loss", ["owner", "socket", None])
+@pytest.mark.parametrize("write", ["status", "labels"])
+async def test_delayed_host_callback_cannot_overwrite_recovered_session(db_uri, loss, write):
+    from ipaddress import ip_network
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.host.frames import HostRunnerExitedFrame
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator
+    from omnigent.stores.backend_route_store import BackendRouteStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    registry, hosts = HostRegistry(), HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation(runner_id="runner-crashed")
+    conversations.set_session_live_status(conv.id, "running")
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        conversations,
+        registry,
+    )
+    other = BackendRouteStore(db_uri, "other", "http://127.0.0.1:8002")
+    started, release = threading.Event(), threading.Event()
+    done = asyncio.Event()
+
+    def persist_failure():
+        started.set()
+        assert release.wait(timeout=budget(10))
+        if write == "status":
+            conversations.set_session_live_status(conv.id, "failed")
+        else:
+            conversations.set_labels(conv.id, {"last_task_error": "stale failure"})
+
+    async def callback(host_id, runner_id, error):
+        try:
+            await asyncio.to_thread(persist_failure)
+        finally:
+            done.set()
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry, hosts, replication=coordinator, on_runner_exited=callback
+        ),
+        prefix="/v1",
+    )
+    comm = None
+    try:
+        comm = await _connect_route(app, _TUNNEL_PATH)
+        await _send_hello_and_wait(comm, registry)
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostRunnerExitedFrame(runner_id="runner-crashed", error="process exited")
+                ),
+            }
+        )
+        assert await asyncio.to_thread(started.wait, budget(5))
+        old = coordinator.store.get("host", _HOST_ID)
+        if loss == "owner":
+            coordinator.store.release(old)
+            other.claim("host", _HOST_ID)
+        elif loss == "socket":
+            replacement, continuous = coordinator.store.claim_connection("host", _HOST_ID, old)
+            assert continuous and replacement.token == old.token
+            assert replacement.connection_token != old.connection_token
+        release.set()
+        await asyncio.wait_for(done.wait(), budget(5))
+        current = conversations.get_conversation(conv.id)
+        assert current.live_status == (
+            "failed" if loss is None and write == "status" else "running"
+        )
+        assert current.labels.get("last_task_error") == (
+            "stale failure" if loss is None and write == "labels" else None
+        )
+        if loss is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await comm.wait(timeout=budget(5))
+            assert hosts.get_host(_HOST_ID).status == "online"
+    finally:
+        release.set()
+        if comm is not None and not comm.future.done():
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.CancelledError):
+                await comm.wait(timeout=budget(5))
         await coordinator.aclose()
