@@ -1168,3 +1168,67 @@ async def test_slow_retired_socket_does_not_block_subsequent_renewals(db_uri):
     finally:
         unblock.set()
         await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["host", "host-bound-runner"])
+async def test_replacement_bounds_old_socket_close_while_holding_resource_lock(db_uri, kind):
+    from types import SimpleNamespace
+
+    from omnigent.host.frames import HostHelloFrame
+
+    registry = HostRegistry()
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        registry,
+    )
+    closing, closed = asyncio.Event(), asyncio.Event()
+
+    async def blocked_close(**kwargs):
+        closing.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def normal_close(**kwargs):
+        pass
+
+    old = SimpleNamespace(scope={}, close=blocked_close)
+    new = SimpleNamespace(scope={}, close=normal_close)
+
+    async def replace(kind, resource):
+        async with coordinator.connection(new, kind, resource) as local:
+            assert local
+        # Subsequent operations on the shared host lock can still proceed.
+        async with coordinator.request_placement("host") as route:
+            assert coordinator.local(route)
+
+    try:
+        if kind == "host":
+            async with coordinator.connection(old, "host", "host"):
+                await asyncio.wait_for(replace("host", "host"), 4)
+        else:
+            host_ws = SimpleNamespace(scope={}, close=normal_close)
+            registry.register(
+                "host",
+                host_ws,
+                HostHelloFrame(version="test", frame_protocol_version=1, name="test"),
+                owner=None,
+            )
+            conv = coordinator.conversations.create_conversation(runner_id="runner")
+            # The saved host is used without needing an unrelated HostStore fixture.
+            from unittest.mock import patch
+
+            with patch.object(coordinator, "_runner_host", return_value="host"):
+                async with (
+                    coordinator.connection(host_ws, "host", "host"),
+                    coordinator.connection(old, "runner", "runner"),
+                ):
+                    await asyncio.wait_for(replace("runner", "runner"), 4)
+            assert coordinator.conversations.get_conversation(conv.id) is not None
+        assert closing.is_set() and closed.is_set()
+    finally:
+        await coordinator.aclose()

@@ -217,6 +217,34 @@ async def drain_provision_cleanup() -> None:
         await asyncio.gather(*list(_provision_cleanup_tasks), return_exceptions=True)
 
 
+async def _terminate_unadopted_allocation(
+    launcher: SandboxHostLauncher, sandbox_id: str, host_id: str, host_store: HostStore
+) -> None:
+    """Keep the allocation reservation and provider operation in one worker."""
+
+    def terminate() -> None:
+        with host_store.unadopted_allocation(
+            provider=launcher.provider, sandbox_id=sandbox_id
+        ) as available:
+            if available:
+                attempted = _termination_attempts.get()
+                try:
+                    launcher.terminate(sandbox_id)
+                except Exception:
+                    if attempted is not None:
+                        attempted.add((launcher.provider, sandbox_id))
+                    raise
+                if attempted is not None:
+                    attempted.add((launcher.provider, sandbox_id))
+
+    try:
+        await asyncio.to_thread(terminate)
+    except Exception:
+        _logger.exception(
+            "Could not clean up unadopted allocation %s for host %s", sandbox_id, host_id
+        )
+
+
 @asynccontextmanager
 async def _supervised_provision(
     launcher: SandboxHostLauncher, name: str, *, host_id: str, host_store: HostStore
@@ -238,25 +266,8 @@ async def _supervised_provision(
             return
         if (launcher.provider, sandbox_id) in attempted:
             return
-        # Only an unrecorded allocation may be cleaned up outside its lost lease.
-        # A newer owner may already have retained the returned id.
         with work_fence_scope(None):
-            try:
-                current = await asyncio.to_thread(host_store.get_host, host_id)
-            except Exception:
-                _logger.exception(
-                    "Could not inspect canceled allocation %s for host %s", sandbox_id, host_id
-                )
-                return
-            if (
-                current is not None
-                and current.sandbox_provider == launcher.provider
-                and sandbox_id in (current.sandbox_id, current.terminating_sandbox_id)
-            ):
-                return
-            await _terminate_sandbox_best_effort(
-                launcher, sandbox_id, host_id=host_id, provider=launcher.provider
-            )
+            await _terminate_unadopted_allocation(launcher, sandbox_id, host_id, host_store)
 
     attempted: set[tuple[str | None, str]] = set()
     tracking = _termination_attempts.set(attempted)
@@ -3948,24 +3959,7 @@ async def _register_and_start_host(
         # The provider allocated the sandbox before registration or startup
         # could fail, so both failures must attempt cleanup.
         if record is None:
-            current = None
-            try:
-                current = await fenced_to_thread(host_store.get_host, host_id)
-            except Exception:
-                _logger.exception("Could not inspect failed host registration")
-            # A provider can reuse an ID already retained for active work or cleanup.
-            if (
-                current is None
-                or current.sandbox_provider != launcher.provider
-                or sandbox_id
-                not in (
-                    current.sandbox_id,
-                    current.terminating_sandbox_id,
-                )
-            ):
-                await _terminate_sandbox_best_effort(
-                    launcher, sandbox_id, host_id=host_id, provider=launcher.provider
-                )
+            await _terminate_unadopted_allocation(launcher, sandbox_id, host_id, host_store)
             if isinstance(exc, ValueError):
                 raise
         elif keep_host_on_failure:

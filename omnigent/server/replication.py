@@ -455,10 +455,13 @@ class ReplicaCoordinator:
             # Claiming a new connection generation also retires every old socket,
             # even if the replacement later fails its protocol handshake.
             entry.route = route
-            for previous in list(entry.connections.values()):
-                if previous is not None:
-                    with suppress(Exception):
-                        await previous.close(code=1001, reason="backend connection replaced")
+            await asyncio.gather(
+                *(
+                    self._close_socket(previous, "backend connection replaced")
+                    for previous in list(entry.connections.values())
+                    if previous is not None
+                )
+            )
         elif entry.route.expires_at < route.expires_at:
             entry.route = route
         entry.connections[reference] = ws
@@ -607,10 +610,7 @@ class ReplicaCoordinator:
                         self._runner_connections[key] = (admission.nonce, ws)
                         ws.scope["omnigent.runner_admission"] = admission
                         if previous is not None and previous[1] is not ws:
-                            with suppress(Exception):
-                                await previous[1].close(
-                                    code=1001, reason="backend connection replaced"
-                                )
+                            await self._close_socket(previous[1], "backend connection replaced")
         if reference is None:
             if route is not None and not self.local(route) and not ws.scope.get("omnigent.peer"):
                 await self.transport.forward_websocket(ws, route)
@@ -685,16 +685,17 @@ class ReplicaCoordinator:
         sockets = [ws for ws in entry.connections.values() if ws is not None]
         if sockets:
 
-            async def close_socket(ws: WebSocket) -> None:
-                with suppress(Exception):
-                    await asyncio.wait_for(
-                        ws.close(code=1001, reason="backend ownership changed"), timeout=2
-                    )
-
             async def close_sockets() -> None:
                 with work_fence_scope(None):
-                    await asyncio.gather(*(close_socket(ws) for ws in sockets))
+                    await asyncio.gather(
+                        *(self._close_socket(ws, "backend ownership changed") for ws in sockets)
+                    )
 
             cleanup = asyncio.create_task(close_sockets())
             self._cleanup.add(cleanup)
             cleanup.add_done_callback(self._cleanup.discard)
+
+    @staticmethod
+    async def _close_socket(ws: WebSocket, reason: str) -> None:
+        with suppress(Exception):
+            await asyncio.wait_for(ws.close(code=1001, reason=reason), timeout=2)

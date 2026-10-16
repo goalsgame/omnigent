@@ -15,11 +15,16 @@ import hashlib
 import hmac
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast
 
 from sqlalchemy import Engine, or_, select, tuple_, update
 from sqlalchemy import delete as sql_delete
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -28,6 +33,7 @@ from omnigent.db.account_authority import require_active_account, session_accoun
 from omnigent.db.backend_fence import host_fence_valid
 from omnigent.db.backend_work_fence import backend_work_transaction
 from omnigent.db.db_models import (
+    SqlBackendRoute,
     SqlConversationMetadata,
     SqlHost,
     SqlSessionPermission,
@@ -881,6 +887,59 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
+    @staticmethod
+    def _lock_allocation(session: Session, provider: str, sandbox_id: str) -> None:
+        # An inactive, private resource row is a transaction mutex, never a peer route.
+        resource = hashlib.sha256(json.dumps([provider, sandbox_id]).encode()).hexdigest()
+        values = {
+            "workspace_id": current_workspace_id(),
+            "kind": "allocation-lock",
+            "resource_id": resource,
+            "replica_id": "allocation-lock",
+            "endpoint": "",
+            "token": "allocation-lock",
+            "expires_at": 0,
+        }
+        dialect = session.get_bind().dialect.name
+        if dialect == "mysql":
+            statement = mysql_insert(SqlBackendRoute).values(**values)
+            statement = statement.on_duplicate_key_update(token=SqlBackendRoute.token)
+        else:
+            insert = pg_insert if dialect in {"postgresql", "cockroachdb"} else sqlite_insert
+            statement = insert(SqlBackendRoute).values(**values).on_conflict_do_nothing()
+        session.execute(statement)
+        session.execute(
+            select(SqlBackendRoute)
+            .where(
+                SqlBackendRoute.workspace_id == current_workspace_id(),
+                SqlBackendRoute.kind == "allocation-lock",
+                SqlBackendRoute.resource_id == resource,
+            )
+            .with_for_update()
+        ).scalar_one()
+
+    @contextmanager
+    def unadopted_allocation(self, *, provider: str, sandbox_id: str) -> Iterator[bool]:
+        """Reserve cleanup through termination, serializing with allocation adoption.
+
+        The callback must finish provider termination before exiting this scope.
+        """
+        with self._lifecycle_session("unadopted_allocation") as session:
+            self._lock_allocation(session, provider, sandbox_id)
+            retained = session.scalar(
+                select(SqlHost.host_id)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.sandbox_provider == provider,
+                    or_(
+                        SqlHost.sandbox_id == sandbox_id,
+                        SqlHost.terminating_sandbox_id == sandbox_id,
+                    ),
+                )
+                .limit(1)
+            )
+            yield retained is None
+
     def register_managed_host(
         self,
         *,
@@ -922,6 +981,7 @@ class HostStore:
         token_hash = hash_host_launch_token(token)
 
         def write(session: Session) -> Host:
+            self._lock_allocation(session, provider, sandbox_id)
             generation = require_active_account(session, user_id)
             row = SqlHost(
                 account_generation=generation,
@@ -963,6 +1023,7 @@ class HostStore:
             self._lifecycle_session("replace_managed_host_sandbox") as session,
             backend_work_transaction(session),
         ):
+            self._lock_allocation(session, provider, sandbox_id)
             require_active_account(session, user_id)
             existing = session.execute(
                 select(SqlHost)
@@ -1021,6 +1082,9 @@ class HostStore:
             snapshot = session.get(SqlHost, (current_workspace_id(), host_id))
             if snapshot is None:
                 return None
+            if snapshot.sandbox_provider is None:
+                return None
+            self._lock_allocation(session, snapshot.sandbox_provider, sandbox_id)
             require_active_account(
                 session, snapshot.user_id, generation=snapshot.account_generation
             )
@@ -1033,7 +1097,7 @@ class HostStore:
                         SqlHost.host_id == host_id,
                         SqlHost.sandbox_id == sandbox_id,
                         SqlHost.updated_at == expected_updated_at,
-                        SqlHost.sandbox_provider.is_not(None),
+                        SqlHost.sandbox_provider == snapshot.sandbox_provider,
                         SqlHost.deleted_at.is_(None),
                         or_(
                             SqlHost.terminating_sandbox_id.is_(None),
