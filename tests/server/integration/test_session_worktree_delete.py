@@ -24,6 +24,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
+    HostStopRunnerFrame,
     decode_host_frame,
 )
 from omnigent.host.git_worktree import (
@@ -93,6 +94,10 @@ async def _register_fake_host(
             if isinstance(frame, HostRemoveWorktreeFrame):
                 captured.append(frame)
                 fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"status": "ok", "error": None})
+            elif isinstance(frame, HostStopRunnerFrame):
+                fut = conn.pending_stops.pop(frame.request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result({"status": "ok", "error": None})
             elif isinstance(frame, HostListWorktreesFrame):
@@ -904,18 +909,20 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
 
 
 @pytest.mark.parametrize(
-    ("co_located", "loss"),
+    ("co_located", "loss", "action"),
     [
-        (False, None),
-        (True, None),
-        (False, "runner"),
-        (True, "runner"),
-        (False, "host"),
-        (True, "host"),
+        (False, None, "delete"),
+        (False, None, "archive"),
+        (True, None, "archive"),
+        (True, None, "delete"),
+        (False, "runner", "delete"),
+        (True, "runner", "delete"),
+        (False, "host", "delete"),
+        (True, "host", "delete"),
     ],
 )
 async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
-    app, db_uri, monkeypatch, co_located, loss
+    app, client, db_uri, monkeypatch, co_located, loss, action
 ):
     from ipaddress import ip_network
 
@@ -930,9 +937,25 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
 
     if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
         pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    from omnigent.server.routes import sessions as facade
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0)
     captured = await _register_fake_host(app, db_uri)
-    sid = _make_worktree_conversation(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
+    if action == "archive":
+        from tests.server.helpers import create_test_session
+
+        session = await create_test_session(client)
+        sid = session["id"]
+        conversations.set_labels(
+            sid, {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(_WORKTREE_PATH)}
+        )
+        conversations.set_host_id(
+            sid, _HOST_ID, workspace=_WORKTREE_PATH, git_branch="feature/login"
+        )
+    else:
+        sid = _make_worktree_conversation(db_uri)
     conversations.replace_runner_id(sid, "standalone-runner")
     other = FastAPI()
     other.include_router(app.router)
@@ -1028,8 +1051,16 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
                     transport=httpx.ASGITransport(app=apps[8001]),
                     base_url="https://public.example",
                 ) as client:
-                    operation = client.request(
-                        "DELETE", f"/v1/sessions/{sid}?delete_branch=true", json={"ignored": True}
+                    operation = (
+                        client.patch(
+                            f"/v1/sessions/{sid}", json={"archived": True, "delete_worktree": True}
+                        )
+                        if action == "archive"
+                        else client.request(
+                            "DELETE",
+                            f"/v1/sessions/{sid}?delete_branch=true",
+                            json={"ignored": True},
+                        )
                     )
                     if loss is not None:
                         if loss == "host" and not co_located:
@@ -1054,15 +1085,23 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
                         assert seen == expected
                         return
                     response = await operation
+                    if action == "archive":
+                        await asyncio.gather(*list(orchestration._detached_stop_tasks))
             assert response.status_code == 200, response.text
-            assert runner_calls == [("DELETE", f"/v1/sessions/{sid}")]
-            expected = [("b", "DELETE", f"/v1/sessions/{sid}")]
+            assert runner_calls == (
+                [] if action == "archive" else [("DELETE", f"/v1/sessions/{sid}")]
+            )
+            expected = [("b", "PATCH" if action == "archive" else "DELETE", f"/v1/sessions/{sid}")]
             if not co_located:
                 expected.append(("a", "DELETE", f"/v1/sessions/{sid}/resources/worktree"))
             assert seen == expected
             assert len(captured) == 1
             assert captured[0].worktree_path == _WORKTREE_PATH
-            assert conversations.get_conversation(sid) is None
+            assert captured[0].delete_branch is (action == "delete")
+            if action == "archive":
+                assert conversations.get_conversation(sid).archived is True
+            else:
+                assert conversations.get_conversation(sid) is None
     finally:
         await runner_client.aclose()
         await a.aclose()

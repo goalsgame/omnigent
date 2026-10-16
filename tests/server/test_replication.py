@@ -824,6 +824,8 @@ async def test_ownership_socket_close_does_not_mark_process_shutdown(db_uri, mon
                     SimpleNamespace(scope={}, close=close), "host", "example"
                 ):
                     pass
+            if coordinator._cleanup:
+                await asyncio.gather(*coordinator._cleanup)
             assert closed == [1001]
             assert not shutdown_state.server_shutting_down()
     finally:
@@ -1083,4 +1085,86 @@ async def test_locked_postgres_lease_does_not_delay_other_renewals(db_uri):
         release.set()
         if worker is not None:
             await worker
+        await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delayed_model_reset_worker_cannot_write_after_lease_transfer(db_uri):
+    import threading
+
+    from omnigent.db.backend_work_fence import BackendWorkFence, work_fence_scope
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.update_conversation(conv.id, model_override="chosen-model")
+    a = BackendRouteStore(db_uri, "a", "http://127.0.0.1:8001")
+    b = BackendRouteStore(db_uri, "b", "http://127.0.0.1:8002")
+    route = a.claim("session", conv.id)
+    fence = BackendWorkFence(db_uri, {(0, "session", conv.id): route})
+    started, proceed = threading.Event(), threading.Event()
+
+    def reset():
+        started.set()
+        assert proceed.wait(10)
+        return store.clear_model_override_if_matches(conv.id, "chosen-model")
+
+    with work_fence_scope(fence):
+        worker = asyncio.create_task(asyncio.to_thread(reset))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        a.release(route)
+        b.claim("session", conv.id)
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        assert store.get_conversation(conv.id).model_override == "chosen-model"
+    finally:
+        proceed.set()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_slow_retired_socket_does_not_block_subsequent_renewals(db_uri):
+    from types import SimpleNamespace
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    closing, unblock = asyncio.Event(), asyncio.Event()
+    now = [1000.0]
+    coordinator.store._now = lambda: now[0]
+
+    async def blocked_close(**kwargs):
+        closing.set()
+        await unblock.wait()
+
+    async def healthy_close(**kwargs):
+        raise AssertionError("The unrelated healthy socket must remain connected")
+
+    try:
+        async with (
+            coordinator.connection(
+                SimpleNamespace(scope={}, close=blocked_close), "runner", "lost"
+            ),
+            coordinator.connection(
+                SimpleNamespace(scope={}, close=healthy_close), "runner", "healthy"
+            ),
+        ):
+            lost = coordinator.store.get("runner", "lost")
+            coordinator.store.release(lost)
+            await asyncio.wait_for(coordinator._renew_once(), 1)
+            await asyncio.wait_for(closing.wait(), 1)
+            for _ in range(4):
+                now[0] += 30
+                await asyncio.wait_for(coordinator._renew_once(), 1)
+                healthy = coordinator.store.get("runner", "healthy")
+                assert healthy is not None and healthy.expires_at == now[0] + 90
+                assert not unblock.is_set()
+            assert coordinator._cleanup
+    finally:
+        unblock.set()
         await coordinator.aclose()

@@ -65,7 +65,9 @@ async def reserve_managed_placement(host_id: str) -> AsyncIterator[None]:
             yield
 
 
-async def cleanup_remote_session_worktree(request: Request, session_id: str, host_id: str) -> bool:
+async def cleanup_remote_session_worktree(
+    request: Request, session_id: str, host_id: str, *, delete_branch: bool = True
+) -> bool:
     """Delegate only host-local cleanup; the caller still owns runner/session deletion."""
     coordinator = _current.get()
     if coordinator is None:
@@ -74,7 +76,9 @@ async def cleanup_remote_session_worktree(request: Request, session_id: str, hos
     if route is None or coordinator.local(route):
         return False
     await asyncio.to_thread(check_backend_work)
-    await coordinator.transport.cleanup_session_worktree(request, route, session_id)
+    await coordinator.transport.cleanup_session_worktree(
+        request, route, session_id, delete_branch=delete_branch
+    )
     await asyncio.to_thread(check_backend_work)
     return True
 
@@ -294,7 +298,7 @@ class ReplicaCoordinator:
             task.cancel("backend is stopping")
         if launches:
             await asyncio.gather(*(task for task, _ in launches), return_exceptions=True)
-        if self._cleanup:
+        while self._cleanup:
             await asyncio.gather(*self._cleanup, return_exceptions=True)
         for owned in list(self._owned.values()):
             with workspace_scope(owned.route.workspace_id):
@@ -649,7 +653,19 @@ class ReplicaCoordinator:
             if fence is not None:
                 fence.lost = True
             task.cancel("backend ownership changed")
-        for ws in list(entry.connections.values()):
-            if ws is not None:
+        sockets = [ws for ws in entry.connections.values() if ws is not None]
+        if sockets:
+
+            async def close_socket(ws: WebSocket) -> None:
                 with suppress(Exception):
-                    await ws.close(code=1001, reason="backend ownership changed")
+                    await asyncio.wait_for(
+                        ws.close(code=1001, reason="backend ownership changed"), timeout=2
+                    )
+
+            async def close_sockets() -> None:
+                with work_fence_scope(None):
+                    await asyncio.gather(*(close_socket(ws) for ws in sockets))
+
+            cleanup = asyncio.create_task(close_sockets())
+            self._cleanup.add(cleanup)
+            cleanup.add_done_callback(self._cleanup.discard)

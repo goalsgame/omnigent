@@ -2960,6 +2960,7 @@ def register_core_routes(
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
                 delete_worktree=body.delete_worktree,
+                request=request,
             )
         elif body.archived is False:
             # Unarchive (including Undo, which re-PATCHes archived=false within

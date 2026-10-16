@@ -3161,13 +3161,19 @@ def register_events_routes(
         return conv, user_id
 
     async def _cleanup_worktree(
-        request: Request, conv: Conversation, *, local_only: bool = False
+        request: Request,
+        conv: Conversation,
+        *,
+        local_only: bool = False,
+        delete_branch: bool = True,
     ) -> None:
         if conv.git_branch is not None and conv.workspace is not None and conv.host_id is not None:
             if not local_only:
                 from omnigent.server.replication import cleanup_remote_session_worktree
 
-                if await cleanup_remote_session_worktree(request, conv.id, conv.host_id):
+                if await cleanup_remote_session_worktree(
+                    request, conv.id, conv.host_id, delete_branch=delete_branch
+                ):
                     return
             from omnigent.server.replication import reserve_managed_placement
             from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
@@ -3177,9 +3183,9 @@ def register_events_routes(
                     host_id=conv.host_id,
                     worktree_path=conv.workspace,
                     branch=conv.git_branch,
-                    delete_branch=True,
+                    delete_branch=delete_branch,
                     host_registry=getattr(request.app.state, "host_registry", None),
-                    reason="session-delete",
+                    reason="session-delete" if delete_branch else "session-archive",
                     expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                     conversation_store=conversation_store,
                     exclude_conversation_id=conv.id,
@@ -3187,10 +3193,23 @@ def register_events_routes(
                 )
 
     @router.delete("/sessions/{session_id}/resources/worktree")
-    async def cleanup_session_worktree(request: Request, session_id: str) -> dict[str, str]:
-        """Remove a session's stored worktree on its host, requiring owner access."""
-        conv, _ = await _owned_delete_session(request, session_id)
-        await _cleanup_worktree(request, conv, local_only=True)
+    async def cleanup_session_worktree(
+        request: Request, session_id: str, delete_branch: bool = True
+    ) -> dict[str, str]:
+        """Clean the saved host worktree; archive cleanup retains its branch."""
+        if delete_branch:
+            conv, _ = await _owned_delete_session(request, session_id)
+        else:
+            user_id = _require_user(request, auth_provider)
+            await _require_access(
+                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            )
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+            if not conv.archived:
+                return {"status": "skipped"}
+        await _cleanup_worktree(request, conv, local_only=True, delete_branch=delete_branch)
         return {"status": "ok"}
 
     # ── DELETE /sessions/{session_id} ──────────────────────────────

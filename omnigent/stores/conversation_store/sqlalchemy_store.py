@@ -3602,7 +3602,8 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> bool:
         """Clear only a matching model selection with an atomic settings compare-and-swap."""
         workspace_id = current_workspace_id()
-        with self._conv_session("clear_model_override_if_matches") as session:
+
+        def clear(session: Session) -> bool:
             original = session.scalar(
                 select(SqlConversation.session_overrides).where(
                     SqlConversation.workspace_id == workspace_id,
@@ -3634,6 +3635,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
             )
             return result.rowcount == 1
+
+        return run_write_transaction(
+            self._conv_session_immediate, "clear_model_override_if_matches", clear
+        )
 
     def rename_conversation_if_title_matches(
         self,

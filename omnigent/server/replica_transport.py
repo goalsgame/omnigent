@@ -295,7 +295,7 @@ class PeerTransport:
         ]
 
     async def cleanup_session_worktree(
-        self, request: Request, route: BackendRoute, session_id: str
+        self, request: Request, route: BackendRoute, session_id: str, *, delete_branch: bool = True
     ) -> None:
         """Ask the host owner to clean the stored worktree with caller authorization."""
         from starlette.exceptions import HTTPException
@@ -306,7 +306,7 @@ class PeerTransport:
             "method": "DELETE",
             "path": path,
             "raw_path": path.encode(),
-            "query_string": b"",
+            "query_string": b"" if delete_branch else b"delete_branch=false",
         }
         # This is a separate bodyless operation, even if the caller supplied
         # an ignored DELETE body on the session endpoint.

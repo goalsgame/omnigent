@@ -876,6 +876,7 @@ async def _archive_stop(
     host_registry: Any,
     *,
     delete_worktree: bool = False,
+    request: Request | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -904,6 +905,7 @@ async def _archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param request: Original authorized request for cross-replica cleanup.
     :param delete_worktree: After the stop, also remove the session's
         server-created worktree directory (the branch is kept).
     """
@@ -964,17 +966,27 @@ async def _archive_stop(
         from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
         try:
-            await _facade._remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=conv.workspace,
-                branch=conv.git_branch,
-                delete_branch=False,
-                host_registry=host_registry,
-                reason="session-archive",
-                expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
-                conversation_store=conversation_store,
-                exclude_conversation_id=session_id,
+            from omnigent.server.replication import (
+                cleanup_remote_session_worktree,
+                reserve_managed_placement,
             )
+
+            if request is not None and await cleanup_remote_session_worktree(
+                request, session_id, conv.host_id, delete_branch=False
+            ):
+                return
+            async with reserve_managed_placement(conv.host_id):
+                await _facade._remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=False,
+                    host_registry=host_registry,
+                    reason="session-archive",
+                    expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=session_id,
+                )
         except Exception:  # noqa: BLE001
             _logger.warning(
                 "Archive worktree cleanup failed for %s",
@@ -991,6 +1003,7 @@ def _spawn_archive_stop(
     host_registry: Any = None,
     *,
     delete_worktree: bool = False,
+    request: Request | None = None,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -1018,6 +1031,7 @@ def _spawn_archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param request: Original authorized request for cross-replica cleanup.
     :param delete_worktree: Forwarded to :func:`_archive_stop`.
     """
     # Replace any pending stop from an earlier archive of this session.
@@ -1038,9 +1052,12 @@ def _spawn_archive_stop(
             runner_router,
             host_registry,
             delete_worktree=delete_worktree,
+            request=request,
         )
 
-    task = asyncio.create_task(_stop_after_grace())
+    from omnigent.server.replication import create_connection_task
+
+    task = create_connection_task(_stop_after_grace())
     _pending_archive_stops[session_id] = task
     _detached_stop_tasks.add(task)
 
