@@ -469,6 +469,10 @@ class _FakeRunnerRouter:
 
 @pytest.fixture
 def runner_globals_reset() -> Iterator[None]:
+    from omnigent.server.routes.sessions import get_server_runner_router, set_server_runner_router
+
+    prior_server_router = get_server_runner_router()
+    set_server_runner_router(None)
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
     prior_direct = _globals._runner_direct_attach_resolver
@@ -479,6 +483,7 @@ def runner_globals_reset() -> Iterator[None]:
     set_runner_client(prior_client)
     set_runner_router(prior_router)
     set_runner_direct_attach_resolver(prior_direct)
+    set_server_runner_router(prior_server_router)
 
 
 @pytest.fixture

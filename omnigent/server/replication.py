@@ -228,6 +228,7 @@ def create_runner_recovery_task(
             key = (route.workspace_id, route.kind, route.resource_id)
             fence.routes = {key: route}
             fence.connection_tokens[key] = route.connection_token or route.token
+            admission.recovery_fences.append(fence)
         coordinator.retain_task(task)
     return task
 
@@ -271,6 +272,14 @@ def create_runner_relay_task(
 class _RunnerAdmission:
     route: BackendRoute
     nonce: str
+    recovery_fences: list[BackendWorkFence] = field(
+        default_factory=list, compare=False, repr=False
+    )
+
+    def invalidate(self) -> None:
+        # Keep these references after task cancellation: SQL workers may still run.
+        for fence in self.recovery_fences:
+            fence.lost = True
 
 
 @dataclass
@@ -627,6 +636,10 @@ class ReplicaCoordinator:
                         admission = _RunnerAdmission(route, uuid.uuid4().hex)
                         key = (route.workspace_id, resource_id)
                         previous = self._runner_connections.get(key)
+                        if previous is not None and previous[1] is not ws:
+                            superseded = previous[1].scope.get("omnigent.runner_admission")
+                            if isinstance(superseded, _RunnerAdmission):
+                                superseded.invalidate()
                         self._runner_connections[key] = (admission.nonce, ws)
                         ws.scope["omnigent.runner_admission"] = admission
                         if previous is not None and previous[1] is not ws:
@@ -655,6 +668,9 @@ class ReplicaCoordinator:
                     yield True
         finally:
             if kind == "runner":
+                admitted = ws.scope.get("omnigent.runner_admission")
+                if isinstance(admitted, _RunnerAdmission):
+                    admitted.invalidate()
                 key = (route.workspace_id, resource_id)
                 current = self._runner_connections.get(key)
                 if current is not None and current[1] is ws:

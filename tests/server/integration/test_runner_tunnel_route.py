@@ -2679,3 +2679,97 @@ async def test_recovery_worker_rejects_lease_transfer(db_uri, host_bound, transf
             await comm.send_input({"type": "websocket.disconnect", "code": 1000})
             await comm.wait(timeout=budget(5))
         await coordinator.aclose()
+
+
+@pytest.mark.parametrize("write", ["error", "binding"])
+async def test_host_bound_recovery_replacement_revokes_only_its_admission(db_uri, write):
+    from types import SimpleNamespace
+
+    from omnigent.server.replication import create_runner_recovery_task
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    recovered, unrelated_release = asyncio.Event(), asyncio.Event()
+    failures = []
+
+    def old_write():
+        started.set()
+        assert release.wait(timeout=budget(10))
+        try:
+            if write == "error":
+                coordinator.conversations.delete_label(conv.id, "last_task_error")
+            else:
+                coordinator.conversations.replace_runner_id(conv.id, "stale-child")
+        except asyncio.CancelledError:
+            failures.append("fenced")
+            raise
+        finally:
+            finished.set()
+
+    async def recover(runner_id, connection):
+        if connection.hello.connection_id == "old":
+            await asyncio.to_thread(old_write)
+        else:
+            await asyncio.to_thread(
+                coordinator.conversations.set_labels, conv.id, {"last_task_error": "replacement"}
+            )
+            await asyncio.to_thread(
+                coordinator.conversations.replace_runner_id, conv.id, "replacement-child"
+            )
+            recovered.set()
+
+    route, coordinator = _replicated_runner_route(db_uri, host_bound=True, on_connect=recover)
+    conv = coordinator.conversations.create_conversation(runner_id="original-child")
+    hid = "51dc949aba31e24ca8f047d6fba31a0d"
+    other_conv = coordinator.conversations.create_conversation(
+        host_id=hid, workspace="/other", runner_id="unrelated-runner"
+    )
+
+    async def close(**kwargs):
+        pass
+
+    other_ws = SimpleNamespace(scope={}, close=close)
+    old = new = unrelated = None
+
+    async def other_recovery():
+        await unrelated_release.wait()
+        await asyncio.to_thread(
+            coordinator.conversations.set_labels, other_conv.id, {"healthy": "yes"}
+        )
+
+    try:
+        async with coordinator.connection(other_ws, "runner", "unrelated-runner"):
+            unrelated = create_runner_recovery_task(other_recovery(), other_ws)
+            old = await _connect_route(route.app, _TUNNEL_PATH)
+            await _send_hello(old, route.registry, connection_id="old")
+            assert await asyncio.to_thread(started.wait, budget(5))
+            host_before = coordinator.store.get("host", hid)
+            nonce_before = coordinator._runner_connections[(0, _RUNNER_ID)][0]
+            new = await _connect_route(route.app, _TUNNEL_PATH)
+            await _send_hello(new, route.registry, connection_id="new")
+            await asyncio.wait_for(recovered.wait(), budget(5))
+            host_after = coordinator.store.get("host", hid)
+            assert host_after.token == host_before.token
+            assert host_after.connection_token == host_before.connection_token
+            assert coordinator._runner_connections[(0, _RUNNER_ID)][0] != nonce_before
+            unrelated_release.set()
+            await unrelated
+            release.set()
+            assert await asyncio.to_thread(finished.wait, budget(5))
+            current = coordinator.conversations.get_conversation(conv.id)
+            assert failures == ["fenced"]
+            assert current.labels["last_task_error"] == "replacement"
+            assert current.runner_id == "replacement-child"
+            assert (
+                coordinator.conversations.get_conversation(other_conv.id).labels["healthy"]
+                == "yes"
+            )
+    finally:
+        release.set()
+        unrelated_release.set()
+        if unrelated is not None:
+            await asyncio.gather(unrelated, return_exceptions=True)
+        for comm in (old, new):
+            if comm is not None and not comm.future.done():
+                await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+                await comm.wait(timeout=budget(5))
+        await coordinator.aclose()
