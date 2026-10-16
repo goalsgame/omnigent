@@ -310,7 +310,13 @@ async def test_remote_initial_owner_prevents_scheduling_launch(db_uri):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("heartbeat", [False, True])
-async def test_nested_host_lease_loss_fences_launch_with_live_session_lease(db_uri, heartbeat):
+@pytest.mark.parametrize("after_scope", [False, True])
+@pytest.mark.parametrize("boundary", ["provider", "binding"])
+async def test_nested_host_lease_loss_fences_launch_with_live_session_lease(
+    db_uri, heartbeat, after_scope, boundary
+):
+    from types import SimpleNamespace
+
     from omnigent.server.replication import create_session_launch_task
     from omnigent.stores.backend_route_store import BackendRouteStore
 
@@ -323,23 +329,42 @@ async def test_nested_host_lease_loss_fences_launch_with_live_session_lease(db_u
     other = BackendRouteStore(db_uri, "other", "http://127.0.0.1:8002")
     started, gate = asyncio.Event(), asyncio.Event()
     calls = []
+    conv = coordinator.conversations.create_conversation()
+
+    async def finish():
+        started.set()
+        await gate.wait()
+        from omnigent.db.backend_work_fence import fenced_to_thread
+
+        if boundary == "binding":
+            await asyncio.to_thread(coordinator.conversations.replace_runner_id, conv.id, "stale")
+        else:
+            await fenced_to_thread(calls.append, "must not execute")
+
+    async def close(**kwargs):
+        pass
 
     async def launch():
-        async with coordinator.reserve("nested-host"):
-            started.set()
-            await gate.wait()
-            from omnigent.db.backend_work_fence import fenced_to_thread
-
-            await fenced_to_thread(calls.append, "must not execute")
+        if after_scope:
+            async with coordinator.connection(
+                SimpleNamespace(scope={}, close=close), "host", "nested-host"
+            ):
+                async with coordinator.reserve("nested-host"):
+                    pass
+            # Host disconnected and reservation exited; the launch still runs.
+            await finish()
+        else:
+            async with coordinator.reserve("nested-host"):
+                await finish()
 
     task = None
     try:
         with replication_scope(coordinator):
-            task = await create_session_launch_task("new-session", launch())
+            task = await create_session_launch_task(conv.id, launch())
         await started.wait()
         route = coordinator.store.get("host", "nested-host")
         assert task in coordinator._owned[(0, "host", "nested-host")].tasks.values()
-        assert coordinator.store.get("session", "new-session") is not None
+        assert coordinator.store.get("session", conv.id) is not None
         coordinator.store.release(route)
         replacement = other.claim("host", "nested-host")
         if heartbeat:
@@ -349,8 +374,9 @@ async def test_nested_host_lease_loss_fences_launch_with_live_session_lease(db_u
         assert isinstance(outcome, asyncio.CancelledError)
         await asyncio.gather(*coordinator._cleanup)
         assert calls == []
+        assert coordinator.conversations.get_conversation(conv.id).runner_id is None
         assert other.get("host", "nested-host").token == replacement.token
-        assert coordinator.store.get("session", "new-session") is None
+        assert coordinator.store.get("session", conv.id) is None
     finally:
         gate.set()
         if task is not None:

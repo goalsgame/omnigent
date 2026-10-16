@@ -177,6 +177,7 @@ class _OwnedResource:
     route: BackendRoute
     connections: dict[str, WebSocket | None] = field(default_factory=dict)
     tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    retained_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 @dataclass
@@ -389,16 +390,23 @@ class ReplicaCoordinator:
         if held is None:
             return
         key, entry = held
-        if self._owned.get(key) is not entry or task in entry.tasks.values():
+        if self._owned.get(key) is not entry or task in entry.retained_tasks:
             return
         reference = uuid.uuid4().hex
         entry.connections[reference] = None
         entry.tasks[reference] = task
+        entry.retained_tasks.add(task)
         fence = self._task_fences.get(task)
-        if fence is not None:
-            fence.routes[key] = entry.route
+        while fence is not None:
+            # Retention survives nested scope exit, including its parent work.
+            # Never replace an older generation to revive work after lease loss.
+            previous = fence.routes.setdefault(key, entry.route)
+            if previous.token != entry.route.token:
+                fence.lost = True
+            fence = fence.parent
 
         def completed(_task: asyncio.Task[None]) -> None:
+            entry.retained_tasks.discard(task)
             cleanup = asyncio.create_task(self._drop_reference(key, entry, reference))
             self._cleanup.add(cleanup)
             cleanup.add_done_callback(self._cleanup.discard)
