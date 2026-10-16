@@ -1469,3 +1469,64 @@ def test_incompatible_harness_is_rejected_during_configuration(routed, explicit)
         InferenceProxyConfig.parse(raw)
     raw["harnesses"] = ["pi-native"]
     assert InferenceProxyConfig.parse(raw) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False])
+async def test_vertex_tool_signature_survives_proxy_and_replay(routed, streaming):
+    service, app, conv, _, calls = routed
+    tool_call = {
+        "id": "call-echo",
+        "type": "function",
+        "function": {"name": "echo", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "opaque-replay-data"}},
+    }
+    provider_message = {"role": "assistant", "tool_calls": [tool_call]}
+
+    def upstream(request):
+        calls.append(request)
+        if streaming:
+            frame = {"choices": [{"index": 0, "delta": provider_message}]}
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content="data: " + json.dumps(frame) + "\n\ndata: [DONE]\n\n",
+            )
+        return httpx.Response(200, json={"choices": [{"message": provider_message}]})
+
+    service.transport = httpx.MockTransport(upstream)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        headers = {"Authorization": "Bearer " + token}
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers=headers,
+            json={"model": "gemini-alias", "stream": streaming, "messages": []},
+        )
+        assert response.status_code == 200
+        body = json.loads(response.text.splitlines()[0][6:]) if streaming else response.json()
+        assistant = body["choices"][0]["delta" if streaming else "message"]
+        assert assistant["reasoning_details"][0]["data"] == "opaque-replay-data"
+        assistant["tool_calls"][0].pop("extra_content")
+        replay = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers=headers,
+            json={
+                "model": "gemini-alias",
+                "stream": streaming,
+                "messages": [
+                    assistant,
+                    {"role": "tool", "tool_call_id": "call-echo", "content": "ok"},
+                ],
+            },
+        )
+        assert replay.status_code == 200
+    forwarded = json.loads(calls[-1].content)["messages"][0]
+    assert "reasoning_details" not in forwarded
+    assert (
+        forwarded["tool_calls"][0]["extra_content"]["google"]["thought_signature"]
+        == "opaque-replay-data"
+    )
+    assert service.active_requests == 0

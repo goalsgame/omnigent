@@ -31,6 +31,7 @@ from omnigent.server.inference_upstreams import (
     InferenceUpstream,
     parse_upstreams,
 )
+from omnigent.server.inference_vertex import vertex_response_bytes
 from omnigent.stores.host_store import host_is_live
 
 _AUDIENCE = "omnigent-session-inference"
@@ -715,7 +716,12 @@ class InferenceProxy:
 
             async def chunks():
                 try:
-                    async for chunk in response.aiter_bytes():
+                    source = (
+                        vertex_response_bytes(response)
+                        if selected.kind == "vertex-openai"
+                        else response.aiter_bytes()
+                    )
+                    async for chunk in source:
                         yield chunk
                 finally:
                     await cleanup()
