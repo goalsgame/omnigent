@@ -903,9 +903,12 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
     assert len(captured) == 1
 
 
-@pytest.mark.parametrize("lose_runner", [False, True])
+@pytest.mark.parametrize(
+    ("co_located", "loss"),
+    [(False, None), (True, None), (False, "runner"), (True, "runner"), (False, "host")],
+)
 async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
-    app, db_uri, monkeypatch, lose_runner
+    app, db_uri, monkeypatch, co_located, loss
 ):
     from ipaddress import ip_network
 
@@ -928,6 +931,9 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
     other.include_router(app.router)
     other.state._state.update(app.state._state)
     other.state.host_registry = HostRegistry()
+    if co_located:
+        other.state.host_registry = app.state.host_registry
+        app.state.host_registry = HostRegistry()
     a, b = (
         ReplicaCoordinator(
             ReplicationConfig(f"http://127.0.0.1:{port}", (ip_network("127.0.0.0/8"),), b"s" * 32),
@@ -937,6 +943,20 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
         )
         for port, backend in ((8001, app), (8002, other))
     )
+    host_owner = b if co_located else a
+    if loss == "host":
+        from omnigent.server.routes import _host_worktree
+
+        original_list = _host_worktree.list_worktrees_on_host
+
+        async def lose_while_listing(**kwargs):
+            result = await original_list(**kwargs)
+            with work_fence_scope(None):
+                a.store.release(a.store.get("host", _HOST_ID))
+                b.store.claim("host", _HOST_ID)
+            return result
+
+        monkeypatch.setattr(_host_worktree, "list_worktrees_on_host", lose_while_listing)
     seen = []
 
     def record(name, backend):
@@ -966,7 +986,7 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
 
     def runner(request):
         runner_calls.append((request.method, request.url.path))
-        if lose_runner:
+        if loss == "runner":
             with work_fence_scope(None):
                 b.store.release(b.store.get("runner", "standalone-runner"))
                 a.store.claim("runner", "standalone-runner")
@@ -993,7 +1013,7 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
         replica.transport._client._transport = Dispatcher()
     try:
         async with (
-            a.request_placement(_HOST_ID),
+            host_owner.request_placement(_HOST_ID),
             b.request_resource("runner", "standalone-runner"),
         ):
             with work_fence_scope(None):
@@ -1004,20 +1024,32 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
                     operation = client.request(
                         "DELETE", f"/v1/sessions/{sid}?delete_branch=true", json={"ignored": True}
                     )
-                    if lose_runner:
-                        with pytest.raises(asyncio.CancelledError):
-                            await operation
+                    if loss is not None:
+                        if loss == "host":
+                            failed = await operation
+                            assert failed.status_code == 499, failed.text
+                        else:
+                            with pytest.raises(asyncio.CancelledError):
+                                await operation
                         assert captured == []
+                        assert runner_calls == [("DELETE", f"/v1/sessions/{sid}")]
+                        if loss == "host":
+                            assert b.store.get("host", _HOST_ID).replica_id == b.store.replica_id
                         assert conversations.get_conversation(sid) is not None
-                        assert seen == [("b", "DELETE", f"/v1/sessions/{sid}")]
+                        expected = [("b", "DELETE", f"/v1/sessions/{sid}")]
+                        if loss == "host":
+                            expected.append(
+                                ("a", "DELETE", f"/v1/sessions/{sid}/resources/worktree")
+                            )
+                        assert seen == expected
                         return
                     response = await operation
             assert response.status_code == 200, response.text
             assert runner_calls == [("DELETE", f"/v1/sessions/{sid}")]
-            assert seen == [
-                ("b", "DELETE", f"/v1/sessions/{sid}"),
-                ("a", "DELETE", f"/v1/sessions/{sid}/resources/worktree"),
-            ]
+            expected = [("b", "DELETE", f"/v1/sessions/{sid}")]
+            if not co_located:
+                expected.append(("a", "DELETE", f"/v1/sessions/{sid}/resources/worktree"))
+            assert seen == expected
             assert len(captured) == 1
             assert captured[0].worktree_path == _WORKTREE_PATH
             assert conversations.get_conversation(sid) is None
