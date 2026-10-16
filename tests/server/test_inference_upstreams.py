@@ -184,3 +184,77 @@ async def test_cancellation_cannot_start_concurrent_adc_refresh(monkeypatch):
     release.set()
     assert await second == "google-access-token"
     assert calls == ["refresh"]
+
+
+def test_refresh_waiters_do_not_starve_executor_after_cancellation(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import google.auth
+
+    started, release = threading.Event(), threading.Event()
+    credentials = SimpleNamespace(valid=False, token=None)
+    calls = []
+
+    def refresh(request):
+        calls.append("refresh")
+        started.set()
+        assert release.wait(5)
+        credentials.token = "google-access-token"
+        credentials.valid = True
+
+    credentials.refresh = refresh
+    monkeypatch.setattr(google.auth, "default", lambda **kwargs: (credentials, None))
+
+    async def probe():
+        # A private loop owns this bounded default executor; other tests and
+        # their database fixtures retain their own executor configuration.
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+        broker = GoogleInferenceCredential()
+        first = asyncio.create_task(broker.credential())
+        waiters = []
+        try:
+            assert await asyncio.to_thread(started.wait, 3)
+            waiters = [asyncio.create_task(broker.credential()) for _ in range(12)]
+            await asyncio.sleep(0)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert (
+                await asyncio.wait_for(asyncio.to_thread(lambda: "database-work"), 1)
+                == "database-work"
+            )
+            assert calls == ["refresh"]
+        finally:
+            release.set()
+            await asyncio.gather(first, *waiters, return_exceptions=True)
+        assert await broker.credential() == "google-access-token"
+        assert calls == ["refresh"]
+
+    asyncio.run(probe())
+
+
+@pytest.mark.asyncio
+async def test_shared_refresh_failure_reaches_waiters_and_can_be_retried(monkeypatch):
+    import google.auth
+
+    credentials = SimpleNamespace(valid=False, token=None)
+    attempts = []
+
+    def refresh(request):
+        attempts.append("refresh")
+        if len(attempts) == 1:
+            raise ValueError("Refresh unavailable")
+        credentials.token = "google-access-token"
+        credentials.valid = True
+
+    credentials.refresh = refresh
+    monkeypatch.setattr(google.auth, "default", lambda **kwargs: (credentials, None))
+    broker = GoogleInferenceCredential()
+    results = await asyncio.gather(
+        broker.credential(), broker.credential(), return_exceptions=True
+    )
+    assert all(isinstance(result, ValueError) for result in results)
+    assert attempts == ["refresh"]
+    assert await broker.credential() == "google-access-token"
+    assert attempts == ["refresh", "refresh"]

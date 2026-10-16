@@ -174,6 +174,7 @@ class GoogleInferenceCredential:
     def __init__(self) -> None:
         self._credentials: Any = None
         self._lock = threading.Lock()
+        self._refresh_task: asyncio.Task[str] | None = None
 
     def _token(self) -> str:
         with self._lock:
@@ -204,5 +205,19 @@ class GoogleInferenceCredential:
             raise ValueError("Google inference authentication unavailable")
         return token
 
+    @staticmethod
+    def _observe_refresh(task: asyncio.Task[str]) -> None:
+        # A cancelled HTTP request can leave no waiter to retrieve a failed
+        # refresh. Observe it without changing what remaining waiters receive.
+        if not task.cancelled():
+            task.exception()
+
     async def credential(self) -> str:
-        return await asyncio.to_thread(self._token)
+        task = self._refresh_task
+        if task is None or task.done():
+            task = asyncio.create_task(asyncio.to_thread(self._token))
+            task.add_done_callback(self._observe_refresh)
+            self._refresh_task = task
+        # Waiters consume no executor workers and cancellation cannot interrupt
+        # the shared refresh or allow a second refresh to start beside it.
+        return await asyncio.shield(task)
