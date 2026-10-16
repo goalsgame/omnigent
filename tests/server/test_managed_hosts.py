@@ -5238,32 +5238,19 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     calls: list[dict[str, object]] = []
     tracker = ManagedLaunchTracker()
 
-    # The racing message has to reach its tracker check while the winner's claim
-    # is still UNSETTLED, because an unsettled claim is what it must rendezvous
-    # on. Both callers await asyncio.to_thread twice before that check, and an
-    # executor hop takes an unpredictable number of event-loop turns to deliver,
-    # so holding the winner open for a fixed number of turns does not establish
-    # the ordering: on a loaded machine the racer arrives after the claim
-    # settled, takes the retry branch, and kicks a second launch. That retry is
-    # intended behaviour and is guarded in production by the is_online check
-    # above, which this test stubs False forever — so a fixed-turn hold made the
-    # test fail for a reason unrelated to the invariant.
-    #
-    # Hold until the racer has demonstrably checked instead. Three reads are the
-    # whole exchange: the winner checks and re-reads after kicking, and the racer
-    # checks once and rendezvouses.
+    # Hold the launch until both racing requests are waiting on its entry.
+    # Tracker inspection by cancellation bookkeeping must not release the gate.
     raced = asyncio.Event()
-    reads = 0
-    tracker_get = tracker.get
+    waiters = set()
+    await_settled = orchestration._await_settled_managed_launch
 
-    def _counting_get(session_id: str) -> ManagedLaunch | None:
-        nonlocal reads
-        reads += 1
-        if reads >= 3:
+    async def parked(launch):
+        waiters.add(asyncio.current_task())
+        if len(waiters) == 2:
             raced.set()
-        return tracker_get(session_id)
+        return await await_settled(launch)
 
-    monkeypatch.setattr(tracker, "get", _counting_get)
+    monkeypatch.setattr(orchestration, "_await_settled_managed_launch", parked)
 
     async def _capture(**kwargs: object) -> None:
         calls.append(kwargs)

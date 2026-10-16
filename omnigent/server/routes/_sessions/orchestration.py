@@ -4746,7 +4746,7 @@ def _kick_managed_relaunch(
             session_id,
             extra={"session_id": session_id},
         )
-    from omnigent.server.replication import create_managed_launch_task
+    from omnigent.server.replication import create_managed_launch_task, managed_launch_cancellation
 
     relaunch_task = create_managed_launch_task(
         _run_managed_launch(
@@ -4762,7 +4762,8 @@ def _kick_managed_relaunch(
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,
-        )
+        ),
+        on_cancel=managed_launch_cancellation(tracker, session_id),
     )
     from omnigent.server.replication import retain_managed_task
 
@@ -4846,7 +4847,7 @@ def _kick_managed_wake_impl(
             session_id,
             extra={"session_id": session_id},
         )
-    from omnigent.server.replication import create_managed_launch_task
+    from omnigent.server.replication import create_managed_launch_task, managed_launch_cancellation
 
     wake_task = create_managed_launch_task(
         _run_managed_wake(
@@ -4860,7 +4861,8 @@ def _kick_managed_wake_impl(
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             agent_store=wake_agent_store,
             agent_id=conv.agent_id,
-        )
+        ),
+        on_cancel=managed_launch_cancellation(tracker, session_id),
     )
     from omnigent.server.replication import retain_managed_task
 

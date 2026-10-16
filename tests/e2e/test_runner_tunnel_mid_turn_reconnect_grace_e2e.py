@@ -272,7 +272,9 @@ class _ReconnectStack:
         self._binding_token = uuid.uuid4().hex + uuid.uuid4().hex
         self.runner_id = token_bound_runner_id(self._binding_token)
         self._database_uri = f"sqlite:///{tmp_path / 'reconnect.db'}"
-        self._conversation_database_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+        self._conversation_database_uri = (
+            self._database_uri if replication else f"sqlite:///{tmp_path / 'conversations.db'}"
+        )
         self._artifact_dir = tmp_path / "artifacts"
         self._artifact_dir.mkdir()
         self._replication_config = tmp_path / "replication.yaml" if replication else None

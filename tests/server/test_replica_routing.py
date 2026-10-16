@@ -27,6 +27,14 @@ def coordinator(db_uri, port):
     )
 
 
+@pytest.fixture(autouse=True)
+def supported_database(db_uri):
+    from sqlalchemy.engine import make_url
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+
+
 @pytest.mark.asyncio
 async def test_two_cold_requests_choose_one_backend_and_retain_background_launch(db_uri):
     a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
@@ -215,16 +223,33 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_u
     conv = a.conversations.create_conversation(host_id=hid, workspace="/source")
     calls = []
 
-    def endpoint(name):
+    def endpoint(name, replica):
         async def serve(scope, receive, send):
-            calls.append((name, await Request(scope, receive).json()))
-            await JSONResponse({"backend": name})(scope, receive, send)
+            request = Request(scope, receive)
+            if scope["path"] == "/v1/runners":
+                route = await replica.runner_route("new-runner")
+                data = (
+                    [{"runner_id": "new-runner", "online": True}]
+                    if route is not None and replica.local(route)
+                    else []
+                )
+                data.extend(await replica.remote_runners(request))
+                response = {"data": data}
+            else:
+                if request.method == "PATCH":
+                    body = await request.json()
+                    replica.conversations.replace_runner_id(conv.id, body["runner_id"])
+                else:
+                    body = await request.body()
+                calls.append((name, body))
+                response = {"backend": name}
+            await JSONResponse(response)(scope, receive, send)
 
         return serve
 
     apps = {
-        8001: ReplicaRoutingMiddleware(endpoint("a"), a, None),
-        8002: ReplicaRoutingMiddleware(endpoint("b"), b, None),
+        8001: ReplicaRoutingMiddleware(endpoint("a", a), a, None),
+        8002: ReplicaRoutingMiddleware(endpoint("b", b), b, None),
     }
 
     class Dispatcher(httpx.AsyncBaseTransport):
@@ -250,6 +275,21 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_u
             assert response.status_code == 200
             assert response.json() == {"backend": "b"}
             assert calls == [("b", {"runner_id": "new-runner"})]
+            bound = a.conversations.get_conversation(conv.id)
+            assert bound.runner_id == "new-runner" and bound.host_id == hid
+            assert (await a.runner_route("new-runner")).replica_id == b.store.replica_id
+            for path, method in [
+                (f"/v1/sessions/{conv.id}", "GET"),
+                (f"/v1/sessions/{conv.id}/messages", "POST"),
+                ("/v1/runners/new-runner", "GET"),
+            ]:
+                followup = await client.request(method, path)
+                assert followup.status_code == 200
+                assert followup.json() == {"backend": "b"}
+            inventory = await client.get("/v1/runners")
+            assert inventory.status_code == 200
+            assert inventory.json() == {"data": [{"runner_id": "new-runner", "online": True}]}
+            assert all(name == "b" for name, _ in calls)
     finally:
         await a.aclose()
         await b.aclose()

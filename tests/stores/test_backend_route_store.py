@@ -9,6 +9,14 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.stores.backend_route_store import BackendRouteStore
 
 
+@pytest.fixture(autouse=True)
+def supported_database(db_uri):
+    from sqlalchemy.engine import make_url
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+
+
 @pytest.fixture
 def replicas(db_uri):
     uri = db_uri

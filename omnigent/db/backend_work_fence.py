@@ -62,7 +62,9 @@ def check_backend_work(session: Session | None = None) -> None:
     from omnigent.db.utils import get_or_create_engine
 
     engine = get_or_create_engine(fence.database_uri)
-    if session is not None and session.get_bind() is engine:
+    if session is not None:
+        if session.get_bind() is not engine:
+            raise ValueError("replication cannot fence writes to a separate database")
         fence.check(session)
     else:
         with Session(engine) as authority:

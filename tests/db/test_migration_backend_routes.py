@@ -16,6 +16,13 @@ _REVISION = "oh1a2b3c4d5e"
 def migrate(engine, uri, revision, *, downgrade=False):
     config = _build_alembic_config(uri)
     with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            from omnigent.db.cockroachdb import (
+                _crdb_server_version,
+                _prepare_crdb_schema_transaction,
+            )
+
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
         config.attributes["connection"] = connection
         (command.downgrade if downgrade else command.upgrade)(config, revision)
         connection.commit()
@@ -47,8 +54,9 @@ def test_upgrade_and_downgrade_preserve_existing_sessions(db_uri):
         assert store.get_conversation(original.id).title == "keep this session"
         migrate(engine, db_uri, _REVISION)
         assert_schema(engine)
-        routes = BackendRouteStore(db_uri, "a", "http://127.0.0.1:8001")
-        assert routes.claim("session", original.id).replica_id == "a"
+        if engine.dialect.name in {"sqlite", "postgresql"}:
+            routes = BackendRouteStore(db_uri, "a", "http://127.0.0.1:8001")
+            assert routes.claim("session", original.id).replica_id == "a"
         migrate(engine, db_uri, _PREVIOUS, downgrade=True)
         assert "omnigent_backend_routes" not in sa.inspect(engine).get_table_names()
         assert store.get_conversation(original.id).title == "keep this session"

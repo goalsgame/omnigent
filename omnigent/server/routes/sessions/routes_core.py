@@ -505,7 +505,10 @@ def register_core_routes(
         # session page immediately after this 201) already carries the
         # "provisioning" stage.
         _publish_sandbox_status(session_id, "provisioning")
-        from omnigent.server.replication import create_session_launch_task
+        from omnigent.server.replication import (
+            create_session_launch_task,
+            managed_launch_cancellation,
+        )
 
         launch_task = await create_session_launch_task(
             session_id,
@@ -525,6 +528,7 @@ def register_core_routes(
                 agent_store=agent_store,
                 agent_id=agent_id,
             ),
+            on_cancel=managed_launch_cancellation(managed_launches, session_id),
         )
         from omnigent.server.replication import retain_managed_task
 

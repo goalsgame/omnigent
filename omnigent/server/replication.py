@@ -27,6 +27,7 @@ from omnigent.stores.backend_route_store import BackendRoute, BackendRouteStore
 
 if TYPE_CHECKING:
     from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
     from omnigent.stores import ConversationStore
 
 _logger = logging.getLogger(__name__)
@@ -74,23 +75,47 @@ def placed_managed_launch(
     return placed
 
 
-def create_managed_launch_task(coroutine: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+def managed_launch_cancellation(
+    tracker: ManagedLaunchTracker, session_id: str
+) -> Callable[[], None]:
+    entry = tracker.get(session_id)
+
+    def interrupted() -> None:
+        if entry is None or tracker.get(session_id) is not entry or entry.settled.is_set():
+            return
+        reason = "Managed sandbox launch interrupted; retry the session"
+        tracker.fail(session_id, reason)
+        from omnigent.server.routes._sessions.helpers import _publish_sandbox_status
+
+        _publish_sandbox_status(session_id, "failed", error=reason)
+
+    return interrupted
+
+
+def create_managed_launch_task(
+    coroutine: Coroutine[Any, Any, None], *, on_cancel: Callable[[], None] | None = None
+) -> asyncio.Task[None]:
     coordinator = _current.get()
     if coordinator is None:
-        return asyncio.create_task(coroutine)
-    fence = BackendWorkFence(coordinator.database_uri)
-    held = _held.get()
-    if held is not None:
-        key, entry = held
-        fence.routes[key] = entry.route
-    task = asyncio.create_task(guarded_work(coroutine, fence))
-    fences = coordinator._task_fences
-    fences[task] = fence
+        task = asyncio.create_task(coroutine)
+        fences = None
+    else:
+        fence = BackendWorkFence(coordinator.database_uri)
+        held = _held.get()
+        if held is not None:
+            key, entry = held
+            fence.routes[key] = entry.route
+        task = asyncio.create_task(guarded_work(coroutine, fence))
+        fences = coordinator._task_fences
+        fences[task] = fence
 
     def completed(done: asyncio.Task[None]) -> None:
-        fences.pop(done, None)
+        if fences is not None:
+            fences.pop(done, None)
         # Cancellation before the wrapper starts must close the supplied coroutine.
         coroutine.close()
+        if done.cancelled() and on_cancel is not None:
+            on_cancel()
 
     task.add_done_callback(completed)
     return task
@@ -104,21 +129,26 @@ def retain_managed_task(task: asyncio.Task[None]) -> None:
 
 
 async def create_session_launch_task(
-    session_id: str, coroutine: Coroutine[Any, Any, None]
+    session_id: str,
+    coroutine: Coroutine[Any, Any, None],
+    *,
+    on_cancel: Callable[[], None] | None = None,
 ) -> asyncio.Task[None]:
     """Reserve the new session before scheduling any provider work."""
     coordinator = _current.get()
     if coordinator is None:
-        return create_managed_launch_task(coroutine)
+        return create_managed_launch_task(coroutine, on_cancel=on_cancel)
     try:
         async with coordinator.request_resource("session", session_id) as route:
             if not coordinator.local(route):
                 raise RuntimeError("new session is owned by another backend")
-            task = create_managed_launch_task(coroutine)
+            task = create_managed_launch_task(coroutine, on_cancel=on_cancel)
             coordinator.retain_task(task)
             return task
     except BaseException:
         coroutine.close()
+        if on_cancel is not None:
+            on_cancel()
         raise
 
 
@@ -143,6 +173,13 @@ class ReplicaCoordinator:
         conversations: ConversationStore,
         hosts: HostRegistry,
     ) -> None:
+        if (
+            conversations.storage_location != database_uri
+            or (conversations.conversation_storage_location or database_uri) != database_uri
+        ):
+            raise ValueError(
+                "replication requires one shared metadata and conversation database URI"
+            )
         self.config = config
         self.database_uri = database_uri
         self._task_fences: dict[asyncio.Task[None], BackendWorkFence] = {}
@@ -207,6 +244,9 @@ class ReplicaCoordinator:
         return None
 
     async def runner_route(self, runner_id: str) -> BackendRoute | None:
+        direct = await asyncio.to_thread(self.store.get, "runner", runner_id)
+        if direct is not None:
+            return direct
         host_id = await asyncio.to_thread(self._runner_host, runner_id)
         return await asyncio.to_thread(
             self.store.get, "host" if host_id else "runner", host_id or runner_id

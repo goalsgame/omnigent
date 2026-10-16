@@ -11,6 +11,14 @@ from omnigent.server.replication import ReplicaCoordinator, replication_scope, r
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
+@pytest.fixture(autouse=True)
+def supported_database(db_uri):
+    from sqlalchemy.engine import make_url
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_request_reference_transfers_to_background_task(db_uri, cancel):
@@ -437,3 +445,80 @@ def test_lifecycle_transaction_holds_placement_until_commit(db_uri):
                 with pytest.raises(TimeoutError):
                     future.result(timeout=0.1)
         assert future.result(timeout=5)
+
+
+def test_replication_rejects_separate_conversation_database(db_uri, tmp_path):
+    conversations = SqlAlchemyConversationStore(db_uri, f"sqlite:///{tmp_path / 'separate.db'}")
+    with pytest.raises(ValueError, match="one shared metadata and conversation database"):
+        ReplicaCoordinator(
+            ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+            db_uri,
+            conversations,
+            HostRegistry(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before_start", [False, True])
+async def test_canceled_launch_settles_tracker_and_allows_retry(db_uri, monkeypatch, before_start):
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.replication import create_session_launch_task, managed_launch_cancellation
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    tracker = ManagedLaunchTracker()
+    session_id = "retry-session"
+    tracker.begin(session_id)
+    original = tracker.get(session_id)
+    progress = []
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._publish_sandbox_status",
+        lambda sid, stage, error=None: progress.append((sid, stage, error)),
+    )
+    interrupted = managed_launch_cancellation(tracker, session_id)
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def blocked_launch():
+        started.set()
+        await gate.wait()
+
+    task = None
+    try:
+        with replication_scope(coordinator):
+            task = await create_session_launch_task(
+                session_id, blocked_launch(), on_cancel=interrupted
+            )
+        if before_start:
+            task.cancel()
+        else:
+            await started.wait()
+            coordinator.store.release(coordinator.store.get("session", session_id))
+            await coordinator._renew_once()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(*coordinator._cleanup)
+        assert original.settled.is_set() and "interrupted" in original.error
+        assert progress == [(session_id, "failed", original.error)]
+        tracker.begin(session_id)
+        retry_entry = tracker.get(session_id)
+        interrupted()  # A delayed callback must not settle a newer attempt.
+        assert not retry_entry.settled.is_set()
+
+        async def retry():
+            tracker.finish(session_id)
+
+        with replication_scope(coordinator):
+            task = await create_session_launch_task(
+                session_id, retry(), on_cancel=managed_launch_cancellation(tracker, session_id)
+            )
+        await task
+        assert retry_entry.settled.is_set() and retry_entry.error is None
+        assert tracker.get(session_id) is None
+    finally:
+        gate.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await coordinator.aclose()

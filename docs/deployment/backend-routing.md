@@ -6,6 +6,10 @@ provide a complete active/active deployment: cross-replica discovery events,
 scheduled-task coordination, and graceful inference-stream draining are still
 required before enabling multiple production backends.
 
+Replication requires metadata and conversations in one database, using the same
+database URI. Split-database replication is rejected because a placement lock
+cannot atomically fence a transaction in another database.
+
 All replicas must use the same PostgreSQL metadata database, account and
 authentication configuration, and shared artifact storage. Each replica needs
 its own directly reachable IP endpoint and the same peer authentication secret.

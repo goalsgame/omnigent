@@ -94,6 +94,8 @@ class ReplicaRoutingMiddleware:
                     return None
             elif self.coordinator.conversations.get_session_owner(session_id) != user:
                 return None
+        if conv.runner_id and self.coordinator.store.get("runner", conv.runner_id) is not None:
+            return ("runner", conv.runner_id)
         host = routing_host_id(conv, self.coordinator.conversations)
         return ("host", host) if host else ("session", session_id)
 
@@ -125,10 +127,14 @@ class ReplicaRoutingMiddleware:
         conv = await asyncio.to_thread(self.coordinator.conversations.get_conversation, canonical)
         if conv is None:
             return None
+        if conv.runner_id:
+            runner = await self.coordinator.runner_route(conv.runner_id)
+            if runner is not None:
+                return runner
         host = await asyncio.to_thread(routing_host_id, conv, self.coordinator.conversations)
         if host:
             return await asyncio.to_thread(self.coordinator.store.get, "host", host)
-        return await self.coordinator.runner_route(conv.runner_id) if conv.runner_id else None
+        return None
 
     async def _target(self, kind: str, resource_id: str) -> BackendRoute | None:
         if kind == "sessions":
