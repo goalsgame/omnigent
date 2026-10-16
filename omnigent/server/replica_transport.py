@@ -294,6 +294,35 @@ class PeerTransport:
             if isinstance(row, dict) and isinstance(row.get("runner_id"), str)
         ]
 
+    async def cleanup_session_worktree(
+        self, request: Request, route: BackendRoute, session_id: str
+    ) -> None:
+        """Ask the host owner to clean the stored worktree with caller authorization."""
+        from starlette.exceptions import HTTPException
+
+        path = f"/v1/sessions/{session_id}/resources/worktree"
+        scope: Scope = {
+            **request.scope,
+            "method": "DELETE",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+        }
+        headers = _headers(scope["headers"])
+        headers.append((PEER_HEADER, self._context(scope, route).encode()))
+        try:
+            response = await self._client.delete(
+                self._url(scope, route), headers=headers, timeout=180
+            )
+        except httpx.TransportError:
+            raise HTTPException(503, "Session host is reconnecting; retry shortly") from None
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", "Session worktree cleanup failed")
+            except (ValueError, AttributeError):
+                detail = "Session worktree cleanup failed"
+            raise HTTPException(response.status_code, detail)
+
     async def forward_websocket(self, ws: WebSocket, route: BackendRoute) -> None:
         headers = _headers(ws.scope["headers"], websocket=True)
         headers.append((PEER_HEADER, self._context(ws.scope, route).encode()))

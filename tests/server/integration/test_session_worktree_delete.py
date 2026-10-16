@@ -901,3 +901,107 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
     assert response.status_code == 200, response.text
     assert calls == [(_WORKTREE_PATH, True)]
     assert len(captured) == 1
+
+
+async def test_rebound_runner_delete_cleans_worktree_on_other_backend(app, db_uri, monkeypatch):
+    from ipaddress import ip_network
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.db.backend_work_fence import work_fence_scope
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.replica_routing import ReplicaRoutingMiddleware
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator
+    from omnigent.server.routes.sessions import routes_events
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    captured = await _register_fake_host(app, db_uri)
+    sid = _make_worktree_conversation(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.replace_runner_id(sid, "standalone-runner")
+    other = FastAPI()
+    other.include_router(app.router)
+    other.state._state.update(app.state._state)
+    other.state.host_registry = HostRegistry()
+    a, b = (
+        ReplicaCoordinator(
+            ReplicationConfig(f"http://127.0.0.1:{port}", (ip_network("127.0.0.0/8"),), b"s" * 32),
+            db_uri,
+            conversations,
+            backend.state.host_registry,
+        )
+        for port, backend in ((8001, app), (8002, other))
+    )
+    seen = []
+
+    def record(name, backend):
+        async def serve(scope, receive, send):
+            seen.append((name, scope["method"], scope["path"]))
+            await backend(scope, receive, send)
+
+        return serve
+
+    apps = {
+        8001: ReplicaRoutingMiddleware(record("a", app), a, None),
+        8002: ReplicaRoutingMiddleware(record("b", other), b, None),
+    }
+
+    class Dispatcher(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            # Simulate crossing a process boundary, not inheriting its work fence.
+            with work_fence_scope(None):
+                return await httpx.ASGITransport(app=apps[request.url.port]).handle_async_request(
+                    request
+                )
+
+    runner_calls = []
+
+    def runner(request):
+        runner_calls.append((request.method, request.url.path))
+        return httpx.Response(200, json={})
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    )
+
+    async def runner_for_session(*args, **kwargs):
+        return runner_client
+
+    monkeypatch.setattr(
+        routes_events, "_get_runner_client_for_resource_access", runner_for_session
+    )
+
+    # No running turn needs stopping; verify the actual runner deletion below.
+    async def no_turn(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(routes_events, "_best_effort_stop", no_turn)
+    for replica in (a, b):
+        await replica.transport._client._transport.aclose()
+        replica.transport._client._transport = Dispatcher()
+    try:
+        async with (
+            a.request_placement(_HOST_ID),
+            b.request_resource("runner", "standalone-runner"),
+        ):
+            with work_fence_scope(None):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=apps[8001]),
+                    base_url="https://public.example",
+                ) as client:
+                    response = await client.delete(f"/v1/sessions/{sid}?delete_branch=true")
+            assert response.status_code == 200, response.text
+            assert runner_calls == [("DELETE", f"/v1/sessions/{sid}")]
+            assert seen == [
+                ("b", "DELETE", f"/v1/sessions/{sid}"),
+                ("a", "DELETE", f"/v1/sessions/{sid}/resources/worktree"),
+            ]
+            assert len(captured) == 1
+            assert captured[0].worktree_path == _WORKTREE_PATH
+            assert conversations.get_conversation(sid) is None
+    finally:
+        await runner_client.aclose()
+        await a.aclose()
+        await b.aclose()

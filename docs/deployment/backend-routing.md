@@ -36,17 +36,23 @@ retains its original credentials and origin and passes through ordinary route
 authorization again. Peer signatures authenticate routing context; they do not
 grant access to sessions. A request can make at most one peer hop.
 
-Leases expire unless renewed. Resource generations fence launch work; separate
-connection generations fence delayed host disconnects and heartbeats. A verified
-live reconnect preserves the resource generation, so in-flight launch validation
-does not race with replacement of its socket. Runner connections attached to a host remain on
-that host's backend. Standalone runner identity remains recorded after its
-connection lease is released, so reconnects cannot be mistaken for host launches. Managed launch tasks retain placement after their HTTP
-request returns, including newly created sessions that have no host binding yet.
-Losing ownership cancels retained launch tasks. Background launch writes validate
-the current lease inside metadata transactions, and provider calls check ownership
-before and after execution. An external operation already in flight cannot be
-recalled; stale work must not start another operation or commit new launch state.
+Leases expire unless renewed. Resource generations fence launch and in-flight
+mutation work; separate connection generations fence delayed host disconnects
+and heartbeats. Every admitted socket gets a new connection generation. A
+verified live reconnect preserves the resource generation, so launch validation
+does not race with socket replacement. Runner connections attached to a host
+remain on that host's backend. Standalone runner identity remains recorded after
+its connection lease is released, so reconnects cannot be mistaken for host
+launches. Managed launch tasks retain placement after their HTTP request returns,
+including newly created sessions that have no host binding yet.
+
+Losing ownership cancels retained launches and local mutations. Their writes
+validate current leases inside metadata transactions, and provider calls check
+ownership before and after execution. Nested mutations retain their parent fences.
+An external operation already in flight cannot be recalled; stale work must not
+start another operation or commit new state. Session deletion keeps runner cleanup
+on the runner owner and delegates worktree cleanup to the host owner, repeating
+owner authorization using the caller's credentials.
 
 Runner listings include authenticated peer inventories, and host listings include
 capabilities reported by the current lease owner.

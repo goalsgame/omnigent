@@ -170,7 +170,7 @@ async def test_rejected_replacement_retires_superseded_host_connection(db_uri):
             async with coordinator.connection(replacement, "host", "example") as replacing:
                 assert replacing
                 # Simulate invalid hello/protocol: exit before registering.
-                assert closed == [{"code": 1012, "reason": "backend connection replaced"}]
+                assert closed == [{"code": 1001, "reason": "backend connection replaced"}]
             assert coordinator.store.get("host", "example") is not None
         assert coordinator.store.get("host", "example") is None
     finally:
@@ -762,4 +762,117 @@ async def test_launch_validation_across_live_socket_handover(db_uri, monkeypatch
             if not t.done():
                 t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", [False, True])
+async def test_ownership_socket_close_does_not_mark_process_shutdown(db_uri, monkeypatch, loss):
+    from types import SimpleNamespace
+
+    from omnigent.server import shutdown_state
+
+    monkeypatch.setattr(shutdown_state, "_marked_at", None)
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    closed = []
+
+    async def close(**kwargs):
+        closed.append(kwargs["code"])
+        shutdown_state.note_tunnel_close_code(kwargs["code"])
+
+    try:
+        async with coordinator.connection(
+            SimpleNamespace(scope={}, close=close), "host", "example"
+        ):
+            if loss:
+                route = coordinator.store.get("host", "example")
+                coordinator.store.release(route)
+                await coordinator._renew_once()
+            else:
+                async with coordinator.connection(
+                    SimpleNamespace(scope={}, close=close), "host", "example"
+                ):
+                    pass
+            assert closed == [1001]
+            assert not shutdown_state.server_shutting_down()
+    finally:
+        await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retained_launch_reconnect_rotates_socket_before_delayed_readiness(db_uri):
+    import threading
+    from types import SimpleNamespace
+
+    from omnigent.server.replication import create_managed_launch_task
+    from omnigent.stores.host_store import HostStore
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    hosts = HostStore(db_uri)
+    started, release = threading.Event(), threading.Event()
+    launch_gate = asyncio.Event()
+
+    async def close(**kwargs):
+        pass
+
+    def delayed_readiness():
+        started.set()
+        assert release.wait(timeout=5)
+        hosts.update_harness_readiness("6d86ee544f1d5b7068ac56f5927a5b5c", {"pi": False})
+
+    launch = write = None
+    try:
+        with replication_scope(coordinator):
+            async with coordinator.connection(
+                SimpleNamespace(scope={}, close=close), "host", "6d86ee544f1d5b7068ac56f5927a5b5c"
+            ):
+                await asyncio.to_thread(
+                    hosts.upsert_on_connect,
+                    "6d86ee544f1d5b7068ac56f5927a5b5c",
+                    "original",
+                    "local",
+                )
+                old = coordinator.store.get("host", "6d86ee544f1d5b7068ac56f5927a5b5c")
+                launch = create_managed_launch_task(launch_gate.wait())
+                retain_managed_task(launch)
+                write = asyncio.create_task(asyncio.to_thread(delayed_readiness))
+                assert await asyncio.to_thread(started.wait, 2)
+            # The socket is gone, but the launch still retains resource ownership.
+            assert coordinator.store.get("host", "6d86ee544f1d5b7068ac56f5927a5b5c") is not None
+            async with coordinator.connection(
+                SimpleNamespace(scope={}, close=close), "host", "6d86ee544f1d5b7068ac56f5927a5b5c"
+            ):
+                new = coordinator.store.get("host", "6d86ee544f1d5b7068ac56f5927a5b5c")
+                assert new.token == old.token
+                assert new.connection_token != old.connection_token
+                await asyncio.to_thread(
+                    hosts.upsert_on_connect,
+                    "6d86ee544f1d5b7068ac56f5927a5b5c",
+                    "replacement",
+                    "local",
+                    configured_harnesses={"pi": True},
+                )
+                release.set()
+                await write
+                assert hosts.get_host("6d86ee544f1d5b7068ac56f5927a5b5c").configured_harnesses == {
+                    "pi": True
+                }
+                launch_gate.set()
+                await launch
+    finally:
+        release.set()
+        launch_gate.set()
+        await asyncio.gather(
+            *(task for task in (launch, write) if task is not None), return_exceptions=True
+        )
         await coordinator.aclose()

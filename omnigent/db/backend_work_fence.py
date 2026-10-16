@@ -24,11 +24,22 @@ class BackendWorkFence:
     database_uri: str
     routes: dict[tuple[int, str, str], BackendRoute] = field(default_factory=dict)
     lost: bool = False
+    parent: BackendWorkFence | None = None
 
     def check(self, session: Session) -> None:
-        if self.lost:
-            raise asyncio.CancelledError("backend ownership lost")
-        for key, route in sorted(self.routes.items()):
+        routes = dict(self.routes)
+        ancestor: BackendWorkFence | None = self
+        while ancestor is not None:
+            if ancestor.lost:
+                self.lost = True
+                raise asyncio.CancelledError("backend ownership lost")
+            for key, route in ancestor.routes.items():
+                if key in routes and routes[key].token != route.token:
+                    self.lost = True
+                    raise asyncio.CancelledError("backend ownership changed within a request")
+                routes[key] = route
+            ancestor = ancestor.parent
+        for key, route in sorted(routes.items()):
             row = session.scalar(
                 select(SqlBackendRoute)
                 .where(
@@ -53,6 +64,11 @@ def work_fence_scope(fence: BackendWorkFence | None) -> Iterator[None]:
         yield
     finally:
         _current.reset(token)
+
+
+def current_work_fence() -> BackendWorkFence | None:
+    """Return the ownership scope inherited by nested mutations."""
+    return _current.get()
 
 
 def check_backend_work(session: Session | None = None) -> None:

@@ -273,32 +273,38 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(
                 transport=httpx.ASGITransport(app=apps[ingress]), base_url="https://public.example"
             ) as client,
         ):
-            response = await client.patch(f"/v1/sessions/{conv.id}", json={"runner_id": runner_id})
-            assert response.status_code == 200
-            assert response.json() == {"backend": "b"}
-            assert calls == [("b", {"runner_id": runner_id})]
-            bound = a.conversations.get_conversation(conv.id)
-            assert bound.runner_id == "new-runner" and bound.host_id == hid
-            assert (await a.runner_route("new-runner")).replica_id == b.store.replica_id
-            for path, method in [
-                (f"/v1/sessions/{conv.id}", "GET"),
-                (f"/v1/sessions/{conv.id}/messages", "POST"),
-                ("/v1/runners/new-runner", "GET"),
-            ]:
-                followup = await client.request(method, path)
-                assert followup.status_code == 200
-                assert followup.json() == {"backend": "b"}
-            inventory = await client.get("/v1/runners")
-            assert inventory.status_code == 200
-            assert inventory.json() == {"data": [{"runner_id": "new-runner", "online": True}]}
-            assert all(name == "b" for name, _ in calls)
-            skills = await client.get("/v1/skills", params={"session_id": conv.id})
-            assert skills.status_code == 200
-            assert skills.json() == {"backend": "a"}
-            # An offline runner still permits host-backed workspace reads.
-            b.store.release(b.store.get("runner", "new-runner"))
-            fallback = await client.get(f"/v1/sessions/{conv.id}/resources/github")
-            assert fallback.status_code == 200 and fallback.json() == {"backend": "a"}
+            from omnigent.db.backend_work_fence import work_fence_scope
+
+            # The two placement contexts above model other requests/backends.
+            with work_fence_scope(None):
+                response = await client.patch(
+                    f"/v1/sessions/{conv.id}", json={"runner_id": runner_id}
+                )
+                assert response.status_code == 200
+                assert response.json() == {"backend": "b"}
+                assert calls == [("b", {"runner_id": runner_id})]
+                bound = a.conversations.get_conversation(conv.id)
+                assert bound.runner_id == "new-runner" and bound.host_id == hid
+                assert (await a.runner_route("new-runner")).replica_id == b.store.replica_id
+                for path, method in [
+                    (f"/v1/sessions/{conv.id}", "GET"),
+                    (f"/v1/sessions/{conv.id}/messages", "POST"),
+                    ("/v1/runners/new-runner", "GET"),
+                ]:
+                    followup = await client.request(method, path)
+                    assert followup.status_code == 200
+                    assert followup.json() == {"backend": "b"}
+                inventory = await client.get("/v1/runners")
+                assert inventory.status_code == 200
+                assert inventory.json() == {"data": [{"runner_id": "new-runner", "online": True}]}
+                assert all(name == "b" for name, _ in calls)
+                skills = await client.get("/v1/skills", params={"session_id": conv.id})
+                assert skills.status_code == 200
+                assert skills.json() == {"backend": "a"}
+                # An offline runner still permits host-backed workspace reads.
+                b.store.release(b.store.get("runner", "new-runner"))
+                fallback = await client.get(f"/v1/sessions/{conv.id}/resources/github")
+                assert fallback.status_code == 200 and fallback.json() == {"backend": "a"}
         # Both old sockets/leases are gone, and the original host is offline.
         assert a.store.get("host", hid) is None
         assert b.store.get("runner", "new-runner") is None
@@ -326,3 +332,95 @@ async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(
         await b.aclose()
         if restarted is not None:
             await restarted.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_type", ["application/vnd.api+json", "Application/JSON; charset=utf-8"]
+)
+async def test_create_routes_all_supported_json_media_types(db_uri, content_type):
+    a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
+    hid = "2c167be5bad7438196cd12a3be5fce08"
+    observed = []
+
+    async def owner(scope, receive, send):
+        observed.append(await Request(scope, receive).json())
+        await JSONResponse({"owner": "b"})(scope, receive, send)
+
+    async def wrong(scope, receive, send):
+        pytest.fail("Host-backed create reached the wrong backend")
+
+    await a.transport._client.aclose()
+    a.transport._client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=ReplicaRoutingMiddleware(owner, b, None))
+    )
+    try:
+        async with b.request_placement(hid):
+            from omnigent.db.backend_work_fence import work_fence_scope
+
+            with work_fence_scope(None):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=ReplicaRoutingMiddleware(wrong, a, None)),
+                    base_url="https://public.example",
+                ) as client:
+                    response = await client.post(
+                        "/v1/sessions",
+                        content='{"host_id":"' + hid + '"}',
+                        headers={"Content-Type": content_type},
+                    )
+                    assert response.status_code == 200
+                    assert observed == [{"host_id": hid}]
+    finally:
+        await a.aclose()
+        await b.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["provider", "transaction"])
+@pytest.mark.parametrize("heartbeat", [False, True])
+async def test_local_http_mutation_is_fenced_after_ownership_loss(db_uri, boundary, heartbeat):
+    from contextlib import suppress
+
+    from omnigent.db.backend_work_fence import fenced_to_thread
+
+    a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
+    conv = a.conversations.create_conversation()
+    started, gate = asyncio.Event(), asyncio.Event()
+    writes = []
+
+    async def mutation(scope, receive, send):
+        started.set()
+        # Even a handler that catches cancellation cannot cross a write boundary.
+        with suppress(asyncio.CancelledError):
+            await gate.wait()
+        if boundary == "provider":
+            await fenced_to_thread(writes.append, "provider-called")
+        else:
+            await asyncio.to_thread(a.conversations.create_conversation, title="stale")
+        await JSONResponse({"unexpected": "success"})(scope, receive, send)
+
+    task = None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=ReplicaRoutingMiddleware(mutation, a, None)),
+            base_url="https://public.example",
+        ) as client:
+            task = asyncio.create_task(client.delete(f"/v1/sessions/{conv.id}"))
+            await started.wait()
+            route = a.store.get("session", conv.id)
+            assert route is not None
+            a.store.release(route)
+            assert b.store.claim("session", conv.id).replica_id == b.store.replica_id
+            if heartbeat:
+                await a._renew_once()
+            gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert writes == []
+            assert all(row.title != "stale" for row in a.conversations.list_conversations().data)
+    finally:
+        gate.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await a.aclose()
+        await b.aclose()

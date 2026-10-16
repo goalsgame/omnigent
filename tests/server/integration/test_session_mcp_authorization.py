@@ -360,3 +360,14 @@ async def test_bundle_replacement_requires_owner(
     assert await _download_bundle(client, session_id) == (
         mcp_edit if level == LEVEL_OWNER else expected
     )
+
+
+@pytest.mark.parametrize("level", _LEVELS)
+async def test_worktree_cleanup_requires_session_owner(client, db_uri, level):
+    """Delegated cleanup repeats owner authorization and does not delete metadata."""
+    session_id, headers = await _create_session(client, db_uri, _bundle(), level)
+    response = await client.delete(
+        f"/v1/sessions/{session_id}/resources/worktree", headers=headers
+    )
+    assert response.status_code == (200 if level == LEVEL_OWNER else 403), response.text
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(session_id) is not None

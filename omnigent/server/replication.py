@@ -20,7 +20,12 @@ from starlette.responses import JSONResponse
 from starlette.websockets import WebSocket
 
 from omnigent.db.backend_fence import backend_fence_scope, current_backend_fence
-from omnigent.db.backend_work_fence import BackendWorkFence, guarded_work, work_fence_scope
+from omnigent.db.backend_work_fence import (
+    BackendWorkFence,
+    current_work_fence,
+    guarded_work,
+    work_fence_scope,
+)
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.replica_transport import PeerTransport, ReplicationConfig
 from omnigent.stores.backend_route_store import BackendRoute, BackendRouteStore
@@ -57,6 +62,18 @@ async def reserve_managed_placement(host_id: str) -> AsyncIterator[None]:
     else:
         async with coordinator.reserve(host_id):
             yield
+
+
+async def cleanup_remote_session_worktree(request: Request, session_id: str, host_id: str) -> bool:
+    """Delegate only host-local cleanup; the caller still owns runner/session deletion."""
+    coordinator = _current.get()
+    if coordinator is None:
+        return False
+    route = await asyncio.to_thread(coordinator.store.get, "host", host_id)
+    if route is None or coordinator.local(route):
+        return False
+    await coordinator.transport.cleanup_session_worktree(request, route, session_id)
+    return True
 
 
 def placed_managed_launch(
@@ -311,7 +328,9 @@ class ReplicaCoordinator:
             await asyncio.to_thread(self.store.renew, entry.route, self._host_report(host_id))
 
     @asynccontextmanager
-    async def _reference(self, route: BackendRoute, ws: WebSocket | None) -> AsyncIterator[None]:
+    async def _reference(
+        self, route: BackendRoute, ws: WebSocket | None, task: asyncio.Task | None = None
+    ) -> AsyncIterator[None]:
         key = (route.workspace_id, route.kind, route.resource_id)
         reference = uuid.uuid4().hex
         entry = self._owned.get(key)
@@ -328,10 +347,12 @@ class ReplicaCoordinator:
             for previous in list(entry.connections.values()):
                 if previous is not None:
                     with suppress(Exception):
-                        await previous.close(code=1012, reason="backend connection replaced")
+                        await previous.close(code=1001, reason="backend connection replaced")
         elif entry.route.expires_at < route.expires_at:
             entry.route = route
         entry.connections[reference] = ws
+        if task is not None:
+            entry.tasks[reference] = task
         handle = _held.set((key, entry))
         try:
             yield
@@ -390,13 +411,27 @@ class ReplicaCoordinator:
                 route = await asyncio.to_thread(self.store.claim, kind, resource_id)
             reference = None
             if self.local(route):
-                reference = self._reference(route, None)
+                reference = self._reference(route, None, asyncio.current_task())
                 await reference.__aenter__()
-        try:
+        if reference is None:
             yield route
+            return
+        task = asyncio.current_task()
+        previous = self._task_fences.get(task) if task is not None else None
+        fence = BackendWorkFence(self.database_uri, parent=current_work_fence())
+        fence.routes[(route.workspace_id, route.kind, route.resource_id)] = route
+        if task is not None:
+            self._task_fences[task] = fence
+        try:
+            with work_fence_scope(fence):
+                yield route
         finally:
-            if reference is not None:
-                await reference.__aexit__(None, None, None)
+            if task is not None:
+                if previous is None:
+                    self._task_fences.pop(task, None)
+                else:
+                    self._task_fences[task] = previous
+            await reference.__aexit__(None, None, None)
 
     @asynccontextmanager
     async def request_placement(self, host_id: str) -> AsyncIterator[BackendRoute]:
@@ -433,21 +468,12 @@ class ReplicaCoordinator:
             else:
                 key = (current_workspace_id(), kind, resource_id)
                 entry = self._owned.get(key)
-                # The first tunnel of a provisioning host adopts its launch
-                # reservation; no prior connection generation needs replacing.
-                reserved = entry is not None and not any(entry.connections.values())
-                route = (
-                    await asyncio.to_thread(self.store.get, kind, resource_id)
-                    if reserved
-                    else None
+                route, _continuous = await asyncio.to_thread(
+                    self.store.claim_connection,
+                    kind,
+                    resource_id,
+                    entry.route if entry is not None else None,
                 )
-                if route is None or not self.local(route):
-                    route, _continuous = await asyncio.to_thread(
-                        self.store.claim_connection,
-                        kind,
-                        resource_id,
-                        entry.route if entry is not None else None,
-                    )
             reference = None
             if route is not None and self.local(route):
                 # Runners must wait for their host's control tunnel to register.
@@ -515,4 +541,4 @@ class ReplicaCoordinator:
         for ws in list(entry.connections.values()):
             if ws is not None:
                 with suppress(Exception):
-                    await ws.close(code=1012, reason="backend ownership changed")
+                    await ws.close(code=1001, reason="backend ownership changed")

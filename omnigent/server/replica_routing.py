@@ -23,6 +23,7 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes, workspace_sco
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.replication import ReplicaCoordinator, replication_scope
+from omnigent.server.routes._content_type import _is_json_media_type, _request_media_type
 from omnigent.stores.backend_route_store import BackendRoute
 
 if TYPE_CHECKING:
@@ -94,7 +95,11 @@ class ReplicaRoutingMiddleware:
                     return None
             elif self.coordinator.conversations.get_session_owner(session_id) != user:
                 return None
-        if conv.runner_id and self.coordinator.store.is_standalone_runner(conv.runner_id):
+        if (
+            not scope["path"].endswith("/resources/worktree")
+            and conv.runner_id
+            and self.coordinator.store.is_standalone_runner(conv.runner_id)
+        ):
             return ("runner", conv.runner_id)
         host = routing_host_id(conv, self.coordinator.conversations)
         return ("host", host) if host else ("session", session_id)
@@ -183,12 +188,12 @@ class ReplicaRoutingMiddleware:
             return message
 
         request = Request(scope, capture)
-        content_type = request.headers.get("content-type", "")
+        content_type = _request_media_type(request)
         payload = None
         try:
-            if content_type.startswith("application/json"):
+            if _is_json_media_type(content_type):
                 payload = await request.json()
-            elif content_type.startswith("multipart/form-data"):
+            elif content_type == "multipart/form-data":
                 async with request.form() as form:
                     metadata = form.get("metadata")
                     if isinstance(metadata, str):
@@ -303,6 +308,10 @@ class ReplicaRoutingMiddleware:
                         route = await self._session_host_route(query["session_id"])
                     elif query.get("host_id"):
                         route = await self._target("hosts", query["host_id"])
+                if route is None and path.endswith("/resources/worktree"):
+                    match_session = re.fullmatch(r"/v1/sessions/([^/]+)/resources/worktree", path)
+                    if match_session:
+                        route = await self._session_host_route(match_session.group(1))
                 match = _RESOURCE.match(path)
                 if route is None and match:
                     route = await self._target(match.group(1), match.group(2))
