@@ -44,6 +44,8 @@ class HarnessInferenceBinding:
     default_model: str | None = None
     model_allowlist: tuple[str, ...] | None = None
     model_limits: dict[str, ModelLimitOverride] = field(default_factory=dict)
+    model_apis: dict[str, str] = field(default_factory=dict)
+    model_reasoning: dict[str, bool] = field(default_factory=dict)
 
 
 def validate_inference_credentials(
@@ -109,7 +111,14 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
     for name, value in harnesses.items():
         if not isinstance(name, str) or not name.strip() or not isinstance(value, dict):
             raise ValueError("Each inference harness must name a configuration mapping")
-        if set(value) - {"provider", "default_model", "model_allowlist", "model_limits"}:
+        if set(value) - {
+            "provider",
+            "default_model",
+            "model_allowlist",
+            "model_limits",
+            "model_apis",
+            "model_reasoning",
+        }:
             raise ValueError(f"Unknown inference setting for harness {name!r}")
         provider = value.get("provider")
         if not isinstance(provider, str) or provider not in providers:
@@ -140,6 +149,27 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             "acp",
         } and not (key.startswith("acp:") and key.removeprefix("acp:").strip()):
             raise ValueError(f"Harness {name!r} does not support inference bindings")
+        model_apis = value.get("model_apis", {})
+        if (
+            not isinstance(model_apis, dict)
+            or ("model_apis" in value and key != "pi-native")
+            or any(
+                not isinstance(model, str)
+                or not model
+                or api not in ("openai-completions", "anthropic-messages")
+                for model, api in model_apis.items()
+            )
+            or (model_apis and (allowed is None or set(model_apis) != set(allowed)))
+        ):
+            raise ValueError("model_apis requires an exact Pi model allowlist and supported APIs")
+        reasoning = value.get("model_reasoning", {})
+        if (
+            not isinstance(reasoning, dict)
+            or ("model_reasoning" in value and key != "pi-native")
+            or any(type(v) is not bool for v in reasoning.values())
+            or (reasoning and (allowed is None or not set(reasoning) <= set(allowed)))
+        ):
+            raise ValueError("model_reasoning requires allowed Pi models and boolean values")
         limits_raw = value.get("model_limits", {})
         if not isinstance(limits_raw, dict):
             raise ValueError(f"Harness {name!r} model_limits must be a mapping")
@@ -173,6 +203,8 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             default_model=default,
             model_allowlist=tuple(dict.fromkeys(allowed)) if allowed is not None else None,
             model_limits=limits,
+            model_apis=dict(model_apis),
+            model_reasoning=dict(reasoning),
         )
     return result
 

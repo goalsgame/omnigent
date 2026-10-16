@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 from types import SimpleNamespace
@@ -423,7 +424,6 @@ async def test_responses_are_stateless(setup):
             headers={"Authorization": "Bearer " + token},
         )
         assert response.status_code == 200
-    import json
 
     assert json.loads(calls[0].content)["store"] is False
 
@@ -448,7 +448,6 @@ def test_native_shell_auth_refreshes_without_posix_shell_dependency(monkeypatch)
 
 
 def test_host_exchange_outputs_only_access_token(tmp_path, monkeypatch, capsys):
-    import json
 
     from omnigent.host import inference_proxy
 
@@ -963,7 +962,6 @@ async def test_inherited_owner_binding_revokes_when_root_authority_changes(setup
 @pytest.mark.asyncio
 async def test_asgi_disconnect_cancels_upstream_header_wait_and_releases_capacity(setup):
     import asyncio
-    import json
 
     from asgiref.testing import ApplicationCommunicator
 
@@ -1033,7 +1031,6 @@ async def test_asgi_disconnect_cancels_upstream_header_wait_and_releases_capacit
 
 @pytest.mark.parametrize("shadow", ["omnigent.py", "omnigent/__init__.py", "httpx.py"])
 def test_refresh_command_does_not_import_workspace_modules(tmp_path, shadow):
-    import json
     import os
     import subprocess
 
@@ -1135,3 +1132,340 @@ def test_windows_refresh_ignores_workspace_powershell_executable(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "trusted-system-shell"
+
+
+def _multi_upstream_raw():
+    return {
+        "public_url": "https://server.example",
+        "signing_key_env": "INFERENCE_TEST_SIGNING",
+        "models": ["model-a", "reasoning-model", "gemini-alias", "external-alias"],
+        "harnesses": ["pi-native", "openai-agents"],
+        "upstreams": {
+            "router": {"kind": "openrouter"},
+            "claude": {"kind": "vertex-anthropic", "project": "example-project", "location": "eu"},
+            "gemini": {
+                "kind": "vertex-openai",
+                "project": "example-project",
+                "location": "europe-west1",
+            },
+            "external": {
+                "kind": "openai",
+                "base_url": "https://inference.example/v1",
+                "api_key_env": "INFERENCE_TEST_EXTERNAL",
+            },
+        },
+        "model_routes": {
+            "model-a": {"upstream": "router", "model": "openai/model-a"},
+            "reasoning-model": {"upstream": "claude", "model": "claude-test@20990101"},
+            "gemini-alias": {"upstream": "gemini", "model": "google/gemini-test"},
+            "external-alias": {"upstream": "external", "model": "private/model"},
+        },
+        "model_reasoning": {"reasoning-model": True, "gemini-alias": False},
+        "model_limits": {
+            "reasoning-model": {"context_window": 1000000, "max_output_tokens": 64000}
+        },
+    }
+
+
+@pytest.fixture
+def routed(setup, monkeypatch):
+    monkeypatch.setenv("INFERENCE_TEST_SIGNING", "s" * 48)
+    monkeypatch.setenv("INFERENCE_TEST_EXTERNAL", "external-secret")
+    service, app, conv, host, calls = setup
+    service.config = InferenceProxyConfig.parse(_multi_upstream_raw())
+
+    async def credential():
+        return "google-secret"
+
+    service.google_credential = SimpleNamespace(credential=credential)
+    return service, app, conv, host, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "endpoint", "target", "credential"),
+    [
+        (
+            "model-a",
+            "chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "upstream-secret",
+        ),
+        (
+            "gemini-alias",
+            "chat/completions",
+            "https://europe-west1-aiplatform.googleapis.com/v1/projects/example-project/locations/europe-west1/endpoints/openapi/chat/completions",
+            "google-secret",
+        ),
+        (
+            "external-alias",
+            "responses",
+            "https://inference.example/v1/responses",
+            "external-secret",
+        ),
+        (
+            "reasoning-model",
+            "v1/messages",
+            "https://aiplatform.eu.rep.googleapis.com/v1/projects/example-project/locations/eu/publishers/anthropic/models/claude-test@20990101:streamRawPredict",
+            "google-secret",
+        ),
+    ],
+)
+async def test_routes_select_only_operator_upstream_and_credential(
+    routed, model, endpoint, target, credential
+):
+    service, app, conv, _, calls = routed
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            f"/v1/inference/sessions/session/{endpoint}",
+            headers={"Authorization": "Bearer " + token, "X-Api-Key": "caller-secret"},
+            json={
+                "model": model,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    assert response.status_code == 200
+    assert str(calls[0].url) == target
+    assert calls[0].headers["authorization"] == "Bearer " + credential
+    assert "x-api-key" not in calls[0].headers
+    assert response.content == b'data: {"text":"hello"}\n\ndata: [DONE]\n\n'
+    assert all(
+        secret not in response.text
+        for secret in ("google-secret", "external-secret", "upstream-secret")
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_claude_preserves_tools_images_and_thinking(routed):
+    service, app, conv, _, calls = routed
+    payload = {
+        "model": "reasoning-model",
+        "max_tokens": 256,
+        "stream": False,
+        "system": [{"type": "text", "text": "help", "cache_control": {"type": "ephemeral"}}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "example"},
+                    },
+                    {"type": "tool_result", "tool_use_id": "call", "content": "ok"},
+                ],
+            }
+        ],
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+        "tools": [{"name": "lookup", "description": "find", "input_schema": {"type": "object"}}],
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/v1/messages?beta=true",
+            headers={
+                "Authorization": "Bearer " + token,
+                "anthropic-beta": "fine-grained-tool-streaming-2025-05-14",
+            },
+            json=payload,
+        )
+    assert response.status_code == 200
+    outgoing = json.loads(calls[0].content)
+    assert outgoing == {key: value for key, value in payload.items() if key != "model"} | {
+        "anthropic_version": "vertex-2023-10-16"
+    }
+    assert str(calls[0].url).endswith(":rawPredict")
+    assert calls[0].headers["anthropic-beta"] == "fine-grained-tool-streaming-2025-05-14"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "endpoint"),
+    [
+        ("reasoning-model", "chat/completions"),
+        ("model-a", "v1/messages"),
+        ("gemini-alias", "responses"),
+    ],
+)
+async def test_incompatible_protocol_fails_before_any_upstream_auth(routed, model, endpoint):
+    service, app, conv, _, calls = routed
+
+    async def forbidden():
+        pytest.fail("invalid protocol must not obtain upstream credentials")
+
+    service.broker = SimpleNamespace(credential=forbidden)
+    service.google_credential = SimpleNamespace(credential=forbidden)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            f"/v1/inference/sessions/session/{endpoint}",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": model},
+        )
+    assert response.status_code == 400
+    assert not calls
+    assert service.active_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_google_refresh_failure_is_sanitized_and_releases_capacity(routed):
+    service, app, conv, _, calls = routed
+
+    async def unavailable():
+        raise ValueError("secret-value-from-authentication-library")
+
+    service.google_credential = SimpleNamespace(credential=unavailable)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "gemini-alias"},
+        )
+    assert response.status_code == 502
+    assert "secret-value" not in response.text
+    assert not calls and service.active_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_owner_is_rechecked_after_google_refresh(routed):
+    service, app, conv, host, calls = routed
+
+    async def revoked():
+        host.user_id = "other-owner"
+        return "google-secret"
+
+    service.google_credential = SimpleNamespace(credential=revoked)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "gemini-alias"},
+        )
+    assert response.status_code == 401
+    assert not calls and service.active_requests == 0
+
+
+def test_native_model_protocols_and_limits_reach_real_pi_config(routed, tmp_path):
+    from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
+    from omnigent.host.inference_proxy import prepare
+
+    service, _, conv, _, _ = routed
+    config = service.launch_config(
+        conv, conv.runner_id, "pi-native", conv.host_id, "alice", "generation"
+    )
+    runtime = prepare(config, tmp_path)
+    resolved = resolve_pi_native_provider(model="reasoning-model", config_loader=lambda: runtime)
+    assert resolved is not None
+    assert resolved.api == "anthropic-messages"
+    assert resolved.auth_header is True
+    rendered = resolved.to_models_config()["providers"]
+    protocols = {
+        row["id"]: provider["api"] for provider in rendered.values() for row in provider["models"]
+    }
+    assert protocols == {
+        "model-a": "openai-completions",
+        "reasoning-model": "anthropic-messages",
+        "gemini-alias": "openai-completions",
+        "external-alias": "openai-completions",
+    }
+    claude = next(
+        row
+        for provider in rendered.values()
+        for row in provider["models"]
+        if row["id"] == "reasoning-model"
+    )
+    assert claude["reasoning"] is True
+    assert claude["contextWindow"] == 1000000
+    assert claude["maxTokens"] == 64000
+    assert all(
+        provider["baseUrl"].startswith("https://server.example/v1/inference/")
+        for provider in rendered.values()
+    )
+    assert "google-secret" not in str(runtime) and "external-secret" not in str(runtime)
+
+
+@pytest.mark.asyncio
+async def test_protocol_and_limit_metadata_is_signed_and_attested(routed):
+    service, app, conv, _, _ = routed
+    config = service.launch_config(
+        conv, conv.runner_id, "pi-native", conv.host_id, "alice", "generation"
+    )["server_inference"]
+    path = config["url"].removeprefix("https://server.example")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        response = await client.post(
+            path + "/token", headers={"Authorization": "Bearer " + config["grant"]}
+        )
+    assert response.status_code == 200
+    attested = response.json()["runtime_binding"]
+    assert attested["model_reasoning"] == config["model_reasoning"]
+    assert attested["model_apis"] == config["model_apis"]
+    assert attested["model_limits"] == config["model_limits"]
+    openai_config = service.launch_config(
+        conv, conv.runner_id, "openai-agents", conv.host_id, "alice", "generation"
+    )["server_inference"]
+    assert "reasoning-model" not in openai_config["models"]
+    assert "model_apis" not in openai_config and "model_limits" not in openai_config
+
+
+@pytest.mark.parametrize("wire_api", [None, "responses"])
+def test_explicit_model_api_overrides_openai_family_default(routed, tmp_path, wire_api):
+    from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
+    from omnigent.host.inference_proxy import prepare
+
+    service, _, conv, _, _ = routed
+    config = service.launch_config(
+        conv, conv.runner_id, "pi-native", conv.host_id, "alice", "generation"
+    )
+    runtime = prepare(config, tmp_path)
+    family = runtime["providers"]["server-inference"]["openai"]
+    if wire_api is None:
+        family.pop("wire_api")
+    else:
+        family["wire_api"] = wire_api
+    resolved = resolve_pi_native_provider(model="model-a", config_loader=lambda: runtime)
+    assert resolved is not None and resolved.api == "openai-completions"
+
+
+@pytest.mark.parametrize("value", [{"hidden": True}, {"model-a": "true"}, [], None])
+def test_reasoning_metadata_requires_allowed_models_and_booleans(routed, value):
+    from omnigent.server.inference_proxy import InferenceProxyConfig
+
+    raw = _multi_upstream_raw()
+    raw["model_reasoning"] = value
+    with pytest.raises(ValueError):
+        InferenceProxyConfig.parse(raw)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_incompatible_harness_is_rejected_during_configuration(routed, explicit):
+    from omnigent.server.inference_proxy import InferenceProxyConfig
+
+    raw = _multi_upstream_raw()
+    raw["models"] = ["reasoning-model"]
+    raw["upstreams"] = {"claude": raw["upstreams"]["claude"]}
+    raw["model_routes"] = {"reasoning-model": raw["model_routes"]["reasoning-model"]}
+    raw["model_reasoning"] = {"reasoning-model": True}
+    if explicit:
+        raw["harnesses"] = ["pi-native", "openai-agents"]
+    else:
+        raw.pop("harnesses")
+    with pytest.raises(ValueError, match="compatible model"):
+        InferenceProxyConfig.parse(raw)
+    raw["harnesses"] = ["pi-native"]
+    assert InferenceProxyConfig.parse(raw) is not None

@@ -1731,7 +1731,30 @@ def resolve_pi_native_provider(
         selected = resolve_bound_model(config, "pi-native", model)
         if entry is None:
             raise ValueError("The Pi inference binding has no configured provider.")
-        resolved = _inline_family_pi_provider(entry, model=selected, preserve_model_ids=True)
+
+        def bound_model_provider(
+            model_id: str | None, provider_entry: ProviderEntry = entry
+        ) -> PiProviderConfig | None:
+            model_entry = provider_entry
+            if model_id in binding.model_apis:
+                family = (
+                    "anthropic"
+                    if binding.model_apis[model_id] == "anthropic-messages"
+                    else "openai"
+                )
+                model_entry = replace(
+                    provider_entry,
+                    families={
+                        name: replace(config, wire_api=CHAT_WIRE_API)
+                        if name == "openai"
+                        else config
+                        for name, config in provider_entry.families.items()
+                        if name == family
+                    },
+                )
+            return _inline_family_pi_provider(model_entry, model=model_id, preserve_model_ids=True)
+
+        resolved = bound_model_provider(selected)
         if resolved is None:
             raise ValueError(f"Configured provider {entry.name!r} cannot route Pi.")
         if binding.model_allowlist is not None:
@@ -1742,7 +1765,7 @@ def resolve_pi_native_provider(
                 "openai-completions": _PI_COMPLETIONS_PROVIDER_ID,
             }
             for model_id in binding.model_allowlist:
-                routed = _inline_family_pi_provider(entry, model=model_id, preserve_model_ids=True)
+                routed = bound_model_provider(model_id)
                 if routed is None:
                     raise ValueError(
                         f"Configured provider {entry.name!r} cannot route {model_id!r}."
@@ -1767,13 +1790,15 @@ def resolve_pi_native_provider(
                 curated_models=True,
                 model_allowlist=binding.model_allowlist,
             )
-        if binding.model_limits:
+        if binding.model_limits or binding.model_reasoning:
 
             def apply_limits(models: list[_PiModelEntry]) -> list[_PiModelEntry]:
                 updated: list[_PiModelEntry] = []
                 for row in models:
                     limits = binding.model_limits.get(row["id"])
                     enriched: _PiModelEntry = {**row}
+                    if row["id"] in binding.model_reasoning:
+                        enriched["reasoning"] = binding.model_reasoning[row["id"]]
                     if limits is not None:
                         if limits.context_window is not None:
                             enriched["contextWindow"] = limits.context_window

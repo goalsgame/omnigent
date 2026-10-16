@@ -1120,12 +1120,19 @@ def register_core_routes(
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
-        inference_snapshot, inference_model = await prepare_create_inference(
+        (
+            inference_snapshot,
+            inference_model,
+            inference_policy_labels,
+        ) = await prepare_create_inference(
             request,
             parsed_metadata,
             spec,
             user_id,
             conversation_store,
+        )
+        parsed_metadata = parsed_metadata.model_copy(
+            update={"labels": {**(parsed_metadata.labels or {}), **inference_policy_labels}}
         )
         from omnigent.models.model_catalog import spec_harness
         from omnigent.server.routes._session_harness_readiness import (
@@ -2638,10 +2645,13 @@ def register_core_routes(
                 raise _session_not_found()
             from omnigent.server.routes.sandbox_inference import (
                 configured_snapshot,
+                proxy_policy,
                 validate_saved_selection,
             )
 
-            if configured_snapshot(conv_for_model.inference_snapshot):
+            if configured_snapshot(conv_for_model.inference_snapshot) or proxy_policy(
+                conv_for_model
+            ):
                 model_override = await validate_saved_selection(
                     request, conv_for_model, None if clear_model else model_override
                 )
@@ -2858,11 +2868,11 @@ def register_core_routes(
                     code=ErrorCode.NOT_FOUND,
                 )
 
-        from omnigent.server.routes.sandbox_inference import configured_snapshot
+        from omnigent.server.routes.sandbox_inference import configured_snapshot, proxy_policy
 
         if (
             conv is not None
-            and configured_snapshot(conv.inference_snapshot)
+            and (configured_snapshot(conv.inference_snapshot) or proxy_policy(conv))
             and (cost_control_mode_override == "on" or subagent_routing_override == "on")
         ):
             raise OmnigentError(
@@ -3391,8 +3401,12 @@ def register_core_routes(
             )
 
         from omnigent.server.routes.sandbox_inference import (
+            PROXY_POLICY_LABEL,
             actual_harness,
             configured_snapshot,
+            managed_proxy_catalog,
+            proxy_policy,
+            selected_catalog_model,
             validate_saved_selection,
         )
 
@@ -3532,13 +3546,42 @@ def register_core_routes(
                 # aliases), so the fork falls back to the bound agent default.
                 clear_override_model = True
 
-        if source_configured:
+        source_proxy_policy = proxy_policy(source)
+        if source_proxy_policy is not None and switching_agent:
+            raise OmnigentError(
+                "Start a new session to change a server inference agent",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        destination_proxy_policy = source_proxy_policy
+        destination_proxy_catalog = None
+        if source_proxy_policy is not None and body.host_type == "managed":
+            # An omitted destination preserves the source provider, independently
+            # of later deployment-default changes. Explicit destinations must
+            # support the same server-managed inference policy.
+            provider = body.sandbox_provider or source_proxy_policy["provider"]
+            destination_proxy_catalog = managed_proxy_catalog(
+                request, provider, source_proxy_policy["harness"]
+            )
+            if destination_proxy_catalog is None:
+                raise OmnigentError(
+                    "The destination sandbox does not support this session's server inference policy",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            target = request.app.state.sandbox_config.for_provider(provider)
+            assert target is not None
+            destination_proxy_policy = {**source_proxy_policy, "provider": target.provider}
+            body = body.model_copy(update={"sandbox_provider": target.provider})
+        if source_configured or source_proxy_policy is not None:
             selected_model = (
                 (None if clear_override_model else override_model)
                 if model_override_set
                 else source.model_override
             )
-            override_model = await validate_saved_selection(request, source, selected_model)
+            override_model = (
+                selected_catalog_model(destination_proxy_catalog, selected_model)
+                if destination_proxy_catalog is not None
+                else await validate_saved_selection(request, source, selected_model)
+            )
             clear_override_model = False
             model_override_set = True
 
@@ -3604,6 +3647,8 @@ def register_core_routes(
         # so refuse to stamp it on a non-Codex fork). Stamped via extra_labels,
         # which the store applies AFTER the drop so the opt-in wins.
         extra_labels: dict[str, str] = {}
+        if destination_proxy_policy is not None:
+            extra_labels[PROXY_POLICY_LABEL] = json.dumps(destination_proxy_policy)
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":

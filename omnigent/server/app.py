@@ -2994,7 +2994,7 @@ def create_app(
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
-    async def info() -> ServerInfoResponse:
+    async def info(request: Request) -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -3074,6 +3074,16 @@ def create_app(
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+            proxy = getattr(app.state, "inference_proxy", None)
+            if proxy is not None and proxy.config.managed_sandboxes:
+                from omnigent.server.routes.sandbox_inference import managed_proxy_catalog
+
+                for provider in sandbox_providers:
+                    if any(
+                        managed_proxy_catalog(request, provider, harness) is not None
+                        for harness in proxy.config.harnesses
+                    ):
+                        sandbox_provider_capabilities[provider]["inference_models"] = True
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -4003,8 +4013,8 @@ def create_app(
     )
     app.state.inference_proxy = None
     if inference_proxy_config is not None:
-        if host_store is None or openrouter_wif_broker is None or host_registry is None:
-            raise ValueError("inference_proxy requires hosts and openrouter_wif")
+        if host_store is None or host_registry is None:
+            raise ValueError("inference_proxy requires hosts")
         inference_proxy = InferenceProxy(
             inference_proxy_config,
             conversation_store,
