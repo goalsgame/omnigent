@@ -47,7 +47,7 @@ _current: ContextVar[BackendWorkFence | None] = ContextVar("backend_launch_fence
 
 
 @contextmanager
-def work_fence_scope(fence: BackendWorkFence) -> Iterator[None]:
+def work_fence_scope(fence: BackendWorkFence | None) -> Iterator[None]:
     token = _current.set(fence)
     try:
         yield
@@ -67,6 +67,14 @@ def check_backend_work(session: Session | None = None) -> None:
     else:
         with Session(engine) as authority:
             fence.check(authority)
+
+
+@contextmanager
+def backend_work_transaction(session: Session) -> Iterator[None]:
+    """Lock placement before lifecycle writes and validate again before commit."""
+    check_backend_work(session)
+    yield
+    check_backend_work(session)
 
 
 async def fenced_to_thread(function: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:

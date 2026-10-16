@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account, session_account_owner_query
 from omnigent.db.backend_fence import host_fence_valid
+from omnigent.db.backend_work_fence import backend_work_transaction
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
@@ -318,9 +319,9 @@ class HostStore:
         )
 
         def write(session: Session) -> Host:
-            generation = require_active_account(session, user_id)
             if not host_fence_valid(session, host_id):
                 raise OmnigentError("Host connection was superseded", code=ErrorCode.CONFLICT)
+            generation = require_active_account(session, user_id)
             if managed_token is not None:
                 result = cast(
                     CursorResult[tuple[object]],
@@ -958,7 +959,10 @@ class HostStore:
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
-        with self._lifecycle_session("replace_managed_host_sandbox") as session:
+        with (
+            self._lifecycle_session("replace_managed_host_sandbox") as session,
+            backend_work_transaction(session),
+        ):
             require_active_account(session, user_id)
             existing = session.execute(
                 select(SqlHost)
@@ -1010,7 +1014,10 @@ class HostStore:
         longer current and the provider must not be asked to resume that sandbox id.
         """
         now = now_epoch()
-        with self._lifecycle_session("rearm_managed_host") as session:
+        with (
+            self._lifecycle_session("rearm_managed_host") as session,
+            backend_work_transaction(session),
+        ):
             snapshot = session.get(SqlHost, (current_workspace_id(), host_id))
             if snapshot is None:
                 return None
@@ -1257,7 +1264,10 @@ class HostStore:
         :param sandbox_id: Exact provider id that was terminated.
         :returns: ``True`` when that recorded id was cleared.
         """
-        with self._lifecycle_session("mark_sandbox_terminated") as session:
+        with (
+            self._lifecycle_session("mark_sandbox_terminated") as session,
+            backend_work_transaction(session),
+        ):
             row = session.execute(
                 select(SqlHost)
                 .where(

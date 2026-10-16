@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse
 from starlette.websockets import WebSocket
 
 from omnigent.db.backend_fence import backend_fence_scope
-from omnigent.db.backend_work_fence import BackendWorkFence, guarded_work
+from omnigent.db.backend_work_fence import BackendWorkFence, guarded_work, work_fence_scope
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.replica_transport import PeerTransport, ReplicationConfig
 from omnigent.stores.backend_route_store import BackendRoute, BackendRouteStore
@@ -293,7 +293,10 @@ class ReplicaCoordinator:
                     return
                 self._owned.pop(key, None)
                 try:
-                    await asyncio.to_thread(self.store.release, entry.route)
+                    # Lease cleanup is already generation-conditional and must
+                    # still run when the guarded launch has been canceled.
+                    with work_fence_scope(None):
+                        await asyncio.to_thread(self.store.release, entry.route)
                 except Exception:
                     _logger.exception("Could not release backend resource placement")
 
@@ -302,7 +305,7 @@ class ReplicaCoordinator:
         if held is None:
             return
         key, entry = held
-        if self._owned.get(key) is not entry:
+        if self._owned.get(key) is not entry or task in entry.tasks.values():
             return
         reference = uuid.uuid4().hex
         entry.connections[reference] = None
@@ -353,6 +356,9 @@ class ReplicaCoordinator:
         async with self.request_placement(host_id) as route:
             if not self.local(route):
                 raise RuntimeError("managed host is owned by another backend")
+            task = asyncio.current_task()
+            if task is not None and task in self._task_fences:
+                self.retain_task(task)
             yield
 
     @asynccontextmanager

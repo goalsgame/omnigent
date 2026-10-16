@@ -265,6 +265,7 @@ class ReplicaRoutingMiddleware:
         async with AsyncExitStack() as stack:
             try:
                 route = None
+                explicit_target = False
                 if scope["type"] == "http" and (
                     (
                         scope["method"] == "POST"
@@ -277,6 +278,7 @@ class ReplicaRoutingMiddleware:
                     or (scope["method"] == "PATCH" and re.fullmatch(r"/v1/sessions/[^/]+", path))
                 ):
                     route, receive = await self._create_target(scope, receive, stack)
+                    explicit_target = route is not None
                 if route is None and scope["type"] == "http" and path == "/v1/skills":
                     query = Request(scope).query_params
                     if query.get("session_id"):
@@ -290,6 +292,7 @@ class ReplicaRoutingMiddleware:
                     match
                     and scope["type"] == "http"
                     and scope["method"] in {"POST", "PATCH", "PUT", "DELETE"}
+                    and not explicit_target
                     and (route is None or self.coordinator.local(route))
                 ):
                     resource = await asyncio.to_thread(

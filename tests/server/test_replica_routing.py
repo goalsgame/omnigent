@@ -205,3 +205,51 @@ async def test_host_dependent_endpoints_forward_to_owner(db_uri, endpoint):
     finally:
         await a.aclose()
         await b.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ingress", [8001, 8002])
+async def test_runner_rebind_preserves_explicit_destination_across_peer_hop(db_uri, ingress):
+    a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
+    hid = "2c167be5bad7438196cd12a3be5fce08"
+    conv = a.conversations.create_conversation(host_id=hid, workspace="/source")
+    calls = []
+
+    def endpoint(name):
+        async def serve(scope, receive, send):
+            calls.append((name, await Request(scope, receive).json()))
+            await JSONResponse({"backend": name})(scope, receive, send)
+
+        return serve
+
+    apps = {
+        8001: ReplicaRoutingMiddleware(endpoint("a"), a, None),
+        8002: ReplicaRoutingMiddleware(endpoint("b"), b, None),
+    }
+
+    class Dispatcher(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return await httpx.ASGITransport(app=apps[request.url.port]).handle_async_request(
+                request
+            )
+
+    for replica in (a, b):
+        await replica.transport._client._transport.aclose()
+        replica.transport._client._transport = Dispatcher()
+    try:
+        async with (
+            a.request_placement(hid),
+            b.request_resource("runner", "new-runner"),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=apps[ingress]), base_url="https://public.example"
+            ) as client,
+        ):
+            response = await client.patch(
+                f"/v1/sessions/{conv.id}", json={"runner_id": "new-runner"}
+            )
+            assert response.status_code == 200
+            assert response.json() == {"backend": "b"}
+            assert calls == [("b", {"runner_id": "new-runner"})]
+    finally:
+        await a.aclose()
+        await b.aclose()

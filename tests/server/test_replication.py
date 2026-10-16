@@ -298,3 +298,142 @@ async def test_remote_initial_owner_prevents_scheduling_launch(db_uri):
         assert not coordinator._task_fences
     finally:
         await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heartbeat", [False, True])
+async def test_nested_host_lease_loss_fences_launch_with_live_session_lease(db_uri, heartbeat):
+    from omnigent.server.replication import create_session_launch_task
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    other = BackendRouteStore(db_uri, "other", "http://127.0.0.1:8002")
+    started, gate = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def launch():
+        async with coordinator.reserve("nested-host"):
+            started.set()
+            await gate.wait()
+            from omnigent.db.backend_work_fence import fenced_to_thread
+
+            await fenced_to_thread(calls.append, "must not execute")
+
+    task = None
+    try:
+        with replication_scope(coordinator):
+            task = await create_session_launch_task("new-session", launch())
+        await started.wait()
+        route = coordinator.store.get("host", "nested-host")
+        assert task in coordinator._owned[(0, "host", "nested-host")].tasks.values()
+        assert coordinator.store.get("session", "new-session") is not None
+        coordinator.store.release(route)
+        replacement = other.claim("host", "nested-host")
+        if heartbeat:
+            await coordinator._renew_once()
+        gate.set()
+        outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+        assert isinstance(outcome, asyncio.CancelledError)
+        await asyncio.gather(*coordinator._cleanup)
+        assert calls == []
+        assert other.get("host", "nested-host").token == replacement.token
+        assert coordinator.store.get("session", "new-session") is None
+    finally:
+        gate.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await coordinator.aclose()
+
+
+@pytest.mark.parametrize("operation", ["replace", "rearm"])
+def test_lifecycle_write_rechecks_lease_after_outer_provider_boundary(db_uri, operation):
+    import time
+
+    from omnigent.db.account_authority import account_checks_scope
+    from omnigent.db.backend_work_fence import (
+        BackendWorkFence,
+        check_backend_work,
+        work_fence_scope,
+    )
+    from omnigent.stores.backend_route_store import BackendRouteStore
+    from omnigent.stores.host_store import HostStore
+
+    hosts = HostStore(db_uri)
+    a = BackendRouteStore(db_uri, "a", "http://127.0.0.1:8001")
+    b = BackendRouteStore(db_uri, "b", "http://127.0.0.1:8002")
+    hid = "2c167be5bad7438196cd12a3be5fce08"
+    expires = int(time.time()) + 300
+    with account_checks_scope(False):
+        host = hosts.register_managed_host(
+            host_id=hid,
+            name="test",
+            user_id="alice",
+            token="original",
+            provider="agent_sandbox",
+            sandbox_id="old-sandbox",
+            token_expires_at=expires,
+        )
+        route = a.claim("host", hid)
+        fence = BackendWorkFence(db_uri, {(0, "host", hid): route})
+        with work_fence_scope(fence):
+            check_backend_work()  # The outer provider-boundary check succeeded.
+        a.release(route)
+        b.claim("host", hid)
+        with work_fence_scope(fence), pytest.raises(asyncio.CancelledError):
+            if operation == "replace":
+                hosts.replace_managed_host_sandbox(
+                    host_id=hid,
+                    user_id="alice",
+                    token="new",
+                    provider="agent_sandbox",
+                    sandbox_id="new-sandbox",
+                    token_expires_at=expires,
+                )
+            else:
+                hosts.rearm_managed_host(
+                    hid,
+                    sandbox_id="old-sandbox",
+                    expected_updated_at=host.updated_at,
+                    token="new",
+                    token_expires_at=expires,
+                )
+        assert hosts.get_host(hid).sandbox_id == "old-sandbox"
+        assert hosts.resolve_launch_token(hid, "original") is not None
+        assert hosts.resolve_launch_token(hid, "new") is None
+
+
+def test_lifecycle_transaction_holds_placement_until_commit(db_uri):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    from omnigent.db.backend_work_fence import (
+        BackendWorkFence,
+        backend_work_transaction,
+        work_fence_scope,
+    )
+    from omnigent.stores.backend_route_store import BackendRouteStore
+    from omnigent.stores.host_store import HostStore
+
+    hosts = HostStore(db_uri)
+    a = BackendRouteStore(db_uri, "a", "http://127.0.0.1:8001")
+    route = a.claim("host", "example")
+    fence = BackendWorkFence(db_uri, {(0, "host", "example"): route})
+    started = Event()
+
+    def replace_lease():
+        started.set()
+        return a.release(route)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with work_fence_scope(fence), hosts._lifecycle_session("test_lock") as session:
+            with backend_work_transaction(session):
+                future = executor.submit(replace_lease)
+                assert started.wait(timeout=5)
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=0.1)
+        assert future.result(timeout=5)
