@@ -951,6 +951,9 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(app, db_ur
     class Dispatcher(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
             # Simulate crossing a process boundary, not inheriting its work fence.
+            if request.url.path.endswith("/resources/worktree"):
+                assert request.headers.get("content-length") in (None, "0")
+                assert await request.aread() == b""
             with work_fence_scope(None):
                 return await httpx.ASGITransport(app=apps[request.url.port]).handle_async_request(
                     request
@@ -991,7 +994,9 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(app, db_ur
                     transport=httpx.ASGITransport(app=apps[8001]),
                     base_url="https://public.example",
                 ) as client:
-                    response = await client.delete(f"/v1/sessions/{sid}?delete_branch=true")
+                    response = await client.request(
+                        "DELETE", f"/v1/sessions/{sid}?delete_branch=true", json={"ignored": True}
+                    )
             assert response.status_code == 200, response.text
             assert runner_calls == [("DELETE", f"/v1/sessions/{sid}")]
             assert seen == [

@@ -378,13 +378,19 @@ async def test_create_routes_all_supported_json_media_types(db_uri, content_type
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["provider", "transaction"])
 @pytest.mark.parametrize("heartbeat", [False, True])
-async def test_local_http_mutation_is_fenced_after_ownership_loss(db_uri, boundary, heartbeat):
+@pytest.mark.parametrize("explicit_runner", [False, True])
+async def test_local_http_mutation_is_fenced_after_ownership_loss(
+    db_uri, boundary, heartbeat, explicit_runner
+):
     from contextlib import suppress
 
     from omnigent.db.backend_work_fence import fenced_to_thread
 
     a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
     conv = a.conversations.create_conversation()
+    kind, resource = ("runner", "selected-runner") if explicit_runner else ("session", conv.id)
+    if explicit_runner:
+        a.store.claim(kind, resource)
     started, gate = asyncio.Event(), asyncio.Event()
     writes = []
 
@@ -405,12 +411,17 @@ async def test_local_http_mutation_is_fenced_after_ownership_loss(db_uri, bounda
             transport=httpx.ASGITransport(app=ReplicaRoutingMiddleware(mutation, a, None)),
             base_url="https://public.example",
         ) as client:
-            task = asyncio.create_task(client.delete(f"/v1/sessions/{conv.id}"))
+            operation = (
+                client.patch(f"/v1/sessions/{conv.id}", json={"runner_id": resource})
+                if explicit_runner
+                else client.delete(f"/v1/sessions/{conv.id}")
+            )
+            task = asyncio.create_task(operation)
             await started.wait()
-            route = a.store.get("session", conv.id)
+            route = a.store.get(kind, resource)
             assert route is not None
             a.store.release(route)
-            assert b.store.claim("session", conv.id).replica_id == b.store.replica_id
+            assert b.store.claim(kind, resource).replica_id == b.store.replica_id
             if heartbeat:
                 await a._renew_once()
             gate.set()

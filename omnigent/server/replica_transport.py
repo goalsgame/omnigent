@@ -308,7 +308,13 @@ class PeerTransport:
             "raw_path": path.encode(),
             "query_string": b"",
         }
-        headers = _headers(scope["headers"])
+        # This is a separate bodyless operation, even if the caller supplied
+        # an ignored DELETE body on the session endpoint.
+        headers = [
+            (key, value)
+            for key, value in _headers(scope["headers"])
+            if key.lower() != b"content-length"
+        ]
         headers.append((PEER_HEADER, self._context(scope, route).encode()))
         try:
             response = await self._client.delete(

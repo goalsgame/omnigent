@@ -50,7 +50,7 @@ class ReplicaRoutingMiddleware:
         self.permissions = permission_store
 
     def _authorized_mutation_resource(
-        self, scope: Scope, kind: str, resource: str
+        self, scope: Scope, kind: str, resource: str, explicit_route: BackendRoute | None = None
     ) -> tuple[str, str] | None:
         from omnigent.runner.routing import routing_host_id
         from omnigent.server.auth import LEVEL_EDIT
@@ -95,6 +95,8 @@ class ReplicaRoutingMiddleware:
                     return None
             elif self.coordinator.conversations.get_session_owner(session_id) != user:
                 return None
+        if explicit_route is not None:
+            return explicit_route.kind, explicit_route.resource_id
         if (
             not scope["path"].endswith("/resources/worktree")
             and conv.runner_id
@@ -319,11 +321,14 @@ class ReplicaRoutingMiddleware:
                     match
                     and scope["type"] == "http"
                     and scope["method"] in {"POST", "PATCH", "PUT", "DELETE"}
-                    and not explicit_target
                     and (route is None or self.coordinator.local(route))
                 ):
                     resource = await asyncio.to_thread(
-                        self._authorized_mutation_resource, scope, match.group(1), match.group(2)
+                        self._authorized_mutation_resource,
+                        scope,
+                        match.group(1),
+                        match.group(2),
+                        route if explicit_target else None,
                     )
                     if resource is not None:
                         route = await stack.enter_async_context(
