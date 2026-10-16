@@ -4437,6 +4437,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             session.add(agent_row)
             session.add(meta_row)
+            from omnigent.db.backend_placement import insert_initial_session_placement
+
+            insert_initial_session_placement(session, conversation_id)
             return meta_row, agent_row
 
         meta_row, agent_row = run_write_transaction(

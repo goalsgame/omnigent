@@ -36,6 +36,11 @@ Leases expire unless renewed. Generation tokens fence delayed disconnects and
 heartbeats after reconnection. Runner connections attached to a host remain on
 that host's backend. Managed launch tasks retain placement after their HTTP
 request returns, including newly created sessions that have no host binding yet.
+Losing ownership cancels retained launch tasks. Background launch writes validate
+the current lease inside metadata transactions, and provider calls check ownership
+before and after execution. An external operation already in flight cannot be
+recalled; stale work must not start another operation or commit new launch state.
+
 Runner listings include authenticated peer inventories, and host listings include
 capabilities reported by the current lease owner.
 

@@ -153,3 +153,32 @@ async def test_forwarding_preserves_auth_body_and_origin_without_cookie_leak(con
     finally:
         await transport.aclose()
         await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [httpx.ReadError, httpx.RemoteProtocolError])
+async def test_peer_disconnect_before_headers_is_retryable_without_replay(config, failure):
+    peer = PeerTransport(config)
+    calls = []
+
+    def disconnected(request):
+        calls.append(request.method)
+        raise failure("peer went away", request=request)
+
+    await peer._client.aclose()
+    peer._client = httpx.AsyncClient(transport=httpx.MockTransport(disconnected))
+    route = BackendRoute(0, "host", "example", "b", "http://127.0.0.1:8002", "nonce", 999999)
+
+    async def ingress(scope, receive, send):
+        await peer.forward_http(scope, receive, send, route)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=ingress), base_url="https://public.example"
+        ) as client:
+            response = await client.post("/v1/sessions/example/messages", json={"message": "once"})
+            assert response.status_code == 503
+            assert response.headers["retry-after"] == "1"
+            assert calls == ["POST"]
+    finally:
+        await peer.aclose()

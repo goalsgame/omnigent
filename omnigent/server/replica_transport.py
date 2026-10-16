@@ -237,9 +237,8 @@ class PeerTransport:
     def _url(self, scope: Scope, route: BackendRoute, *, websocket: bool = False) -> str:
         self.config.validate_endpoint(route.endpoint)
         path = scope.get("root_path", "").encode() + scope.get("raw_path", scope["path"].encode())
-        url = httpx.URL(route.endpoint).copy_with(
-            raw_path=path, query=scope.get("query_string", b"")
-        )
+        query = scope.get("query_string", b"")
+        url = httpx.URL(route.endpoint).copy_with(raw_path=path + (b"?" + query if query else b""))
         if websocket:
             url = url.copy_with(scheme="wss" if url.scheme == "https" else "ws")
         return str(url)
@@ -268,7 +267,7 @@ class PeerTransport:
             )
             response.raw_headers = _headers(upstream.headers.raw)
             await response(scope, receive, send)
-        except (httpx.ConnectError, httpx.ConnectTimeout):
+        except httpx.TransportError:
             if upstream is not None:
                 raise
             await JSONResponse(

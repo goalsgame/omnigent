@@ -86,6 +86,7 @@ async def test_two_cold_requests_choose_one_backend_and_retain_background_launch
                 break
             await asyncio.sleep(0.01)
         assert a.store.get("host", hid) is None
+        await asyncio.gather(*a._cleanup, *b._cleanup)
         assert not a._locks and not b._locks
     finally:
         gate.set()
@@ -145,3 +146,62 @@ async def test_body_replay_is_byte_exact_even_if_form_parsing_stops_early(db_uri
             assert response.json()["sha256"] == hashlib.sha256(expected).hexdigest()
     finally:
         await replica.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint", ["skills-host", "skills-session", "import", "import-stream", "clear-runner"]
+)
+async def test_host_dependent_endpoints_forward_to_owner(db_uri, endpoint):
+    a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
+    hid = "2c167be5bad7438196cd12a3be5fce08"
+    conv = a.conversations.create_conversation(host_id=hid, workspace="/workspace")
+    observed = []
+
+    def backend(name):
+        async def serve(scope, receive, send):
+            observed.append((name, await Request(scope, receive).body()))
+            await JSONResponse({"backend": name})(scope, receive, send)
+
+        return serve
+
+    apps = {
+        8001: ReplicaRoutingMiddleware(backend("a"), a, None),
+        8002: ReplicaRoutingMiddleware(backend("b"), b, None),
+    }
+
+    class Dispatcher(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return await httpx.ASGITransport(app=apps[request.url.port]).handle_async_request(
+                request
+            )
+
+    await b.transport._client._transport.aclose()
+    b.transport._client._transport = Dispatcher()
+    try:
+        async with (
+            a.request_placement(hid),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=apps[8002]), base_url="https://public.example"
+            ) as client,
+        ):
+            if endpoint.startswith("skills"):
+                key, value = (
+                    ("host_id", hid) if endpoint == "skills-host" else ("session_id", conv.id)
+                )
+                response = await client.get("/v1/skills", params={key: value})
+            elif endpoint == "clear-runner":
+                response = await client.patch(f"/v1/sessions/{conv.id}", json={"runner_id": ""})
+            else:
+                path = "/v1/imports/local" + ("/stream" if endpoint == "import-stream" else "")
+                response = await client.post(path, json={"host_id": hid, "source": "pi"})
+            assert response.status_code == 200
+            assert response.json() == {"backend": "a"}
+            assert len(observed) == 1
+            if endpoint == "clear-runner":
+                import json
+
+                assert json.loads(observed[0][1]) == {"runner_id": ""}
+    finally:
+        await a.aclose()
+        await b.aclose()

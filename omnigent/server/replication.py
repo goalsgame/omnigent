@@ -6,12 +6,12 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import wraps
-from typing import TYPE_CHECKING, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import httpx
 from fastapi import HTTPException
@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse
 from starlette.websockets import WebSocket
 
 from omnigent.db.backend_fence import backend_fence_scope
+from omnigent.db.backend_work_fence import BackendWorkFence, guarded_work
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.replica_transport import PeerTransport, ReplicationConfig
 from omnigent.stores.backend_route_store import BackendRoute, BackendRouteStore
@@ -73,6 +74,28 @@ def placed_managed_launch(
     return placed
 
 
+def create_managed_launch_task(coroutine: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    coordinator = _current.get()
+    if coordinator is None:
+        return asyncio.create_task(coroutine)
+    fence = BackendWorkFence(coordinator.database_uri)
+    held = _held.get()
+    if held is not None:
+        key, entry = held
+        fence.routes[key] = entry.route
+    task = asyncio.create_task(guarded_work(coroutine, fence))
+    fences = coordinator._task_fences
+    fences[task] = fence
+
+    def completed(done: asyncio.Task[None]) -> None:
+        fences.pop(done, None)
+        # Cancellation before the wrapper starts must close the supplied coroutine.
+        coroutine.close()
+
+    task.add_done_callback(completed)
+    return task
+
+
 def retain_managed_task(task: asyncio.Task[None]) -> None:
     """Transfer a request's placement reference to its background launch task."""
     coordinator = _current.get()
@@ -80,20 +103,30 @@ def retain_managed_task(task: asyncio.Task[None]) -> None:
         coordinator.retain_task(task)
 
 
-async def retain_created_session_task(session_id: str, task: asyncio.Task[None]) -> None:
-    """Keep a newly committed session on its creating backend until launch settles."""
+async def create_session_launch_task(
+    session_id: str, coroutine: Coroutine[Any, Any, None]
+) -> asyncio.Task[None]:
+    """Reserve the new session before scheduling any provider work."""
     coordinator = _current.get()
-    if coordinator is not None:
+    if coordinator is None:
+        return create_managed_launch_task(coroutine)
+    try:
         async with coordinator.request_resource("session", session_id) as route:
             if not coordinator.local(route):
                 raise RuntimeError("new session is owned by another backend")
+            task = create_managed_launch_task(coroutine)
             coordinator.retain_task(task)
+            return task
+    except BaseException:
+        coroutine.close()
+        raise
 
 
 @dataclass
 class _OwnedResource:
     route: BackendRoute
     connections: dict[str, WebSocket | None] = field(default_factory=dict)
+    tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
 
 
 @dataclass
@@ -111,6 +144,8 @@ class ReplicaCoordinator:
         hosts: HostRegistry,
     ) -> None:
         self.config = config
+        self.database_uri = database_uri
+        self._task_fences: dict[asyncio.Task[None], BackendWorkFence] = {}
         self.store = BackendRouteStore(
             database_uri, uuid.uuid4().hex, config.endpoint, ttl=config.lease_seconds
         )
@@ -146,6 +181,12 @@ class ReplicaCoordinator:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._task
+        launches = list(self._task_fences.items())
+        for task, fence in launches:
+            fence.lost = True
+            task.cancel("backend is stopping")
+        if launches:
+            await asyncio.gather(*(task for task, _ in launches), return_exceptions=True)
         if self._cleanup:
             await asyncio.gather(*self._cleanup, return_exceptions=True)
         for owned in list(self._owned.values()):
@@ -216,7 +257,19 @@ class ReplicaCoordinator:
         if entry is None:
             entry = _OwnedResource(route)
             self._owned[key] = entry
-        elif entry.route.token != route.token or entry.route.expires_at < route.expires_at:
+        elif entry.route.token != route.token:
+            # Claiming a new connection generation also retires every old socket,
+            # even if the replacement later fails its protocol handshake.
+            entry.route = route
+            for task in entry.tasks.values():
+                fence = self._task_fences.get(task)
+                if fence is not None:
+                    fence.routes[key] = route
+            for previous in list(entry.connections.values()):
+                if previous is not None:
+                    with suppress(Exception):
+                        await previous.close(code=1012, reason="backend connection replaced")
+        elif entry.route.expires_at < route.expires_at:
             entry.route = route
         entry.connections[reference] = ws
         handle = _held.set((key, entry))
@@ -235,6 +288,7 @@ class ReplicaCoordinator:
                 if self._owned.get(key) is not entry:
                     return
                 entry.connections.pop(reference, None)
+                entry.tasks.pop(reference, None)
                 if entry.connections:
                     return
                 self._owned.pop(key, None)
@@ -252,6 +306,10 @@ class ReplicaCoordinator:
             return
         reference = uuid.uuid4().hex
         entry.connections[reference] = None
+        entry.tasks[reference] = task
+        fence = self._task_fences.get(task)
+        if fence is not None:
+            fence.routes[key] = entry.route
 
         def completed(_task: asyncio.Task[None]) -> None:
             cleanup = asyncio.create_task(self._drop_reference(key, entry, reference))
@@ -307,7 +365,18 @@ class ReplicaCoordinator:
             if host_id:
                 route = await asyncio.to_thread(self.store.get, "host", host_id)
             else:
-                route = await asyncio.to_thread(self.store.claim, kind, resource_id)
+                key = (current_workspace_id(), kind, resource_id)
+                entry = self._owned.get(key)
+                # The first tunnel of a provisioning host adopts its launch
+                # reservation; no prior connection generation needs replacing.
+                reserved = entry is not None and not any(entry.connections.values())
+                route = (
+                    await asyncio.to_thread(self.store.get, kind, resource_id)
+                    if reserved
+                    else None
+                )
+                if route is None or not self.local(route):
+                    route = await asyncio.to_thread(self.store.claim, kind, resource_id)
             reference = None
             if route is not None and self.local(route):
                 # Runners must wait for their host's control tunnel to register.
@@ -339,25 +408,33 @@ class ReplicaCoordinator:
     async def _renew_loop(self) -> None:
         while True:
             await asyncio.sleep(self.config.lease_seconds / 3)
-            for key, entry in list(self._owned.items()):
-                with workspace_scope(key[0]):
-                    current = entry.route
-                    started = time.time()
-                    try:
-                        report = self._host_report(key[2]) if key[1] == "host" else None
-                        renewed = await asyncio.to_thread(self.store.renew, current, report)
-                    except Exception:
-                        _logger.exception("Backend ownership heartbeat failed")
-                        if entry.route.expires_at > time.time():
-                            continue
-                        renewed = False
-                    if self._owned.get(key) is not entry or entry.route.token != current.token:
+            await self._renew_once()
+
+    async def _renew_once(self) -> None:
+        for key, entry in list(self._owned.items()):
+            with workspace_scope(key[0]):
+                current = entry.route
+                started = time.time()
+                try:
+                    report = self._host_report(key[2]) if key[1] == "host" else None
+                    renewed = await asyncio.to_thread(self.store.renew, current, report)
+                except Exception:
+                    _logger.exception("Backend ownership heartbeat failed")
+                    if entry.route.expires_at > time.time():
                         continue
-                    if renewed:
-                        entry.route = replace(current, expires_at=started + self.store.ttl)
-                        continue
-                    self._owned.pop(key, None)
-                    for ws in list(entry.connections.values()):
-                        if ws is not None:
-                            with suppress(Exception):
-                                await ws.close(code=1012, reason="backend ownership changed")
+                    renewed = False
+                if self._owned.get(key) is not entry or entry.route.token != current.token:
+                    continue
+                if renewed:
+                    entry.route = replace(current, expires_at=started + self.store.ttl)
+                    continue
+                self._owned.pop(key, None)
+                for task in set(entry.tasks.values()):
+                    fence = self._task_fences.get(task)
+                    if fence is not None:
+                        fence.lost = True
+                    task.cancel("backend ownership changed")
+                for ws in list(entry.connections.values()):
+                    if ws is not None:
+                        with suppress(Exception):
+                            await ws.close(code=1012, reason="backend ownership changed")

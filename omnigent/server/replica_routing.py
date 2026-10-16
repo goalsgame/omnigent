@@ -204,7 +204,7 @@ class ReplicaRoutingMiddleware:
                 ("parent_session_id", "sessions"),
             ):
                 resource_id = payload.get(field)
-                if isinstance(resource_id, str):
+                if isinstance(resource_id, str) and resource_id:
                     route = await self._target(kind, resource_id)
                     break
         return route, replay
@@ -268,11 +268,21 @@ class ReplicaRoutingMiddleware:
                 if scope["type"] == "http" and (
                     (
                         scope["method"] == "POST"
-                        and (path == "/v1/sessions" or path.endswith("/fork"))
+                        and (
+                            path == "/v1/sessions"
+                            or path.endswith("/fork")
+                            or path in {"/v1/imports/local", "/v1/imports/local/stream"}
+                        )
                     )
                     or (scope["method"] == "PATCH" and re.fullmatch(r"/v1/sessions/[^/]+", path))
                 ):
                     route, receive = await self._create_target(scope, receive, stack)
+                if route is None and scope["type"] == "http" and path == "/v1/skills":
+                    query = Request(scope).query_params
+                    if query.get("session_id"):
+                        route = await self._target("sessions", query["session_id"])
+                    elif query.get("host_id"):
+                        route = await self._target("hosts", query["host_id"])
                 match = _RESOURCE.match(path)
                 if route is None and match:
                     route = await self._target(match.group(1), match.group(2))

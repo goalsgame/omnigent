@@ -182,6 +182,7 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 from fastapi import HTTPException
 
+from omnigent.db.backend_work_fence import fenced_to_thread
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.onboarding.sandboxes.base import SandboxGoneError
@@ -994,7 +995,7 @@ async def preload_managed_sandbox_sdk(deployment: ManagedSandboxDeployment | Non
     from omnigent.onboarding.sandboxes.kubernetes import _ensure_sdk
 
     try:
-        await asyncio.to_thread(_ensure_sdk)
+        await fenced_to_thread(_ensure_sdk)
     except click.ClickException:
         _logger.warning("Kubernetes SDK preload unavailable; managed launches will retry")
 
@@ -3535,11 +3536,11 @@ async def launch_managed_host(
     host_name = f"managed-{host_id[:8]}"
     try:
         with startup_span("server.prepare_agent"):
-            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         with startup_span("server.prepare_launcher"):
-            await asyncio.to_thread(launcher.prepare)
+            await fenced_to_thread(launcher.prepare)
         with startup_span("server.provision_worker", host_id=host_id):
-            sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+            sandbox_id = await fenced_to_thread(launcher.provision, host_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3630,10 +3631,10 @@ async def relaunch_managed_host(
         )
     try:
         with startup_span("server.prepare_agent"):
-            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         with startup_span("server.prepare_launcher"):
-            await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+            await fenced_to_thread(launcher.prepare)
+        sandbox_id = await fenced_to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3712,7 +3713,7 @@ async def _start_sandbox_host(
     # one-dimensional.
     if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
         start_classified = cast(Callable[..., str], launcher.start_host)
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             start_classified,
             sandbox_id,
             token=token,
@@ -3725,7 +3726,7 @@ async def _start_sandbox_host(
             agent_name=agent_name,
         )
     if host_config is None and on_stage is None:
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             launcher.start_host,
             sandbox_id,
             token=token,
@@ -3735,7 +3736,7 @@ async def _start_sandbox_host(
             repos=repos,
         )
     if host_config is None:
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             launcher.start_host,
             sandbox_id,
             token=token,
@@ -3746,7 +3747,7 @@ async def _start_sandbox_host(
             on_stage=on_stage,
         )
     if on_stage is None:
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             launcher.start_host,
             sandbox_id,
             token=token,
@@ -3756,7 +3757,7 @@ async def _start_sandbox_host(
             repos=repos,
             host_config=host_config,
         )
-    return await asyncio.to_thread(
+    return await fenced_to_thread(
         launcher.start_host,
         sandbox_id,
         token=token,
@@ -3829,7 +3830,7 @@ async def _register_and_start_host(
     try:
         with startup_span("server.persist_host", host_id=host_id):
             if keep_host_on_failure:
-                record = await asyncio.to_thread(
+                record = await fenced_to_thread(
                     host_store.replace_managed_host_sandbox,
                     host_id=host_id,
                     user_id=owner,
@@ -3841,7 +3842,7 @@ async def _register_and_start_host(
                 if record is None:
                     raise ValueError(f"managed host {host_id!r} no longer exists")
             else:
-                record = await asyncio.to_thread(
+                record = await fenced_to_thread(
                     host_store.register_managed_host,
                     host_id=host_id,
                     name=host_name,
@@ -3874,7 +3875,7 @@ async def _register_and_start_host(
         if record is None:
             current = None
             try:
-                current = await asyncio.to_thread(host_store.get_host, host_id)
+                current = await fenced_to_thread(host_store.get_host, host_id)
             except Exception:
                 _logger.exception("Could not inspect failed host registration")
             # A provider can reuse an ID already retained for active work or cleanup.
@@ -3899,7 +3900,7 @@ async def _register_and_start_host(
                 host_id=record.host_id,
                 provider=record.sandbox_provider,
             )
-            await asyncio.to_thread(host_store.revoke_launch_token, host_id)
+            await fenced_to_thread(host_store.revoke_launch_token, host_id)
         else:
             # The row was just armed with THIS single-provider config, so a
             # one-provider deployment tears it back down with the same launcher.
@@ -3928,7 +3929,7 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
     """
     deadline = time.monotonic() + MANAGED_HOST_ONLINE_TIMEOUT_S
     while time.monotonic() < deadline:
-        if await asyncio.to_thread(host_store.is_online, host_id):
+        if await fenced_to_thread(host_store.is_online, host_id):
             return
         await asyncio.sleep(_ONLINE_POLL_INTERVAL_S)
     raise HTTPException(
@@ -4093,16 +4094,16 @@ async def resume_managed_host(
         return
     # Cross-replica DB liveness (freshness-gated): never trust the per-replica
     # registry alone. Cheap gate before taking the lock.
-    if not force and await asyncio.to_thread(host_store.is_online, host_id):
+    if not force and await fenced_to_thread(host_store.is_online, host_id):
         return
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
     async with resume_lock:
         # Re-check under the lock: a concurrent waker may have brought the host
         # online while we waited.
-        if not force and await asyncio.to_thread(host_store.is_online, host_id):
+        if not force and await fenced_to_thread(host_store.is_online, host_id):
             return
-        host = await asyncio.to_thread(host_store.get_host, host_id)
+        host = await fenced_to_thread(host_store.get_host, host_id)
         if host is None:
             return
         # Provider-matched launcher (None if config dropped / provider changed).
@@ -4124,10 +4125,10 @@ async def resume_managed_host(
         )
         try:
             with startup_span("server.prepare_agent"):
-                await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
-            await asyncio.to_thread(launcher.resume, sandbox_id)
+                await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await fenced_to_thread(launcher.resume, sandbox_id)
             token = secrets.token_urlsafe(32)
-            armed = await asyncio.to_thread(
+            armed = await fenced_to_thread(
                 host_store.rearm_managed_host,
                 host.host_id,
                 sandbox_id=sandbox_id,
@@ -4136,7 +4137,7 @@ async def resume_managed_host(
                 token_expires_at=now_epoch() + entry.token_ttl_s,
             )
             if armed is None:
-                current = await asyncio.to_thread(host_store.get_host, host.host_id)
+                current = await fenced_to_thread(host_store.get_host, host.host_id)
                 if current is None:
                     await _terminate_sandbox_best_effort(
                         launcher,
@@ -4153,7 +4154,7 @@ async def resume_managed_host(
                         provider=host.sandbox_provider,
                     )
                     if terminated and current.terminating_sandbox_id == sandbox_id:
-                        await asyncio.to_thread(
+                        await fenced_to_thread(
                             host_store.mark_sandbox_terminated,
                             host.host_id,
                             sandbox_id=sandbox_id,
@@ -4206,7 +4207,7 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
-    tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    tombstone = await fenced_to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
         return
     launcher = _launcher_for_teardown(tombstone, config)
@@ -4220,7 +4221,7 @@ async def terminate_managed_host(
                 provider=tombstone.sandbox_provider,
             )
             if terminated:
-                await asyncio.to_thread(
+                await fenced_to_thread(
                     host_store.mark_sandbox_terminated,
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
@@ -4244,7 +4245,7 @@ async def _terminate_sandbox_best_effort(
         )
         return False
     try:
-        await asyncio.to_thread(launcher.terminate, sandbox_id)
+        await fenced_to_thread(launcher.terminate, sandbox_id)
         return True
     except Exception:  # noqa: BLE001 — provider cleanup must remain best-effort.
         _logger.warning(

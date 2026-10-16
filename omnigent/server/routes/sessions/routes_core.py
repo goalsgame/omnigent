@@ -505,7 +505,10 @@ def register_core_routes(
         # session page immediately after this 201) already carries the
         # "provisioning" stage.
         _publish_sandbox_status(session_id, "provisioning")
-        launch_task = asyncio.create_task(
+        from omnigent.server.replication import create_session_launch_task
+
+        launch_task = await create_session_launch_task(
+            session_id,
             _run_managed_launch(
                 session_id=session_id,
                 # On auth-disabled servers user_id is None; the sandbox
@@ -521,13 +524,12 @@ def register_core_routes(
                 provider=sandbox_provider,
                 agent_store=agent_store,
                 agent_id=agent_id,
-            )
+            ),
         )
-        from omnigent.server.replication import retain_created_session_task, retain_managed_task
+        from omnigent.server.replication import retain_managed_task
 
         _managed_launch_tasks.add(launch_task)
         retain_managed_task(launch_task)
-        await retain_created_session_task(session_id, launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
 
     async def _bind_and_launch_on_caller_host(

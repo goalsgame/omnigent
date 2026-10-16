@@ -4746,7 +4746,9 @@ def _kick_managed_relaunch(
             session_id,
             extra={"session_id": session_id},
         )
-    relaunch_task = asyncio.create_task(
+    from omnigent.server.replication import create_managed_launch_task
+
+    relaunch_task = create_managed_launch_task(
         _run_managed_launch(
             session_id=session_id,
             owner=host.user_id,
@@ -4844,7 +4846,9 @@ def _kick_managed_wake_impl(
             session_id,
             extra={"session_id": session_id},
         )
-    wake_task = asyncio.create_task(
+    from omnigent.server.replication import create_managed_launch_task
+
+    wake_task = create_managed_launch_task(
         _run_managed_wake(
             session_id=session_id,
             conv=conv,
