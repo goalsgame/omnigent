@@ -378,9 +378,11 @@ async def test_create_routes_all_supported_json_media_types(db_uri, content_type
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["provider", "transaction"])
 @pytest.mark.parametrize("heartbeat", [False, True])
-@pytest.mark.parametrize("explicit_runner", [False, True])
+@pytest.mark.parametrize(
+    "mode", ["delete", "patch", "host-create", "runner-create", "import", "import-stream"]
+)
 async def test_local_http_mutation_is_fenced_after_ownership_loss(
-    db_uri, boundary, heartbeat, explicit_runner
+    db_uri, boundary, heartbeat, mode
 ):
     from contextlib import suppress
 
@@ -388,8 +390,14 @@ async def test_local_http_mutation_is_fenced_after_ownership_loss(
 
     a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
     conv = a.conversations.create_conversation()
-    kind, resource = ("runner", "selected-runner") if explicit_runner else ("session", conv.id)
-    if explicit_runner:
+    kind, resource = (
+        ("runner", "selected-runner")
+        if mode in {"patch", "runner-create"}
+        else ("host", "2c167be5bad7438196cd12a3be5fce08")
+        if mode in {"host-create", "import", "import-stream"}
+        else ("session", conv.id)
+    )
+    if mode != "delete":
         a.store.claim(kind, resource)
     started, gate = asyncio.Event(), asyncio.Event()
     writes = []
@@ -402,7 +410,7 @@ async def test_local_http_mutation_is_fenced_after_ownership_loss(
         if boundary == "provider":
             await fenced_to_thread(writes.append, "provider-called")
         else:
-            await asyncio.to_thread(a.conversations.create_conversation, title="stale")
+            await asyncio.to_thread(a.conversations.replace_runner_id, conv.id, "stale-runner")
         await JSONResponse({"unexpected": "success"})(scope, receive, send)
 
     task = None
@@ -411,11 +419,15 @@ async def test_local_http_mutation_is_fenced_after_ownership_loss(
             transport=httpx.ASGITransport(app=ReplicaRoutingMiddleware(mutation, a, None)),
             base_url="https://public.example",
         ) as client:
-            operation = (
-                client.patch(f"/v1/sessions/{conv.id}", json={"runner_id": resource})
-                if explicit_runner
-                else client.delete(f"/v1/sessions/{conv.id}")
-            )
+            if mode == "patch":
+                operation = client.patch(f"/v1/sessions/{conv.id}", json={"runner_id": resource})
+            elif mode in {"host-create", "runner-create"}:
+                operation = client.post("/v1/sessions", json={f"{kind}_id": resource})
+            elif mode in {"import", "import-stream"}:
+                path = "/v1/imports/local" + ("/stream" if mode == "import-stream" else "")
+                operation = client.post(path, json={"host_id": resource})
+            else:
+                operation = client.delete(f"/v1/sessions/{conv.id}")
             task = asyncio.create_task(operation)
             await started.wait()
             route = a.store.get(kind, resource)
@@ -428,7 +440,7 @@ async def test_local_http_mutation_is_fenced_after_ownership_loss(
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert writes == []
-            assert all(row.title != "stale" for row in a.conversations.list_conversations().data)
+            assert a.conversations.get_conversation(conv.id).runner_id is None
     finally:
         gate.set()
         if task is not None:

@@ -27,6 +27,7 @@ from omnigent.server.routes._content_type import _is_json_media_type, _request_m
 from omnigent.stores.backend_route_store import BackendRoute
 
 if TYPE_CHECKING:
+    from omnigent.runner.routing import RunnerRouter
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store import PermissionStore
 
@@ -42,12 +43,14 @@ class ReplicaRoutingMiddleware:
         auth_provider: AuthProvider | None,
         host_store: HostStore | None = None,
         permission_store: PermissionStore | None = None,
+        runner_router: RunnerRouter | None = None,
     ) -> None:
         self.app = app
         self.coordinator = coordinator
         self.auth = auth_provider
         self.host_store = host_store
         self.permissions = permission_store
+        self.runner_router = runner_router
 
     def _authorized_mutation_resource(
         self, scope: Scope, kind: str, resource: str, explicit_route: BackendRoute | None = None
@@ -105,6 +108,26 @@ class ReplicaRoutingMiddleware:
             return ("runner", conv.runner_id)
         host = routing_host_id(conv, self.coordinator.conversations)
         return ("host", host) if host else ("session", session_id)
+
+    def _authorized_collection_resource(
+        self, scope: Scope, route: BackendRoute
+    ) -> tuple[str, str] | None:
+        try:
+            user = self.auth.get_user_id(HTTPConnection(scope)) if self.auth else None
+            if self.auth is None:
+                return route.kind, route.resource_id
+            if user is None:
+                return None
+            if route.kind == "host":
+                return self._authorized_mutation_resource(scope, "hosts", route.resource_id)
+            if route.kind == "runner":
+                from omnigent.server.routes._sessions.helpers import _registered_runner_id
+
+                _registered_runner_id(self.runner_router, route.resource_id, user_id=user)
+                return route.kind, route.resource_id
+        except OmnigentError:
+            return None
+        return None
 
     async def _error(self, scope: Scope, receive: Receive, send: Send, status: int) -> None:
         response = JSONResponse(
@@ -329,6 +352,21 @@ class ReplicaRoutingMiddleware:
                         match.group(1),
                         match.group(2),
                         route if explicit_target else None,
+                    )
+                    if resource is not None:
+                        route = await stack.enter_async_context(
+                            self.coordinator.request_resource(*resource)
+                        )
+                if (
+                    not match
+                    and explicit_target
+                    and route is not None
+                    and scope["type"] == "http"
+                    and scope["method"] == "POST"
+                    and self.coordinator.local(route)
+                ):
+                    resource = await asyncio.to_thread(
+                        self._authorized_collection_resource, scope, route
                     )
                     if resource is not None:
                         route = await stack.enter_async_context(

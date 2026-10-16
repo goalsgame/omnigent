@@ -4436,6 +4436,7 @@ def create_app(
             auth_provider=auth_provider,
             host_store=host_store,
             permission_store=permission_store,
+            runner_router=runner_router,
         )
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     if resolved_base_path:

@@ -903,7 +903,10 @@ async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
     assert len(captured) == 1
 
 
-async def test_rebound_runner_delete_cleans_worktree_on_other_backend(app, db_uri, monkeypatch):
+@pytest.mark.parametrize("lose_runner", [False, True])
+async def test_rebound_runner_delete_cleans_worktree_on_other_backend(
+    app, db_uri, monkeypatch, lose_runner
+):
     from ipaddress import ip_network
 
     from sqlalchemy.engine import make_url
@@ -963,6 +966,10 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(app, db_ur
 
     def runner(request):
         runner_calls.append((request.method, request.url.path))
+        if lose_runner:
+            with work_fence_scope(None):
+                b.store.release(b.store.get("runner", "standalone-runner"))
+                a.store.claim("runner", "standalone-runner")
         return httpx.Response(200, json={})
 
     runner_client = httpx.AsyncClient(
@@ -994,9 +1001,17 @@ async def test_rebound_runner_delete_cleans_worktree_on_other_backend(app, db_ur
                     transport=httpx.ASGITransport(app=apps[8001]),
                     base_url="https://public.example",
                 ) as client:
-                    response = await client.request(
+                    operation = client.request(
                         "DELETE", f"/v1/sessions/{sid}?delete_branch=true", json={"ignored": True}
                     )
+                    if lose_runner:
+                        with pytest.raises(asyncio.CancelledError):
+                            await operation
+                        assert captured == []
+                        assert conversations.get_conversation(sid) is not None
+                        assert seen == [("b", "DELETE", f"/v1/sessions/{sid}")]
+                        return
+                    response = await operation
             assert response.status_code == 200, response.text
             assert runner_calls == [("DELETE", f"/v1/sessions/{sid}")]
             assert seen == [

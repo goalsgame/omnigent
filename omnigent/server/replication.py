@@ -22,6 +22,7 @@ from starlette.websockets import WebSocket
 from omnigent.db.backend_fence import backend_fence_scope, current_backend_fence
 from omnigent.db.backend_work_fence import (
     BackendWorkFence,
+    check_backend_work,
     current_work_fence,
     guarded_work,
     work_fence_scope,
@@ -72,7 +73,9 @@ async def cleanup_remote_session_worktree(request: Request, session_id: str, hos
     route = await asyncio.to_thread(coordinator.store.get, "host", host_id)
     if route is None or coordinator.local(route):
         return False
+    await asyncio.to_thread(check_backend_work)
     await coordinator.transport.cleanup_session_worktree(request, route, session_id)
+    await asyncio.to_thread(check_backend_work)
     return True
 
 
