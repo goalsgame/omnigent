@@ -53,7 +53,11 @@ class ReplicaRoutingMiddleware:
         self.runner_router = runner_router
 
     def _authorized_mutation_resource(
-        self, scope: Scope, kind: str, resource: str, explicit_route: BackendRoute | None = None
+        self,
+        scope: Scope,
+        kind: str,
+        resource: str,
+        explicit_resource: tuple[str, str] | None = None,
     ) -> tuple[str, str] | None:
         from omnigent.runner.routing import routing_host_id
         from omnigent.server.auth import LEVEL_EDIT
@@ -98,8 +102,8 @@ class ReplicaRoutingMiddleware:
                     return None
             elif self.coordinator.conversations.get_session_owner(session_id) != user:
                 return None
-        if explicit_route is not None:
-            return explicit_route.kind, explicit_route.resource_id
+        if explicit_resource is not None:
+            return explicit_resource
         if (
             not scope["path"].endswith("/resources/worktree")
             and conv.runner_id
@@ -110,24 +114,28 @@ class ReplicaRoutingMiddleware:
         return ("host", host) if host else ("session", session_id)
 
     def _authorized_collection_resource(
-        self, scope: Scope, route: BackendRoute
+        self, scope: Scope, target: tuple[str, str]
     ) -> tuple[str, str] | None:
+        kind, resource_id = target
+        if kind in {"hosts", "sessions"}:
+            if self.auth is None and kind == "hosts":
+                try:
+                    return "host", uuid_to_bytes(resource_id).hex()
+                except InvalidUuidError:
+                    return None
+            return self._authorized_mutation_resource(scope, kind, resource_id)
         try:
             user = self.auth.get_user_id(HTTPConnection(scope)) if self.auth else None
-            if self.auth is None:
-                return route.kind, route.resource_id
-            if user is None:
-                return None
-            if route.kind == "host":
-                return self._authorized_mutation_resource(scope, "hosts", route.resource_id)
-            if route.kind == "runner":
+            if self.auth is not None:
+                if user is None:
+                    return None
                 from omnigent.server.routes._sessions.helpers import _registered_runner_id
 
-                _registered_runner_id(self.runner_router, route.resource_id, user_id=user)
-                return route.kind, route.resource_id
+                _registered_runner_id(self.runner_router, resource_id, user_id=user)
+            host = self.coordinator._runner_host(resource_id)
+            return ("host", host) if host else ("runner", resource_id)
         except OmnigentError:
             return None
-        return None
 
     async def _error(self, scope: Scope, receive: Receive, send: Send, status: int) -> None:
         response = JSONResponse(
@@ -189,15 +197,15 @@ class ReplicaRoutingMiddleware:
 
     async def _create_target(
         self, scope: Scope, receive: Receive, stack: AsyncExitStack
-    ) -> tuple[BackendRoute | None, Receive]:
+    ) -> tuple[BackendRoute | None, Receive, tuple[str, str] | None]:
         # Authenticate before pre-reading uploads. The destination still runs
         # the ordinary route authorization, including scoped-token checks.
         if self.auth is not None:
             try:
                 if await asyncio.to_thread(self.auth.get_user_id, HTTPConnection(scope)) is None:
-                    return None, receive
+                    return None, receive, None
             except OmnigentError:
-                return None, receive
+                return None, receive, None
         spool = stack.enter_context(
             SpooledTemporaryFile(max_size=1024 * 1024)  # noqa: SIM115 -- request stack owns the spool
         )
@@ -224,7 +232,7 @@ class ReplicaRoutingMiddleware:
                     if isinstance(metadata, str):
                         payload = json.loads(metadata)
             else:
-                return None, receive
+                return None, receive, None
         except (ValueError, UnicodeError, HTTPException, MultiPartException):
             # Preserve the normal endpoint's error shape for invalid metadata.
             pass
@@ -243,6 +251,7 @@ class ReplicaRoutingMiddleware:
             return await receive()
 
         route = None
+        target = None
         if isinstance(payload, dict):
             for field, kind in (
                 ("host_id", "hosts"),
@@ -253,9 +262,10 @@ class ReplicaRoutingMiddleware:
                 if field == "runner_id" and isinstance(resource_id, str):
                     resource_id = resource_id.strip()
                 if isinstance(resource_id, str) and resource_id:
+                    target = kind, resource_id
                     route = await self._target(kind, resource_id)
                     break
-        return route, replay
+        return route, replay, target
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         with replication_scope(self.coordinator):
@@ -313,7 +323,8 @@ class ReplicaRoutingMiddleware:
         async with AsyncExitStack() as stack:
             try:
                 route = None
-                explicit_target = False
+                explicit_target = None
+                explicit_resource = None
                 if scope["type"] == "http" and (
                     (
                         scope["method"] == "POST"
@@ -325,8 +336,13 @@ class ReplicaRoutingMiddleware:
                     )
                     or (scope["method"] == "PATCH" and re.fullmatch(r"/v1/sessions/[^/]+", path))
                 ):
-                    route, receive = await self._create_target(scope, receive, stack)
-                    explicit_target = route is not None
+                    route, receive, explicit_target = await self._create_target(
+                        scope, receive, stack
+                    )
+                    if explicit_target is not None:
+                        explicit_resource = await asyncio.to_thread(
+                            self._authorized_collection_resource, scope, explicit_target
+                        )
                 if route is None and scope["type"] == "http" and path == "/v1/skills":
                     query = Request(scope).query_params
                     if query.get("session_id"):
@@ -338,7 +354,7 @@ class ReplicaRoutingMiddleware:
                     if match_session:
                         route = await self._session_host_route(match_session.group(1))
                 match = _RESOURCE.match(path)
-                if route is None and match:
+                if route is None and match and explicit_resource is None:
                     route = await self._target(match.group(1), match.group(2))
                 if (
                     match
@@ -351,7 +367,7 @@ class ReplicaRoutingMiddleware:
                         scope,
                         match.group(1),
                         match.group(2),
-                        route if explicit_target else None,
+                        explicit_resource,
                     )
                     if resource is not None:
                         route = await stack.enter_async_context(
@@ -360,14 +376,11 @@ class ReplicaRoutingMiddleware:
                 if (
                     not match
                     and explicit_target
-                    and route is not None
                     and scope["type"] == "http"
                     and scope["method"] == "POST"
-                    and self.coordinator.local(route)
+                    and (route is None or self.coordinator.local(route))
                 ):
-                    resource = await asyncio.to_thread(
-                        self._authorized_collection_resource, scope, route
-                    )
+                    resource = explicit_resource
                     if resource is not None:
                         route = await stack.enter_async_context(
                             self.coordinator.request_resource(*resource)

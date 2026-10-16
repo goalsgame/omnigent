@@ -978,3 +978,109 @@ async def test_host_mutations_cannot_enqueue_after_ownership_loss(db_uri, comman
             )
     finally:
         await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_initial_placement_cleanup_ignores_lost_request_fence(db_uri, replacement):
+    from omnigent.db.backend_placement import creation_placement_scope
+    from omnigent.db.backend_work_fence import check_backend_work, work_fence_scope
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    other = BackendRouteStore(db_uri, "other", "http://127.0.0.1:8002")
+    try:
+        async with coordinator.request_placement("host") as host:
+            with creation_placement_scope(
+                coordinator.store.replica_id, coordinator.store.endpoint, 90
+            ) as created:
+                conv = coordinator.conversations.create_conversation()
+            initial = coordinator.store.get("session", conv.id)
+            assert initial is not None
+            with work_fence_scope(None):
+                coordinator.store.release(host)
+                other.claim("host", "host")
+                if replacement:
+                    coordinator.store.release(initial)
+                    newer = other.claim("session", conv.id)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.to_thread(check_backend_work)
+            await coordinator.release_created(created)
+            assert coordinator.conversations.get_conversation(conv.id) is not None
+            actual = other.get("session", conv.id)
+            if replacement:
+                assert actual is not None and actual.token == newer.token
+            else:
+                assert actual is None
+    finally:
+        await coordinator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_locked_postgres_lease_does_not_delay_other_renewals(db_uri):
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from sqlalchemy import select, update
+    from sqlalchemy.engine import make_url
+
+    from omnigent.db.db_models import SqlBackendRoute
+    from omnigent.db.utils import get_or_create_engine
+
+    if make_url(db_uri).get_backend_name() != "postgresql":
+        pytest.skip("Requires independent PostgreSQL row locks")
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    engine = get_or_create_engine(db_uri)
+    locked, release = threading.Event(), threading.Event()
+
+    def hold_lock():
+        with engine.begin() as connection:
+            connection.execute(
+                select(SqlBackendRoute)
+                .where(SqlBackendRoute.resource_id == "blocked")
+                .with_for_update()
+            ).all()
+            locked.set()
+            assert release.wait(10)
+
+    async def close(**kwargs):
+        raise AssertionError("Healthy connections must not be retired")
+
+    worker = None
+    try:
+        async with (
+            coordinator.connection(SimpleNamespace(scope={}, close=close), "runner", "blocked"),
+            coordinator.connection(SimpleNamespace(scope={}, close=close), "runner", "healthy"),
+        ):
+            with engine.begin() as connection:
+                connection.execute(
+                    update(SqlBackendRoute)
+                    .where(SqlBackendRoute.resource_id == "healthy")
+                    .values(expires_at=time.time() + 0.8)
+                )
+            worker = asyncio.create_task(asyncio.to_thread(hold_lock))
+            assert await asyncio.to_thread(locked.wait, 5)
+            await asyncio.wait_for(coordinator._renew_once(), 5)
+            healthy = coordinator.store.get("runner", "healthy")
+            assert healthy is not None and healthy.expires_at > time.time() + 30
+            assert not release.is_set()
+            release.set()
+            await worker
+            await coordinator._renew_once()
+            assert coordinator.store.get("runner", "blocked") is not None
+    finally:
+        release.set()
+        if worker is not None:
+            await worker
+        await coordinator.aclose()

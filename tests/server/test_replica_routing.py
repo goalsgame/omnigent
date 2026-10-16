@@ -377,12 +377,13 @@ async def test_create_routes_all_supported_json_media_types(db_uri, content_type
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["provider", "transaction"])
+@pytest.mark.parametrize("initial_expired", [False, True])
 @pytest.mark.parametrize("heartbeat", [False, True])
 @pytest.mark.parametrize(
     "mode", ["delete", "patch", "host-create", "runner-create", "import", "import-stream"]
 )
 async def test_local_http_mutation_is_fenced_after_ownership_loss(
-    db_uri, boundary, heartbeat, mode
+    db_uri, boundary, initial_expired, heartbeat, mode
 ):
     from contextlib import suppress
 
@@ -398,7 +399,9 @@ async def test_local_http_mutation_is_fenced_after_ownership_loss(
         else ("session", conv.id)
     )
     if mode != "delete":
-        a.store.claim(kind, resource)
+        initial = a.store.claim(kind, resource)
+        if initial_expired:
+            a.store.release(initial)
     started, gate = asyncio.Event(), asyncio.Event()
     writes = []
 
@@ -445,5 +448,40 @@ async def test_local_http_mutation_is_fenced_after_ownership_loss(
         gate.set()
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
+        await a.aclose()
+        await b.aclose()
+
+
+@pytest.mark.asyncio
+async def test_missing_explicit_runner_placement_does_not_use_old_remote_host(db_uri):
+    from omnigent.db.backend_work_fence import work_fence_scope
+
+    a, b = coordinator(db_uri, 8001), coordinator(db_uri, 8002)
+    hid = "2c167be5bad7438196cd12a3be5fce08"
+    hosts = HostStore(db_uri)
+    with account_checks_scope(False):
+        hosts.upsert_on_connect(hid, "test-host", "alice")
+    conv = a.conversations.create_conversation(host_id=hid, workspace="/source")
+    observed = []
+
+    async def local(scope, receive, send):
+        route = a.store.get("runner", "selected-runner")
+        assert route is not None and a.local(route)
+        observed.append(await Request(scope, receive).json())
+        await JSONResponse({"backend": "a"})(scope, receive, send)
+
+    try:
+        async with b.request_placement(hid):
+            with work_fence_scope(None):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=ReplicaRoutingMiddleware(local, a, None)),
+                    base_url="https://public.example",
+                ) as client:
+                    response = await client.patch(
+                        f"/v1/sessions/{conv.id}", json={"runner_id": "selected-runner"}
+                    )
+                    assert response.status_code == 200
+                    assert observed == [{"runner_id": "selected-runner"}]
+    finally:
         await a.aclose()
         await b.aclose()

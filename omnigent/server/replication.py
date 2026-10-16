@@ -529,7 +529,9 @@ class ReplicaCoordinator:
                 async with self._resource_lock(route.kind, route.resource_id):
                     key = (route.workspace_id, route.kind, route.resource_id)
                     if key not in self._owned:
-                        await asyncio.to_thread(self.store.release, route)
+                        # Cleanup compares generations even after the request loses ownership.
+                        with work_fence_scope(None):
+                            await asyncio.to_thread(self.store.release, route)
 
     @asynccontextmanager
     async def reserve(self, host_id: str) -> AsyncIterator[None]:
@@ -612,27 +614,32 @@ class ReplicaCoordinator:
             await self._renew_once()
 
     async def _renew_once(self) -> None:
-        for key, entry in list(self._owned.items()):
-            with workspace_scope(key[0]):
-                current = entry.route
-                started = time.time()
-                try:
-                    report = self._host_report(key[2]) if key[1] == "host" else None
-                    renewed = await asyncio.to_thread(self.store.renew, current, report)
-                except Exception:
-                    _logger.exception("Backend ownership heartbeat failed")
-                    if entry.route.expires_at > time.time():
-                        continue
-                    renewed = False
-                if self._owned.get(key) is not entry or entry.route.token != current.token:
-                    continue
-                if renewed:
-                    entry.route = replace(
-                        entry.route,
-                        expires_at=max(entry.route.expires_at, started + self.store.ttl),
-                    )
-                    continue
-                await self._retire_owned(key, entry)
+        concurrency = asyncio.Semaphore(8)
+
+        async def renew(key: tuple[int, str, str], entry: _OwnedResource) -> None:
+            async with concurrency:
+                with workspace_scope(key[0]), work_fence_scope(None):
+                    current = entry.route
+                    started = time.time()
+                    try:
+                        report = self._host_report(key[2]) if key[1] == "host" else None
+                        renewed = await asyncio.to_thread(self.store.renew, current, report)
+                    except Exception:
+                        _logger.exception("Backend ownership heartbeat failed")
+                        if entry.route.expires_at > time.time():
+                            return
+                        renewed = False
+                    if self._owned.get(key) is not entry or entry.route.token != current.token:
+                        return
+                    if renewed:
+                        entry.route = replace(
+                            entry.route,
+                            expires_at=max(entry.route.expires_at, started + self.store.ttl),
+                        )
+                        return
+                    await self._retire_owned(key, entry)
+
+        await asyncio.gather(*(renew(key, entry) for key, entry in list(self._owned.items())))
 
     async def _retire_owned(self, key: tuple[int, str, str], entry: _OwnedResource) -> None:
         if self._owned.get(key) is entry:

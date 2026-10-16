@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import Callable
 
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -221,6 +221,8 @@ class BackendRouteStore:
         """Extend only a still-live, matching generation; never resurrect a lost lease."""
 
         def write(session: Session) -> bool:
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '1000ms'"))
             row = session.scalar(
                 select(SqlBackendRoute)
                 .where(
