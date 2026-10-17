@@ -256,6 +256,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),
     "upload_file": _create_upload_file,
+    "sys_publish_artifact": None,
     "list_files": _create_list_files,
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,

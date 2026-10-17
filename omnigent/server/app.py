@@ -1575,6 +1575,19 @@ def create_app(
     server_metrics = ServerPerformanceMetrics()
     server_metrics_otel = ServerMetricsOtelPublisher()
 
+    from omnigent.server.routes.published_artifacts import (
+        PublicationLimits,
+        collect_published_artifacts,
+        create_published_artifacts_router,
+    )
+    from omnigent.stores.published_artifact_store import PublishedArtifactStore
+
+    publication_uri = getattr(file_store, "storage_location", None)
+    publication_store = (
+        PublishedArtifactStore(publication_uri) if isinstance(publication_uri, str) else None
+    )
+    publication_limits = PublicationLimits.parse(resolved_server_config.get("published_artifacts"))
+
     @asynccontextmanager
     async def _lifespan(
         app_inst: FastAPI,
@@ -1794,9 +1807,18 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        publication_cleanup = (
+            asyncio.create_task(collect_published_artifacts(publication_store, artifact_store))
+            if publication_store is not None
+            else None
+        )
         try:
             yield
         finally:
+            if publication_cleanup is not None:
+                publication_cleanup.cancel()
+                with suppress(asyncio.CancelledError):
+                    await publication_cleanup
             inference_proxy = getattr(app_inst.state, "inference_proxy", None)
             if inference_proxy is not None:
                 await inference_proxy.aclose()
@@ -3260,6 +3282,19 @@ def create_app(
                 _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
         # Still report the list, so admin chrome shows even if promotion failed.
         return {"user_id": user_id, "is_admin": flagged or listed}
+
+    if publication_store is not None:
+        app.include_router(
+            create_published_artifacts_router(
+                publication_store,
+                artifact_store,
+                conversation_store,
+                permission_store,
+                auth_provider,
+                publication_limits,
+            ),
+            prefix="/v1",
+        )
 
     app.include_router(
         create_sessions_router(

@@ -52,6 +52,10 @@ const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
 );
+const ArtifactsPage = withPageView(
+  "artifacts",
+  lazy(() => import("@/pages/ArtifactsPage").then((m) => ({ default: m.ArtifactsPage }))),
+);
 const CanvasPage = withPageView(
   "canvas",
   lazy(() => import("@/pages/CanvasPage").then((m) => ({ default: m.CanvasPage }))),
@@ -171,6 +175,7 @@ function AppRoutes({ basename }: AppProps) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route path={`${prefix}/artifacts/:artifactId?`} element={<ArtifactsPage />} />
           <Route
             path={`${prefix}/canvas`}
             element={

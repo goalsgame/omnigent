@@ -425,6 +425,7 @@ interface SidebarProps {
 function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
+  isArtifactsPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
@@ -437,6 +438,8 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
+  const isArtifactsPage =
+    !isExtensionRoute && /\/artifacts(?:\/[^/]+)?\/?$/.test(location.pathname);
   const isCanvasPage = !isExtensionRoute && leaf === "canvas";
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
@@ -445,6 +448,7 @@ function useActiveNavItem(): {
   const isNewSessionRoute =
     activeConversationId == null &&
     !isInboxPage &&
+    !isArtifactsPage &&
     !isCanvasPage &&
     !isTasksPage &&
     !isUsagePage &&
@@ -460,6 +464,7 @@ function useActiveNavItem(): {
   return {
     isNewChatPage,
     isInboxPage,
+    isArtifactsPage,
     isCanvasPage,
     isTasksPage,
     isUsagePage,
@@ -736,6 +741,7 @@ function SidebarImpl({
   const {
     isNewChatPage,
     isInboxPage,
+    isArtifactsPage,
     isCanvasPage,
     isTasksPage,
     isUsagePage,
@@ -1184,6 +1190,15 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              <PrimaryNavLink
+                to="/artifacts"
+                label="Artifacts"
+                icon={FolderOpenIcon}
+                active={isArtifactsPage}
+                onClick={onNavClick}
+                componentId="sidebar.artifacts"
+                testId="artifacts-nav"
+              />
               {canvasEnabled && (
                 <PrimaryNavLink
                   to="/canvas"

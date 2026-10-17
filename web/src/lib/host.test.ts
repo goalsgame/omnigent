@@ -98,3 +98,19 @@ describe("isDatabricksWorkspace", () => {
     expect(isDatabricksWorkspace()).toBe(true);
   });
 });
+
+describe("artifact renderer mapping", () => {
+  it("requires a browser URL mapping when the host rebases API fetches", async () => {
+    vi.resetModules();
+    const host = await import("./host");
+    const fetcher = vi.fn();
+    host.setOmnigentHostConfig({ fetcher });
+    expect(host.resolveArtifactRendererUrl("/v1/artifact-renderer")).toBeNull();
+    const resolve = vi.fn((path: string) => `/ajax-api/2.0/omnigent${path}`);
+    host.setOmnigentHostConfig({ fetcher, resolveArtifactRendererUrl: resolve });
+    expect(host.resolveArtifactRendererUrl("https://server.example/v1/artifact-renderer")).toBe(
+      "/ajax-api/2.0/omnigent/v1/artifact-renderer",
+    );
+    expect(resolve).toHaveBeenCalledWith("/v1/artifact-renderer");
+  });
+});

@@ -325,6 +325,35 @@ class SqlAgent(OmnigentBase):
     )
 
 
+class SqlPublishedArtifact(OmnigentBase):
+    """Immutable published bytes with ownership independent of a session."""
+
+    __tablename__ = "published_artifacts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(
+        String(128).with_variant(
+            MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        )
+    )
+    owner_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_session_id: Mapped[str] = mapped_column(Uuid16())
+    title: Mapped[str] = mapped_column(String(256))
+    filename: Mapped[str] = mapped_column(String(256))
+    kind: Mapped[str] = mapped_column(String(16))
+    content_type: Mapped[str] = mapped_column(String(128))
+    byte_size: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    expires_at: Mapped[int] = mapped_column(BigInteger, index=True)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    grants_json: Mapped[str] = mapped_column(Text, default="[]")
+    ready: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+
+
 class SqlFile(OmnigentBase):
     """
     SQLAlchemy model for the ``files`` table.
