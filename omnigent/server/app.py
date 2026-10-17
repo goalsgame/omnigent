@@ -3283,6 +3283,20 @@ def create_app(
         # Still report the list, so admin chrome shows even if promotion failed.
         return {"user_id": user_id, "is_admin": flagged or listed}
 
+    if isinstance(publication_uri, str):
+        from omnigent.server.routes.peer_messages import create_peer_messages_router
+        from omnigent.stores.peer_message_store import PeerMessageStore
+
+        app.include_router(
+            create_peer_messages_router(
+                PeerMessageStore(publication_uri),
+                conversation_store,
+                permission_store,
+                auth_provider,
+            ),
+            prefix="/v1",
+        )
+
     if publication_store is not None:
         app.include_router(
             create_published_artifacts_router(
