@@ -3,8 +3,10 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Link } from "@/lib/routing";
 import { ArtifactsPage } from "./ArtifactsPage";
+import { resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 
+vi.mock("@/lib/host", () => ({ resolveArtifactRendererUrl: vi.fn() }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 const artifact = {
   id: "a".repeat(32),
@@ -29,7 +31,10 @@ function show(path = `/artifacts/${artifact.id}`, nextPath?: string) {
   );
 }
 afterEach(cleanup);
-beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
+beforeEach(() => {
+  vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(resolveArtifactRendererUrl).mockImplementation((url) => url ?? "/v1/artifact-renderer");
+});
 
 it("previews untrusted HTML only inside an opaque sandbox without a bridge", async () => {
   vi.mocked(authenticatedFetch)
@@ -140,4 +145,29 @@ it("deletes through router navigation while preserving an embedding basename", a
   fireEvent.click(screen.getByRole("button", { name: "Delete artifact" }));
   expect(await screen.findByText("No published artifacts yet.")).toBeInTheDocument();
   confirm.mockRestore();
+});
+
+it("uses the host-mapped renderer route instead of the server path", async () => {
+  vi.mocked(resolveArtifactRendererUrl).mockReturnValue(
+    "/ajax-api/2.0/omnigent/v1/artifact-renderer",
+  );
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json({ ...artifact, renderer_url: "/v1/artifact-renderer" }))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  show();
+  expect(await screen.findByTitle("Published HTML artifact")).toHaveAttribute(
+    "src",
+    "/ajax-api/2.0/omnigent/v1/artifact-renderer",
+  );
+});
+
+it("keeps downloads available when an embedded host has no renderer mapping", async () => {
+  vi.mocked(resolveArtifactRendererUrl).mockReturnValue(null);
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  show();
+  expect(await screen.findByRole("alert")).toHaveTextContent("configure an artifact renderer URL");
+  expect(screen.queryByTitle("Published HTML artifact")).toBeNull();
+  expect(screen.getByRole("button", { name: /Download/ })).toBeInTheDocument();
 });

@@ -21,7 +21,10 @@ Ask a server-connected agent to create an output in its workspace and call:
 Use `kind: "file"` for other downloads. The native tool confines reads to the
 session workspace and caps its upload at 50 MiB. Publishing requires edit access
 to the source session. Human and machine identities publish as themselves.
-The tool does not grant sharing permissions.
+The tool does not grant sharing permissions. Native publication currently requires
+an unrestricted caller-process filesystem and no-follow directory-relative file
+opens (Linux/macOS). It rejects symlinks, restricted OS environments and platforms
+without confined opens; authenticated REST publication remains available there.
 
 The REST equivalent is a multipart request:
 
@@ -55,6 +58,12 @@ text attachments. Inline images,
 fonts and media may use data URLs. Bundle scripts, styles and data into the HTML
 file before publishing; multi-file sites, module imports and external APIs are
 not supported. No extension or agent-tool bridge is exposed to published HTML.
+
+Embedded hosts that rebase API requests must provide
+`OmnigentHostConfig.resolveArtifactRendererUrl(path)` with a browser-navigable URL
+for `/v1/artifact-renderer`, preserving the endpoint's CSP and other isolation
+headers. Without that mapping, downloads remain available but HTML preview is
+disabled.
 
 ## Retention and storage
 

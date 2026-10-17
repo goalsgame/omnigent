@@ -99,10 +99,10 @@ async def test_copy_on_write_publishing_is_rejected_before_read_or_upload(tmp_pa
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require POSIX")
-async def test_native_publishing_rejects_fifo_before_open(tmp_path, monkeypatch):
+async def test_native_publishing_rejects_fifo_without_upload(tmp_path):
     os.mkfifo(tmp_path / "report.pipe")
     seen = []
-    monkeypatch.setattr("os.open", lambda *args, **kwargs: pytest.fail("must not open FIFO"))
+
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: seen.append(r)), base_url="https://server.example"
     ) as client:
@@ -113,5 +113,80 @@ async def test_native_publishing_rejects_fifo_before_open(tmp_path, monkeypatch)
             conversation_id="a" * 32,
             runner_workspace=tmp_path,
         )
-    assert "regular file" in result
+    assert result.startswith("Error:")
     assert not seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sandbox",
+    [
+        {"cwd_allow_hidden": []},
+        {"mask_paths": ["secret.txt"]},
+    ],
+)
+async def test_native_publishing_rejects_restricted_filesystem(tmp_path, sandbox):
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    (tmp_path / "secret.txt").write_text("masked private content")
+    seen = []
+    spec = AgentSpec(spec_version=1, os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(**sandbox)))
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: seen.append(r)), base_url="https://server.example"
+    ) as client:
+        result = await _execute_file_tool(
+            PublishArtifactTool.name(),
+            {"path": "secret.txt", "title": "Report"},
+            client,
+            conversation_id="a" * 32,
+            runner_workspace=tmp_path,
+            agent_spec=spec,
+        )
+    assert "restricted OS environments" in result
+    assert not seen
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Confined directory opens require POSIX")
+@pytest.mark.parametrize("replacement", ["file", "parent"])
+def test_publication_read_rejects_symlink_replacement(tmp_path, monkeypatch, replacement):
+    from omnigent.runner.published_artifact_file import read_publication_file
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "reports").mkdir()
+    (root / "reports" / "report.txt").write_text("public")
+    outside = tmp_path / "private"
+    outside.mkdir()
+    (outside / "report.txt").write_text("private")
+    original_open = os.open
+    swapped = []
+
+    def racing_open(path, flags, *args, **kwargs):
+        if path == ("report.txt" if replacement == "file" else "reports") and not swapped:
+            swapped.append(True)
+            target = root / "reports" / "report.txt" if replacement == "file" else root / "reports"
+            target.rename(target.with_name(target.name + ".old"))
+            target.symlink_to(outside / "report.txt" if replacement == "file" else outside)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, racing_open})
+    with pytest.raises(OSError):
+        read_publication_file("reports/report.txt", root, 100)
+    assert swapped
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Confined directory opens require POSIX")
+def test_publication_rejects_replaced_workspace_and_bounds_content(tmp_path):
+    from omnigent.runner.published_artifact_file import read_publication_file
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "report.txt").write_bytes(b"1234")
+    with pytest.raises(ValueError, match="limit"):
+        read_publication_file("report.txt", root, 3)
+    assert read_publication_file("report.txt", root, 4) == ("report.txt", b"1234")
+    root.rename(tmp_path / "old-workspace")
+    root.symlink_to(tmp_path / "old-workspace")
+    with pytest.raises(OSError):
+        read_publication_file("report.txt", root, 4)

@@ -27,7 +27,6 @@ import logging
 import mimetypes
 import os
 import re
-import stat
 import tempfile
 import uuid
 import weakref
@@ -7471,25 +7470,26 @@ async def _execute_file_tool(
             return "Error: invalid artifact kind or retention"
         os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
         assert os_spec.cwd is not None
+        if (
+            os_spec.type != "caller_process"
+            or (os_spec.sandbox is not None and os_spec.sandbox.type != "none")
+            or os_spec.fork
+            or os_spec.start_in_scratch
+        ):
+            return "Error: publishing is unavailable for restricted OS environments"
+        from omnigent.runner.published_artifact_file import read_publication_file
+
         try:
-            resolved = safe_resolve(path, Path(os_spec.cwd))
-            if not resolved.is_file():
-                return "Error: publishing requires a regular file"
-            # Bound reads even when a file grows after stat(). Server limits are authoritative.
-            descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-            with os.fdopen(descriptor, "rb") as source:
-                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                    return "Error: publishing requires a regular file"
-                content = source.read(50 * 1024 * 1024 + 1)
-            if len(content) > 50 * 1024 * 1024:
-                return "Error: artifact exceeds the runner upload limit (50 MiB)"
+            filename, content = await asyncio.to_thread(
+                read_publication_file, path, Path(os_spec.cwd), 50 * 1024 * 1024
+            )
             data = {"title": title, "kind": kind}
             if days is not None:
                 data["retention_days"] = str(days)
             response = await server_client.post(
                 f"/v1/sessions/{conversation_id}/artifacts",
                 data=data,
-                files={"file": (resolved.name, content)},
+                files={"file": (filename, content)},
                 timeout=60.0,
             )
             if response.status_code != 201:
@@ -7501,7 +7501,9 @@ async def _execute_file_tool(
             for key in ("viewer_url", "download_url"):
                 result[key] = urljoin(str(server_client.base_url), result[key])
             return json.dumps(result)
-        except (OSError, ValueError, httpx.HTTPError):
+        except ValueError as exc:
+            return f"Error: {exc}"
+        except (OSError, httpx.HTTPError):
             return "Error: artifact could not be read or published"
 
     if tool_name == UploadFileTool.name():

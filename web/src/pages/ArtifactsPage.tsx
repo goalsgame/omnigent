@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "@/lib/routing";
-import { withBasePath } from "@/lib/basePath";
+import { resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -43,6 +43,7 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
   const [principal, setPrincipal] = useState("");
   const [principalType, setPrincipalType] = useState<"user" | "group">("user");
   const [saving, setSaving] = useState(false);
+  const rendererUrl = resolveArtifactRendererUrl(artifact?.renderer_url);
 
   useEffect(() => {
     let active = true;
@@ -257,12 +258,18 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
             </form>
           </details>
         )}
-        {preview !== null && (
+        {preview !== null && !rendererUrl && (
+          <p role="alert">
+            This host must configure an artifact renderer URL to preview HTML. Downloads remain
+            available.
+          </p>
+        )}
+        {preview !== null && rendererUrl && (
           <iframe
             title="Published HTML artifact"
             sandbox="allow-scripts"
             referrerPolicy="no-referrer"
-            src={artifact?.renderer_url ?? withBasePath("/v1/artifact-renderer")}
+            src={rendererUrl}
             onLoad={(event) => {
               event.currentTarget.contentWindow?.postMessage(
                 {
