@@ -385,3 +385,46 @@ async def test_full_application_wires_publication_catalog(client):
     response = await client.get("/v1/artifacts")
     assert response.status_code == 200, response.text
     assert response.json() == {"data": []}
+
+
+@pytest.mark.asyncio
+async def test_links_use_configured_base_path_when_internal_request_has_no_root(publication_env):
+    app, _, _, _, sid = publication_env
+    app.state.base_path = "/proxy/6767"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        item = (await _publish(client, sid)).json()
+        assert item["viewer_url"] == f"/proxy/6767/artifacts/{item['id']}"
+        assert item["download_url"] == f"/proxy/6767/v1/artifacts/{item['id']}/content"
+
+
+@pytest.mark.asyncio
+async def test_app_uses_operator_publication_config_when_no_override(
+    db_uri, tmp_path, monkeypatch
+):
+    from tests.server.routes.test_sessions_sharing_mode import _build_app
+
+    config = {
+        "published_artifacts": {
+            "public_url": "https://public.example",
+            "max_bytes": 100,
+            "max_html_bytes": 100,
+            "retention_days": 7,
+            "max_retention_days": 10,
+        }
+    }
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: config)
+    app = _build_app(db_uri, tmp_path)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    sid = conversations.create_conversation().id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://internal"
+    ) as client:
+        response = await _publish(client, sid)
+        assert response.status_code == 201, response.text
+        item = response.json()
+        assert item["viewer_url"].startswith("https://public.example/artifacts/")
+        assert item["expires_at"] - item["created_at"] == 7 * 86400
+        assert (await _publish(client, sid, content=b"x" * 101)).status_code == 413
+        assert (await _publish(client, sid, retention_days="11")).status_code == 422

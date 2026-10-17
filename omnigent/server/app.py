@@ -1586,7 +1586,7 @@ def create_app(
     publication_store = (
         PublishedArtifactStore(publication_uri) if isinstance(publication_uri, str) else None
     )
-    publication_limits = PublicationLimits.parse((server_config or {}).get("published_artifacts"))
+    publication_limits = PublicationLimits.parse(resolved_server_config.get("published_artifacts"))
 
     @asynccontextmanager
     async def _lifespan(

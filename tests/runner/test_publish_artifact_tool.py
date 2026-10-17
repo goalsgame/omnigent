@@ -5,7 +5,12 @@ import json
 import httpx
 import pytest
 
-from omnigent.runner.tool_dispatch import _execute_file_tool, build_native_relay_tool_schemas
+from omnigent.runner.tool_dispatch import (
+    _execute_file_tool,
+    build_native_relay_tool_schemas,
+    execute_tool,
+)
+from omnigent.spec.types import AgentSpec
 from omnigent.tools.builtins.publish_artifact import PublishArtifactTool
 
 
@@ -64,6 +69,28 @@ async def test_native_publishing_rejects_escape_without_upload(tmp_path, path):
     assert not seen
 
 
-def test_native_default_surface_includes_publish():
-    names = {schema["name"] for schema in build_native_relay_tool_schemas(None)}
+@pytest.mark.parametrize("spec", [None, AgentSpec(spec_version=1)])
+def test_native_default_surface_includes_publish(spec):
+    names = {schema["name"] for schema in build_native_relay_tool_schemas(spec)}
     assert PublishArtifactTool.name() in names
+
+
+@pytest.mark.asyncio
+async def test_copy_on_write_publishing_is_rejected_before_read_or_upload(tmp_path, monkeypatch):
+    (tmp_path / "report.html").write_text("original host file")
+    monkeypatch.setattr("omnigent.sandbox.copy_on_write.has_copy_on_write", lambda _: True)
+    seen = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: seen.append(r)), base_url="https://server.example"
+    ) as client:
+        result = await execute_tool(
+            tool_name=PublishArtifactTool.name(),
+            arguments=json.dumps({"path": "report.html", "title": "Report"}),
+            server_client=client,
+            agent_spec=AgentSpec(spec_version=1),
+            conversation_id="a" * 32,
+            runner_workspace=tmp_path,
+            effective_harness="pi-native",
+        )
+    assert "does not yet support copy_on_write" in result
+    assert not seen

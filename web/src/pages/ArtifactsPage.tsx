@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
-import { Link, useParams } from "@/lib/routing";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Link, useNavigate, useParams } from "@/lib/routing";
 import { authenticatedFetch } from "@/lib/identity";
-import { withBasePath } from "@/lib/basePath";
+import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 
 interface Grant {
@@ -24,6 +24,18 @@ const PREVIEW_POLICY =
 
 export function ArtifactsPage() {
   const { artifactId } = useParams();
+  return <ArtifactContents key={artifactId ?? "catalog"} artifactId={artifactId} />;
+}
+
+function ArtifactContents({ artifactId }: { artifactId?: string }) {
+  const navigate = useNavigate();
+  const alive = useRef(true);
+  useLayoutEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   const [items, setItems] = useState<Artifact[]>([]);
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -109,141 +121,156 @@ export function ArtifactsPage() {
       });
       if (!response.ok)
         throw new Error("Could not update sharing. Use the exact user identity or group name.");
-      setArtifact(await response.json());
+      const updated = await response.json();
+      if (!alive.current) return;
+      setArtifact(updated);
       setPrincipal("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Sharing failed.");
+      if (alive.current) setError(e instanceof Error ? e.message : "Sharing failed.");
     } finally {
-      setSaving(false);
+      if (alive.current) setSaving(false);
     }
   }
 
   async function remove() {
     if (!artifact || !window.confirm("Delete this published artifact and revoke its links?"))
       return;
-    const response = await authenticatedFetch(`/v1/artifacts/${artifact.id}`, { method: "DELETE" });
-    if (response.ok) window.location.assign(withBasePath("/artifacts"));
-    else setError("Could not delete the artifact.");
+    try {
+      const response = await authenticatedFetch(`/v1/artifacts/${artifact.id}`, {
+        method: "DELETE",
+      });
+      if (!alive.current) return;
+      if (response.ok) navigate("/artifacts");
+      else setError("Could not delete the artifact.");
+    } catch {
+      if (alive.current) setError("Could not delete the artifact.");
+    }
   }
 
   return (
-    <main className="flex h-full min-h-0 flex-col gap-4 p-4">
-      <header className="flex flex-wrap items-center gap-3">
-        <h1 className="text-xl font-semibold">{artifact?.title ?? "Published artifacts"}</h1>
-        {artifact && (
-          <>
-            <Button variant="outline" onClick={() => void download()}>
-              Download
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() =>
-                void navigator.clipboard
-                  .writeText(window.location.href)
-                  .catch(() => setError("Could not copy the link."))
-              }
-            >
-              Copy link
-            </Button>
-            {artifact.can_manage && (
-              <Button variant="outline" onClick={() => void remove()}>
-                Delete artifact
+    <PageScroll
+      maxWidthClassName="max-w-none"
+      contentClassName="px-4"
+      data-testid="artifacts-scroll"
+    >
+      <main className="flex min-h-0 flex-col gap-4">
+        <header className="flex flex-wrap items-center gap-3">
+          <h1 className="text-xl font-semibold">{artifact?.title ?? "Published artifacts"}</h1>
+          {artifact && (
+            <>
+              <Button variant="outline" onClick={() => void download()}>
+                Download
               </Button>
+              <Button
+                variant="outline"
+                onClick={() =>
+                  void navigator.clipboard
+                    .writeText(window.location.href)
+                    .catch(() => setError("Could not copy the link."))
+                }
+              >
+                Copy link
+              </Button>
+              {artifact.can_manage && (
+                <Button variant="outline" onClick={() => void remove()}>
+                  Delete artifact
+                </Button>
+              )}
+            </>
+          )}
+        </header>
+        {loading && <p role="status">Loading artifact…</p>}
+        {error && <p role="alert">{error}</p>}
+        {!artifactId && !loading && !error && (
+          <>
+            <p className="text-sm text-muted-foreground">
+              Your published files and self-contained HTML. Links require access; artifacts survive
+              session deletion.
+            </p>
+            {items.length === 0 ? (
+              <p>No published artifacts yet.</p>
+            ) : (
+              <ul>
+                {items.map((item) => (
+                  <li key={item.id}>
+                    <Link className="underline" to={`/artifacts/${item.id}`}>
+                      {item.title}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
             )}
           </>
         )}
-      </header>
-      {loading && <p role="status">Loading artifact…</p>}
-      {error && <p role="alert">{error}</p>}
-      {!artifactId && !loading && !error && (
-        <>
+        {artifact && (
           <p className="text-sm text-muted-foreground">
-            Your published files and self-contained HTML. Links require access; artifacts survive
-            session deletion.
+            {artifact.filename} · {artifact.byte_size.toLocaleString()} bytes · Expires{" "}
+            {new Date(artifact.expires_at * 1000).toLocaleDateString()}
           </p>
-          {items.length === 0 ? (
-            <p>No published artifacts yet.</p>
-          ) : (
+        )}
+        {artifact?.can_manage && (
+          <details>
+            <summary>Sharing</summary>
+            <p className="my-2 text-sm">
+              Only you and these people or groups can open this artifact. Copying a link grants no
+              access.
+            </p>
             <ul>
-              {items.map((item) => (
-                <li key={item.id}>
-                  <Link className="underline" to={`/artifacts/${item.id}`}>
-                    {item.title}
-                  </Link>
+              {artifact.grants?.map((g, i) => (
+                <li key={`${g.principal_type}:${g.principal}`}>
+                  {g.principal_type}: {g.principal}{" "}
+                  <Button
+                    variant="ghost"
+                    disabled={saving}
+                    onClick={() => void share((artifact.grants ?? []).filter((_, n) => n !== i))}
+                  >
+                    Remove access
+                  </Button>
                 </li>
               ))}
             </ul>
-          )}
-        </>
-      )}
-      {artifact && (
-        <p className="text-sm text-muted-foreground">
-          {artifact.filename} · {artifact.byte_size.toLocaleString()} bytes · Expires{" "}
-          {new Date(artifact.expires_at * 1000).toLocaleDateString()}
-        </p>
-      )}
-      {artifact?.can_manage && (
-        <details>
-          <summary>Sharing</summary>
-          <p className="my-2 text-sm">
-            Only you and these people or groups can open this artifact. Copying a link grants no
-            access.
-          </p>
-          <ul>
-            {artifact.grants?.map((g, i) => (
-              <li key={`${g.principal_type}:${g.principal}`}>
-                {g.principal_type}: {g.principal}{" "}
-                <Button
-                  variant="ghost"
-                  disabled={saving}
-                  onClick={() => void share((artifact.grants ?? []).filter((_, n) => n !== i))}
-                >
-                  Remove access
-                </Button>
-              </li>
-            ))}
-          </ul>
-          <form
-            className="mt-2 flex flex-wrap gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (principal.trim())
-                void share([
-                  ...(artifact.grants ?? []),
-                  { principal_type: principalType, principal: principal.trim() },
-                ]);
-            }}
-          >
-            <select
-              aria-label="Principal type"
-              value={principalType}
-              onChange={(e) => setPrincipalType(e.target.value as "user" | "group")}
+            <form
+              className="mt-2 flex flex-wrap gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (principal.trim())
+                  void share([
+                    ...(artifact.grants ?? []),
+                    { principal_type: principalType, principal: principal.trim() },
+                  ]);
+              }}
             >
-              <option value="user">User</option>
-              <option value="group">Group</option>
-            </select>
-            <input
-              aria-label="User identity or group name"
-              className="rounded border bg-background px-2"
-              value={principal}
-              onChange={(e) => setPrincipal(e.target.value)}
-              required
-            />
-            <Button type="submit" disabled={saving}>
-              Grant read access
-            </Button>
-          </form>
-        </details>
-      )}
-      {preview !== null && (
-        <iframe
-          title="Published HTML artifact"
-          sandbox="allow-scripts"
-          referrerPolicy="no-referrer"
-          srcDoc={preview}
-          className="min-h-96 w-full flex-1 rounded border bg-white"
-        />
-      )}
-    </main>
+              <select
+                aria-label="Principal type"
+                value={principalType}
+                onChange={(e) => setPrincipalType(e.target.value as "user" | "group")}
+              >
+                <option value="user">User</option>
+                <option value="group">Group</option>
+              </select>
+              <input
+                aria-label="User identity or group name"
+                className="rounded border bg-background px-2"
+                value={principal}
+                onChange={(e) => setPrincipal(e.target.value)}
+                required
+              />
+              <Button type="submit" disabled={saving}>
+                Grant read access
+              </Button>
+            </form>
+          </details>
+        )}
+        {preview !== null && (
+          <iframe
+            title="Published HTML artifact"
+            sandbox="allow-scripts"
+            referrerPolicy="no-referrer"
+            srcDoc={preview}
+            className="min-h-96 w-full flex-1 rounded border bg-white"
+          />
+        )}
+      </main>
+    </PageScroll>
   );
 }

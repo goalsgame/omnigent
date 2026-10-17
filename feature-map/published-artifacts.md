@@ -26,6 +26,7 @@ Preconditions: use an isolated server with SQL metadata and artifact storage;
 HTML reports must contain their own scripts/styles/data. No provider access is needed.
 
 - API, permissions and independent lifetime: `tests/server/test_published_artifacts.py`.
+- Real-server native publication and session deletion: `tests/e2e/test_published_artifacts.py`.
 - Agent publication and workspace boundaries: `tests/runner/test_publish_artifact_tool.py`.
 - Viewer/list/permission forms: `web/src/pages/ArtifactsPage.test.tsx`.
 - Real browser, own environment: `tests/browser_ui/test_published_artifacts.py`.

@@ -145,7 +145,9 @@ def create_published_artifacts_router(
         return item
 
     def payload(item: PublishedArtifact, request: Request) -> dict[str, Any]:
-        root = request.scope.get("root_path", "").rstrip("/")
+        root = (
+            request.scope.get("root_path") or getattr(request.app.state, "base_path", "") or ""
+        ).rstrip("/")
         result = {
             key: getattr(item, key)
             for key in (

@@ -466,6 +466,7 @@ _BROWSER_TIMEOUT_ERROR = (
 # ``os_env`` gate), so the native relay assembles them separately.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
+    | frozenset({PublishArtifactTool.name()})
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
@@ -6581,7 +6582,13 @@ async def execute_tool(
     )
     if disposable and (
         tool_name in _SKILL_TOOLS
-        or tool_name in {UploadFileTool.name(), "sys_agent_download", "sys_agent_list"}
+        or tool_name
+        in {
+            UploadFileTool.name(),
+            PublishArtifactTool.name(),
+            "sys_agent_download",
+            "sys_agent_list",
+        }
         or (tool_name == "sys_session_create" and args.get("config_path"))
     ):
         return json.dumps(

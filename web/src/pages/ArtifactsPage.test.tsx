@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { Link } from "@/lib/routing";
 import { ArtifactsPage } from "./ArtifactsPage";
 import { authenticatedFetch } from "@/lib/identity";
 
@@ -17,9 +18,10 @@ const artifact = {
 };
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-function show(path = `/artifacts/${artifact.id}`) {
+function show(path = `/artifacts/${artifact.id}`, nextPath?: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
+      {nextPath && <Link to={nextPath}>Navigate away</Link>}
       <Routes>
         <Route path="/artifacts/:artifactId?" element={<ArtifactsPage />} />
       </Routes>
@@ -79,4 +81,58 @@ it("lists owner publications and handles an empty catalog", async () => {
   vi.mocked(authenticatedFetch).mockResolvedValueOnce(json({ data: [] }));
   show("/artifacts");
   expect(await screen.findByText("No published artifacts yet.")).toBeInTheDocument();
+});
+
+it.each(["success", "error"])(
+  "ignores delayed sharing %s after switching artifacts",
+  async (outcome) => {
+    let resolve!: (response: Response) => void;
+    const pending = new Promise<Response>((r) => {
+      resolve = r;
+    });
+    const next = { ...artifact, id: "b".repeat(32), title: "Next report", kind: "file" };
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(json(artifact))
+      .mockResolvedValueOnce(new Response("<h1>A</h1>"))
+      .mockReturnValueOnce(pending)
+      .mockResolvedValueOnce(json(next));
+    show(undefined, `/artifacts/${next.id}`);
+    await screen.findByTitle("Published HTML artifact");
+    fireEvent.click(screen.getByText("Sharing"));
+    fireEvent.change(screen.getByLabelText("User identity or group name"), {
+      target: { value: "reader@example.test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Grant read access" }));
+    fireEvent.click(screen.getByText("Navigate away"));
+    await screen.findByRole("heading", { name: "Next report" });
+    await act(async () => {
+      resolve(outcome === "success" ? json({ ...artifact, title: "Stale report" }) : json({}, 403));
+      await pending;
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Next report" })).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Stale report")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: "Grant read access" })).not.toBeDisabled();
+  },
+);
+
+it("deletes through router navigation while preserving an embedding basename", async () => {
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json({ ...artifact, kind: "file" }))
+    .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    .mockResolvedValueOnce(json({ data: [] }));
+  render(
+    <MemoryRouter basename="/embedded" initialEntries={[`/embedded/artifacts/${artifact.id}`]}>
+      <Routes>
+        <Route path="/artifacts/:artifactId?" element={<ArtifactsPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  await screen.findByText("Report");
+  fireEvent.click(screen.getByRole("button", { name: "Delete artifact" }));
+  expect(await screen.findByText("No published artifacts yet.")).toBeInTheDocument();
+  confirm.mockRestore();
 });

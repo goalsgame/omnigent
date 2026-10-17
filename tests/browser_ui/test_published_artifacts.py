@@ -67,6 +67,7 @@ def test_html_scripts_cannot_read_parent_storage_or_call_api(page: Page, artifac
     expect(frame.locator("#isolation")).to_have_text(
         '{"parentBlocked":true,"storageBlocked":true,"fetchBlocked":true}'
     )
+    assert frame.locator("html").evaluate("() => document.compatMode") == "CSS1Compat"
     frame.get_by_role("button", name="Try interaction").click()
     expect(frame.get_by_role("button", name="Interaction works")).to_be_visible()
     assert page.evaluate("document.body.dataset.compromised") is None
@@ -105,3 +106,28 @@ def test_catalog_navigation_and_group_sharing(
     expect(page.get_by_role("heading", name="Published artifacts")).to_be_visible()
     page.get_by_role("link", name="Isolated report").click()
     expect(page.get_by_role("heading", name="Isolated report")).to_be_visible()
+
+
+def test_long_catalog_scrolls_inside_shell(
+    page: Page, artifact_url: str, browser_contract: BrowserContract
+):
+    rows = [
+        {
+            "id": f"{i:032x}",
+            "title": f"Report {i}",
+            "filename": "x",
+            "kind": "file",
+            "byte_size": 1,
+            "expires_at": 2000000000,
+            "can_manage": True,
+        }
+        for i in range(100)
+    ]
+    browser_contract.json("/v1/artifacts", {"data": rows})
+    page.goto(browser_contract.base_url + "/artifacts")
+    last = page.get_by_role("link", name="Report 99", exact=True)
+    last.scroll_into_view_if_needed()
+    expect(last).to_be_visible()
+    scroller = page.get_by_test_id("artifacts-scroll")
+    assert scroller.evaluate("el => el.scrollHeight > el.clientHeight")
+    assert scroller.evaluate("el => el.scrollTop > 0")
