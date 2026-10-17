@@ -32,7 +32,8 @@ async def test_session_bound_send_read_ack_and_retry_id():
 
     def transport(request):
         requests.append(request)
-        return httpx.Response(201, json={"ok": True})
+        payload = json.loads(request.content) if request.content else {}
+        return httpx.Response(201, json={"ok": True, "id": payload.get("id")})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(transport), base_url="https://example.test"
@@ -87,3 +88,62 @@ async def test_uncertain_send_returns_reusable_id_without_retry():
         assert result["outcome_unknown"] is True
         assert len(result["message_id"]) == 32
         assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 504, 408])
+async def test_ambiguous_http_send_preserves_id_and_bounded_detail(status):
+    identifier = uuid.uuid4().hex
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, text="upstream timeout " * 1000)
+        ),
+        base_url="https://example.test",
+    ) as client:
+        result = json.loads(
+            await execute_peer_tool(
+                "sys_peer_send",
+                {
+                    "recipient_session_id": uuid.uuid4().hex,
+                    "subject": "test",
+                    "body": "hello",
+                    "message_id": identifier,
+                },
+                uuid.uuid4().hex,
+                client,
+            )
+        )
+        assert result["outcome_unknown"] is True
+        assert result["message_id"] == identifier
+        assert len(result["server_detail"]) == 1024
+        assert result["server_detail"].startswith("upstream timeout")
+
+
+@pytest.mark.asyncio
+async def test_invalid_success_body_is_uncertain_but_validation_rejection_is_definite():
+    for status, body, unknown in (
+        (201, "not valid JSON", True),
+        (201, '{"unexpected":"response"}', True),
+        (422, '{"detail":"Message body exceeds 8192 UTF-8 bytes"}', False),
+    ):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request, status=status, body=body: httpx.Response(status, text=body)
+            ),
+            base_url="https://example.test",
+        ) as client:
+            result = json.loads(
+                await execute_peer_tool(
+                    "sys_peer_send",
+                    {
+                        "recipient_session_id": uuid.uuid4().hex,
+                        "subject": "test",
+                        "body": "hello",
+                    },
+                    uuid.uuid4().hex,
+                    client,
+                )
+            )
+            assert result["outcome_unknown"] is unknown
+            assert result["server_detail"] == body
+            assert len(result["message_id"]) == 32

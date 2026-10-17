@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, dataclass, replace
 
 from sqlalchemy import and_, delete, or_, select, update
@@ -63,6 +64,31 @@ class PeerMessageStore:
                     SqlConversationMetadata.id == session_id,
                 )
             )
+
+    def initialize_mailbox_id(self, session_id: str, actor: str) -> str:
+        """Initialize a legacy session only while its observed NULL incarnation is unchanged."""
+
+        def write(session: Session) -> str:
+            require_active_account(session, actor, generation=account_generation(actor))
+            metadata = session.scalar(
+                select(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == session_id,
+                )
+                .with_for_update()
+            )
+            if metadata is None:
+                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            if metadata.peer_mailbox_id is not None:
+                raise OmnigentError(
+                    "Session changed; retry with current access", code=ErrorCode.CONFLICT
+                )
+            mailbox_id = uuid.uuid4().hex
+            metadata.peer_mailbox_id = mailbox_id
+            return mailbox_id
+
+        return run_write_transaction(self._write, "initialize_mailbox", write)
 
     def send(self, message: PeerMessage) -> PeerMessage:
         """Insert once; a repeated message id must describe the same authenticated send."""

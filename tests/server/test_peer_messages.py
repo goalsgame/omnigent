@@ -477,3 +477,34 @@ async def test_send_and_read_with_stale_mailbox_incarnation_fail_closed(peer_env
     assert not store.acknowledge(
         target, old.id, "alice@example.test", mailbox_id=old.recipient_mailbox_id
     )
+
+
+@pytest.mark.asyncio
+async def test_legacy_mailboxes_initialize_only_on_authorized_write(peer_env):
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    app, store, _, _, source, target, _ = peer_env
+    with store._write("prepare_legacy_sessions") as session:
+        for sid in (source, target):
+            session.get(
+                SqlConversationMetadata, (current_workspace_id(), sid)
+            ).peer_mailbox_id = None
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        read = await client.get(_path(target), headers=_headers("reader@example.test"))
+        assert read.status_code == 200 and read.json()["messages"] == []
+        assert store.mailbox_id(target) is None
+        assert (
+            await client.post(
+                _path(source), json=_message(target), headers=_headers("reader@example.test")
+            )
+        ).status_code == 403
+        assert store.mailbox_id(source) is None
+        assert (
+            await client.post(_path(source), json=_message(target), headers=_headers())
+        ).status_code == 201
+        assert store.mailbox_id(source) and store.mailbox_id(target)
+        assert store.mailbox_id(source) != store.mailbox_id(target)
+        with pytest.raises(OmnigentError, match="Session changed"):
+            store.initialize_mailbox_id(target, "alice@example.test")

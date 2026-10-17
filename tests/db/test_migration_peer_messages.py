@@ -56,8 +56,16 @@ def test_upgrade_from_artifacts_preserves_data(tmp_path):
             .scalars()
             .all()
         )
-        assert len(incarnations) == len(set(incarnations)) == 2
-        assert all(incarnations)
+        assert incarnations == [None, None]
+    from omnigent.db.db_models import SqlConversationMetadata
+    from omnigent.stores.peer_message_store import PeerMessageStore
+
+    store = PeerMessageStore(uri)
+    with get_or_create_engine(uri).connect() as conn:
+        session_ids = conn.execute(sa.select(SqlConversationMetadata.id)).scalars().all()
+    incarnations = [store.initialize_mailbox_id(sid, "local") for sid in session_ids]
+    assert len(incarnations) == len(set(incarnations)) == 2
+    assert all(store.mailbox_id(sid) for sid in session_ids)
 
     command.downgrade(config, "oa1b2c3d4e5f")
     assert "peer_messages" not in sa.inspect(engine).get_table_names()

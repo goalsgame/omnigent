@@ -53,7 +53,7 @@ def create_peer_messages_router(
 ) -> APIRouter:
     """Expose inboxes to readers, sends and acknowledgements to session editors."""
 
-    async def authorize(request: Request, session_id: str, level: int) -> tuple[str, str]:
+    async def authorize(request: Request, session_id: str, level: int) -> tuple[str, str | None]:
         user = require_user(request, auth) or "local"
         try:
             if uuid.UUID(hex=session_id).hex != session_id:
@@ -62,10 +62,10 @@ def create_peer_messages_router(
             raise HTTPException(404, "Session not found") from exc
         mailbox_id = await asyncio.to_thread(store.mailbox_id, session_id)
         await require_access(user, session_id, level, permissions, conversations)
-        if mailbox_id is None:
-            raise HTTPException(404, "Session not found")
         if await asyncio.to_thread(conversations.get_conversation, session_id) is None:
             raise HTTPException(404, "Session not found")
+        if mailbox_id is None and level >= 2:
+            mailbox_id = await asyncio.to_thread(store.initialize_mailbox_id, session_id, user)
         return user, mailbox_id
 
     class BoundedMessageRoute(APIRoute):
@@ -98,6 +98,7 @@ def create_peer_messages_router(
     async def send_message(session_id: str, message: SendPeerMessage, request: Request) -> dict:
         user, sender_mailbox = await authorize(request, session_id, 2)
         _, recipient_mailbox = await authorize(request, message.recipient_session_id, 2)
+        assert sender_mailbox is not None and recipient_mailbox is not None
         if session_id == message.recipient_session_id:
             raise HTTPException(422, "Peer messages require a different recipient session")
         now = now_epoch_us()
@@ -139,6 +140,8 @@ def create_peer_messages_router(
                     raise ValueError("Noncanonical cursor")
             except ValueError as exc:
                 raise HTTPException(422, "Invalid message cursor") from exc
+        if mailbox_id is None:
+            return {"messages": [], "cursor": None, "has_more": False}
         rows = await asyncio.to_thread(
             store.list_messages,
             session_id,

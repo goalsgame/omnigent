@@ -4,8 +4,6 @@ Revision ID: ob1b2c3d4e5f
 Revises: oa1b2c3d4e5f
 """
 
-import uuid
-
 import sqlalchemy as sa
 from alembic import op
 
@@ -30,21 +28,6 @@ def upgrade() -> None:
         column["name"] for column in sa.inspect(bind).get_columns(metadata.name)
     }:
         op.add_column(metadata.name, sa.Column("peer_mailbox_id", Uuid16(), nullable=True))
-    rows = bind.execute(
-        sa.select(metadata.c.workspace_id, metadata.c.id).where(
-            metadata.c.peer_mailbox_id.is_(None)
-        )
-    ).all()
-    for workspace_id, session_id in rows:
-        bind.execute(
-            metadata.update()
-            .where(
-                metadata.c.workspace_id == workspace_id,
-                metadata.c.id == session_id,
-                metadata.c.peer_mailbox_id.is_(None),
-            )
-            .values(peer_mailbox_id=uuid.uuid4().hex)
-        )
     if "peer_messages" in sa.inspect(op.get_bind()).get_table_names():
         return
     op.create_table(
