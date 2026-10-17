@@ -1045,6 +1045,12 @@ def test_scope_token_allowed_on_allowlisted_path() -> None:
     """A machine token reaches allowlisted prefixes and their sub-paths."""
     provider = _make_oidc_provider()
     assert provider._check_cookie(_req("/v1/sessions", bearer=_machine_token())) == _MACHINE_SUB
+    assert provider._check_cookie(_req("/v1/artifacts", bearer=_machine_token())) == _MACHINE_SUB
+    assert (
+        provider._check_cookie(_req("/v1/artifacts/abc/content", bearer=_machine_token()))
+        == _MACHINE_SUB
+    )
+    assert provider._check_cookie(_req("/v1/artifactsX", bearer=_machine_token())) is None
     assert (
         provider._check_cookie(_req("/v1/sessions/abc/events", bearer=_machine_token()))
         == _MACHINE_SUB
@@ -1089,6 +1095,12 @@ def test_grant_id_token_still_hits_revocation_denylist() -> None:
     """Device tokens (scope + grant_id) still consult the revocation check."""
     provider = _make_oidc_provider()
     provider.set_grant_revocation_check(lambda grant_id: grant_id == "revoked-1")
+    assert (
+        provider._check_cookie(
+            _req("/v1/artifacts/abc/content", bearer=_device_grant_token("revoked-1"))
+        )
+        is None
+    )
 
     assert (
         provider._check_cookie(_req("/v1/sessions", bearer=_device_grant_token("revoked-1")))

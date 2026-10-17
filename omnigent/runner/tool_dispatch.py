@@ -85,6 +85,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.publish_artifact import PublishArtifactTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -253,6 +254,7 @@ _REST_TOOLS: frozenset[str] = frozenset()
 _FILE_TOOLS = frozenset(
     {
         UploadFileTool.name(),
+        PublishArtifactTool.name(),
         DownloadFileTool.name(),
         "list_files",  # from builtins registry; no standalone class
     }
@@ -581,6 +583,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
         for _cls in (
+            PublishArtifactTool,
             ListCommentsTool,
             UpdateCommentTool,
             SysSessionListTool,
@@ -7448,6 +7451,45 @@ async def _execute_file_tool(
     if conversation_id is None:
         return f"Error: {tool_name} requires a session id"
     files_path = f"/v1/sessions/{conversation_id}/resources/files"
+
+    if tool_name == PublishArtifactTool.name():
+        path, title = args.get("path"), args.get("title")
+        kind, days = args.get("kind", "file"), args.get("retention_days")
+        if not isinstance(path, str) or not path or not isinstance(title, str) or not title:
+            return "Error: publishing requires a workspace path and title"
+        if kind not in ("file", "html") or (
+            days is not None and (type(days) is not int or days <= 0)
+        ):
+            return "Error: invalid artifact kind or retention"
+        os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+        assert os_spec.cwd is not None
+        try:
+            resolved = safe_resolve(path, Path(os_spec.cwd))
+            # Bound reads even when a file grows after stat(). Server limits are authoritative.
+            with resolved.open("rb") as source:
+                content = source.read(50 * 1024 * 1024 + 1)
+            if len(content) > 50 * 1024 * 1024:
+                return "Error: artifact exceeds the runner upload limit (50 MiB)"
+            data = {"title": title, "kind": kind}
+            if days is not None:
+                data["retention_days"] = str(days)
+            response = await server_client.post(
+                f"/v1/sessions/{conversation_id}/artifacts",
+                data=data,
+                files={"file": (resolved.name, content)},
+                timeout=60.0,
+            )
+            if response.status_code != 201:
+                return f"Error: publication rejected (HTTP {response.status_code})"
+            result = response.json()
+            # API paths are deployment-relative; agents need a pasteable absolute link.
+            from urllib.parse import urljoin
+
+            for key in ("viewer_url", "download_url"):
+                result[key] = urljoin(str(server_client.base_url), result[key])
+            return json.dumps(result)
+        except (OSError, ValueError, httpx.HTTPError):
+            return "Error: artifact could not be read or published"
 
     if tool_name == UploadFileTool.name():
         path = args.get("path")

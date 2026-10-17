@@ -70,6 +70,7 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 _DELEGATED_ALLOWED_PREFIXES = (
     "/health",
     "/v1/agents",
+    "/v1/artifacts",
     "/v1/hosts",
     "/v1/sessions",
     "/v1/skills",
