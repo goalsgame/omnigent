@@ -42,7 +42,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.Column("expires_at", sa.BigInteger(), nullable=False),
         sa.Column("deleted", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("grants_json", sa.Text(), nullable=False, server_default="[]"),
+        sa.Column("grants_json", sa.Text(), nullable=False),
         sa.Column("ready", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
     op.create_index("ix_published_artifacts_expires_at", "published_artifacts", ["expires_at"])

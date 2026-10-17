@@ -350,7 +350,7 @@ class SqlPublishedArtifact(OmnigentBase):
     created_at: Mapped[int] = mapped_column(BigInteger)
     expires_at: Mapped[int] = mapped_column(BigInteger, index=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
-    grants_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    grants_json: Mapped[str] = mapped_column(Text, default="[]")
     ready: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 

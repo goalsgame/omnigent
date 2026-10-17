@@ -110,7 +110,8 @@ publication lifetime. Sandbox/session cleanup must not sweep the namespace.
 | `DELETE /v1/artifacts/{id}` | Owner; immediate revocation |
 
 Owner metadata includes `sharing_revision`. Permissions requests must return it
-as `revision`, for example `{"revision":"<sharing_revision>","grants":[{
+as `revision`. Serialized grants are limited to 16,383 UTF-8 bytes; oversized
+lists return 400 without changing access. For example `{"revision":"<sharing_revision>","grants":[{
 "principal_type":"group","principal":"engineering"}]}` or `principal_type: "user"`.
 A stale revision returns 409; reload metadata before editing again. An empty list
 revokes all explicit readers. The owner remains authorized. Every read checks

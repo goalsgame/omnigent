@@ -716,3 +716,34 @@ async def test_stale_client_sharing_cannot_restore_revoked_reader(publication_en
         ).status_code == 404
         missing = await client.put(path, headers=_headers(), json={"grants": []})
         assert missing.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_unicode_grants_obey_serialized_storage_bound(publication_env):
+    from dataclasses import replace
+
+    app, store, _, _, sid = publication_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        item = (await _publish(client, sid)).json()
+        path = f"/v1/artifacts/{item['id']}/permissions"
+        grants = [
+            {"principal_type": "user", "principal": "用" * 127 + chr(0x4E00 + n)}
+            for n in range(100)
+        ]
+        assert len(json.dumps({"grants": grants}, ensure_ascii=False).encode()) < 64 * 1024
+        response = await _share(client, path, headers=_headers(), json={"grants": grants})
+        assert response.status_code == 400
+        original = store.get(item["id"])
+        assert original and original.grants_json == "[]"
+        serialized = json.dumps([{"principal": "用户", "is_group": False}], ensure_ascii=False)
+        boundary = serialized + " " * (16_383 - len(serialized.encode()))
+        assert len(boundary.encode()) == 16_383
+        accepted = replace(original, id="e" * 32, grants_json=boundary)
+        store.create(accepted)
+        assert store.get(accepted.id).grants_json == boundary
+        with pytest.raises(OmnigentError) as too_large:
+            store.create(replace(accepted, id="f" * 32, grants_json=boundary + " "))
+        assert too_large.value.http_status == 400
+        assert store.get("f" * 32) is None

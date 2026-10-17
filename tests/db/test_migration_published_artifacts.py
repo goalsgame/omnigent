@@ -1,9 +1,42 @@
-"""Fresh and upgrade migration paths preserve existing session metadata."""
+"""Publication catalog DDL works through both migrations and ORM creation."""
+
+import importlib
 
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 
-from omnigent.db.utils import _build_alembic_config
+from omnigent.db.db_models import SqlPublishedArtifact
+from omnigent.db.utils import _build_alembic_config, get_or_create_engine
+
+
+def test_publication_migration_and_metadata_accept_text_without_server_default(db_uri):
+    engine = get_or_create_engine(db_uri)
+    migration = importlib.import_module(
+        "omnigent.db.migrations.versions.oa1b2c3d4e5f_add_published_artifacts"
+    )
+    table = SqlPublishedArtifact.__table__
+    with engine.begin() as connection:
+        table.drop(connection)
+        try:
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+                columns = {
+                    column["name"]: column
+                    for column in sa.inspect(connection).get_columns(table.name)
+                }
+                assert columns["grants_json"]["default"] is None
+                assert not columns["grants_json"]["nullable"]
+                assert "owner_generation" in columns
+                migration.downgrade()
+            table.create(connection)
+            columns = {
+                column["name"]: column for column in sa.inspect(connection).get_columns(table.name)
+            }
+            assert columns["grants_json"]["default"] is None
+        finally:
+            table.create(connection, checkfirst=True)
 
 
 def test_upgrade_adds_independent_catalog_and_preserves_session_data(tmp_path):

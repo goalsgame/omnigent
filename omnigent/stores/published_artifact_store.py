@@ -57,6 +57,14 @@ def _entity(row: SqlPublishedArtifact) -> PublishedArtifact:
     )
 
 
+def _validate_grants_size(serialized: str) -> str:
+    if len(serialized.encode("utf-8")) > 16_383:
+        raise OmnigentError(
+            "Artifact sharing exceeds the stored grants limit", code=ErrorCode.INVALID_INPUT
+        )
+    return serialized
+
+
 class PublishedArtifactStore:
     """Store immutable metadata, tombstones and owner-controlled read grants."""
 
@@ -71,6 +79,7 @@ class PublishedArtifactStore:
 
     def create(self, artifact: PublishedArtifact) -> None:
         """Insert pending metadata under the publishing account's authority."""
+        _validate_grants_size(artifact.grants_json)
         with self._write_session("create") as session:
             require_active_account(
                 session, artifact.owner_id, generation=artifact.owner_generation
@@ -118,6 +127,7 @@ class PublishedArtifactStore:
 
         snapshot = self.get(artifact_id) if grants is not None else None
         additions = []
+        serialized_grants = None
         if grants is not None:
             if snapshot is None:
                 return False
@@ -130,6 +140,7 @@ class PublishedArtifactStore:
             }
             additions = [g for g in grants if (g["principal"], g["is_group"]) not in retained]
             grants = [retained.get((g["principal"], g["is_group"]), g) for g in grants]
+            serialized_grants = _validate_grants_size(json.dumps(grants, ensure_ascii=False))
 
         def write(session: Session) -> bool:
             with ExitStack() as targets:
@@ -163,7 +174,8 @@ class PublishedArtifactStore:
                     raise OmnigentError(
                         "Artifact sharing changed; reload and retry", code=ErrorCode.CONFLICT
                     )
-                row.grants_json = json.dumps(grants)
+                assert serialized_grants is not None
+                row.grants_json = serialized_grants
             if delete:
                 row.deleted = True
             return True
