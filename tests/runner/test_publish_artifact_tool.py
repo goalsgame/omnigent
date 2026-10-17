@@ -1,6 +1,7 @@
 """Native publishing uses session authority and stays inside its workspace."""
 
 import json
+import os
 
 import httpx
 import pytest
@@ -93,4 +94,24 @@ async def test_copy_on_write_publishing_is_rejected_before_read_or_upload(tmp_pa
             effective_harness="pi-native",
         )
     assert "does not yet support copy_on_write" in result
+    assert not seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require POSIX")
+async def test_native_publishing_rejects_fifo_before_open(tmp_path, monkeypatch):
+    os.mkfifo(tmp_path / "report.pipe")
+    seen = []
+    monkeypatch.setattr("os.open", lambda *args, **kwargs: pytest.fail("must not open FIFO"))
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: seen.append(r)), base_url="https://server.example"
+    ) as client:
+        result = await _execute_file_tool(
+            PublishArtifactTool.name(),
+            {"path": "report.pipe", "title": "Report"},
+            client,
+            conversation_id="a" * 32,
+            runner_workspace=tmp_path,
+        )
+    assert "regular file" in result
     assert not seen

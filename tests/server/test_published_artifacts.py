@@ -12,9 +12,11 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from omnigent.db.account_authority import account_authority_scope, bind_account_authority
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.group_authority import bind_group_authority, group_authority_scope
 from omnigent.errors import OmnigentError
+from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes.published_artifacts import (
     PublicationLimits,
@@ -31,6 +33,9 @@ class _Auth(AuthProvider):
     def get_user_id(self, request):
         user = request.headers.get("x-test-user")
         if user:
+            generation = request.headers.get("x-test-generation")
+            if generation:
+                bind_account_authority(user, generation)
             bind_group_authority(
                 user, json.loads(request.headers.get("x-test-groups", "[]")), int(time.time()) + 60
             )
@@ -65,6 +70,7 @@ def publication_env(db_uri, tmp_path):
     async def authority(request: Request, call_next):
         with (
             group_authority_scope(),
+            account_authority_scope(None, None),
             workspace_scope(int(request.headers.get("x-test-workspace", "0"))),
         ):
             return await call_next(request)
@@ -208,9 +214,14 @@ async def test_auth_csrf_cache_integrity_and_preview_headers(publication_env):
         # Router-level auth error uses the application's OmnigentError handler in production.
         preview = await client.get(path + "/preview", headers=_headers())
         assert preview.headers["cache-control"] == "private, no-store"
-        assert "sandbox allow-scripts" in preview.headers["content-security-policy"]
-        assert "allow-same-origin" not in preview.headers["content-security-policy"]
-        assert "connect-src 'none'" in preview.headers["content-security-policy"]
+        assert preview.headers["content-security-policy"] == "default-src 'none'; sandbox"
+        assert preview.headers["content-type"].startswith("text/plain")
+        assert preview.headers["content-disposition"].startswith("attachment;")
+        renderer = await client.get("/v1/artifact-renderer")
+        assert renderer.status_code == 200
+        assert "frame-src 'none'" in renderer.headers["content-security-policy"]
+        assert "sandbox allow-scripts" in renderer.headers["content-security-policy"]
+        assert "<h1>report</h1>" not in renderer.text
         download = await client.get(path + "/content", headers=_headers())
         assert download.headers["content-disposition"].startswith("attachment;")
         assert download.headers["x-content-type-options"] == "nosniff"
@@ -428,3 +439,168 @@ async def test_app_uses_operator_publication_config_when_no_override(
         assert item["expires_at"] - item["created_at"] == 7 * 86400
         assert (await _publish(client, sid, content=b"x" * 101)).status_code == 413
         assert (await _publish(client, sid, retention_days="11")).status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user,sid,declared,expected",
+    [
+        ("owner@example.test", None, "100000", 413),
+        ("owner@example.test", None, "-1", 400),
+        ("owner@example.test", None, "invalid", 400),
+        ("reader@example.test", None, None, 403),
+        (None, None, None, 401),
+        ("owner@example.test", "invalid", None, 404),
+    ],
+)
+async def test_upload_rejected_before_body_consumption(
+    publication_env, user, sid, declared, expected
+):
+    app, _, _, _, session_id = publication_env
+    consumed = []
+
+    async def body():
+        consumed.append(True)
+        yield b"not parsed"
+
+    headers = {"Content-Type": "multipart/form-data; boundary=test"}
+    if user:
+        headers.update(_headers(user))
+    if declared is not None:
+        headers["Content-Length"] = declared
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{sid or session_id}/artifacts", headers=headers, content=body()
+        )
+    assert response.status_code == expected
+    assert not consumed
+
+
+@pytest.mark.asyncio
+async def test_chunked_multipart_stops_at_request_budget(publication_env):
+    app, _, _, _, sid = publication_env
+    consumed = []
+
+    async def body():
+        yield b'--test\r\nContent-Disposition: form-data; name="file"; filename="x"\r\n\r\n'
+        for i in range(10):
+            consumed.append(i)
+            yield b"x" * 32768
+        yield b"\r\n--test--\r\n"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{sid}/artifacts",
+            headers=_headers(**{"Content-Type": "multipart/form-data; boundary=test"}),
+            content=body(),
+        )
+    assert response.status_code == 413
+    assert len(consumed) == 3
+
+
+@pytest.mark.asyncio
+async def test_recreated_accounts_cannot_inherit_ownership_or_user_grants(publication_env, db_uri):
+    app, store, _, _, sid = publication_env
+    accounts = SqlAlchemyAccountStore(db_uri)
+    owner, reader = "owner@example.test", "reader@example.test"
+    for user in (owner, reader):
+        accounts.update_password(user, "hashed-password")
+    owner_generation = accounts.login_snapshot(owner)[1]
+    reader_generation = accounts.login_snapshot(reader)[1]
+    assert owner_generation and reader_generation
+    owner_headers = _headers(owner, **{"x-test-generation": owner_generation})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{sid}/artifacts",
+            headers=owner_headers,
+            data={"title": "Report", "kind": "html"},
+            files={"file": ("report.html", b"<h1>private</h1>")},
+        )
+        assert response.status_code == 201
+        item = response.json()
+        assert item["can_manage"]
+        path = f"/v1/artifacts/{item['id']}"
+        grants = {"grants": [{"principal_type": "user", "principal": reader}]}
+        assert (
+            await client.put(path + "/permissions", headers=owner_headers, json=grants)
+        ).status_code == 200
+        assert (
+            await client.get(
+                path, headers=_headers(reader, **{"x-test-generation": reader_generation})
+            )
+        ).status_code == 200
+        assert accounts.delete_user(reader)
+        accounts.create_user_with_password(reader, "replacement-password")
+        replacement_reader = accounts.login_snapshot(reader)[1]
+        assert replacement_reader and replacement_reader != reader_generation
+        reader_headers = _headers(reader, **{"x-test-generation": replacement_reader})
+        assert (await client.get(path, headers=reader_headers)).status_code == 404
+        # The owner may explicitly grant the replacement account fresh access.
+        assert (
+            await client.put(path + "/permissions", headers=owner_headers, json=grants)
+        ).status_code == 200
+        assert (await client.get(path, headers=reader_headers)).status_code == 200
+        assert accounts.delete_user(owner)
+        accounts.create_user_with_password(owner, "replacement-password")
+        replacement_owner = accounts.login_snapshot(owner)[1]
+        assert replacement_owner and replacement_owner != owner_generation
+        replacement_headers = _headers(owner, **{"x-test-generation": replacement_owner})
+        assert (await client.get(path, headers=replacement_headers)).status_code == 404
+        assert (await client.get("/v1/artifacts", headers=replacement_headers)).json() == {
+            "data": []
+        }
+        assert (
+            await client.put(path + "/permissions", headers=replacement_headers, json=grants)
+        ).status_code == 404
+        assert (await client.delete(path, headers=replacement_headers)).status_code == 404
+        with account_authority_scope(owner, owner_generation), pytest.raises(OmnigentError):
+            store.mutate(item["id"], owner, delete=True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_advances_past_full_batch_of_failures(publication_env, monkeypatch):
+    _, store, blobs, _, sid = publication_env
+    for index in range(101):
+        item = PublishedArtifact(
+            id=f"{index:032x}",
+            owner_id="owner@example.test",
+            source_session_id=sid,
+            title="Expired",
+            filename="x",
+            kind="file",
+            content_type="application/octet-stream",
+            byte_size=0,
+            sha256=hashlib.sha256(b"").hexdigest(),
+            created_at=1,
+            expires_at=2,
+        )
+        store.create(item)
+        blobs.put(item.blob_key(), b"")
+    healthy_key = f"published/0/{100:032x}"
+    delete = blobs.delete
+    attempted = []
+
+    def selectively_delete(key):
+        attempted.append(key)
+        if key != healthy_key:
+            raise RuntimeError("retention lock")
+        delete(key)
+
+    monkeypatch.setattr(blobs, "delete", selectively_delete)
+    task = asyncio.create_task(collect_published_artifacts(store, blobs))
+    try:
+        async with asyncio.timeout(10):
+            while blobs.exists(healthy_key):
+                await asyncio.sleep(0.01)
+        assert len(attempted) == 101
+        assert len(store.garbage()) == 100
+        assert not store.garbage(after=(0, f"{99:032x}"))
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

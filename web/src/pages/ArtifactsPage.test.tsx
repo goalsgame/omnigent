@@ -38,9 +38,14 @@ it("previews untrusted HTML only inside an opaque sandbox without a bridge", asy
   show();
   const frame = await screen.findByTitle("Published HTML artifact");
   expect(frame).toHaveAttribute("sandbox", "allow-scripts");
-  expect(frame.getAttribute("srcdoc")).toContain("connect-src 'none'");
-  expect(frame.getAttribute("srcdoc")).toContain("base-uri 'none'");
-  expect(frame.getAttribute("srcdoc")).not.toContain("allow-same-origin");
+  expect(frame).toHaveAttribute("src", "/v1/artifact-renderer");
+  expect(frame).not.toHaveAttribute("srcdoc");
+  const post = vi.spyOn((frame as HTMLIFrameElement).contentWindow!, "postMessage");
+  fireEvent.load(frame);
+  expect(post).toHaveBeenCalledWith(
+    { type: "omnigent.artifact.render", html: "<script>window.x=1</script><h1>HTML</h1>" },
+    "*",
+  );
   expect(screen.queryByText("HTML")).toBeNull();
 });
 

@@ -31,6 +31,7 @@ def upgrade() -> None:
             ),
             nullable=False,
         ),
+        sa.Column("owner_generation", sa.String(32), nullable=True),
         sa.Column("source_session_id", Uuid16(), nullable=False),
         sa.Column("title", sa.String(256), nullable=False),
         sa.Column("filename", sa.String(256), nullable=False),

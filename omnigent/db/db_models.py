@@ -339,6 +339,7 @@ class SqlPublishedArtifact(OmnigentBase):
             MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
         )
     )
+    owner_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
     source_session_id: Mapped[str] = mapped_column(Uuid16())
     title: Mapped[str] = mapped_column(String(256))
     filename: Mapped[str] = mapped_column(String(256))

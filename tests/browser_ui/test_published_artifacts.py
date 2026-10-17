@@ -1,8 +1,11 @@
 """Published HTML isolation and sharing in a real browser with a sealed backend."""
 
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.server.routes.published_artifacts import ARTIFACT_RENDERER_HTML, RENDERER_CSP
 from tests.browser_ui.conftest import BrowserContract
 
 _ARTIFACT = "a" * 32
@@ -54,6 +57,15 @@ def artifact_url(browser_contract: BrowserContract):
         "can_manage": True,
         "grants": [],
     }
+    browser_contract.route(
+        browser_contract._matcher("/v1/artifact-renderer"),
+        lambda route: route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=ARTIFACT_RENDERER_HTML,
+            headers={"Content-Security-Policy": RENDERER_CSP},
+        ),
+    )
     browser_contract.json(f"/v1/artifacts/{_ARTIFACT}", publication)
     browser_contract.response(f"/v1/artifacts/{_ARTIFACT}/preview", status=200, body=_HTML)
     browser_contract.json("/v1/artifacts", {"data": [publication]})
@@ -63,7 +75,9 @@ def artifact_url(browser_contract: BrowserContract):
 def test_html_scripts_cannot_read_parent_storage_or_call_api(page: Page, artifact_url: str):
     page.goto(artifact_url)
     expect(page.get_by_role("heading", name="Isolated report")).to_be_visible()
-    frame = page.frame_locator('iframe[title="Published HTML artifact"]')
+    frame = page.frame_locator('iframe[title="Published HTML artifact"]').frame_locator(
+        'iframe[title="Artifact content"]'
+    )
     expect(frame.locator("#isolation")).to_have_text(
         '{"parentBlocked":true,"storageBlocked":true,"fetchBlocked":true}'
     )
@@ -131,3 +145,62 @@ def test_long_catalog_scrolls_inside_shell(
     scroller = page.get_by_test_id("artifacts-scroll")
     assert scroller.evaluate("el => el.scrollHeight > el.clientHeight")
     assert scroller.evaluate("el => el.scrollTop > 0")
+
+
+@pytest.mark.parametrize(
+    "navigation",
+    [
+        '<script>location.replace("https://blocked.invalid/leak")</script>',
+        '<meta http-equiv="refresh" content="0;url=https://blocked.invalid/leak">',
+    ],
+)
+def test_renderer_blocks_script_and_meta_navigation_under_nonce_only_parent(
+    page: Page, artifact_url: str, browser_contract: BrowserContract, navigation: str
+):
+    # A separate HTTP document permits artifact scripts under a nonce-only host CSP.
+    parent = """<!doctype html><iframe id="outer" sandbox="allow-scripts"
+    src="/v1/artifact-renderer"></iframe>"""
+    browser_contract.route(
+        browser_contract.base_url + "/renderer-parent",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=parent,
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'self'; script-src 'nonce-host'; frame-src 'self'"
+                )
+            },
+        ),
+    )
+    leaked = []
+    browser_contract.route(
+        re.compile(r"https://blocked\.invalid/.*"),
+        lambda route: (leaked.append(route.request.url), route.abort()),
+    )
+    page.goto(browser_contract.base_url + "/renderer-parent")
+    expect(
+        page.frame_locator("#outer").locator('iframe[title="Artifact content"]')
+    ).to_be_visible()
+    page.evaluate(
+        """html => document.querySelector('#outer').contentWindow.postMessage(
+            {type:'omnigent.artifact.render', html}, '*')""",
+        "<button onclick=\"this.textContent='works'\">Try</button>",
+    )
+    frame = page.frame_locator("#outer").frame_locator('iframe[title="Artifact content"]')
+    frame.get_by_role("button", name="Try", exact=True).click()
+    expect(frame.get_by_role("button", name="works", exact=True)).to_be_visible()
+    inner = page.frames[-1]
+    with page.expect_console_message(predicate=lambda message: "frame-src" in message.text):
+        inner.evaluate(
+            """html => {
+                const node = document.createElement('div'); node.innerHTML = html;
+                const el=node.firstChild;
+                if(el.tagName==='SCRIPT') {
+                    const script=document.createElement('script');
+                    script.textContent=el.textContent; document.body.append(script);
+                } else document.head.append(el);
+            }""",
+            navigation,
+        )
+    assert not leaked

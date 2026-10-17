@@ -42,12 +42,16 @@ The viewer supports downloading, copying the link, deleting, and granting or
 revoking read access to exact user identities or OIDC group names. Group grants
 use verified, unexpired membership claims, with the same exact-name semantics
 as session sharing. Only the publication owner can change its grants or delete
-it. New grants honor the server's sharing-disabled policy; revocation remains
+it. Local-account ownership and user grants are bound to the account registration,
+so deleting and recreating a username does not restore access. New grants honor the server's sharing-disabled policy; revocation remains
 available. Anonymous/public grants are not supported.
 
 HTML runs inside an iframe with an opaque origin. Inline JavaScript and CSS
 work; the page cannot read the parent application, browser storage or call
-Omnigent APIs. External assets and fetch requests are blocked. Inline images,
+Omnigent APIs. External assets, fetch requests and frame navigation are blocked. A static,
+credential-free renderer document applies the isolation policy independently of
+the host application's script policy. Direct preview URLs return non-executable
+text attachments. Inline images,
 fonts and media may use data URLs. Bundle scripts, styles and data into the HTML
 file before publishing; multi-file sites, module imports and external APIs are
 not supported. No extension or agent-tool bridge is exposed to published HTML.
@@ -90,7 +94,7 @@ publication lifetime. Sandbox/session cleanup must not sweep the namespace.
 | `GET /v1/artifacts` | Latest 100 publications owned by the caller |
 | `GET /v1/artifacts/{id}` | Owner or explicitly granted reader |
 | `GET /v1/artifacts/{id}/content` | Same; forced download |
-| `GET /v1/artifacts/{id}/preview` | Same; isolated HTML only |
+| `GET /v1/artifacts/{id}/preview` | Same; non-executable HTML source |
 | `PUT /v1/artifacts/{id}/permissions` | Owner; replace the read-grant list |
 | `DELETE /v1/artifacts/{id}` | Owner; immediate revocation |
 

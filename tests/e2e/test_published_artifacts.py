@@ -52,6 +52,18 @@ async def test_native_publication_survives_source_session_deletion(
             first = await api.get(publication["download_url"])
             assert first.status_code == 200
             assert first.content == content
+            preview = await api.get(f"/v1/artifacts/{publication['id']}/preview")
+            assert preview.content == content
+            assert preview.headers["content-type"].startswith("text/plain")
+            assert preview.headers["content-disposition"].startswith("attachment;")
+            assert preview.headers["content-security-policy"] == "default-src 'none'; sandbox"
+            async with httpx.AsyncClient(
+                base_url=str(http_client.base_url), trust_env=False
+            ) as public:
+                renderer = await public.get("/v1/artifact-renderer")
+                assert renderer.status_code == 200
+                assert "frame-src 'none'" in renderer.headers["content-security-policy"]
+                assert content not in renderer.content
             deleted = await api.delete(f"/v1/sessions/{sid}")
             deleted.raise_for_status()
             after = await api.get(publication["download_url"])

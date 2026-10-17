@@ -13,8 +13,12 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+from starlette.types import Message, Receive, Scope, Send
 
+from omnigent.db.account_authority import account_generation
 from omnigent.db.group_authority import GROUP_PRINCIPAL_PREFIX, access_principals, group_principal
 from omnigent.db.utils import now_epoch
 from omnigent.server.auth import AuthProvider, SharingMode
@@ -27,12 +31,25 @@ from omnigent.stores.published_artifact_store import PublishedArtifact, Publishe
 
 _LOGGER = logging.getLogger(__name__)
 _UUID = re.compile(r"[a-f0-9]{32}")
-PREVIEW_CSP = (
+RENDERER_CSP = (
     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
     "img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; "
-    "object-src 'none'; base-uri 'none'; form-action 'none'; "
-    "frame-ancestors 'self'; sandbox allow-scripts"
+    "frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; "
+    "sandbox allow-scripts"
 )
+ARTIFACT_RENDERER_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="referrer" content="no-referrer"><style>
+html,body,iframe{margin:0;border:0;width:100%;height:100%;display:block}
+</style></head><body><iframe title="Artifact content" sandbox="allow-scripts"
+referrerpolicy="no-referrer"></iframe><script>
+let initialized=false;
+addEventListener('message',event=>{
+  if(initialized || event.source!==parent ||
+     event.data?.type!=='omnigent.artifact.render' || typeof event.data.html!=='string')return;
+  initialized=true;
+  document.querySelector('iframe').srcdoc='<!doctype html>'+event.data.html;
+});
+</script></body></html>"""
 
 
 @dataclass(frozen=True)
@@ -107,10 +124,21 @@ class ArtifactSharing(BaseModel):
     grants: list[ArtifactGrant] = Field(max_length=100)
 
 
+def _owned(item: PublishedArtifact, actor: str) -> bool:
+    return item.owner_id == actor and item.owner_generation == account_generation(actor)
+
+
 def _readable(item: PublishedArtifact, actor: str) -> bool:
     principals = access_principals(actor)
-    return item.owner_id == actor or any(
-        grant["principal"] in (principals[1:] if grant["is_group"] else principals[:1])
+    return _owned(item, actor) or any(
+        (
+            grant["principal"] in principals[1:]
+            if grant["is_group"]
+            else (
+                grant["principal"] == actor
+                and grant.get("account_generation") == account_generation(actor)
+            )
+        )
         for grant in json.loads(item.grants_json)
     )
 
@@ -128,7 +156,61 @@ def create_published_artifacts_router(
     def private_response(response: Response) -> None:
         response.headers["Cache-Control"] = "private, no-store"
 
-    router = APIRouter(dependencies=[Depends(private_response)])
+    class BoundedPublicationRoute(APIRoute):
+        async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] != "http" or scope["method"] not in {"POST", "PUT"}:
+                await super().handle(scope, receive, send)
+                return
+            budget = limits.max_bytes + 64 * 1024 if scope["method"] == "POST" else 64 * 1024
+            declared = Headers(scope=scope).get("content-length")
+            if declared is not None:
+                try:
+                    size = int(declared)
+                except ValueError as exc:
+                    raise HTTPException(400, "Invalid Content-Length") from exc
+                if size < 0:
+                    raise HTTPException(400, "Invalid Content-Length")
+                if size > budget:
+                    raise HTTPException(413, "Artifact request exceeds the upload limit")
+            request = Request(scope)
+            user = actor(request)
+            require_trusted_origin(request)
+            session_id = scope.get("path_params", {}).get("session_id")
+            if scope["method"] == "POST" and session_id:
+                if not _UUID.fullmatch(session_id):
+                    raise HTTPException(404, "Session not found")
+                await require_access(user, session_id, 2, permissions, conversations)
+            received = 0
+
+            async def bounded_receive() -> Message:
+                nonlocal received
+                message = await receive()
+                if message["type"] == "http.request":
+                    received += len(message.get("body", b""))
+                    if received > budget:
+                        raise HTTPException(413, "Artifact request exceeds the upload limit")
+                return message
+
+            await super().handle(scope, bounded_receive, send)
+
+    router = APIRouter(
+        route_class=BoundedPublicationRoute, dependencies=[Depends(private_response)]
+    )
+
+    @router.get("/artifact-renderer", include_in_schema=False)
+    async def renderer() -> Response:
+        # This public shell has no artifact bytes, credentials or application bridge.
+        return Response(
+            ARTIFACT_RENDERER_HTML,
+            media_type="text/html",
+            headers={
+                "Content-Security-Policy": RENDERER_CSP,
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Cache-Control": "public, max-age=3600",
+                "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+            },
+        )
 
     def actor(request: Request) -> str:
         return require_user(request, auth) or "local"
@@ -140,7 +222,7 @@ def create_published_artifacts_router(
         if not _UUID.fullmatch(artifact_id):
             raise HTTPException(404, "Artifact not found")
         item = await asyncio.to_thread(store.get, artifact_id)
-        if item is None or not (item.owner_id == user if owner else _readable(item, user)):
+        if item is None or not (_owned(item, user) if owner else _readable(item, user)):
             raise HTTPException(404, "Artifact not found")
         return item
 
@@ -168,9 +250,10 @@ def create_published_artifacts_router(
         result.update(
             viewer_url=f"{origin}{root}/artifacts/{item.id}",
             download_url=f"{origin}{root}/v1/artifacts/{item.id}/content",
-            can_manage=item.owner_id == actor(request),
+            renderer_url=f"{origin}{root}/v1/artifact-renderer",
+            can_manage=_owned(item, actor(request)),
         )
-        if item.owner_id == actor(request):
+        if _owned(item, actor(request)):
             from omnigent.db.group_authority import group_name
 
             result["grants"] = [
@@ -229,6 +312,7 @@ def create_published_artifacts_router(
         item = PublishedArtifact(
             id=uuid.uuid4().hex,
             owner_id=user,
+            owner_generation=account_generation(user),
             source_session_id=session_id,
             title=title,
             filename=filename,
@@ -291,7 +375,17 @@ def create_published_artifacts_router(
                 or any(ord(c) < 32 for c in principal)
             ):
                 raise HTTPException(422, "Invalid user identity")
-            entry = {"principal": principal, "is_group": grant.principal_type == "group"}
+            entry: dict[str, Any] = {
+                "principal": principal,
+                "is_group": grant.principal_type == "group",
+            }
+            if grant.principal_type == "user":
+                target = (
+                    await asyncio.to_thread(permissions.get_user, principal)
+                    if permissions
+                    else None
+                )
+                entry["account_generation"] = target.account_generation if target else None
             if entry not in grants:
                 grants.append(entry)
         sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
@@ -328,15 +422,13 @@ def create_published_artifacts_router(
             "Cache-Control": "private, no-store",
             "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": "inline"
-            if preview
-            else "attachment; filename*=UTF-8''" + quote(item.filename, safe=""),
-            "Content-Security-Policy": PREVIEW_CSP if preview else "default-src 'none'; sandbox",
+            "Content-Disposition": "attachment; filename*=UTF-8''" + quote(item.filename, safe=""),
+            "Content-Security-Policy": "default-src 'none'; sandbox",
             "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
         }
         return Response(
             data,
-            media_type="text/html; charset=utf-8" if preview else "application/octet-stream",
+            media_type="text/plain; charset=utf-8" if preview else "application/octet-stream",
             headers=headers,
         )
 
@@ -347,7 +439,7 @@ def create_published_artifacts_router(
 
     @router.get("/artifacts/{artifact_id}/preview")
     async def preview(request: Request, artifact_id: str) -> Response:
-        """Render HTML with an opaque origin, no parent access and no API connections."""
+        """Return non-executable source for the isolated renderer; direct navigation downloads."""
         return await content(request, artifact_id, preview=True)
 
     return router
@@ -357,15 +449,17 @@ async def collect_published_artifacts(store: PublishedArtifactStore, blobs: Arti
     """Retry expired/tombstoned blob deletion without retaining sandbox resources."""
     while True:
         try:
-            rows = await asyncio.to_thread(store.garbage)
-            for workspace_id, item in rows:
-                try:
-                    if not await asyncio.to_thread(store.claim_garbage, workspace_id, item.id):
-                        continue
-                    await asyncio.to_thread(blobs.delete, item.blob_key(workspace_id))
-                    await asyncio.to_thread(store.forget, workspace_id, item.id)
-                except Exception:
-                    _LOGGER.exception("Published artifact blob cleanup failed; retrying")
+            after = None
+            while rows := await asyncio.to_thread(store.garbage, after=after):
+                after = (rows[-1][0], rows[-1][1].id)
+                for workspace_id, item in rows:
+                    try:
+                        if not await asyncio.to_thread(store.claim_garbage, workspace_id, item.id):
+                            continue
+                        await asyncio.to_thread(blobs.delete, item.blob_key(workspace_id))
+                        await asyncio.to_thread(store.forget, workspace_id, item.id)
+                    except Exception:
+                        _LOGGER.exception("Published artifact blob cleanup failed; retrying")
         except Exception:
             _LOGGER.exception("Published artifact cleanup failed; retrying next cycle")
         await asyncio.sleep(60)

@@ -27,6 +27,7 @@ import logging
 import mimetypes
 import os
 import re
+import stat
 import tempfile
 import uuid
 import weakref
@@ -7472,8 +7473,13 @@ async def _execute_file_tool(
         assert os_spec.cwd is not None
         try:
             resolved = safe_resolve(path, Path(os_spec.cwd))
+            if not resolved.is_file():
+                return "Error: publishing requires a regular file"
             # Bound reads even when a file grows after stat(). Server limits are authoritative.
-            with resolved.open("rb") as source:
+            descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    return "Error: publishing requires a regular file"
                 content = source.read(50 * 1024 * 1024 + 1)
             if len(content) > 50 * 1024 * 1024:
                 return "Error: artifact exceeds the runner upload limit (50 MiB)"

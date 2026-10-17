@@ -6,9 +6,10 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, true
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import account_generation, require_active_account
 from omnigent.db.db_models import SqlPublishedArtifact, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -33,6 +34,7 @@ class PublishedArtifact:
     sha256: str
     created_at: int
     expires_at: int
+    owner_generation: str | None = None
     deleted: bool = False
     grants_json: str = "[]"
     ready: bool = True
@@ -62,8 +64,11 @@ class PublishedArtifactStore:
         )
 
     def create(self, artifact: PublishedArtifact) -> None:
-        """Insert metadata after the immutable blob has been stored."""
+        """Insert pending metadata under the publishing account's authority."""
         with self._write_session("create") as session:
+            require_active_account(
+                session, artifact.owner_id, generation=artifact.owner_generation
+            )
             session.add(
                 SqlPublishedArtifact(workspace_id=current_workspace_id(), **asdict(artifact))
             )
@@ -84,6 +89,7 @@ class PublishedArtifactStore:
                 .where(
                     SqlPublishedArtifact.workspace_id == current_workspace_id(),
                     SqlPublishedArtifact.owner_id == owner_id,
+                    SqlPublishedArtifact.owner_generation == account_generation(owner_id),
                     SqlPublishedArtifact.deleted.is_(False),
                     SqlPublishedArtifact.ready.is_(True),
                     SqlPublishedArtifact.expires_at > now_epoch(),
@@ -104,6 +110,15 @@ class PublishedArtifactStore:
         """Serialize owner-only grant replacement and immediate revocation."""
 
         def write(session: Session) -> bool:
+            require_active_account(
+                session,
+                owner_id,
+                related_accounts={
+                    g["principal"]: g.get("account_generation")
+                    for g in (grants or [])
+                    if not g["is_group"]
+                },
+            )
             row = session.scalar(
                 select(SqlPublishedArtifact)
                 .where(
@@ -115,6 +130,7 @@ class PublishedArtifactStore:
             if (
                 row is None
                 or row.owner_id != owner_id
+                or row.owner_generation != account_generation(owner_id)
                 or row.deleted
                 or row.expires_at <= now_epoch()
             ):
@@ -146,8 +162,10 @@ class PublishedArtifactStore:
 
         return run_write_transaction(self._write_session, "complete", write)
 
-    def garbage(self, limit: int = 100) -> list[tuple[int, PublishedArtifact]]:
-        """Enumerate expired/tombstoned rows across tenants for system cleanup."""
+    def garbage(
+        self, limit: int = 100, *, after: tuple[int, str] | None = None
+    ) -> list[tuple[int, PublishedArtifact]]:
+        """Page eligible rows across tenants without retry failures blocking later rows."""
         with self._session("garbage") as session:
             rows = session.scalars(
                 select(SqlPublishedArtifact)
@@ -161,6 +179,18 @@ class PublishedArtifactStore:
                         ),
                     )
                 )
+                .where(
+                    or_(
+                        SqlPublishedArtifact.workspace_id > after[0],
+                        and_(
+                            SqlPublishedArtifact.workspace_id == after[0],
+                            SqlPublishedArtifact.id > after[1],
+                        ),
+                    )
+                    if after is not None
+                    else true()
+                )
+                .order_by(SqlPublishedArtifact.workspace_id, SqlPublishedArtifact.id)
                 .limit(limit)
             )
             return [(row.workspace_id, _entity(row)) for row in rows]

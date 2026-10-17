@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "@/lib/routing";
+import { withBasePath } from "@/lib/basePath";
 import { authenticatedFetch } from "@/lib/identity";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -17,10 +18,8 @@ interface Artifact {
   expires_at: number;
   can_manage: boolean;
   grants?: Grant[];
+  renderer_url?: string;
 }
-// The iframe also enforces an opaque origin. Never add allow-same-origin or an API bridge.
-const PREVIEW_POLICY =
-  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
 export function ArtifactsPage() {
   const { artifactId } = useParams();
@@ -75,10 +74,7 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
           );
           if (!content.ok) throw new Error("Could not load the HTML preview.");
           const html = await content.text();
-          if (active)
-            setPreview(
-              `<meta http-equiv="Content-Security-Policy" content="${PREVIEW_POLICY}"><meta name="referrer" content="no-referrer">${html}`,
-            );
+          if (active) setPreview(html);
         }
       } catch (e) {
         if (active) setError(e instanceof Error ? e.message : "Could not load artifacts.");
@@ -266,7 +262,16 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
             title="Published HTML artifact"
             sandbox="allow-scripts"
             referrerPolicy="no-referrer"
-            srcDoc={preview}
+            src={artifact?.renderer_url ?? withBasePath("/v1/artifact-renderer")}
+            onLoad={(event) => {
+              event.currentTarget.contentWindow?.postMessage(
+                {
+                  type: "omnigent.artifact.render",
+                  html: preview,
+                },
+                "*",
+              );
+            }}
             className="min-h-96 w-full flex-1 rounded border bg-white"
           />
         )}
