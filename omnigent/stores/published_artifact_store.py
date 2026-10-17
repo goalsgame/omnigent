@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from sqlalchemy import and_, or_, select, true
 from sqlalchemy.orm import Session
 
-from omnigent.db.account_authority import account_generation, require_active_account
+from omnigent.db.account_authority import (
+    account_generation,
+    require_active_account,
+    target_account_scope,
+)
 from omnigent.db.db_models import SqlPublishedArtifact, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -17,6 +22,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 
 
 @dataclass(frozen=True)
@@ -106,19 +112,35 @@ class PublishedArtifactStore:
         *,
         grants: list[dict[str, Any]] | None = None,
         delete: bool = False,
+        expected_grants_json: str | None = None,
     ) -> bool:
         """Serialize owner-only grant replacement and immediate revocation."""
 
+        snapshot = self.get(artifact_id) if grants is not None else None
+        additions = []
+        if grants is not None:
+            if snapshot is None:
+                return False
+            if expected_grants_json is not None and expected_grants_json != snapshot.grants_json:
+                raise OmnigentError(
+                    "Artifact sharing changed; reload and retry", code=ErrorCode.CONFLICT
+                )
+            retained = {
+                (g["principal"], g["is_group"]): g for g in json.loads(snapshot.grants_json)
+            }
+            additions = [g for g in grants if (g["principal"], g["is_group"]) not in retained]
+            grants = [retained.get((g["principal"], g["is_group"]), g) for g in grants]
+
         def write(session: Session) -> bool:
-            require_active_account(
-                session,
-                owner_id,
-                related_accounts={
-                    g["principal"]: g.get("account_generation")
-                    for g in (grants or [])
-                    if not g["is_group"]
-                },
-            )
+            with ExitStack() as targets:
+                for grant in additions:
+                    if not grant["is_group"]:
+                        targets.enter_context(
+                            target_account_scope(
+                                grant["principal"], grant.get("account_generation")
+                            )
+                        )
+                require_active_account(session, owner_id)
             row = session.scalar(
                 select(SqlPublishedArtifact)
                 .where(
@@ -136,6 +158,11 @@ class PublishedArtifactStore:
             ):
                 return False
             if grants is not None:
+                assert snapshot is not None
+                if row.grants_json != snapshot.grants_json:
+                    raise OmnigentError(
+                        "Artifact sharing changed; reload and retry", code=ErrorCode.CONFLICT
+                    )
                 row.grants_json = json.dumps(grants)
             if delete:
                 row.deleted = True

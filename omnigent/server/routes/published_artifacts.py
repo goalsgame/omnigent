@@ -360,6 +360,7 @@ def create_published_artifacts_router(
         """Replace read grants; groups match exact, verified issuer claims."""
         item = await authorized(request, artifact_id, owner=True)
         grants = []
+        retained = {(g["principal"], g["is_group"]): g for g in json.loads(item.grants_json)}
         for grant in body.grants:
             try:
                 principal = (
@@ -379,7 +380,10 @@ def create_published_artifacts_router(
                 "principal": principal,
                 "is_group": grant.principal_type == "group",
             }
-            if grant.principal_type == "user":
+            saved = retained.get((principal, entry["is_group"]))
+            if saved is not None:
+                entry = saved
+            elif grant.principal_type == "user":
                 target = (
                     await asyncio.to_thread(permissions.get_user, principal)
                     if permissions
@@ -393,7 +397,13 @@ def create_published_artifacts_router(
             entry not in json.loads(item.grants_json) for entry in grants
         ):
             raise HTTPException(403, "Sharing has been disabled for this server")
-        if not await asyncio.to_thread(store.mutate, item.id, actor(request), grants=grants):
+        if not await asyncio.to_thread(
+            store.mutate,
+            item.id,
+            actor(request),
+            grants=grants,
+            expected_grants_json=item.grants_json,
+        ):
             raise HTTPException(404, "Artifact not found")
         return payload(await authorized(request, artifact_id, owner=True), request)
 

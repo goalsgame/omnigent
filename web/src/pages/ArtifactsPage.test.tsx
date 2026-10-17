@@ -3,10 +3,13 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Link } from "@/lib/routing";
 import { ArtifactsPage } from "./ArtifactsPage";
-import { resolveArtifactRendererUrl } from "@/lib/host";
+import { getOmnigentTransformShareLink, resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 
-vi.mock("@/lib/host", () => ({ resolveArtifactRendererUrl: vi.fn() }));
+vi.mock("@/lib/host", () => ({
+  resolveArtifactRendererUrl: vi.fn(),
+  getOmnigentTransformShareLink: vi.fn(),
+}));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 const artifact = {
   id: "a".repeat(32),
@@ -33,6 +36,7 @@ function show(path = `/artifacts/${artifact.id}`, nextPath?: string) {
 afterEach(cleanup);
 beforeEach(() => {
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(getOmnigentTransformShareLink).mockReturnValue(undefined);
   vi.mocked(resolveArtifactRendererUrl).mockImplementation((url) => url ?? "/v1/artifact-renderer");
 });
 
@@ -170,4 +174,35 @@ it("keeps downloads available when an embedded host has no renderer mapping", as
   expect(await screen.findByRole("alert")).toHaveTextContent("configure an artifact renderer URL");
   expect(screen.queryByTitle("Published HTML artifact")).toBeNull();
   expect(screen.getByRole("button", { name: /Download/ })).toBeInTheDocument();
+});
+
+it("copies the host-transformed share URL with the clipboard fallback", async () => {
+  vi.mocked(authenticatedFetch).mockResolvedValueOnce(json({ ...artifact, kind: "file" }));
+  vi.mocked(getOmnigentTransformShareLink).mockReturnValue(
+    (path) => `https://public.example${path}?workspace=42`,
+  );
+  const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  const exec = Object.getOwnPropertyDescriptor(document, "execCommand");
+  let copied = "";
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+  Object.defineProperty(document, "execCommand", {
+    configurable: true,
+    value: vi.fn(() => {
+      copied = document.querySelector("textarea")?.value ?? "";
+      return true;
+    }),
+  });
+  try {
+    show();
+    await screen.findByText("Report");
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+    await waitFor(() =>
+      expect(copied).toBe(`https://public.example/artifacts/${artifact.id}?workspace=42`),
+    );
+  } finally {
+    if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+    if (exec) Object.defineProperty(document, "execCommand", exec);
+    else Reflect.deleteProperty(document, "execCommand");
+  }
 });

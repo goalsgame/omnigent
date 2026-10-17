@@ -46,7 +46,9 @@ revoking read access to exact user identities or OIDC group names. Group grants
 use verified, unexpired membership claims, with the same exact-name semantics
 as session sharing. Only the publication owner can change its grants or delete
 it. Local-account ownership and user grants are bound to the account registration,
-so deleting and recreating a username does not restore access. New grants honor the server's sharing-disabled policy; revocation remains
+so deleting and recreating a username does not restore access. Retained grants
+keep their original registration binding during other edits. To explicitly grant
+a replacement registration access, remove its grant first, then add it again. New grants honor the server's sharing-disabled policy; revocation remains
 available. Anonymous/public grants are not supported.
 
 HTML runs inside an iframe with an opaque origin. Inline JavaScript and CSS

@@ -541,7 +541,17 @@ async def test_recreated_accounts_cannot_inherit_ownership_or_user_grants(public
         assert replacement_reader and replacement_reader != reader_generation
         reader_headers = _headers(reader, **{"x-test-generation": replacement_reader})
         assert (await client.get(path, headers=reader_headers)).status_code == 404
-        # The owner may explicitly grant the replacement account fresh access.
+        unrelated = {
+            "grants": [*grants["grants"], {"principal_type": "group", "principal": "engineering"}]
+        }
+        assert (
+            await client.put(path + "/permissions", headers=owner_headers, json=unrelated)
+        ).status_code == 200
+        assert (await client.get(path, headers=reader_headers)).status_code == 404
+        # Explicit regrant requires removing the retained registration first.
+        assert (
+            await client.put(path + "/permissions", headers=owner_headers, json={"grants": []})
+        ).status_code == 200
         assert (
             await client.put(path + "/permissions", headers=owner_headers, json=grants)
         ).status_code == 200
@@ -596,7 +606,7 @@ async def test_cleanup_advances_past_full_batch_of_failures(publication_env, mon
     task = asyncio.create_task(collect_published_artifacts(store, blobs))
     try:
         async with asyncio.timeout(10):
-            while blobs.exists(healthy_key):
+            while blobs.exists(healthy_key) or store.garbage(after=(0, f"{99:032x}")):
                 await asyncio.sleep(0.01)
         assert len(attempted) == 101
         assert len(store.garbage()) == 100
@@ -604,3 +614,59 @@ async def test_cleanup_advances_past_full_batch_of_failures(publication_env, mon
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_revocation_preserves_deleted_retained_grantees(publication_env, db_uri):
+    app, store, _, _, sid = publication_env
+    accounts = SqlAlchemyAccountStore(db_uri)
+    owner, deleted, revoked = "owner@example.test", "reader@example.test", "editor@example.test"
+    for user in (owner, deleted, revoked):
+        accounts.update_password(user, "hashed-password")
+    owner_headers = _headers(owner, **{"x-test-generation": accounts.login_snapshot(owner)[1]})
+    revoked_headers = _headers(
+        revoked, **{"x-test-generation": accounts.login_snapshot(revoked)[1]}
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{sid}/artifacts",
+            headers=owner_headers,
+            data={"title": "Report"},
+            files={"file": ("report.txt", b"private")},
+        )
+        path = f"/v1/artifacts/{response.json()['id']}"
+        grant_a = {"principal_type": "user", "principal": deleted}
+        grant_b = {"principal_type": "user", "principal": revoked}
+        assert (
+            await client.put(
+                path + "/permissions", headers=owner_headers, json={"grants": [grant_a, grant_b]}
+            )
+        ).status_code == 200
+        assert (await client.get(path, headers=revoked_headers)).status_code == 200
+        assert accounts.delete_user(deleted)
+        assert (
+            await client.put(
+                path + "/permissions", headers=owner_headers, json={"grants": [grant_a]}
+            )
+        ).status_code == 200
+        assert (await client.get(path, headers=revoked_headers)).status_code == 404
+        # Removed retained accounts cannot be added anew until active again.
+        assert (
+            await client.put(path + "/permissions", headers=owner_headers, json={"grants": []})
+        ).status_code == 200
+        invalid = await client.put(
+            path + "/permissions", headers=owner_headers, json={"grants": [grant_a]}
+        )
+        assert invalid.status_code == 409
+        assert (await client.get(path, headers=owner_headers)).status_code == 200
+        # A stale full-list write cannot silently overwrite a concurrent edit.
+        current = store.get(response.json()["id"])
+        assert current
+        with (
+            account_authority_scope(owner, accounts.login_snapshot(owner)[1]),
+            pytest.raises(OmnigentError) as conflict,
+        ):
+            store.mutate(current.id, owner, grants=[], expected_grants_json="stale")
+        assert conflict.value.http_status == 409

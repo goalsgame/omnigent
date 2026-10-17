@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "@/lib/routing";
-import { resolveArtifactRendererUrl } from "@/lib/host";
+import { Link, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import { withBasePath } from "@/lib/basePath";
+import { copyText } from "@/lib/clipboard";
+import { getOmnigentTransformShareLink, resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -28,6 +30,7 @@ export function ArtifactsPage() {
 
 function ArtifactContents({ artifactId }: { artifactId?: string }) {
   const navigate = useNavigate();
+  const rebasePath = useRebasePath();
   const alive = useRef(true);
   useLayoutEffect(() => {
     alive.current = true;
@@ -161,9 +164,10 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
               <Button
                 variant="outline"
                 onClick={() =>
-                  void navigator.clipboard
-                    .writeText(window.location.href)
-                    .catch(() => setError("Could not copy the link."))
+                  void copyText(
+                    getOmnigentTransformShareLink()?.(rebasePath(`/artifacts/${artifact.id}`)) ??
+                      `${window.location.origin}${withBasePath(rebasePath(`/artifacts/${artifact.id}`))}`,
+                  ).catch(() => setError("Could not copy the link."))
                 }
               >
                 Copy link
