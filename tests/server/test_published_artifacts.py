@@ -110,6 +110,13 @@ async def _publish(
     )
 
 
+async def _share(client, path, *, headers, json):
+    if "revision" not in json:
+        current = await client.get(path.removesuffix("/permissions"), headers=headers)
+        json = {**json, "revision": current.json().get("sharing_revision", "0" * 64)}
+    return await client.put(path, headers=headers, json=json)
+
+
 @pytest.mark.asyncio
 async def test_publication_survives_source_deletion_and_remains_private(publication_env):
     app, store, blobs, conversations, session_id = publication_env
@@ -161,8 +168,8 @@ async def test_explicit_user_group_grants_revocation_and_tenant_isolation(public
             {"principal_type": "user", "principal": "reader@example.test"},
             {"principal_type": "group", "principal": "engineering"},
         ]
-        result = await client.put(
-            path + "/permissions", headers=_headers(), json={"grants": grants}
+        result = await _share(
+            client, path + "/permissions", headers=_headers(), json={"grants": grants}
         )
         assert result.status_code == 200, result.text
         assert (await client.get(path, headers=_headers("reader@example.test"))).status_code == 200
@@ -173,10 +180,10 @@ async def test_explicit_user_group_grants_revocation_and_tenant_isolation(public
             await client.get(path, headers={**member, "x-test-workspace": "42"})
         ).status_code == 404
         assert (
-            await client.put(path + "/permissions", headers=member, json={"grants": []})
+            await _share(client, path + "/permissions", headers=member, json={"grants": []})
         ).status_code == 404
         assert (await client.delete(path, headers=member)).status_code == 404
-        await client.put(path + "/permissions", headers=_headers(), json={"grants": []})
+        await _share(client, path + "/permissions", headers=_headers(), json={"grants": []})
         assert (await client.get(path + "/preview", headers=member)).status_code == 404
         assert (
             await client.get(path + "/content", headers=_headers("reader@example.test"))
@@ -294,10 +301,12 @@ async def test_sharing_off_allows_revocation_but_no_new_grants(publication_env):
         item = (await _publish(client, sid)).json()
         path = f"/v1/artifacts/{item['id']}/permissions"
         body = {"grants": [{"principal_type": "user", "principal": "reader@example.test"}]}
-        assert (await client.put(path, headers=_headers(), json=body)).status_code == 200
+        assert (await _share(client, path, headers=_headers(), json=body)).status_code == 200
         app.state.sharing_mode = lambda: SharingMode.OFF
-        assert (await client.put(path, headers=_headers(), json={"grants": []})).status_code == 200
-        assert (await client.put(path, headers=_headers(), json=body)).status_code == 403
+        assert (
+            await _share(client, path, headers=_headers(), json={"grants": []})
+        ).status_code == 200
+        assert (await _share(client, path, headers=_headers(), json=body)).status_code == 403
 
 
 def test_pending_publications_and_cleanup_are_serialized(publication_env):
@@ -365,7 +374,8 @@ async def test_missing_auth_bad_grants_retention_and_filename(publication_env):
             {"principal_type": "user", "principal": "__public__"},
             {"principal_type": "group", "principal": " engineering"},
         ]:
-            response = await client.put(
+            response = await _share(
+                client,
                 f"/v1/artifacts/{item['id']}/permissions",
                 headers=_headers(),
                 json={"grants": [grant]},
@@ -528,7 +538,7 @@ async def test_recreated_accounts_cannot_inherit_ownership_or_user_grants(public
         path = f"/v1/artifacts/{item['id']}"
         grants = {"grants": [{"principal_type": "user", "principal": reader}]}
         assert (
-            await client.put(path + "/permissions", headers=owner_headers, json=grants)
+            await _share(client, path + "/permissions", headers=owner_headers, json=grants)
         ).status_code == 200
         assert (
             await client.get(
@@ -545,15 +555,15 @@ async def test_recreated_accounts_cannot_inherit_ownership_or_user_grants(public
             "grants": [*grants["grants"], {"principal_type": "group", "principal": "engineering"}]
         }
         assert (
-            await client.put(path + "/permissions", headers=owner_headers, json=unrelated)
+            await _share(client, path + "/permissions", headers=owner_headers, json=unrelated)
         ).status_code == 200
         assert (await client.get(path, headers=reader_headers)).status_code == 404
         # Explicit regrant requires removing the retained registration first.
         assert (
-            await client.put(path + "/permissions", headers=owner_headers, json={"grants": []})
+            await _share(client, path + "/permissions", headers=owner_headers, json={"grants": []})
         ).status_code == 200
         assert (
-            await client.put(path + "/permissions", headers=owner_headers, json=grants)
+            await _share(client, path + "/permissions", headers=owner_headers, json=grants)
         ).status_code == 200
         assert (await client.get(path, headers=reader_headers)).status_code == 200
         assert accounts.delete_user(owner)
@@ -566,7 +576,7 @@ async def test_recreated_accounts_cannot_inherit_ownership_or_user_grants(public
             "data": []
         }
         assert (
-            await client.put(path + "/permissions", headers=replacement_headers, json=grants)
+            await _share(client, path + "/permissions", headers=replacement_headers, json=grants)
         ).status_code == 404
         assert (await client.delete(path, headers=replacement_headers)).status_code == 404
         with account_authority_scope(owner, owner_generation), pytest.raises(OmnigentError):
@@ -640,24 +650,27 @@ async def test_revocation_preserves_deleted_retained_grantees(publication_env, d
         grant_a = {"principal_type": "user", "principal": deleted}
         grant_b = {"principal_type": "user", "principal": revoked}
         assert (
-            await client.put(
-                path + "/permissions", headers=owner_headers, json={"grants": [grant_a, grant_b]}
+            await _share(
+                client,
+                path + "/permissions",
+                headers=owner_headers,
+                json={"grants": [grant_a, grant_b]},
             )
         ).status_code == 200
         assert (await client.get(path, headers=revoked_headers)).status_code == 200
         assert accounts.delete_user(deleted)
         assert (
-            await client.put(
-                path + "/permissions", headers=owner_headers, json={"grants": [grant_a]}
+            await _share(
+                client, path + "/permissions", headers=owner_headers, json={"grants": [grant_a]}
             )
         ).status_code == 200
         assert (await client.get(path, headers=revoked_headers)).status_code == 404
         # Removed retained accounts cannot be added anew until active again.
         assert (
-            await client.put(path + "/permissions", headers=owner_headers, json={"grants": []})
+            await _share(client, path + "/permissions", headers=owner_headers, json={"grants": []})
         ).status_code == 200
-        invalid = await client.put(
-            path + "/permissions", headers=owner_headers, json={"grants": [grant_a]}
+        invalid = await _share(
+            client, path + "/permissions", headers=owner_headers, json={"grants": [grant_a]}
         )
         assert invalid.status_code == 409
         assert (await client.get(path, headers=owner_headers)).status_code == 200
@@ -670,3 +683,36 @@ async def test_revocation_preserves_deleted_retained_grantees(publication_env, d
         ):
             store.mutate(current.id, owner, grants=[], expected_grants_json="stale")
         assert conflict.value.http_status == 409
+
+
+@pytest.mark.asyncio
+async def test_stale_client_sharing_cannot_restore_revoked_reader(publication_env):
+    app, _, _, _, sid = publication_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        item = (await _publish(client, sid)).json()
+        path = f"/v1/artifacts/{item['id']}/permissions"
+        reader = {"principal_type": "user", "principal": "reader@example.test"}
+        first = await _share(client, path, headers=_headers(), json={"grants": [reader]})
+        stale = first.json()["sharing_revision"]
+        assert (
+            await _share(client, path, headers=_headers(), json={"grants": [], "revision": stale})
+        ).status_code == 200
+        response = await _share(
+            client,
+            path,
+            headers=_headers(),
+            json={
+                "grants": [reader, {"principal_type": "group", "principal": "engineering"}],
+                "revision": stale,
+            },
+        )
+        assert response.status_code == 409
+        assert (
+            await client.get(
+                path.removesuffix("/permissions"), headers=_headers("reader@example.test")
+            )
+        ).status_code == 404
+        missing = await client.put(path, headers=_headers(), json={"grants": []})
+        assert missing.status_code == 422

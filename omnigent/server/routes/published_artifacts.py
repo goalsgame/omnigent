@@ -122,6 +122,7 @@ class ArtifactSharing(BaseModel):
     """Replace the complete set of explicit read grants; ownership is immutable."""
 
     grants: list[ArtifactGrant] = Field(max_length=100)
+    revision: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 def _owned(item: PublishedArtifact, actor: str) -> bool:
@@ -254,6 +255,7 @@ def create_published_artifacts_router(
             can_manage=_owned(item, actor(request)),
         )
         if _owned(item, actor(request)):
+            result["sharing_revision"] = hashlib.sha256(item.grants_json.encode()).hexdigest()
             from omnigent.db.group_authority import group_name
 
             result["grants"] = [
@@ -359,6 +361,8 @@ def create_published_artifacts_router(
     async def share(request: Request, artifact_id: str, body: ArtifactSharing) -> dict[str, Any]:
         """Replace read grants; groups match exact, verified issuer claims."""
         item = await authorized(request, artifact_id, owner=True)
+        if body.revision != hashlib.sha256(item.grants_json.encode()).hexdigest():
+            raise HTTPException(409, "Artifact sharing changed; reload and retry")
         grants = []
         retained = {(g["principal"], g["is_group"]): g for g in json.loads(item.grants_json)}
         for grant in body.grants:

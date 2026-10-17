@@ -20,6 +20,7 @@ interface Artifact {
   expires_at: number;
   can_manage: boolean;
   grants?: Grant[];
+  sharing_revision?: string;
   renderer_url?: string;
 }
 
@@ -117,8 +118,10 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
       const response = await authenticatedFetch(`/v1/artifacts/${artifact.id}/permissions`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ grants }),
+        body: JSON.stringify({ grants, revision: artifact.sharing_revision }),
       });
+      if (response.status === 409)
+        throw new Error("Sharing changed in another window. Reload before editing permissions.");
       if (!response.ok)
         throw new Error("Could not update sharing. Use the exact user identity or group name.");
       const updated = await response.json();

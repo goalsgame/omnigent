@@ -109,7 +109,9 @@ publication lifetime. Sandbox/session cleanup must not sweep the namespace.
 | `PUT /v1/artifacts/{id}/permissions` | Owner; replace the read-grant list |
 | `DELETE /v1/artifacts/{id}` | Owner; immediate revocation |
 
-Permissions requests use `{"grants":[{"principal_type":"group",
-"principal":"engineering"}]}` or `principal_type: "user"`. An empty list
+Owner metadata includes `sharing_revision`. Permissions requests must return it
+as `revision`, for example `{"revision":"<sharing_revision>","grants":[{
+"principal_type":"group","principal":"engineering"}]}` or `principal_type: "user"`.
+A stale revision returns 409; reload metadata before editing again. An empty list
 revokes all explicit readers. The owner remains authorized. Every read checks
 current identity, tenant, expiry and grants; unauthorized IDs return 404.

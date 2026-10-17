@@ -20,6 +20,7 @@ const artifact = {
   expires_at: 1800000000,
   can_manage: true,
   grants: [],
+  sharing_revision: "c".repeat(64),
 };
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -78,7 +79,10 @@ it("grants exact group read access and exposes no agent-side permission bridge",
       `/v1/artifacts/${artifact.id}/permissions`,
       expect.objectContaining({
         method: "PUT",
-        body: JSON.stringify({ grants: [{ principal_type: "group", principal: "engineering" }] }),
+        body: JSON.stringify({
+          grants: [{ principal_type: "group", principal: "engineering" }],
+          revision: artifact.sharing_revision,
+        }),
       }),
     ),
   );
@@ -204,5 +208,83 @@ it("copies the host-transformed share URL with the clipboard fallback", async ()
     else Reflect.deleteProperty(navigator, "clipboard");
     if (exec) Object.defineProperty(document, "execCommand", exec);
     else Reflect.deleteProperty(document, "execCommand");
+  }
+});
+
+it("rejects stale sharing without presenting the attempted grant as saved", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"))
+    .mockResolvedValueOnce(json({}, 409));
+  show();
+  await screen.findByText("Report");
+  fireEvent.click(screen.getByText("Sharing"));
+  fireEvent.change(screen.getByLabelText("Principal type"), { target: { value: "group" } });
+  fireEvent.change(screen.getByLabelText("User identity or group name"), {
+    target: { value: "engineering" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Grant read access" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Sharing changed in another window");
+  expect(screen.queryByText("group: engineering", { exact: false })).toBeNull();
+  expect(authenticatedFetch).toHaveBeenLastCalledWith(
+    `/v1/artifacts/${artifact.id}/permissions`,
+    expect.objectContaining({
+      body: JSON.stringify({
+        grants: [{ principal_type: "group", principal: "engineering" }],
+        revision: artifact.sharing_revision,
+      }),
+    }),
+  );
+});
+
+it.each([200, 403])("downloads authenticated bytes or reports rejection (%s)", async (status) => {
+  const response = new Response("exact bytes", { status });
+  const blob = vi.spyOn(response, "blob");
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json({ ...artifact, kind: "file" }))
+    .mockResolvedValueOnce(response);
+  const create = vi.fn((_blob: Blob) => "blob:artifact-download"),
+    revoke = vi.fn();
+  const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+  const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+  Object.defineProperty(URL, "createObjectURL", { configurable: true, value: create });
+  Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revoke });
+  let filename = "",
+    href = "";
+  const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    filename = this.download;
+    href = this.href;
+  });
+  try {
+    show();
+    await screen.findByText("Report");
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    });
+    expect(authenticatedFetch).toHaveBeenLastCalledWith(`/v1/artifacts/${artifact.id}/content`);
+    if (status === 403) {
+      expect(screen.getByRole("alert")).toHaveTextContent("Download unavailable");
+      expect(create).not.toHaveBeenCalled();
+      expect(blob).not.toHaveBeenCalled();
+    } else {
+      expect(click).toHaveBeenCalled();
+      expect(await create.mock.calls[0][0].text()).toBe("exact bytes");
+      expect(blob).toHaveBeenCalledOnce();
+      expect(filename).toBe("report.html");
+      expect(href).toBe("blob:artifact-download");
+      expect(revoke).not.toHaveBeenCalled();
+      act(() => vi.advanceTimersByTime(30_000));
+      expect(revoke).toHaveBeenCalledWith("blob:artifact-download");
+    }
+  } finally {
+    vi.useRealTimers();
+    click.mockRestore();
+    if (createDescriptor) Object.defineProperty(URL, "createObjectURL", createDescriptor);
+    else Reflect.deleteProperty(URL, "createObjectURL");
+    if (revokeDescriptor) Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+    else Reflect.deleteProperty(URL, "revokeObjectURL");
   }
 });

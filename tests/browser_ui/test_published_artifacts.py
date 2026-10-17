@@ -56,6 +56,7 @@ def artifact_url(browser_contract: BrowserContract):
         "expires_at": 2000000000,
         "can_manage": True,
         "grants": [],
+        "sharing_revision": "c" * 64,
     }
     browser_contract.route(
         browser_contract._matcher("/v1/artifact-renderer"),
@@ -106,6 +107,7 @@ def test_catalog_navigation_and_group_sharing(
             "expires_at": 2000000000,
             "can_manage": True,
             "grants": request.post_data_json["grants"],
+            "sharing_revision": "d" * 64,
         }
 
     browser_contract.json(f"/v1/artifacts/{_ARTIFACT}/permissions", saved, method="PUT")
@@ -115,7 +117,9 @@ def test_catalog_navigation_and_group_sharing(
     page.get_by_label("User identity or group name").fill("engineering")
     page.get_by_role("button", name="Grant read access").click()
     expect(page.get_by_text("group: engineering", exact=False)).to_be_visible()
-    assert received == [{"grants": [{"principal_type": "group", "principal": "engineering"}]}]
+    assert received == [
+        {"grants": [{"principal_type": "group", "principal": "engineering"}], "revision": "c" * 64}
+    ]
     page.get_by_test_id("artifacts-nav").click()
     expect(page.get_by_role("heading", name="Published artifacts")).to_be_visible()
     page.get_by_role("link", name="Isolated report").click()
