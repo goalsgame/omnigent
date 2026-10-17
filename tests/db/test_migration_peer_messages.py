@@ -1,0 +1,50 @@
+"""Peer catalog migration and cross-dialect schema contract."""
+
+import importlib
+
+import sqlalchemy as sa
+from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+
+from omnigent.db.db_models import SqlPeerMessage
+from omnigent.db.utils import _build_alembic_config, get_or_create_engine
+
+
+def test_peer_migration_and_orm_schema_agree(db_uri):
+    engine = get_or_create_engine(db_uri)
+    migration = importlib.import_module(
+        "omnigent.db.migrations.versions.ob1b2c3d4e5f_add_peer_messages"
+    )
+    table = SqlPeerMessage.__table__
+    with engine.begin() as connection:
+        table.drop(connection)
+        try:
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+                columns = {c["name"]: c for c in sa.inspect(connection).get_columns(table.name)}
+                assert columns["body"]["default"] is None
+                assert not columns["body"]["nullable"]
+                assert columns["acknowledged_at"]["nullable"]
+                assert len(sa.inspect(connection).get_indexes(table.name)) == 3
+                migration.downgrade()
+            table.create(connection)
+        finally:
+            table.create(connection, checkfirst=True)
+
+
+def test_upgrade_from_artifacts_preserves_data(tmp_path):
+    uri = f"sqlite:///{tmp_path / 'upgrade.db'}"
+    config = _build_alembic_config(uri)
+    command.upgrade(config, "oa1b2c3d4e5f")
+    engine = sa.create_engine(uri)
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE upgrade_marker (value TEXT)"))
+        conn.execute(sa.text("INSERT INTO upgrade_marker VALUES ('preserved')"))
+    command.upgrade(config, "head")
+    with engine.connect() as conn:
+        assert "peer_messages" in sa.inspect(conn).get_table_names()
+        assert conn.scalar(sa.text("SELECT value FROM upgrade_marker")) == "preserved"
+    command.downgrade(config, "oa1b2c3d4e5f")
+    assert "peer_messages" not in sa.inspect(engine).get_table_names()
+    engine.dispose()

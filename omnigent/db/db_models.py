@@ -325,6 +325,32 @@ class SqlAgent(OmnigentBase):
     )
 
 
+class SqlPeerMessage(OmnigentBase):
+    """Session-addressed coordination messages with immutable sender attribution."""
+
+    __tablename__ = "peer_messages"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    sender_session_id: Mapped[str] = mapped_column(Uuid16())
+    recipient_session_id: Mapped[str] = mapped_column(Uuid16())
+    sender_user_id: Mapped[str] = mapped_column(String(128))
+    sender_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subject: Mapped[str] = mapped_column(String(256))
+    body: Mapped[str] = mapped_column(Text)
+    reply_to: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    expires_at: Mapped[int] = mapped_column(BigInteger, index=True)
+    acknowledged_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    __table_args__ = (
+        Index(
+            "ix_peer_messages_inbox", "workspace_id", "recipient_session_id", "created_at", "id"
+        ),
+        Index("ix_peer_messages_outbox", "workspace_id", "sender_session_id", "created_at", "id"),
+    )
+
+
 class SqlPublishedArtifact(OmnigentBase):
     """Immutable published bytes with ownership independent of a session."""
 
