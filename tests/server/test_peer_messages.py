@@ -508,3 +508,53 @@ async def test_legacy_mailboxes_initialize_only_on_authorized_write(peer_env):
         assert store.mailbox_id(source) != store.mailbox_id(target)
         with pytest.raises(OmnigentError, match="Session changed"):
             store.initialize_mailbox_id(target, "alice@example.test")
+
+
+@pytest.mark.asyncio
+async def test_delayed_send_and_backward_clock_cannot_land_behind_cursor(peer_env, monkeypatch):
+    from dataclasses import replace
+
+    app, store, _, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = (
+            await client.post(_path(source), json=_message(target), headers=_headers())
+        ).json()
+        # Capture an old request before later requests are committed and paginated.
+        delayed = replace(
+            store.list_messages(target)[0],
+            id=uuid.uuid4().hex,
+            created_at=first["created_at"] - 100_000,
+            expires_at=first["expires_at"] - 100_000,
+        )
+        await client.post(_path(source), json=_message(target), headers=_headers())
+        await client.post(_path(source), json=_message(target), headers=_headers())
+        page = (await client.get(_path(target), params={"limit": 2}, headers=_headers())).json()
+        assert page["has_more"]
+        monkeypatch.setattr(
+            "omnigent.stores.peer_message_store.now_epoch_us",
+            lambda: first["created_at"] - 200_000,
+        )
+        committed = store.send(delayed)
+        assert committed.created_at > int(page["cursor"].split(":")[0])
+        remaining = (
+            await client.get(_path(target), params={"cursor": page["cursor"]}, headers=_headers())
+        ).json()
+        assert committed.id in {item["id"] for item in remaining["messages"]}
+        assert remaining["messages"][-1]["id"] == committed.id
+        # Identical retries retain the original ordering key and receipt.
+        assert store.send(delayed) == committed
+        from sqlalchemy import update
+
+        from omnigent.db.db_models import SqlPeerMessage, current_workspace_id
+
+        with store._write("expire_mailbox_history") as session:
+            session.execute(
+                update(SqlPeerMessage)
+                .where(SqlPeerMessage.workspace_id == current_workspace_id())
+                .values(expires_at=0)
+            )
+        after_cleanup = store.send(replace(delayed, id=uuid.uuid4().hex))
+        assert after_cleanup.created_at > committed.created_at
+        assert [row.id for row in store.list_messages(target)] == [after_cleanup.id]

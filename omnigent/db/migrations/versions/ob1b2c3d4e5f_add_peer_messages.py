@@ -28,6 +28,13 @@ def upgrade() -> None:
         column["name"] for column in sa.inspect(bind).get_columns(metadata.name)
     }:
         op.add_column(metadata.name, sa.Column("peer_mailbox_id", Uuid16(), nullable=True))
+    if "peer_message_clock" not in {
+        column["name"] for column in sa.inspect(bind).get_columns(metadata.name)
+    }:
+        op.add_column(
+            metadata.name,
+            sa.Column("peer_message_clock", sa.BigInteger(), nullable=False, server_default="0"),
+        )
     if "peer_messages" in sa.inspect(op.get_bind()).get_table_names():
         return
     op.create_table(
@@ -64,9 +71,12 @@ def downgrade() -> None:
     """Remove the messageboard catalog."""
     if "peer_messages" in sa.inspect(op.get_bind()).get_table_names():
         op.drop_table("peer_messages")
-    if "peer_mailbox_id" in {
+    columns = {
         column["name"]
         for column in sa.inspect(op.get_bind()).get_columns("omnigent_conversation_metadata")
-    }:
+    }
+    if columns & {"peer_mailbox_id", "peer_message_clock"}:
         with op.batch_alter_table("omnigent_conversation_metadata") as batch:
-            batch.drop_column("peer_mailbox_id")
+            for name in ("peer_message_clock", "peer_mailbox_id"):
+                if name in columns:
+                    batch.drop_column(name)

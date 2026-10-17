@@ -37,7 +37,8 @@ surface is native tools and authenticated HTTP, usable from any connected client
 A send returns a `message_id`. Retry uncertain sends with the same ID and identical
 recipient, subject, body and reply target. Reusing the ID for different content is
 rejected. Acknowledgement is idempotent. Inboxes use bounded chronological pages;
-follow `cursor` while `has_more` is true. Use `unread_only` for unacknowledged messages.
+follow `cursor` while `has_more` is true. Ordering keys are allocated under both
+mailboxes' transaction locks, so a delayed send cannot commit behind a cursor. Use `unread_only` for unacknowledged messages.
 
 ## HTTP API
 

@@ -100,6 +100,7 @@ class PeerMessageStore:
                 generation=account_generation(message.sender_user_id),
             )
             mailboxes = {}
+            metadata_rows = []
             for sid in sorted({message.sender_session_id, message.recipient_session_id}):
                 metadata = session.scalar(
                     select(SqlConversationMetadata)
@@ -112,6 +113,7 @@ class PeerMessageStore:
                 if metadata is None or metadata.peer_mailbox_id is None:
                     raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
                 mailboxes[sid] = metadata.peer_mailbox_id
+                metadata_rows.append(metadata)
             bound = replace(
                 message,
                 sender_mailbox_id=mailboxes[message.sender_session_id],
@@ -159,6 +161,14 @@ class PeerMessageStore:
                     (bound.recipient_session_id, bound.recipient_mailbox_id),
                 }:
                     raise OmnigentError("Reply target not found", code=ErrorCode.NOT_FOUND)
+            timestamp = max(now_epoch_us(), *(row.peer_message_clock + 1 for row in metadata_rows))
+            bound = replace(
+                bound,
+                created_at=timestamp,
+                expires_at=timestamp + (message.expires_at - message.created_at),
+            )
+            for row in metadata_rows:
+                row.peer_message_clock = timestamp
             session.add(SqlPeerMessage(workspace_id=current_workspace_id(), **asdict(bound)))
             return bound
 

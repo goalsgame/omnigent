@@ -792,6 +792,8 @@ class SqlConversationMetadata(OmnigentBase):
     peer_mailbox_id: Mapped[str | None] = mapped_column(
         Uuid16(), nullable=True, default=lambda: uuid.uuid4().hex
     )
+    peer_message_clock: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
     # Enum stored as a stable int code (CONVERSATION_KIND: default=1, sub_agent=2).
     kind: Mapped[int] = mapped_column(SmallInteger, default=1)
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
