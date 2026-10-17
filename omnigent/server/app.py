@@ -3925,18 +3925,20 @@ def create_app(
                 return owner
         return None
 
-    def _resolve_runner_placement(runner_id: str) -> tuple[str, str] | None:
+    def _resolve_runner_placements(runner_ids: list[str]) -> dict[str, tuple[str, str]]:
         from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
 
+        result = {}
         if conversation_store is not None:
-            for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+            for conv in conversation_store.list_conversations_by_runner_ids(runner_ids):
                 if (
-                    conv.host_id
+                    conv.runner_id
+                    and conv.host_id
                     and conv.workspace
                     and conv.labels.get(INFERENCE_HOST_POLICY_LABEL) == conv.host_id
                 ):
-                    return conv.host_id, conv.workspace
-        return None
+                    result.setdefault(conv.runner_id, (conv.host_id, conv.workspace))
+        return result
 
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
@@ -3949,7 +3951,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
-            resolve_runner_placement=_resolve_runner_placement,
+            resolve_runner_placements=_resolve_runner_placements,
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),

@@ -2773,3 +2773,104 @@ async def test_host_bound_recovery_replacement_revokes_only_its_admission(db_uri
                 await comm.send_input({"type": "websocket.disconnect", "code": 1000})
                 await comm.wait(timeout=budget(5))
         await coordinator.aclose()
+
+
+@pytest.mark.parametrize("runner_count", [2, 12])
+async def test_peer_inventory_batches_shared_host_and_workspace_placements(
+    db_uri, monkeypatch, runner_count
+):
+    from contextlib import AsyncExitStack
+    from types import SimpleNamespace
+
+    from sqlalchemy import event
+
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    route, coordinator = _replicated_runner_route(db_uri, host_bound=True)
+    hid = "51dc949aba31e24ca8f047d6fba31a0d"
+    runner_ids = [f"batch-{i}" for i in range(runner_count)] + ["standalone"]
+    looked_up = []
+    original_many = coordinator.store.get_many
+
+    def placements(resources):
+        looked_up.append(resources)
+        return original_many(resources)
+
+    monkeypatch.setattr(coordinator.store, "get_many", placements)
+
+    def workspaces(ids):
+        return {
+            conv.runner_id: (conv.host_id, conv.workspace)
+            for conv in coordinator.conversations.list_conversations_by_runner_ids(ids)
+            if conv.host_id
+            and conv.workspace
+            and conv.labels.get(INFERENCE_HOST_POLICY_LABEL) == conv.host_id
+        }
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(
+            route.registry, replication=coordinator, resolve_runner_placements=workspaces
+        ),
+        prefix="/v1",
+    )
+
+    async def peer(scope, receive, send):
+        # Peer inventories do not recursively query other backends.
+        scope["omnigent.peer"] = True
+        await app(scope, receive, send)
+
+    async def close(**kwargs):
+        pass
+
+    selects = []
+
+    def count_queries(conn, cursor, statement, parameters, context, many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    try:
+        async with AsyncExitStack() as stack:
+            for rid in runner_ids:
+                if rid != "standalone":
+                    coordinator.conversations.create_conversation(
+                        host_id=hid,
+                        workspace=f"/{rid}",
+                        runner_id=rid,
+                        labels={INFERENCE_HOST_POLICY_LABEL: hid},
+                    )
+                ws = SimpleNamespace(scope={}, close=close)
+                assert await stack.enter_async_context(coordinator.connection(ws, "runner", rid))
+                route.registry.register(
+                    rid, ws, HelloFrame(runner_version="test", frame_protocol_version=1)
+                )
+            engine = coordinator.store._session.engine
+            event.listen(engine, "before_cursor_execute", count_queries)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=peer), base_url="http://test"
+                ) as client:
+                    response = await client.get("/v1/runners")
+                assert response.status_code == 200
+                rows = {row["runner_id"]: row for row in response.json()["data"]}
+                assert set(rows) == set(runner_ids)
+                assert len(selects) == 4  # One resource query; metadata, conversations and labels.
+                assert set(looked_up[0]) == {("host", hid), ("runner", "standalone")}
+                for rid in runner_ids[:-1]:
+                    assert rows[rid]["host_id"] == hid
+                    assert rows[rid]["workspace"] == f"/{rid}"
+                    assert rows[rid]["reusable"] is False
+                assert "host_id" not in rows["standalone"]
+            finally:
+                event.remove(engine, "before_cursor_execute", count_queries)
+            coordinator.store.release(coordinator.store.get("host", hid))
+            other = BackendRouteStore(db_uri, "other", "http://127.0.0.1:8002")
+            other.claim("host", hid)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=peer), base_url="http://test"
+            ) as client:
+                response = await client.get("/v1/runners")
+            assert [row["runner_id"] for row in response.json()["data"]] == ["standalone"]
+    finally:
+        await coordinator.aclose()

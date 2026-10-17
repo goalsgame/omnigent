@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import Callable
 
-from sqlalchemy import and_, delete, or_, select, text, update
+from sqlalchemy import and_, delete, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -102,6 +102,28 @@ class BackendRouteStore:
                 )
             )
             return _route(row) if row is not None else None
+
+    def get_many(self, resources: list[tuple[str, str]]) -> dict[tuple[str, str], BackendRoute]:
+        """Resolve fresh resource placements in bounded batches within this workspace."""
+        keys = list(dict.fromkeys(resources))
+        if not keys:
+            return {}
+        for kind, resource in keys:
+            self._key(kind, resource)
+        result = {}
+        with self._session("resolve_resource_owners") as session:
+            for offset in range(0, len(keys), 200):
+                rows = session.scalars(
+                    select(SqlBackendRoute).where(
+                        SqlBackendRoute.workspace_id == current_workspace_id(),
+                        tuple_(SqlBackendRoute.kind, SqlBackendRoute.resource_id).in_(
+                            keys[offset : offset + 200]
+                        ),
+                        SqlBackendRoute.expires_at > self._now(),
+                    )
+                )
+                result.update(((row.kind, row.resource_id), _route(row)) for row in rows)
+        return result
 
     def is_standalone_runner(self, runner_id: str) -> bool:
         """A runner-owned lease records origin even after the socket disconnects."""

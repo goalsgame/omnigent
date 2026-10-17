@@ -218,3 +218,56 @@ def test_live_reconnect_fences_old_socket_without_revoking_launch_lease(db_uri):
     assert store.host_metadata([hid]) == {}
     assert store.renew(new, {"version": "current"})
     assert store.host_metadata([hid])[hid]["version"] == "current"
+
+
+def test_batch_resolution_chunks_large_inputs_and_scopes_expiry(db_uri, replicas):
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlBackendRoute
+    from omnigent.db.utils import get_or_create_engine
+
+    store, _, _ = replicas
+    engine = get_or_create_engine(db_uri)
+    rows = [
+        {
+            "workspace_id": 0,
+            "kind": "host",
+            "resource_id": f"resource-{i}",
+            "replica_id": "a",
+            "endpoint": "http://127.0.0.1:8001",
+            "token": str(i),
+            "expires_at": 1090,
+        }
+        for i in range(501)
+    ]
+    rows.extend(
+        [
+            {**rows[0], "workspace_id": 1, "replica_id": "other"},
+            {**rows[0], "resource_id": "expired", "expires_at": 999},
+        ]
+    )
+    with Session(engine) as session:
+        session.execute(SqlBackendRoute.__table__.insert(), rows)
+        session.commit()
+    statements = []
+
+    def capture(conn, cursor, statement, params, context, many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        resources = [("host", f"resource-{i}") for i in range(501)]
+        resolved = store.get_many([*resources, resources[0], ("host", "expired")])
+        assert set(resolved) == set(resources)
+        assert all(row.workspace_id == 0 and row.replica_id == "a" for row in resolved.values())
+        assert len(statements) == 3
+        assert store.get_many([]) == {}
+        assert len(statements) == 3
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    with workspace_scope(1):
+        resolved = store.get_many(resources)
+        assert set(resolved) == {resources[0]}
+        assert resolved[resources[0]].replica_id == "other"

@@ -193,6 +193,7 @@ def create_runner_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     resolve_runner_placement: Callable[[str], tuple[str, str] | None] | None = None,
+    resolve_runner_placements: Callable[[list[str]], dict[str, tuple[str, str]]] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
@@ -232,6 +233,7 @@ def create_runner_tunnel_router(
         runner-side analog of the host tunnel's ``resolve_launch_token``.
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
+    :param resolve_runner_placements: Optional batch resolver used for runner inventories.
     :param resolve_runner_placement: Placement of session-isolated runners, which
         require a fresh host launch instead of adoption by unrelated sessions.
     :param mint_managed_runner_token: Accounts-mode issuer that validates the
@@ -270,27 +272,35 @@ def create_runner_tunnel_router(
             advertised harnesses.
         """
         user_id = _get_user_id_from_request(request)
-        data: list[dict[str, object]] = []
+        visible = {}
         for runner_id in registry.online_runner_ids():
             session = registry.get(runner_id)
-            if session is None:
-                continue
-            # Scope listing to the caller's own runners.
-            if user_id is not None and session.owner is not None and session.owner != user_id:
-                continue
-            if replication is not None:
-                placement = await replication.runner_route(runner_id)
-                if placement is None or not replication.local(placement):
-                    continue
+            if session is not None and (
+                user_id is None or session.owner is None or session.owner == user_id
+            ):
+                visible[runner_id] = session
+        if replication is not None:
+            local = await replication.local_runner_ids(
+                {rid: session.ws for rid, session in visible.items()}
+            )
+            visible = {rid: session for rid, session in visible.items() if rid in local}
+        placements = (
+            await asyncio.to_thread(resolve_runner_placements, list(visible))
+            if resolve_runner_placements is not None and visible
+            else {}
+        )
+        data: list[dict[str, object]] = []
+        for runner_id, session in visible.items():
             item: dict[str, object] = {
                 "runner_id": runner_id,
                 "online": True,
                 "harnesses": list(session.hello.harnesses),
             }
-            if resolve_runner_placement is not None:
+            placement = placements.get(runner_id)
+            if resolve_runner_placements is None and resolve_runner_placement is not None:
                 placement = await asyncio.to_thread(resolve_runner_placement, runner_id)
-                if placement is not None:
-                    item.update(reusable=False, host_id=placement[0], workspace=placement[1])
+            if placement is not None:
+                item.update(reusable=False, host_id=placement[0], workspace=placement[1])
             data.append(item)
         if replication is not None:
             data.extend(await replication.remote_runners(request))

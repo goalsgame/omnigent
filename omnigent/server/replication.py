@@ -386,6 +386,35 @@ class ReplicaCoordinator:
             self.store.get, "host" if host_id else "runner", host_id or runner_id
         )
 
+    async def local_runner_ids(self, sockets: dict[str, Any]) -> set[str]:
+        """Validate admitted local sockets using one lookup per batch of unique resources."""
+        workspace = current_workspace_id()
+        admitted = {}
+        for runner_id, ws in sockets.items():
+            current = self._runner_connections.get((workspace, runner_id))
+            admission = ws.scope.get("omnigent.runner_admission")
+            if (
+                current is not None
+                and current[1] is ws
+                and isinstance(admission, _RunnerAdmission)
+                and current[0] == admission.nonce
+            ):
+                admitted[runner_id] = admission
+        routes = await asyncio.to_thread(
+            self.store.get_many,
+            list({(a.route.kind, a.route.resource_id) for a in admitted.values()}),
+        )
+        return {
+            runner_id
+            for runner_id, admission in admitted.items()
+            if (route := routes.get((admission.route.kind, admission.route.resource_id)))
+            is not None
+            and self.local(route)
+            and route.token == admission.route.token
+            and self._runner_connections.get((workspace, runner_id))
+            == (admission.nonce, sockets[runner_id])
+        }
+
     async def remote_runners(self, request: Request) -> list[dict[str, object]]:
         if request.scope.get("omnigent.peer"):
             return []
