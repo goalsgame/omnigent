@@ -1,6 +1,7 @@
 """Peer catalog migration and cross-dialect schema contract."""
 
 import importlib
+import uuid
 
 import sqlalchemy as sa
 from alembic import command
@@ -30,7 +31,8 @@ def test_peer_migration_and_orm_schema_agree(db_uri):
                 migration.downgrade()
             table.create(connection)
         finally:
-            table.create(connection, checkfirst=True)
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
 
 
 def test_upgrade_from_artifacts_preserves_data(tmp_path):
@@ -41,10 +43,22 @@ def test_upgrade_from_artifacts_preserves_data(tmp_path):
     with engine.begin() as conn:
         conn.execute(sa.text("CREATE TABLE upgrade_marker (value TEXT)"))
         conn.execute(sa.text("INSERT INTO upgrade_marker VALUES ('preserved')"))
+        metadata = sa.Table("omnigent_conversation_metadata", sa.MetaData(), autoload_with=conn)
+        for _ in range(2):
+            conn.execute(metadata.insert().values(workspace_id=0, id=uuid.uuid4().bytes, kind=1))
+
     command.upgrade(config, "head")
     with engine.connect() as conn:
         assert "peer_messages" in sa.inspect(conn).get_table_names()
         assert conn.scalar(sa.text("SELECT value FROM upgrade_marker")) == "preserved"
+        incarnations = (
+            conn.execute(sa.text("SELECT peer_mailbox_id FROM omnigent_conversation_metadata"))
+            .scalars()
+            .all()
+        )
+        assert len(incarnations) == len(set(incarnations)) == 2
+        assert all(incarnations)
+
     command.downgrade(config, "oa1b2c3d4e5f")
     assert "peer_messages" not in sa.inspect(engine).get_table_names()
     engine.dispose()

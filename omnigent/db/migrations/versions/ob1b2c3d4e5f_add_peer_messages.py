@@ -4,6 +4,8 @@ Revision ID: ob1b2c3d4e5f
 Revises: oa1b2c3d4e5f
 """
 
+import uuid
+
 import sqlalchemy as sa
 from alembic import op
 
@@ -17,6 +19,32 @@ depends_on = None
 
 def upgrade() -> None:
     """Create inbox storage without runner-dependent state or session foreign keys."""
+    bind = op.get_bind()
+    metadata = sa.table(
+        "omnigent_conversation_metadata",
+        sa.column("workspace_id", sa.BigInteger()),
+        sa.column("id", Uuid16()),
+        sa.column("peer_mailbox_id", Uuid16()),
+    )
+    if "peer_mailbox_id" not in {
+        column["name"] for column in sa.inspect(bind).get_columns(metadata.name)
+    }:
+        op.add_column(metadata.name, sa.Column("peer_mailbox_id", Uuid16(), nullable=True))
+    rows = bind.execute(
+        sa.select(metadata.c.workspace_id, metadata.c.id).where(
+            metadata.c.peer_mailbox_id.is_(None)
+        )
+    ).all()
+    for workspace_id, session_id in rows:
+        bind.execute(
+            metadata.update()
+            .where(
+                metadata.c.workspace_id == workspace_id,
+                metadata.c.id == session_id,
+                metadata.c.peer_mailbox_id.is_(None),
+            )
+            .values(peer_mailbox_id=uuid.uuid4().hex)
+        )
     if "peer_messages" in sa.inspect(op.get_bind()).get_table_names():
         return
     op.create_table(
@@ -27,6 +55,8 @@ def upgrade() -> None:
         sa.Column("recipient_session_id", Uuid16(), nullable=False),
         sa.Column("sender_user_id", sa.String(128), nullable=False),
         sa.Column("sender_generation", sa.String(32), nullable=True),
+        sa.Column("sender_mailbox_id", Uuid16(), nullable=False),
+        sa.Column("recipient_mailbox_id", Uuid16(), nullable=False),
         sa.Column("subject", sa.String(256), nullable=False),
         sa.Column("body", sa.Text(), nullable=False),
         sa.Column("reply_to", Uuid16(), nullable=True),
@@ -51,3 +81,9 @@ def downgrade() -> None:
     """Remove the messageboard catalog."""
     if "peer_messages" in sa.inspect(op.get_bind()).get_table_names():
         op.drop_table("peer_messages")
+    if "peer_mailbox_id" in {
+        column["name"]
+        for column in sa.inspect(op.get_bind()).get_columns("omnigent_conversation_metadata")
+    }:
+        with op.batch_alter_table("omnigent_conversation_metadata") as batch:
+            batch.drop_column("peer_mailbox_id")

@@ -28,7 +28,9 @@ There are no process-local delivery queues or background model invocations.
 Text is bounded to 8 KiB of UTF-8 per message; use published artifacts for larger
 outputs. Messages expire after 90 days. Expired records are hidden immediately
 and physically removed on the next send in the same workspace. Deleted sessions'
-mailboxes are inaccessible. The messageboard has no separate HTML/web UI; its
+mailboxes are inaccessible. A unique session-incarnation ID keeps a deleted and
+re-imported session from inheriting the previous owner's inbox, outbox or reply
+relationships, even when its external import ID is identical. The messageboard has no separate HTML/web UI; its
 surface is native tools and authenticated HTTP, usable from any connected client.
 
 A send returns a `message_id`. Retry uncertain sends with the same ID and identical

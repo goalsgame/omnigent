@@ -413,3 +413,67 @@ async def test_native_dispatch_to_real_api_and_persisted_inbox(peer_env):
             agent_spec=spec,
         )
         assert store.list_messages(target, unread_only=True) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recreate_source", [False, True], ids=["recipient", "sender"])
+async def test_delete_reimport_by_another_owner_cannot_recover_mailbox(peer_env, recreate_source):
+    from omnigent.server.routes.imports import _import_conversation_id
+
+    app, store, conversations, permissions, source, target, _ = peer_env
+    reused = _import_conversation_id("codex", "previously-imported-session")
+    conversations.create_conversation(conversation_id=reused)
+    permissions.grant("alice@example.test", reused, 4)
+    source, target = (reused, target) if recreate_source else (source, reused)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        data = _message(target)
+        original = await client.post(_path(source), json=data, headers=_headers())
+        assert original.status_code == 201
+        old_mailbox = store.mailbox_id(reused)
+        await conversations.delete_conversation(reused)
+        conversations.create_conversation(conversation_id=reused)
+        permissions.grant("bob@example.test", reused, 4)
+        permissions.grant("bob@example.test", target if recreate_source else source, 2)
+        assert store.mailbox_id(reused) != old_mailbox
+        for direction in ("received", "sent"):
+            response = await client.get(
+                _path(reused),
+                params={"direction": direction},
+                headers=_headers("bob@example.test"),
+            )
+            assert response.status_code == 200 and response.json()["messages"] == []
+        assert (
+            await client.post(
+                _path(reused) + f"/{data['id']}/acknowledge", headers=_headers("bob@example.test")
+            )
+        ).status_code == 404
+        assert (
+            await client.post(
+                _path(target),
+                json=_message(source, reply_to=data["id"]),
+                headers=_headers("bob@example.test"),
+            )
+        ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_send_and_read_with_stale_mailbox_incarnation_fail_closed(peer_env):
+    from dataclasses import replace
+
+    app, store, conversations, permissions, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(_path(source), json=_message(target), headers=_headers())
+    old = store.list_messages(target)[0]
+    await conversations.delete_conversation(target)
+    conversations.create_conversation(conversation_id=target)
+    permissions.grant("alice@example.test", target, 4)
+    with pytest.raises(OmnigentError, match="Session changed"):
+        store.send(replace(old, id=uuid.uuid4().hex))
+    assert store.list_messages(target, mailbox_id=old.recipient_mailbox_id) == []
+    assert not store.acknowledge(
+        target, old.id, "alice@example.test", mailbox_id=old.recipient_mailbox_id
+    )

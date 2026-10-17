@@ -53,17 +53,20 @@ def create_peer_messages_router(
 ) -> APIRouter:
     """Expose inboxes to readers, sends and acknowledgements to session editors."""
 
-    async def authorize(request: Request, session_id: str, level: int) -> str:
+    async def authorize(request: Request, session_id: str, level: int) -> tuple[str, str]:
         user = require_user(request, auth) or "local"
         try:
             if uuid.UUID(hex=session_id).hex != session_id:
                 raise ValueError("Noncanonical session id")
         except ValueError as exc:
             raise HTTPException(404, "Session not found") from exc
+        mailbox_id = await asyncio.to_thread(store.mailbox_id, session_id)
         await require_access(user, session_id, level, permissions, conversations)
+        if mailbox_id is None:
+            raise HTTPException(404, "Session not found")
         if await asyncio.to_thread(conversations.get_conversation, session_id) is None:
             raise HTTPException(404, "Session not found")
-        return user
+        return user, mailbox_id
 
     class BoundedMessageRoute(APIRoute):
         async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -93,8 +96,8 @@ def create_peer_messages_router(
 
     @router.post("/sessions/{session_id}/peer-messages", status_code=201)
     async def send_message(session_id: str, message: SendPeerMessage, request: Request) -> dict:
-        user = await authorize(request, session_id, 2)
-        await authorize(request, message.recipient_session_id, 2)
+        user, sender_mailbox = await authorize(request, session_id, 2)
+        _, recipient_mailbox = await authorize(request, message.recipient_session_id, 2)
         if session_id == message.recipient_session_id:
             raise HTTPException(422, "Peer messages require a different recipient session")
         now = now_epoch_us()
@@ -106,6 +109,8 @@ def create_peer_messages_router(
                 recipient_session_id=message.recipient_session_id,
                 sender_user_id=user,
                 sender_generation=account_generation(user),
+                sender_mailbox_id=sender_mailbox,
+                recipient_mailbox_id=recipient_mailbox,
                 subject=message.subject,
                 body=message.body,
                 reply_to=message.reply_to,
@@ -124,7 +129,7 @@ def create_peer_messages_router(
         cursor: str | None = Query(default=None, max_length=64),
         limit: int = Query(default=10, ge=1, le=20),
     ) -> dict:
-        await authorize(request, session_id, 1)
+        _, mailbox_id = await authorize(request, session_id, 1)
         after = None
         if cursor:
             try:
@@ -141,6 +146,7 @@ def create_peer_messages_router(
             unread_only=unread_only,
             after=after,
             limit=limit + 1,
+            mailbox_id=mailbox_id,
         )
         page = rows[:limit]
         return {
@@ -151,13 +157,15 @@ def create_peer_messages_router(
 
     @router.post("/sessions/{session_id}/peer-messages/{message_id}/acknowledge")
     async def acknowledge(session_id: str, message_id: str, request: Request) -> dict:
-        user = await authorize(request, session_id, 2)
+        user, mailbox_id = await authorize(request, session_id, 2)
         try:
             if uuid.UUID(hex=message_id).hex != message_id:
                 raise ValueError("Noncanonical message id")
         except ValueError as exc:
             raise HTTPException(404, "Message not found") from exc
-        if not await asyncio.to_thread(store.acknowledge, session_id, message_id, user):
+        if not await asyncio.to_thread(
+            store.acknowledge, session_id, message_id, user, mailbox_id=mailbox_id
+        ):
             raise HTTPException(404, "Message not found")
         return {"id": message_id, "acknowledged": True}
 

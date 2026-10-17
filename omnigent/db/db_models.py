@@ -337,6 +337,8 @@ class SqlPeerMessage(OmnigentBase):
     recipient_session_id: Mapped[str] = mapped_column(Uuid16())
     sender_user_id: Mapped[str] = mapped_column(String(128))
     sender_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sender_mailbox_id: Mapped[str] = mapped_column(Uuid16())
+    recipient_mailbox_id: Mapped[str] = mapped_column(Uuid16())
     subject: Mapped[str] = mapped_column(String(256))
     body: Mapped[str] = mapped_column(Text)
     reply_to: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
@@ -787,6 +789,9 @@ class SqlConversationMetadata(OmnigentBase):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    peer_mailbox_id: Mapped[str | None] = mapped_column(
+        Uuid16(), nullable=True, default=lambda: uuid.uuid4().hex
+    )
     # Enum stored as a stable int code (CONVERSATION_KIND: default=1, sub_agent=2).
     kind: Mapped[int] = mapped_column(SmallInteger, default=1)
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
