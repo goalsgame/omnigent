@@ -1537,6 +1537,17 @@ def create_app(
 
     tunnel_registry = TunnelRegistry()
     host_registry = HostRegistry()
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator
+
+    replication_config = ReplicationConfig.parse(resolved_server_config.get("replication"))
+    replication = (
+        ReplicaCoordinator(
+            replication_config, agent_store.storage_location, conversation_store, host_registry
+        )
+        if replication_config is not None
+        else None
+    )
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
@@ -1604,6 +1615,8 @@ def create_app(
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
+        if replication is not None:
+            await replication.start()
 
         # Initialise usage telemetry (fire-and-forget; no-op when disabled).
         from omnigent.telemetry import init_client as _init_telemetry
@@ -1836,6 +1849,11 @@ def create_app(
             await _mcp_pool.shutdown_all()
             if mcp_broker is not None:
                 await asyncio.to_thread(mcp_broker.client.close)
+            if replication is not None:
+                await replication.aclose()
+            from omnigent.server.managed_hosts import drain_provision_cleanup
+
+            await drain_provision_cleanup()
 
     from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
 
@@ -2092,6 +2110,7 @@ def create_app(
     from omnigent.server.managed_hosts import ManagedLaunchTracker
 
     app.state.managed_launches = ManagedLaunchTracker()
+    app.state.replication = replication
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
@@ -3906,30 +3925,33 @@ def create_app(
                 return owner
         return None
 
-    def _resolve_runner_placement(runner_id: str) -> tuple[str, str] | None:
+    def _resolve_runner_placements(runner_ids: list[str]) -> dict[str, tuple[str, str]]:
         from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
 
+        result = {}
         if conversation_store is not None:
-            for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+            for conv in conversation_store.list_conversations_by_runner_ids(runner_ids):
                 if (
-                    conv.host_id
+                    conv.runner_id
+                    and conv.host_id
                     and conv.workspace
                     and conv.labels.get(INFERENCE_HOST_POLICY_LABEL) == conv.host_id
                 ):
-                    return conv.host_id, conv.workspace
-        return None
+                    result.setdefault(conv.runner_id, (conv.host_id, conv.workspace))
+        return result
 
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
         create_runner_tunnel_router(
             tunnel_registry,
+            replication=replication,
             allowed_tunnel_tokens=runner_tunnel_tokens,
             on_runner_disconnect=_on_runner_disconnect,
             on_runner_connect=_on_runner_connect,
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
-            resolve_runner_placement=_resolve_runner_placement,
+            resolve_runner_placements=_resolve_runner_placements,
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
@@ -4050,6 +4072,7 @@ def create_app(
             create_host_tunnel_router(
                 host_registry,
                 host_store,
+                replication=replication,
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
@@ -4065,6 +4088,7 @@ def create_app(
                 host_registry,
                 host_store,
                 conversation_store,
+                replication=replication,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
                 agent_store=agent_store,
@@ -4408,6 +4432,17 @@ def create_app(
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
+    if replication is not None:
+        from omnigent.server.replica_routing import ReplicaRoutingMiddleware
+
+        app.add_middleware(
+            ReplicaRoutingMiddleware,
+            coordinator=replication,
+            auth_provider=auth_provider,
+            host_store=host_store,
+            permission_store=permission_store,
+            runner_router=runner_router,
+        )
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before

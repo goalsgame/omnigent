@@ -2437,3 +2437,440 @@ async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
     await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
     await ws.close(code=4000)
     await asyncio.wait_for(sender, timeout=5)  # returns instead of raising
+
+
+def _replicated_runner_route(db_uri, *, host_bound=False, on_connect=None):
+    from ipaddress import ip_network
+    from types import SimpleNamespace
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.host_store import HostStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    hosts, registry = HostRegistry(), TunnelRegistry()
+    conversations = SqlAlchemyConversationStore(db_uri)
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        conversations,
+        hosts,
+    )
+    if host_bound:
+        hid = "51dc949aba31e24ca8f047d6fba31a0d"
+        HostStore(db_uri).upsert_on_connect(hid, "host", "local")
+        hosts.register(
+            hid,
+            SimpleNamespace(),
+            HostHelloFrame(version="test", name="host", frame_protocol_version=1),
+            owner=None,
+        )
+        conv = conversations.create_conversation(host_id=hid, workspace="/test")
+        conversations.replace_runner_id(conv.id, _RUNNER_ID)
+        coordinator.store.claim("host", hid)
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(
+            registry, replication=coordinator, on_runner_connect=on_connect
+        ),
+        prefix="/v1",
+    )
+    return TunnelRouteApp(app, registry), coordinator
+
+
+@pytest.mark.parametrize("host_bound", [False, True])
+async def test_superseded_runner_hello_cannot_replace_healthy_socket(db_uri, host_bound):
+    route, coordinator = _replicated_runner_route(db_uri, host_bound=host_bound)
+    received, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_app(scope, receive, send):
+        async def delayed_receive():
+            message = await receive()
+            if scope.get("delay_hello") and message["type"] == "websocket.receive":
+                received.set()
+                await release.wait()
+            return message
+
+        await route.app(scope, delayed_receive, send)
+
+    old = ApplicationCommunicator(
+        delayed_app, {**_websocket_scope(_TUNNEL_PATH), "delay_hello": True}
+    )
+    new = None
+    try:
+        await old.send_input({"type": "websocket.connect"})
+        assert (await old.receive_output(timeout=budget(2)))["type"] == "websocket.accept"
+        await old.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="old", frame_protocol_version=1, connection_id="superseded"
+                    )
+                ),
+            }
+        )
+        await asyncio.wait_for(received.wait(), timeout=budget(2))
+        new = await _connect_route(route.app, _TUNNEL_PATH)
+        await _send_hello(new, route.registry, connection_id="replacement")
+        healthy = route.registry.get(_RUNNER_ID)
+        assert healthy.hello.connection_id == "replacement"
+        release.set()
+        await old.wait(timeout=budget(2))
+        assert route.registry.get(_RUNNER_ID) is healthy
+    finally:
+        release.set()
+        for comm in (old, new):
+            if comm is not None and not comm.future.done():
+                await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+                await comm.wait(timeout=budget(2))
+        await coordinator.aclose()
+        assert not coordinator._runner_connections
+
+
+@pytest.mark.parametrize("transfer", [False, True])
+async def test_accepted_batch_retains_lease_after_disconnect_and_fences_transferred_writes(
+    db_uri, transfer
+):
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    route, coordinator = _replicated_runner_route(db_uri)
+    conv = coordinator.conversations.create_conversation(title="original")
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    async def ingest(**kwargs):
+        batch = kwargs["batch"]
+
+        def write():
+            started.set()
+            assert release.wait(timeout=budget(10))
+            try:
+                coordinator.conversations.update_conversation(conv.id, title="accepted")
+            finally:
+                finished.set()
+
+        await asyncio.to_thread(write)
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(2)))["text"]), EventReadyFrame
+        )
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    EventBatchFrame(
+                        id="accepted",
+                        session_id=conv.id,
+                        events=[{"type": "external_output_text_delta", "data": {}}],
+                    )
+                ),
+            }
+        )
+        assert await asyncio.to_thread(started.wait, budget(2))
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2))
+        lease = coordinator.store.get("runner", _RUNNER_ID)
+        assert lease is not None
+        assert route.app.state.runner_event_ingest_slots._value == 15
+        if transfer:
+            coordinator.store.release(lease)
+            other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+            assert other.claim("runner", _RUNNER_ID).replica_id == "replacement"
+        release.set()
+        assert await asyncio.to_thread(finished.wait, budget(2))
+        while route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0):
+            await asyncio.sleep(0.01)
+        await asyncio.gather(*coordinator._cleanup)
+        assert coordinator.conversations.get_conversation(conv.id).title == (
+            "original" if transfer else "accepted"
+        )
+        if not transfer:
+            assert coordinator.store.get("runner", _RUNNER_ID) is None
+    finally:
+        release.set()
+        if not comm.future.done():
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(2))
+        await coordinator.aclose()
+
+
+@pytest.mark.parametrize("host_bound", [False, True])
+@pytest.mark.parametrize("transfer", [False, True])
+@pytest.mark.parametrize("write", ["error", "binding"])
+async def test_recovery_worker_rejects_lease_transfer(db_uri, host_bound, transfer, write):
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    failures = []
+
+    def persist():
+        started.set()
+        assert release.wait(timeout=budget(10))
+        try:
+            if write == "error":
+                coordinator.conversations.delete_label(conv.id, "last_task_error")
+            else:
+                coordinator.conversations.replace_runner_id(conv.id, "stale-child-runner")
+        except asyncio.CancelledError:
+            failures.append("fenced")
+            raise
+        finally:
+            finished.set()
+
+    async def recover(runner_id, connection):
+        await asyncio.to_thread(persist)
+
+    route, coordinator = _replicated_runner_route(
+        db_uri, host_bound=host_bound, on_connect=recover
+    )
+    conv = coordinator.conversations.create_conversation(runner_id="new-owner-runner")
+    coordinator.conversations.set_labels(conv.id, {"last_task_error": "new-owner-error"})
+    comm = None
+    try:
+        comm = await _connect_route(route.app, _TUNNEL_PATH)
+        await _send_hello(comm, route.registry, connection_id="recovery")
+        assert await asyncio.to_thread(started.wait, budget(5))
+        resource = (
+            ("host", "51dc949aba31e24ca8f047d6fba31a0d") if host_bound else ("runner", _RUNNER_ID)
+        )
+        if transfer:
+            old = coordinator.store.get(*resource)
+            coordinator.store.release(old)
+            other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+            other.claim(*resource)
+            # Canceling the hook cannot cancel the already running SQL worker.
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(5))
+        release.set()
+        assert await asyncio.to_thread(finished.wait, budget(5))
+        current = coordinator.conversations.get_conversation(conv.id)
+        assert failures == (["fenced"] if transfer else [])
+        assert current.labels.get("last_task_error") == (
+            None if write == "error" and not transfer else "new-owner-error"
+        )
+        assert current.runner_id == (
+            "stale-child-runner" if write == "binding" and not transfer else "new-owner-runner"
+        )
+    finally:
+        release.set()
+        if comm is not None and not comm.future.done():
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(5))
+        await coordinator.aclose()
+
+
+@pytest.mark.parametrize("write", ["error", "binding"])
+async def test_host_bound_recovery_replacement_revokes_only_its_admission(db_uri, write):
+    from types import SimpleNamespace
+
+    from omnigent.server.replication import create_runner_recovery_task
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    recovered, unrelated_release = asyncio.Event(), asyncio.Event()
+    failures = []
+
+    def old_write():
+        started.set()
+        assert release.wait(timeout=budget(10))
+        try:
+            if write == "error":
+                coordinator.conversations.delete_label(conv.id, "last_task_error")
+            else:
+                coordinator.conversations.replace_runner_id(conv.id, "stale-child")
+        except asyncio.CancelledError:
+            failures.append("fenced")
+            raise
+        finally:
+            finished.set()
+
+    async def recover(runner_id, connection):
+        if connection.hello.connection_id == "old":
+            await asyncio.to_thread(old_write)
+        else:
+            await asyncio.to_thread(
+                coordinator.conversations.set_labels, conv.id, {"last_task_error": "replacement"}
+            )
+            await asyncio.to_thread(
+                coordinator.conversations.replace_runner_id, conv.id, "replacement-child"
+            )
+            recovered.set()
+
+    route, coordinator = _replicated_runner_route(db_uri, host_bound=True, on_connect=recover)
+    conv = coordinator.conversations.create_conversation(runner_id="original-child")
+    hid = "51dc949aba31e24ca8f047d6fba31a0d"
+    other_conv = coordinator.conversations.create_conversation(
+        host_id=hid, workspace="/other", runner_id="unrelated-runner"
+    )
+
+    async def close(**kwargs):
+        pass
+
+    other_ws = SimpleNamespace(scope={}, close=close)
+    old = new = unrelated = None
+
+    async def other_recovery():
+        await unrelated_release.wait()
+        await asyncio.to_thread(
+            coordinator.conversations.set_labels, other_conv.id, {"healthy": "yes"}
+        )
+
+    try:
+        async with coordinator.connection(other_ws, "runner", "unrelated-runner"):
+            unrelated = create_runner_recovery_task(other_recovery(), other_ws)
+            old = await _connect_route(route.app, _TUNNEL_PATH)
+            await _send_hello(old, route.registry, connection_id="old")
+            assert await asyncio.to_thread(started.wait, budget(5))
+            host_before = coordinator.store.get("host", hid)
+            nonce_before = coordinator._runner_connections[(0, _RUNNER_ID)][0]
+            new = await _connect_route(route.app, _TUNNEL_PATH)
+            await _send_hello(new, route.registry, connection_id="new")
+            await asyncio.wait_for(recovered.wait(), budget(5))
+            host_after = coordinator.store.get("host", hid)
+            assert host_after.token == host_before.token
+            assert host_after.connection_token == host_before.connection_token
+            assert coordinator._runner_connections[(0, _RUNNER_ID)][0] != nonce_before
+            unrelated_release.set()
+            await unrelated
+            release.set()
+            assert await asyncio.to_thread(finished.wait, budget(5))
+            current = coordinator.conversations.get_conversation(conv.id)
+            assert failures == ["fenced"]
+            assert current.labels["last_task_error"] == "replacement"
+            assert current.runner_id == "replacement-child"
+            assert (
+                coordinator.conversations.get_conversation(other_conv.id).labels["healthy"]
+                == "yes"
+            )
+    finally:
+        release.set()
+        unrelated_release.set()
+        if unrelated is not None:
+            await asyncio.gather(unrelated, return_exceptions=True)
+        for comm in (old, new):
+            if comm is not None and not comm.future.done():
+                await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+                await comm.wait(timeout=budget(5))
+        await coordinator.aclose()
+
+
+@pytest.mark.parametrize("runner_count", [2, 12])
+async def test_peer_inventory_batches_shared_host_and_workspace_placements(
+    db_uri, monkeypatch, runner_count
+):
+    from contextlib import AsyncExitStack
+    from types import SimpleNamespace
+
+    from sqlalchemy import event
+
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    route, coordinator = _replicated_runner_route(db_uri, host_bound=True)
+    hid = "51dc949aba31e24ca8f047d6fba31a0d"
+    runner_ids = [f"batch-{i}" for i in range(runner_count)] + ["standalone"]
+    looked_up = []
+    original_many = coordinator.store.get_many
+
+    def placements(resources):
+        looked_up.append(resources)
+        return original_many(resources)
+
+    monkeypatch.setattr(coordinator.store, "get_many", placements)
+
+    def workspaces(ids):
+        return {
+            conv.runner_id: (conv.host_id, conv.workspace)
+            for conv in coordinator.conversations.list_conversations_by_runner_ids(ids)
+            if conv.host_id
+            and conv.workspace
+            and conv.labels.get(INFERENCE_HOST_POLICY_LABEL) == conv.host_id
+        }
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(
+            route.registry, replication=coordinator, resolve_runner_placements=workspaces
+        ),
+        prefix="/v1",
+    )
+
+    async def peer(scope, receive, send):
+        # Peer inventories do not recursively query other backends.
+        scope["omnigent.peer"] = True
+        await app(scope, receive, send)
+
+    async def close(**kwargs):
+        pass
+
+    selects = []
+
+    def count_queries(conn, cursor, statement, parameters, context, many):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    try:
+        async with AsyncExitStack() as stack:
+            for rid in runner_ids:
+                if rid != "standalone":
+                    coordinator.conversations.create_conversation(
+                        host_id=hid,
+                        workspace=f"/{rid}",
+                        runner_id=rid,
+                        labels={INFERENCE_HOST_POLICY_LABEL: hid},
+                    )
+                ws = SimpleNamespace(scope={}, close=close)
+                assert await stack.enter_async_context(coordinator.connection(ws, "runner", rid))
+                route.registry.register(
+                    rid, ws, HelloFrame(runner_version="test", frame_protocol_version=1)
+                )
+            engine = coordinator.store._session.engine
+            event.listen(engine, "before_cursor_execute", count_queries)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=peer), base_url="http://test"
+                ) as client:
+                    response = await client.get("/v1/runners")
+                assert response.status_code == 200
+                rows = {row["runner_id"]: row for row in response.json()["data"]}
+                assert set(rows) == set(runner_ids)
+                assert len(selects) == 4  # One resource query; metadata, conversations and labels.
+                assert set(looked_up[0]) == {("host", hid), ("runner", "standalone")}
+                for rid in runner_ids[:-1]:
+                    assert rows[rid]["host_id"] == hid
+                    assert rows[rid]["workspace"] == f"/{rid}"
+                    assert rows[rid]["reusable"] is False
+                assert "host_id" not in rows["standalone"]
+            finally:
+                event.remove(engine, "before_cursor_execute", count_queries)
+            coordinator.store.release(coordinator.store.get("host", hid))
+            other = BackendRouteStore(db_uri, "other", "http://127.0.0.1:8002")
+            other.claim("host", hid)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=peer), base_url="http://test"
+            ) as client:
+                response = await client.get("/v1/runners")
+            assert [row["runner_id"] for row in response.json()["data"]] == ["standalone"]
+    finally:
+        await coordinator.aclose()

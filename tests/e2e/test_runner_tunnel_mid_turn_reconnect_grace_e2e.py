@@ -264,6 +264,7 @@ class _ReconnectStack:
         tmp_path: Path,
         *,
         fail_conversation_reads: bool = False,
+        replication: bool = False,
     ) -> None:
         self._mock_base = f"{mock_llm_server_url}/v1"
         self._port = find_free_port()
@@ -271,9 +272,16 @@ class _ReconnectStack:
         self._binding_token = uuid.uuid4().hex + uuid.uuid4().hex
         self.runner_id = token_bound_runner_id(self._binding_token)
         self._database_uri = f"sqlite:///{tmp_path / 'reconnect.db'}"
-        self._conversation_database_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+        self._conversation_database_uri = (
+            self._database_uri if replication else f"sqlite:///{tmp_path / 'conversations.db'}"
+        )
         self._artifact_dir = tmp_path / "artifacts"
         self._artifact_dir.mkdir()
+        self._replication_config = tmp_path / "replication.yaml" if replication else None
+        if self._replication_config is not None:
+            self._replication_config.write_text(
+                json.dumps({"replication": {"allowed_networks": ["127.0.0.0/8"]}})
+            )
         self.server_log = tmp_path / "server.log"
         # The server's own log file. Its stderr mirroring is env-dependent,
         # so assertions on server log lines read this path, which
@@ -290,7 +298,9 @@ class _ReconnectStack:
         self.proxy: _TunnelIngressProxy | None = None
         self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
 
-    def _server_env(self, process_log: Path | None = None) -> dict[str, str]:
+    def _server_env(
+        self, process_log: Path | None = None, *, port: int | None = None
+    ) -> dict[str, str]:
         env = {
             **_ambient_free_environ(),
             "OPENAI_API_KEY": "mock-key",
@@ -298,8 +308,14 @@ class _ReconnectStack:
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": self._binding_token,
             "OMNIGENT_PROCESS_LOG_FILE": str(process_log or self.process_log),
         }
+        if self._replication_config is not None:
+            env["OMNIGENT_REPLICA_URL"] = f"http://127.0.0.1:{port or self._port}"
+            env["OMNIGENT_REPLICA_KEY"] = "local-test-backend-peer-key-32-bytes"
         apply_server_env(env, _REPO_ROOT)
         return env
+
+    def _config_args(self) -> list[str]:
+        return ["--config", str(self._replication_config)] if self._replication_config else []
 
     def start(self) -> None:
         """Start the server, proxy, and runner, then wait for registration."""
@@ -316,6 +332,7 @@ class _ReconnectStack:
                 sys.executable,
                 *entrypoint,
                 "server",
+                *self._config_args(),
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -415,6 +432,7 @@ class _Replica:
                 "-m",
                 "omnigent.cli",
                 "server",
+                *self._stack._config_args(),
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -426,7 +444,7 @@ class _Replica:
                 "--artifact-location",
                 str(self._stack._artifact_dir),
             ],
-            env=self._stack._server_env(process_log=self.process_log),
+            env=self._stack._server_env(process_log=self.process_log, port=self.port),
             stdout=self._handle,
             stderr=subprocess.STDOUT,
         )

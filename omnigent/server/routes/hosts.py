@@ -61,6 +61,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.replication import ReplicaCoordinator
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
 from omnigent.server.routes._workspace_validation import (
@@ -309,6 +310,9 @@ async def _proxy_create_dir(
         ``error`` (string or ``None``).
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
+    from omnigent.db.backend_work_fence import check_backend_work
+
+    await asyncio.to_thread(check_backend_work)
     request_id = secrets.token_hex(8)
     loop = asyncio.get_running_loop()
     future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -369,6 +373,9 @@ async def _proxy_install_harness(
         ``None``).
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
+    from omnigent.db.backend_work_fence import check_backend_work
+
+    await asyncio.to_thread(check_backend_work)
     request_id = secrets.token_hex(8)
     loop = asyncio.get_running_loop()
     future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -430,6 +437,9 @@ async def _proxy_store_secret(
         ``gateway_inference`` / ``error``.
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
+    from omnigent.db.backend_work_fence import check_backend_work
+
+    await asyncio.to_thread(check_backend_work)
     request_id = frame.request_id
     loop = asyncio.get_running_loop()
     future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -647,6 +657,7 @@ def create_hosts_router(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
+    replication: ReplicaCoordinator | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -699,6 +710,11 @@ def create_hosts_router(
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
         now = now_epoch()
+        reports = (
+            await asyncio.to_thread(replication.store.host_metadata, [h.host_id for h in hosts])
+            if replication is not None
+            else {}
+        )
         result: list[dict[str, Any]] = []
         for host in hosts:
             # Status comes from the DB, not host_registry. The registry
@@ -727,8 +743,16 @@ def create_hosts_router(
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
                     # gateway-backed".
-                    "gateway_inference": host_registry.gateway_inference(host.host_id),
-                    "interactive_shells": host_registry.interactive_shells(host.host_id),
+                    "gateway_inference": (
+                        host_registry.gateway_inference(host.host_id)
+                        if host_registry.get(host.host_id) is not None
+                        else reports.get(host.host_id, {}).get("gateway_inference")
+                    ),
+                    "interactive_shells": (
+                        host_registry.interactive_shells(host.host_id)
+                        if host_registry.get(host.host_id) is not None
+                        else reports.get(host.host_id, {}).get("interactive_shells")
+                    ),
                 }
             )
         return {"hosts": result}
@@ -1134,6 +1158,9 @@ def create_hosts_router(
         from omnigent.server.routes._host_launch import remember_inference_host_policy
 
         await remember_inference_host_policy(target.conv, conn, host_registry, conversation_store)
+        from omnigent.db.backend_work_fence import check_backend_work
+
+        await asyncio.to_thread(check_backend_work)
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future

@@ -37,6 +37,7 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import time
@@ -142,6 +143,10 @@ def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type
     def _run() -> Any:
         try:
             return fn(*args)
+        except asyncio.CancelledError:
+            if on_failure is not None:
+                on_failure()
+            raise
         except Exception:  # noqa: BLE001 — best-effort display state
             _logger.warning("session live-state write failed (%s)", description, exc_info=True)
             if on_failure is not None:

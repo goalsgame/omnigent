@@ -3137,6 +3137,72 @@ def register_events_routes(
             },
         )
 
+    async def _owned_delete_session(
+        request: Request, session_id: str
+    ) -> tuple[Conversation, str | None]:
+        user_id = _require_user(request, auth_provider)
+        if permission_store is not None and user_id is not None:
+            is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
+            if not is_admin:
+                grant = await asyncio.to_thread(permission_store.get, user_id, session_id)
+                if grant is None or grant.level < LEVEL_OWNER:
+                    if grant is not None:
+                        raise OmnigentError(
+                            "Only the session owner can delete this session",
+                            code=ErrorCode.FORBIDDEN,
+                        )
+                    raise OmnigentError(
+                        "Conversation not found",
+                        code=ErrorCode.NOT_FOUND,
+                    )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        return conv, user_id
+
+    async def _cleanup_worktree(
+        request: Request,
+        conv: Conversation,
+        *,
+        local_only: bool = False,
+        delete_branch: bool = True,
+    ) -> None:
+        if conv.git_branch is not None and conv.workspace is not None and conv.host_id is not None:
+            if not local_only:
+                from omnigent.server.replication import cleanup_remote_session_worktree
+
+                if await cleanup_remote_session_worktree(
+                    request, conv.id, conv.host_id, delete_branch=delete_branch
+                ):
+                    return
+            from omnigent.server.replication import reserve_managed_placement
+            from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+            async with reserve_managed_placement(conv.host_id):
+                await _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=delete_branch,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    reason="session-delete" if delete_branch else "session-archive",
+                    expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=conv.id,
+                    fail_if_unavailable=True,
+                )
+
+    @router.delete("/sessions/{session_id}/resources/worktree")
+    async def cleanup_session_worktree(
+        request: Request, session_id: str, delete_branch: bool = True
+    ) -> dict[str, str]:
+        """Clean the saved host worktree; archive cleanup retains its branch."""
+        conv, _ = await _owned_delete_session(request, session_id)
+        if not delete_branch and not conv.archived:
+            return {"status": "skipped"}
+        await _cleanup_worktree(request, conv, local_only=True, delete_branch=delete_branch)
+        return {"status": "ok"}
+
     # ── DELETE /sessions/{session_id} ──────────────────────────────
 
     @router.delete(
@@ -3177,24 +3243,7 @@ def register_events_routes(
             ``delete_branch=true`` and the host is offline so
             worktree cleanup cannot run.
         """
-        user_id = _require_user(request, auth_provider)
-        if permission_store is not None and user_id is not None:
-            is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
-            if not is_admin:
-                grant = await asyncio.to_thread(permission_store.get, user_id, session_id)
-                if grant is None or grant.level < LEVEL_OWNER:
-                    if grant is not None:
-                        raise OmnigentError(
-                            "Only the session owner can delete this session",
-                            code=ErrorCode.FORBIDDEN,
-                        )
-                    raise OmnigentError(
-                        "Conversation not found",
-                        code=ErrorCode.NOT_FOUND,
-                    )
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None:
-            raise _session_not_found()
+        conv, user_id = await _owned_delete_session(request, session_id)
         await _best_effort_stop(session_id, conversation_store, runner_router)
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
@@ -3235,26 +3284,8 @@ def register_events_routes(
         # unreachable host fails the delete (409) with the session
         # retained, so nothing irrecoverable may be destroyed first.
         # Git errors on a reachable host stay best-effort.
-        if (
-            delete_branch
-            and conv.git_branch is not None
-            and conv.workspace is not None
-            and conv.host_id is not None
-        ):
-            from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
-
-            await _remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=conv.workspace,
-                branch=conv.git_branch,
-                delete_branch=True,
-                host_registry=getattr(request.app.state, "host_registry", None),
-                reason="session-delete",
-                expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
-                conversation_store=conversation_store,
-                exclude_conversation_id=conv.id,
-                fail_if_unavailable=True,
-            )
+        if delete_branch:
+            await _cleanup_worktree(request, conv)
         # Session file cleanup. delete_all_for_session returns only the blob
         # keys that became orphaned — a blob still shared by a fork in another
         # session is not returned, so the fork's attachment survives.

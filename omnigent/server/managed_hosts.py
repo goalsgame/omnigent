@@ -173,7 +173,9 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
@@ -182,6 +184,7 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 from fastapi import HTTPException
 
+from omnigent.db.backend_work_fence import check_backend_work, fenced_to_thread, work_fence_scope
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.onboarding.sandboxes.base import SandboxGoneError
@@ -190,6 +193,7 @@ from omnigent.onboarding.sandboxes.base import SandboxGoneError
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.server.replication import placed_managed_launch
 from omnigent.startup_timing import startup_span, startup_timed
 from omnigent.stores.host_store import Host, HostStore
 
@@ -198,6 +202,89 @@ if TYPE_CHECKING:
     from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
+
+# custom-lint: disable-next=workspace-scoped-cache -- cleanup task lifetimes
+_provision_cleanup_tasks: set[asyncio.Task[None]] = set()
+
+_termination_attempts: ContextVar[set[tuple[str | None, str]] | None] = ContextVar(
+    "sandbox_termination_attempts", default=None
+)
+
+
+async def drain_provision_cleanup() -> None:
+    """Finish late allocation cleanup during server shutdown."""
+    while _provision_cleanup_tasks:
+        await asyncio.gather(*list(_provision_cleanup_tasks), return_exceptions=True)
+
+
+async def _terminate_unadopted_allocation(
+    launcher: SandboxHostLauncher, sandbox_id: str, host_id: str, host_store: HostStore
+) -> None:
+    """Keep the allocation reservation and provider operation in one worker."""
+
+    def terminate() -> None:
+        with host_store.unadopted_allocation(
+            provider=launcher.provider, sandbox_id=sandbox_id
+        ) as available:
+            if available:
+                attempted = _termination_attempts.get()
+                try:
+                    launcher.terminate(sandbox_id)
+                except Exception:
+                    if attempted is not None:
+                        attempted.add((launcher.provider, sandbox_id))
+                    raise
+                if attempted is not None:
+                    attempted.add((launcher.provider, sandbox_id))
+
+    try:
+        await asyncio.to_thread(terminate)
+    except Exception:
+        _logger.exception(
+            "Could not clean up unadopted allocation %s for host %s", sandbox_id, host_id
+        )
+
+
+@asynccontextmanager
+async def _supervised_provision(
+    launcher: SandboxHostLauncher, name: str, *, host_id: str, host_store: HostStore
+) -> AsyncIterator[str]:
+    """Keep allocation results available when cancellation interrupts provisioning."""
+
+    def provision() -> str:
+        check_backend_work()
+        return launcher.provision(name)
+
+    allocation: asyncio.Task[str] | None = None
+
+    async def cleanup() -> None:
+        if allocation is None:
+            return
+        try:
+            sandbox_id = await allocation
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001 -- no allocation id was returned
+            return
+        if (launcher.provider, sandbox_id) in attempted:
+            return
+        with work_fence_scope(None):
+            await _terminate_unadopted_allocation(launcher, sandbox_id, host_id, host_store)
+
+    attempted: set[tuple[str | None, str]] = set()
+    tracking = _termination_attempts.set(attempted)
+    try:
+        with startup_span("server.provision_worker", host_id=host_id):
+            allocation = asyncio.create_task(asyncio.to_thread(provision))
+            sandbox_id = await asyncio.shield(allocation)
+            await asyncio.to_thread(check_backend_work)
+        yield sandbox_id
+    except BaseException:
+        task = asyncio.create_task(cleanup())
+        _provision_cleanup_tasks.add(task)
+        task.add_done_callback(_provision_cleanup_tasks.discard)
+        raise
+    finally:
+        _termination_attempts.reset(tracking)
+
 
 # Providers the YAML `sandbox:` section accepts. Parsing accepts all
 # known providers so a deployment can stage config ahead of support
@@ -993,7 +1080,7 @@ async def preload_managed_sandbox_sdk(deployment: ManagedSandboxDeployment | Non
     from omnigent.onboarding.sandboxes.kubernetes import _ensure_sdk
 
     try:
-        await asyncio.to_thread(_ensure_sdk)
+        await fenced_to_thread(_ensure_sdk)
     except click.ClickException:
         _logger.warning("Kubernetes SDK preload unavailable; managed launches will retry")
 
@@ -3534,28 +3621,28 @@ async def launch_managed_host(
     host_name = f"managed-{host_id[:8]}"
     try:
         with startup_span("server.prepare_agent"):
-            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         with startup_span("server.prepare_launcher"):
-            await asyncio.to_thread(launcher.prepare)
-        with startup_span("server.provision_worker", host_id=host_id):
-            sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+            await fenced_to_thread(launcher.prepare)
+        async with _supervised_provision(
+            launcher, host_name, host_id=host_id, host_store=host_store
+        ) as sandbox_id:
+            workspace = await _register_and_start_host(
+                launcher=launcher,
+                config=entry,
+                host_store=host_store,
+                host_id=host_id,
+                host_name=host_name,
+                owner=owner,
+                sandbox_id=sandbox_id,
+                repos=repos,
+                agent_name=agent_name,
+                on_stage=on_stage,
+            )
     except click.ClickException as exc:
         raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox launch failed: {exc.message}",
+            status_code=502, detail=f"managed sandbox launch failed: {exc.message}"
         ) from exc
-    workspace = await _register_and_start_host(
-        launcher=launcher,
-        config=entry,
-        host_store=host_store,
-        host_id=host_id,
-        host_name=host_name,
-        owner=owner,
-        sandbox_id=sandbox_id,
-        repos=repos,
-        agent_name=agent_name,
-        on_stage=on_stage,
-    )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
 
@@ -3629,33 +3716,34 @@ async def relaunch_managed_host(
         )
     try:
         with startup_span("server.prepare_agent"):
-            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         with startup_span("server.prepare_launcher"):
-            await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+            await fenced_to_thread(launcher.prepare)
+        async with _supervised_provision(
+            launcher, host.name, host_id=host.host_id, host_store=host_store
+        ) as sandbox_id:
+            try:
+                workspace = await _register_and_start_host(
+                    launcher=launcher,
+                    config=entry,
+                    host_store=host_store,
+                    host_id=host.host_id,
+                    host_name=host.name,
+                    owner=host.user_id,
+                    sandbox_id=sandbox_id,
+                    repos=repos,
+                    agent_name=agent_name,
+                    on_stage=on_stage,
+                    keep_host_on_failure=True,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
+                ) from exc
     except click.ClickException as exc:
         raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox relaunch failed: {exc.message}",
-        ) from exc
-    try:
-        workspace = await _register_and_start_host(
-            launcher=launcher,
-            config=entry,
-            host_store=host_store,
-            host_id=host.host_id,
-            host_name=host.name,
-            owner=host.user_id,
-            sandbox_id=sandbox_id,
-            repos=repos,
-            agent_name=agent_name,
-            on_stage=on_stage,
-            keep_host_on_failure=True,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
+            status_code=502, detail=f"managed sandbox relaunch failed: {exc.message}"
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
@@ -3711,7 +3799,7 @@ async def _start_sandbox_host(
     # one-dimensional.
     if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
         start_classified = cast(Callable[..., str], launcher.start_host)
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             start_classified,
             sandbox_id,
             token=token,
@@ -3724,7 +3812,7 @@ async def _start_sandbox_host(
             agent_name=agent_name,
         )
     if host_config is None and on_stage is None:
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             launcher.start_host,
             sandbox_id,
             token=token,
@@ -3734,7 +3822,7 @@ async def _start_sandbox_host(
             repos=repos,
         )
     if host_config is None:
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             launcher.start_host,
             sandbox_id,
             token=token,
@@ -3745,7 +3833,7 @@ async def _start_sandbox_host(
             on_stage=on_stage,
         )
     if on_stage is None:
-        return await asyncio.to_thread(
+        return await fenced_to_thread(
             launcher.start_host,
             sandbox_id,
             token=token,
@@ -3755,7 +3843,7 @@ async def _start_sandbox_host(
             repos=repos,
             host_config=host_config,
         )
-    return await asyncio.to_thread(
+    return await fenced_to_thread(
         launcher.start_host,
         sandbox_id,
         token=token,
@@ -3769,6 +3857,7 @@ async def _start_sandbox_host(
 
 
 @startup_timed("server.host_registration_and_start", host_argument="host_id")
+@placed_managed_launch
 async def _register_and_start_host(
     *,
     launcher: SandboxHostLauncher,
@@ -3827,7 +3916,7 @@ async def _register_and_start_host(
     try:
         with startup_span("server.persist_host", host_id=host_id):
             if keep_host_on_failure:
-                record = await asyncio.to_thread(
+                record = await fenced_to_thread(
                     host_store.replace_managed_host_sandbox,
                     host_id=host_id,
                     user_id=owner,
@@ -3839,7 +3928,7 @@ async def _register_and_start_host(
                 if record is None:
                     raise ValueError(f"managed host {host_id!r} no longer exists")
             else:
-                record = await asyncio.to_thread(
+                record = await fenced_to_thread(
                     host_store.register_managed_host,
                     host_id=host_id,
                     name=host_name,
@@ -3870,24 +3959,7 @@ async def _register_and_start_host(
         # The provider allocated the sandbox before registration or startup
         # could fail, so both failures must attempt cleanup.
         if record is None:
-            current = None
-            try:
-                current = await asyncio.to_thread(host_store.get_host, host_id)
-            except Exception:
-                _logger.exception("Could not inspect failed host registration")
-            # A provider can reuse an ID already retained for active work or cleanup.
-            if (
-                current is None
-                or current.sandbox_provider != launcher.provider
-                or sandbox_id
-                not in (
-                    current.sandbox_id,
-                    current.terminating_sandbox_id,
-                )
-            ):
-                await _terminate_sandbox_best_effort(
-                    launcher, sandbox_id, host_id=host_id, provider=launcher.provider
-                )
+            await _terminate_unadopted_allocation(launcher, sandbox_id, host_id, host_store)
             if isinstance(exc, ValueError):
                 raise
         elif keep_host_on_failure:
@@ -3897,7 +3969,7 @@ async def _register_and_start_host(
                 host_id=record.host_id,
                 provider=record.sandbox_provider,
             )
-            await asyncio.to_thread(host_store.revoke_launch_token, host_id)
+            await fenced_to_thread(host_store.revoke_launch_token, host_id)
         else:
             # The row was just armed with THIS single-provider config, so a
             # one-provider deployment tears it back down with the same launcher.
@@ -3926,7 +3998,7 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
     """
     deadline = time.monotonic() + MANAGED_HOST_ONLINE_TIMEOUT_S
     while time.monotonic() < deadline:
-        if await asyncio.to_thread(host_store.is_online, host_id):
+        if await fenced_to_thread(host_store.is_online, host_id):
             return
         await asyncio.sleep(_ONLINE_POLL_INTERVAL_S)
     raise HTTPException(
@@ -4091,16 +4163,16 @@ async def resume_managed_host(
         return
     # Cross-replica DB liveness (freshness-gated): never trust the per-replica
     # registry alone. Cheap gate before taking the lock.
-    if not force and await asyncio.to_thread(host_store.is_online, host_id):
+    if not force and await fenced_to_thread(host_store.is_online, host_id):
         return
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
     async with resume_lock:
         # Re-check under the lock: a concurrent waker may have brought the host
         # online while we waited.
-        if not force and await asyncio.to_thread(host_store.is_online, host_id):
+        if not force and await fenced_to_thread(host_store.is_online, host_id):
             return
-        host = await asyncio.to_thread(host_store.get_host, host_id)
+        host = await fenced_to_thread(host_store.get_host, host_id)
         if host is None:
             return
         # Provider-matched launcher (None if config dropped / provider changed).
@@ -4122,10 +4194,10 @@ async def resume_managed_host(
         )
         try:
             with startup_span("server.prepare_agent"):
-                await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
-            await asyncio.to_thread(launcher.resume, sandbox_id)
+                await fenced_to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await fenced_to_thread(launcher.resume, sandbox_id)
             token = secrets.token_urlsafe(32)
-            armed = await asyncio.to_thread(
+            armed = await fenced_to_thread(
                 host_store.rearm_managed_host,
                 host.host_id,
                 sandbox_id=sandbox_id,
@@ -4134,7 +4206,7 @@ async def resume_managed_host(
                 token_expires_at=now_epoch() + entry.token_ttl_s,
             )
             if armed is None:
-                current = await asyncio.to_thread(host_store.get_host, host.host_id)
+                current = await fenced_to_thread(host_store.get_host, host.host_id)
                 if current is None:
                     await _terminate_sandbox_best_effort(
                         launcher,
@@ -4151,7 +4223,7 @@ async def resume_managed_host(
                         provider=host.sandbox_provider,
                     )
                     if terminated and current.terminating_sandbox_id == sandbox_id:
-                        await asyncio.to_thread(
+                        await fenced_to_thread(
                             host_store.mark_sandbox_terminated,
                             host.host_id,
                             sandbox_id=sandbox_id,
@@ -4204,7 +4276,7 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
-    tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    tombstone = await fenced_to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
         return
     launcher = _launcher_for_teardown(tombstone, config)
@@ -4218,7 +4290,7 @@ async def terminate_managed_host(
                 provider=tombstone.sandbox_provider,
             )
             if terminated:
-                await asyncio.to_thread(
+                await fenced_to_thread(
                     host_store.mark_sandbox_terminated,
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
@@ -4242,9 +4314,15 @@ async def _terminate_sandbox_best_effort(
         )
         return False
     try:
-        await asyncio.to_thread(launcher.terminate, sandbox_id)
+        await fenced_to_thread(launcher.terminate, sandbox_id)
+        attempted = _termination_attempts.get()
+        if attempted is not None:
+            attempted.add((provider, sandbox_id))
         return True
     except Exception:  # noqa: BLE001 — provider cleanup must remain best-effort.
+        attempted = _termination_attempts.get()
+        if attempted is not None:
+            attempted.add((provider, sandbox_id))
         _logger.warning(
             "Failed to terminate managed sandbox %s (provider=%s) for host %s",
             sandbox_id,

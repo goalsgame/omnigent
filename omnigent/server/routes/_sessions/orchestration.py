@@ -876,6 +876,7 @@ async def _archive_stop(
     host_registry: Any,
     *,
     delete_worktree: bool = False,
+    request: Request | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -904,6 +905,7 @@ async def _archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param request: Original authorized request for cross-replica cleanup.
     :param delete_worktree: After the stop, also remove the session's
         server-created worktree directory (the branch is kept).
     """
@@ -964,17 +966,27 @@ async def _archive_stop(
         from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
         try:
-            await _facade._remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=conv.workspace,
-                branch=conv.git_branch,
-                delete_branch=False,
-                host_registry=host_registry,
-                reason="session-archive",
-                expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
-                conversation_store=conversation_store,
-                exclude_conversation_id=session_id,
+            from omnigent.server.replication import (
+                cleanup_remote_session_worktree,
+                reserve_managed_placement,
             )
+
+            if request is not None and await cleanup_remote_session_worktree(
+                request, session_id, conv.host_id, delete_branch=False
+            ):
+                return
+            async with reserve_managed_placement(conv.host_id):
+                await _facade._remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=False,
+                    host_registry=host_registry,
+                    reason="session-archive",
+                    expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=session_id,
+                )
         except Exception:  # noqa: BLE001
             _logger.warning(
                 "Archive worktree cleanup failed for %s",
@@ -991,6 +1003,7 @@ def _spawn_archive_stop(
     host_registry: Any = None,
     *,
     delete_worktree: bool = False,
+    request: Request | None = None,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -1018,6 +1031,7 @@ def _spawn_archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param request: Original authorized request for cross-replica cleanup.
     :param delete_worktree: Forwarded to :func:`_archive_stop`.
     """
     # Replace any pending stop from an earlier archive of this session.
@@ -1038,9 +1052,12 @@ def _spawn_archive_stop(
             runner_router,
             host_registry,
             delete_worktree=delete_worktree,
+            request=request,
         )
 
-    task = asyncio.create_task(_stop_after_grace())
+    from omnigent.server.replication import create_connection_task
+
+    task = create_connection_task(_stop_after_grace())
     _pending_archive_stops[session_id] = task
     _detached_stop_tasks.add(task)
 
@@ -4746,7 +4763,9 @@ def _kick_managed_relaunch(
             session_id,
             extra={"session_id": session_id},
         )
-    relaunch_task = asyncio.create_task(
+    from omnigent.server.replication import create_managed_launch_task, managed_launch_cancellation
+
+    relaunch_task = create_managed_launch_task(
         _run_managed_launch(
             session_id=session_id,
             owner=host.user_id,
@@ -4760,9 +4779,13 @@ def _kick_managed_relaunch(
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,
-        )
+        ),
+        on_cancel=managed_launch_cancellation(tracker, session_id),
     )
+    from omnigent.server.replication import retain_managed_task
+
     _managed_launch_tasks.add(relaunch_task)
+    retain_managed_task(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
 
 
@@ -4841,7 +4864,9 @@ def _kick_managed_wake_impl(
             session_id,
             extra={"session_id": session_id},
         )
-    wake_task = asyncio.create_task(
+    from omnigent.server.replication import create_managed_launch_task, managed_launch_cancellation
+
+    wake_task = create_managed_launch_task(
         _run_managed_wake(
             session_id=session_id,
             conv=conv,
@@ -4853,9 +4878,13 @@ def _kick_managed_wake_impl(
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             agent_store=wake_agent_store,
             agent_id=conv.agent_id,
-        )
+        ),
+        on_cancel=managed_launch_cancellation(tracker, session_id),
     )
+    from omnigent.server.replication import retain_managed_task
+
     _managed_launch_tasks.add(wake_task)
+    retain_managed_task(wake_task)
     wake_task.add_done_callback(_managed_launch_tasks.discard)
 
 
@@ -8880,7 +8909,9 @@ def _ensure_runner_relay(
     # heartbeat-only relay readiness tests that never emit persistable frames.
     relay_store = cast(ConversationStore, conversation_store)
     with runner_log_scope(session_id, runner_id):
-        task = asyncio.create_task(
+        from omnigent.server.replication import create_runner_relay_task
+
+        task = create_runner_relay_task(
             _relay_runner_stream(
                 session_id,
                 runner_client,
@@ -8888,8 +8919,9 @@ def _ensure_runner_relay(
                 ready,
                 runner_id=runner_id,
             ),
-            name=f"runner-relay-{session_id}",
+            runner_id,
         )
+        task.set_name(f"runner-relay-{session_id}")
     # A heartbeat-only stream may never repeat the pre-handoff idle edge.
     # Retain only immutable status metadata for this relay's lifetime.
     status_snapshot = (

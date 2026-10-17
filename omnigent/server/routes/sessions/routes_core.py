@@ -505,7 +505,13 @@ def register_core_routes(
         # session page immediately after this 201) already carries the
         # "provisioning" stage.
         _publish_sandbox_status(session_id, "provisioning")
-        launch_task = asyncio.create_task(
+        from omnigent.server.replication import (
+            create_session_launch_task,
+            managed_launch_cancellation,
+        )
+
+        launch_task = await create_session_launch_task(
+            session_id,
             _run_managed_launch(
                 session_id=session_id,
                 # On auth-disabled servers user_id is None; the sandbox
@@ -521,9 +527,13 @@ def register_core_routes(
                 provider=sandbox_provider,
                 agent_store=agent_store,
                 agent_id=agent_id,
-            )
+            ),
+            on_cancel=managed_launch_cancellation(managed_launches, session_id),
         )
+        from omnigent.server.replication import retain_managed_task
+
         _managed_launch_tasks.add(launch_task)
+        retain_managed_task(launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
 
     async def _bind_and_launch_on_caller_host(
@@ -643,6 +653,9 @@ def register_core_routes(
         from omnigent.server.routes._host_launch import remember_inference_host_policy
 
         await remember_inference_host_policy(target.conv, conn, host_registry, conversation_store)
+        from omnigent.db.backend_work_fence import check_backend_work
+
+        await asyncio.to_thread(check_backend_work)
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -2947,6 +2960,7 @@ def register_core_routes(
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
                 delete_worktree=body.delete_worktree,
+                request=request,
             )
         elif body.archived is False:
             # Unarchive (including Undo, which re-PATCHes archived=false within

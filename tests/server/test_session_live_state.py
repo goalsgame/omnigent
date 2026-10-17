@@ -435,3 +435,53 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
         (False, 0),
         (True, 3),
     ]
+
+
+@pytest.mark.parametrize("field", ["status", "pending"])
+def test_rejected_fenced_write_evicts_same_value_for_healthy_retry(db_uri, field):
+    from sqlalchemy.engine import make_url
+
+    from omnigent.db.backend_work_fence import BackendWorkFence, work_fence_scope
+    from omnigent.stores.backend_route_store import BackendRouteStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.set_session_live_status(conv.id, "running")
+    store.set_pending_elicitation_count(conv.id, 3)
+    old = BackendRouteStore(db_uri, "old", "http://127.0.0.1:8001")
+    new = BackendRouteStore(db_uri, "new", "http://127.0.0.1:8002")
+    route = old.claim("session", conv.id)
+    old.release(route)
+    replacement = new.claim("session", conv.id)
+    key = (0, "session", conv.id)
+    publish = (
+        session_live_state.persist_live_status
+        if field == "status"
+        else session_live_state.persist_pending_count
+    )
+    value = "idle" if field == "status" else 0
+    cache = (
+        session_live_state._last_status if field == "status" else session_live_state._last_pending
+    )
+    session_live_state.configure(store)
+    try:
+        with work_fence_scope(BackendWorkFence(db_uri, {key: route})):
+            publish(conv.id, value)
+        session_live_state.submit("drain rejected write", lambda: None).result(timeout=5)
+        assert cache.get(conv.id) is None
+        persisted = store.get_conversation(conv.id)
+        assert (
+            persisted.live_status if field == "status" else persisted.pending_elicitation_count
+        ) == ("running" if field == "status" else 3)
+        with work_fence_scope(BackendWorkFence(db_uri, {key: replacement})):
+            publish(conv.id, value)
+        session_live_state.submit("drain healthy retry", lambda: None).result(timeout=5)
+        persisted = store.get_conversation(conv.id)
+        assert (
+            persisted.live_status if field == "status" else persisted.pending_elicitation_count
+        ) == value
+    finally:
+        session_live_state.configure(None)

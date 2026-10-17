@@ -3333,3 +3333,96 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transfer", [False, True])
+@pytest.mark.parametrize("caller", ["read", "runner", "bootstrap"])
+async def test_relay_retains_generation_across_runner_reconnect(db_uri, transfer, caller):
+    from ipaddress import ip_network
+    from types import SimpleNamespace
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    rid = "retained-relay-runner"
+    store.replace_runner_id(conv.id, rid)
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        store,
+        HostRegistry(),
+    )
+    release = asyncio.Event()
+    events = [
+        {"type": "response.in_progress", "response": {"id": "retained-relay", "model": "debby"}},
+        {"type": "response.output_text.delta", "delta": "relay survived"},
+        {"type": "response.completed", "response": {"id": "retained-relay", "model": "debby"}},
+    ]
+    runner = _ScriptedRunnerClient(release, events)
+
+    async def close(**kwargs):
+        pass
+
+    handle = None
+    try:
+        async with coordinator.connection(SimpleNamespace(scope={}, close=close), "runner", rid):
+            original = coordinator.store.get("runner", rid)
+            if caller != "read":
+                kind, resource = ("session", conv.id) if caller == "bootstrap" else ("runner", rid)
+                async with coordinator.request_resource(kind, resource):
+                    handle = sessions_module._ensure_runner_relay(conv.id, rid, runner, store)
+                    await asyncio.wait_for(handle.ready.wait(), timeout=_TASK_TIMEOUT_S)
+            else:
+                from omnigent.server.replication import _held
+
+                token = _held.set(None)
+                try:
+                    handle = sessions_module._ensure_runner_relay(conv.id, rid, runner, store)
+                finally:
+                    _held.reset(token)
+                await asyncio.wait_for(handle.ready.wait(), timeout=_TASK_TIMEOUT_S)
+        # The HTTP reservation and socket have both exited, but the relay is live.
+        if caller == "bootstrap":
+            assert coordinator.store.get("session", conv.id) is None
+        assert coordinator.store.get("runner", rid).token == original.token
+        if transfer:
+            coordinator.store.release(original)
+            other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+            other.claim("runner", rid)
+            await coordinator._renew_once()
+            await asyncio.gather(handle.task, return_exceptions=True)
+            assert handle.task.cancelled()
+            assert store.list_items(conv.id).data == []
+        else:
+            async with coordinator.connection(
+                SimpleNamespace(scope={}, close=close), "runner", rid
+            ):
+                reused = sessions_module._ensure_runner_relay(conv.id, rid, runner, store)
+                assert reused is handle
+                assert coordinator.store.get("runner", rid).token == original.token
+                release.set()
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+                messages = [
+                    item for item in store.list_items(conv.id).data if item.type == "message"
+                ]
+                assert len(messages) == 1
+                assert messages[0].data.model_dump()["content"] == [
+                    {"type": "output_text", "text": "relay survived"}
+                ]
+    finally:
+        release.set()
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            await asyncio.gather(handle.task, return_exceptions=True)
+        sessions_module._runner_relay_tasks.pop(conv.id, None)
+        await coordinator.aclose()

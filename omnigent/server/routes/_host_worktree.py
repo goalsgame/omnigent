@@ -16,6 +16,7 @@ import secrets
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 
+from omnigent.db.backend_work_fence import check_backend_work
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostListWorktreesFrame,
@@ -151,6 +152,9 @@ async def _await_host_worktree_result(
     :raises WorktreeHostUnavailableError: On connection loss or no
         reply within :data:`_WORKTREE_TIMEOUT_S`.
     """
+    # A preflight may have awaited host or database I/O since route admission.
+    # Validate at the command boundary, before creating or enqueueing any work.
+    await asyncio.to_thread(check_backend_work)
     future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
     pending[request_id] = future
     try:

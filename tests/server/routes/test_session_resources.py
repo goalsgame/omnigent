@@ -469,6 +469,10 @@ class _FakeRunnerRouter:
 
 @pytest.fixture
 def runner_globals_reset() -> Iterator[None]:
+    from omnigent.server.routes.sessions import get_server_runner_router, set_server_runner_router
+
+    prior_server_router = get_server_runner_router()
+    set_server_runner_router(None)
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
     prior_direct = _globals._runner_direct_attach_resolver
@@ -479,6 +483,7 @@ def runner_globals_reset() -> Iterator[None]:
     set_runner_client(prior_client)
     set_runner_router(prior_router)
     set_runner_direct_attach_resolver(prior_direct)
+    set_server_runner_router(prior_server_router)
 
 
 @pytest.fixture
@@ -8795,3 +8800,84 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before-reservation", "before-dispatch"])
+async def test_offline_github_write_rejects_host_lease_transfer(
+    offline_env_client, db_uri, monkeypatch, phase
+):
+    from contextlib import asynccontextmanager
+    from ipaddress import ip_network
+    from types import SimpleNamespace
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.db.backend_work_fence import work_fence_scope
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import ReplicaCoordinator, replication_scope
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.stores.backend_route_store import BackendRouteStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    hosts = HostRegistry()
+    conn = hosts.register(
+        "host_offline",
+        SimpleNamespace(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="host"),
+        owner=None,
+    )
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        hosts,
+    )
+    other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+    original_write = _host_filesystem.write_workspace_from_host
+
+    async def real_host_write(**kwargs):
+        # Use the real host writer behind the endpoint fixture's host resolver.
+        return await original_write(**{**kwargs, "host_registry": hosts, "host_conn": conn})
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", real_host_write)
+    original_reserve = coordinator.request_placement
+
+    def transfer():
+        with work_fence_scope(None):
+            current = coordinator.store.get("host", "host_offline")
+            coordinator.store.release(current)
+            other.claim("host", "host_offline")
+
+    @asynccontextmanager
+    async def lose_before_dispatch(host_id):
+        async with original_reserve(host_id) as route:
+            transfer()
+            yield route
+
+    try:
+        coordinator.store.claim("host", "host_offline")
+        if phase == "before-reservation":
+            transfer()
+        else:
+            monkeypatch.setattr(coordinator, "request_placement", lose_before_dispatch)
+        with replication_scope(coordinator):
+            # The request starts with only the disconnected standalone runner's lease.
+            async with coordinator.request_resource("runner", "offline-standalone"):
+                request = offline_env_client.post(
+                    f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/preferences",
+                    json={"account": "octocat"},
+                )
+                if phase == "before-reservation":
+                    response = await request
+                    assert response.status_code == 503
+                else:
+                    with pytest.raises(asyncio.CancelledError):
+                        await request
+                assert conn.outbound_queue.empty()
+                assert not conn.pending_fs_requests
+    finally:
+        await coordinator.aclose()

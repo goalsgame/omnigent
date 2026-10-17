@@ -1484,3 +1484,56 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+@pytest.mark.parametrize("operation", ["register", "replace"])
+def test_unadopted_allocation_reservation_blocks_adoption_after_inspection(db_uri, operation):
+    from sqlalchemy.engine import make_url
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Allocation coordination supports SQLite and PostgreSQL")
+    store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    fields = {
+        "host_id": host_id,
+        "user_id": "alice",
+        "token": "new",
+        "provider": "modal",
+        "sandbox_id": "allocation",
+        "token_expires_at": now_epoch() + 300,
+    }
+    if operation == "replace":
+        store.register_managed_host(**{**fields, "sandbox_id": "old", "name": "managed"})
+    started, finished = threading.Event(), threading.Event()
+    order, errors = [], []
+
+    def adopt():
+        started.set()
+        try:
+            if operation == "register":
+                store.register_managed_host(**fields, name="managed")
+            else:
+                store.replace_managed_host_sandbox(**fields)
+            order.append("adopted")
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=adopt)
+    try:
+        with store.unadopted_allocation(provider="modal", sandbox_id="allocation") as available:
+            assert available  # The metadata lookup has completed under the reservation.
+            worker.start()
+            assert started.wait(2)
+            assert not finished.wait(0.1)
+            # Provider termination remains inside the same reservation.
+            order.append("terminated")
+        assert finished.wait(5)
+        assert not errors
+        assert order == ["terminated", "adopted"]
+        with store.unadopted_allocation(provider="modal", sandbox_id="allocation") as available:
+            assert not available
+    finally:
+        if worker.ident is not None:
+            worker.join(timeout=5)

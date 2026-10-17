@@ -1682,6 +1682,14 @@ class ConversationStore(ABC):
         """
         ...
 
+    def list_conversations_by_runner_ids(self, runner_ids: list[str]) -> list[Conversation]:
+        """Batch runner bindings; stores may override to avoid per-runner queries."""
+        return [
+            conv
+            for runner in dict.fromkeys(runner_ids)
+            for conv in self.list_conversations_by_runner_id(runner)
+        ]
+
     @abstractmethod
     def set_host_id(
         self,

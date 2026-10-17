@@ -49,7 +49,6 @@ from omnigent.server.managed_hosts import (
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedHostLaunch,
-    ManagedLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -5238,32 +5237,19 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     calls: list[dict[str, object]] = []
     tracker = ManagedLaunchTracker()
 
-    # The racing message has to reach its tracker check while the winner's claim
-    # is still UNSETTLED, because an unsettled claim is what it must rendezvous
-    # on. Both callers await asyncio.to_thread twice before that check, and an
-    # executor hop takes an unpredictable number of event-loop turns to deliver,
-    # so holding the winner open for a fixed number of turns does not establish
-    # the ordering: on a loaded machine the racer arrives after the claim
-    # settled, takes the retry branch, and kicks a second launch. That retry is
-    # intended behaviour and is guarded in production by the is_online check
-    # above, which this test stubs False forever — so a fixed-turn hold made the
-    # test fail for a reason unrelated to the invariant.
-    #
-    # Hold until the racer has demonstrably checked instead. Three reads are the
-    # whole exchange: the winner checks and re-reads after kicking, and the racer
-    # checks once and rendezvouses.
+    # Hold the launch until both racing requests are waiting on its entry.
+    # Tracker inspection by cancellation bookkeeping must not release the gate.
     raced = asyncio.Event()
-    reads = 0
-    tracker_get = tracker.get
+    waiters = set()
+    await_settled = orchestration._await_settled_managed_launch
 
-    def _counting_get(session_id: str) -> ManagedLaunch | None:
-        nonlocal reads
-        reads += 1
-        if reads >= 3:
+    async def parked(launch):
+        waiters.add(asyncio.current_task())
+        if len(waiters) == 2:
             raced.set()
-        return tracker_get(session_id)
+        return await await_settled(launch)
 
-    monkeypatch.setattr(tracker, "get", _counting_get)
+    monkeypatch.setattr(orchestration, "_await_settled_managed_launch", parked)
 
     async def _capture(**kwargs: object) -> None:
         calls.append(kwargs)
@@ -5760,3 +5746,161 @@ async def test_lifespan_waits_for_sdk_import_before_ready(
         release.set()
         await asyncio.wait_for(task, timeout=20)
     assert ready.is_set()
+
+
+@pytest.mark.parametrize(
+    ("operation", "adopted"), [("launch", False), ("relaunch", False), ("relaunch", True)]
+)
+@pytest.mark.parametrize("heartbeat", [False, True])
+async def test_provision_allocation_is_recovered_after_ownership_loss(
+    db_uri, monkeypatch, operation, adopted, heartbeat
+):
+    import threading
+    from ipaddress import ip_network
+
+    from sqlalchemy.engine import make_url
+
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.managed_hosts import drain_provision_cleanup
+    from omnigent.server.replica_transport import ReplicationConfig
+    from omnigent.server.replication import (
+        ReplicaCoordinator,
+        create_managed_launch_task,
+        replication_scope,
+        retain_managed_task,
+    )
+    from omnigent.stores.backend_route_store import BackendRouteStore
+
+    if make_url(db_uri).get_backend_name() not in {"sqlite", "postgresql"}:
+        pytest.skip("Replica placement supports SQLite and PostgreSQL")
+    started, release = threading.Event(), threading.Event()
+    fake = FakeSandboxLauncher(provision_gate=release)
+    original_provision = fake.provision
+
+    def blocked_provision(name):
+        started.set()
+        return original_provision(name)
+
+    monkeypatch.setattr(fake, "provision", blocked_provision)
+    hosts = HostStore(db_uri)
+    hid = "51dc949aba31e24ca8f047d6fba31a0d"
+    if operation == "relaunch":
+        host = hosts.register_managed_host(
+            host_id=hid,
+            name="managed-existing",
+            user_id=_OWNER,
+            token="original",
+            provider=fake.provider,
+            sandbox_id="sb-old",
+            token_expires_at=now_epoch() + 3600,
+        )
+    coordinator = ReplicaCoordinator(
+        ReplicationConfig("http://127.0.0.1:8001", (ip_network("127.0.0.0/8"),), b"s" * 32),
+        db_uri,
+        SqlAlchemyConversationStore(db_uri),
+        HostRegistry(),
+    )
+    other = BackendRouteStore(db_uri, "replacement", "http://127.0.0.1:8002")
+    kind, resource = ("host", hid) if operation == "relaunch" else ("session", "new-session")
+    task = None
+    try:
+        with replication_scope(coordinator):
+            async with coordinator.request_resource(kind, resource) as route:
+                call = (
+                    relaunch_managed_host(
+                        config=_injected_config(fake), host=host, host_store=hosts
+                    )
+                    if operation == "relaunch"
+                    else launch_managed_host(
+                        config=_injected_config(fake), owner=_OWNER, host_store=hosts
+                    )
+                )
+                task = create_managed_launch_task(call)
+                retain_managed_task(task)
+        assert await asyncio.to_thread(started.wait, 2)
+        coordinator.store.release(route)
+        other.claim(kind, resource)
+        if adopted:
+            hosts.replace_managed_host_sandbox(
+                host_id=hid,
+                user_id=_OWNER,
+                token="new-owner",
+                provider=fake.provider,
+                sandbox_id="sb-fake-1",
+                token_expires_at=now_epoch() + 3600,
+            )
+        if heartbeat:
+            await coordinator._renew_once()
+        release.set()
+        outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+        assert isinstance(outcome, asyncio.CancelledError)
+        await drain_provision_cleanup()
+        assert fake.provisioned_names
+        assert ("sb-fake-1" in fake.terminated) is not adopted
+        assert fake.host_starts == []
+        if adopted:
+            assert hosts.get_host(hid).sandbox_id == "sb-fake-1"
+            assert hosts.resolve_launch_token(hid, "new-owner") is not None
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await drain_provision_cleanup()
+        await coordinator.aclose()
+
+
+async def test_lifespan_drains_canceled_provision_allocation(
+    runtime_init, db_uri, tmp_path, monkeypatch
+):
+    import threading
+
+    from omnigent.server import managed_hosts
+
+    started, release = threading.Event(), threading.Event()
+    draining = asyncio.Event()
+    fake = FakeSandboxLauncher(provision_gate=release)
+    provision = fake.provision
+
+    def blocked(name):
+        started.set()
+        return provision(name)
+
+    monkeypatch.setattr(fake, "provision", blocked)
+    drain = managed_hosts.drain_provision_cleanup
+
+    async def observed_drain():
+        draining.set()
+        await drain()
+
+    monkeypatch.setattr(managed_hosts, "drain_provision_cleanup", observed_drain)
+    config = _injected_config(fake)
+    hosts = HostStore(db_uri)
+    app = _capability_probe_app(db_uri, tmp_path, config, host_store=hosts)
+
+    async def finish_during_shutdown():
+        await draining.wait()
+        release.set()
+
+    releaser = asyncio.create_task(finish_during_shutdown())
+    task = None
+    try:
+        async with app.router.lifespan_context(app):
+            task = asyncio.create_task(
+                launch_managed_host(config=config, owner=_OWNER, host_store=hosts)
+            )
+            assert await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            assert task.cancelled()
+            assert fake.terminated == []
+        assert draining.is_set()
+        await releaser
+        assert fake.terminated == ["sb-fake-1"]
+        assert fake.host_starts == []
+    finally:
+        release.set()
+        releaser.cancel()
+        await asyncio.gather(releaser, return_exceptions=True)
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await drain()

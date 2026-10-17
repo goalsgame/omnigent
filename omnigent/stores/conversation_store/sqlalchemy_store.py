@@ -1156,6 +1156,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
+                from omnigent.db.backend_placement import insert_initial_session_placement
+
+                insert_initial_session_placement(meta_sess, new_id)
                 meta = SqlConversationMetadata(
                     id=new_id,
                     kind=encoded_kind,
@@ -3599,7 +3602,8 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> bool:
         """Clear only a matching model selection with an atomic settings compare-and-swap."""
         workspace_id = current_workspace_id()
-        with self._conv_session("clear_model_override_if_matches") as session:
+
+        def clear(session: Session) -> bool:
             original = session.scalar(
                 select(SqlConversation.session_overrides).where(
                     SqlConversation.workspace_id == workspace_id,
@@ -3631,6 +3635,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
             )
             return result.rowcount == 1
+
+        return run_write_transaction(
+            self._conv_session_immediate, "clear_model_override_if_matches", clear
+        )
 
     def rename_conversation_if_title_matches(
         self,
@@ -4055,43 +4063,44 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``"runner_token_a1b2c3d4..."``.
         :returns: List of :class:`Conversation` entities.
         """
-        with self._session("list_conversations_by_runner_id") as session:
-            meta_rows = (
-                session.execute(
-                    select(SqlConversationMetadata).where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.runner_id == runner_id,
+        return self.list_conversations_by_runner_ids([runner_id])
+
+    def list_conversations_by_runner_ids(self, runner_ids: list[str]) -> list[Conversation]:
+        """Hydrate runner bindings and labels with bounded batch queries."""
+        runner_ids = list(dict.fromkeys(runner_ids))
+        if not runner_ids:
+            return []
+        meta_rows = []
+        with self._session("list_conversations_by_runner_ids") as session:
+            for offset in range(0, len(runner_ids), 200):
+                meta_rows.extend(
+                    session.scalars(
+                        select(SqlConversationMetadata).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.runner_id.in_(
+                                runner_ids[offset : offset + 200]
+                            ),
+                        )
                     )
                 )
-                .scalars()
-                .all()
-            )
-        if not meta_rows:
-            return []
         conv_ids = [m.id for m in meta_rows]
         meta_by_id = {m.id: m for m in meta_rows}
-        with self._conv_session("list_conversations_by_runner_id") as ap_sess:
-            ap_rows = (
-                ap_sess.execute(
+        result = []
+        with self._conv_session("list_conversations_by_runner_ids") as session:
+            for offset in range(0, len(conv_ids), 200):
+                batch = conv_ids[offset : offset + 200]
+                rows = session.scalars(
                     select(SqlConversation).where(
                         SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id.in_(conv_ids),
+                        SqlConversation.id.in_(batch),
                     )
+                ).all()
+                labels = _fetch_labels_bulk(session, batch)
+                result.extend(
+                    _to_conversation(row, meta_by_id.get(row.id), labels.get(row.id, {}))
+                    for row in rows
                 )
-                .scalars()
-                .all()
-            )
-            # Hydrate labels (one batched query, no N+1): the runner
-            # session-init envelope is built from ``conversation.labels``, and
-            # the reconnect path (``_on_runner_connect``) sources its
-            # conversations here. Without this the envelope ships empty labels,
-            # so fork directives (carry-history / source transcript) never reach
-            # the runner and a forked native session launches without history.
-            labels_by_conv = _fetch_labels_bulk(ap_sess, conv_ids)
-        return [
-            _to_conversation(r, meta_by_id.get(r.id), labels_by_conv.get(r.id, {}))
-            for r in ap_rows
-        ]
+        return result
 
     def set_host_id(
         self,
@@ -4434,6 +4443,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             session.add(agent_row)
             session.add(meta_row)
+            from omnigent.db.backend_placement import insert_initial_session_placement
+
+            insert_initial_session_placement(session, conversation_id)
             return meta_row, agent_row
 
         meta_row, agent_row = run_write_transaction(
@@ -5039,6 +5051,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         def insert_metadata(
             meta_sess: Session,
         ) -> SqlConversationMetadata:
+            from omnigent.db.backend_placement import insert_initial_session_placement
+
+            insert_initial_session_placement(meta_sess, new_conv_id)
             fork_meta = SqlConversationMetadata(
                 id=new_conv_id,
                 kind=encoded_default_kind,

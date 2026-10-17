@@ -1053,7 +1053,12 @@ def run_write_transaction(
     for attempt in range(max_retries + 1):
         try:
             with session_maker(operation_name) as session:
-                return callback(session)
+                from omnigent.db.backend_work_fence import check_backend_work
+
+                check_backend_work(session)
+                result = callback(session)
+                check_backend_work(session)
+                return result
         except DBAPIError as exc:
             retryable = (is_cockroachdb(dialect) and _is_serialization_failure(exc)) or (
                 dialect == "mysql" and getattr(exc.orig, "args", ())[:1] == (1213,)

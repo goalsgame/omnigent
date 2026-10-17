@@ -48,6 +48,7 @@ from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelR
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.replication import ReplicaCoordinator, create_connection_task
 from omnigent.server.routes._auth_helpers import require_user
 
 _logger = logging.getLogger(__name__)
@@ -188,9 +189,11 @@ def create_runner_tunnel_router(
     on_runner_disconnect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
     on_runner_connect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
     auth_provider: AuthProvider | None = None,
+    replication: ReplicaCoordinator | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     resolve_runner_placement: Callable[[str], tuple[str, str] | None] | None = None,
+    resolve_runner_placements: Callable[[list[str]], dict[str, tuple[str, str]]] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
@@ -230,6 +233,7 @@ def create_runner_tunnel_router(
         runner-side analog of the host tunnel's ``resolve_launch_token``.
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
+    :param resolve_runner_placements: Optional batch resolver used for runner inventories.
     :param resolve_runner_placement: Placement of session-isolated runners, which
         require a fresh host launch instead of adoption by unrelated sessions.
     :param mint_managed_runner_token: Accounts-mode issuer that validates the
@@ -268,25 +272,39 @@ def create_runner_tunnel_router(
             advertised harnesses.
         """
         user_id = _get_user_id_from_request(request)
-        data: list[dict[str, object]] = []
+        visible = {}
         for runner_id in registry.online_runner_ids():
             session = registry.get(runner_id)
-            if session is None:
-                continue
-            # Scope listing to the caller's own runners.
-            if user_id is not None and session.owner is not None and session.owner != user_id:
-                continue
+            if session is not None and (
+                user_id is None or session.owner is None or session.owner == user_id
+            ):
+                visible[runner_id] = session
+        if replication is not None:
+            local = await replication.local_runner_ids(
+                {rid: session.ws for rid, session in visible.items()}
+            )
+            visible = {rid: session for rid, session in visible.items() if rid in local}
+        placements = (
+            await asyncio.to_thread(resolve_runner_placements, list(visible))
+            if resolve_runner_placements is not None and visible
+            else {}
+        )
+        data: list[dict[str, object]] = []
+        for runner_id, session in visible.items():
             item: dict[str, object] = {
                 "runner_id": runner_id,
                 "online": True,
                 "harnesses": list(session.hello.harnesses),
             }
-            if resolve_runner_placement is not None:
+            placement = placements.get(runner_id)
+            if resolve_runner_placements is None and resolve_runner_placement is not None:
                 placement = await asyncio.to_thread(resolve_runner_placement, runner_id)
-                if placement is not None:
-                    item.update(reusable=False, host_id=placement[0], workspace=placement[1])
+            if placement is not None:
+                item.update(reusable=False, host_id=placement[0], workspace=placement[1])
             data.append(item)
-        return {"data": data}
+        if replication is not None:
+            data.extend(await replication.remote_runners(request))
+        return {"data": list({row["runner_id"]: row for row in data}.values())}
 
     @router.get("/runners/{runner_id}/status")
     async def runner_status(request: Request, runner_id: str) -> dict[str, str | bool]:
@@ -480,6 +498,14 @@ def create_runner_tunnel_router(
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
 
+        if replication is not None:
+            async with replication.connection(ws, "runner", runner_id) as local:
+                if local:
+                    await _serve_connected(ws, runner_id, tunnel_owner)
+        else:
+            await _serve_connected(ws, runner_id, tunnel_owner)
+
+    async def _serve_connected(ws: WebSocket, runner_id: str, tunnel_owner: str | None) -> None:
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
@@ -534,7 +560,14 @@ def create_runner_tunnel_router(
             #    (and an unauthenticated non-loopback peer already
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
-            session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            async with contextlib.AsyncExitStack() as registration:
+                if replication is not None:
+                    current = await registration.enter_async_context(
+                        replication.runner_registration(ws, runner_id)
+                    )
+                    if not current:
+                        return
+                session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
             session.diagnostics.settings.update(
                 tunnel_side="server",
                 app_ping_interval_s=PING_INTERVAL_S,
@@ -592,12 +625,13 @@ def create_runner_tunnel_router(
                     await registry.send_text(session, encode_frame(EventReadyFrame()))
 
                 if on_runner_connect is not None:
-                    owned.append(
-                        asyncio.create_task(
-                            _run_connect_hook(on_runner_connect, session),
-                            name=f"tunnel-recovery:{runner_id}",
-                        )
+                    from omnigent.server.replication import create_runner_recovery_task
+
+                    recovery = create_runner_recovery_task(
+                        _run_connect_hook(on_runner_connect, session), ws
                     )
+                    recovery.set_name(f"tunnel-recovery:{runner_id}")
+                    owned.append(recovery)
 
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},
@@ -901,7 +935,7 @@ async def _receive_loop(
                     continue
                 await slots.acquire()
                 runner_active[runner_id] = runner_active.get(runner_id, 0) + 1
-                task = asyncio.create_task(process(resp_frame))
+                task = create_connection_task(process(resp_frame))
                 active.add(task)
                 task.add_done_callback(finished)
                 continue
