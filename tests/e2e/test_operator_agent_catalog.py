@@ -13,8 +13,12 @@ import yaml
 
 def test_operator_catalog_survives_server_restart(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
-    spec = tmp_path / "custom-pi.yaml"
-    spec.write_text("name: custom-pi\nexecutor:\n  harness: pi-native\nprompt: Help the team.\n")
+    specs = tmp_path / "agents"
+    specs.mkdir()
+    for name in ("custom-pi", "reviewer"):
+        (specs / f"{name}.yaml").write_text(
+            f"name: {name}\nexecutor:\n  harness: pi-native\nprompt: Help the team.\n"
+        )
     config = tmp_path / "config.yaml"
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -30,10 +34,19 @@ def test_operator_catalog_survives_server_restart(tmp_path: Path) -> None:
         "HOST": "127.0.0.1",
         "PORT": str(port),
         "OMNIGENT_CONFIG": str(config),
-        "OMNIGENT_BUILTIN_AGENT_DIRS": str(spec),
+        "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(
+            str(p) for p in sorted(specs.glob("*.yaml"))
+        ),
     }
     catalogs = []
-    for settings in [{}, {"agents": {"allowed_names": ["custom-pi"]}}]:
+    configured = {
+        "agents": {
+            "allowed_names": ["custom-pi", "reviewer"],
+            "display_names": {"custom-pi": "Team Assistant", "reviewer": "Code Reviewer"},
+            "default_name": "custom-pi",
+        }
+    }
+    for settings in [{}, configured]:
         config.write_text(yaml.safe_dump(settings))
         with (tmp_path / "server.log").open("a") as log:
             proc = subprocess.Popen(
@@ -57,10 +70,28 @@ def test_operator_catalog_survives_server_restart(tmp_path: Path) -> None:
                         time.sleep(0.1)
                     response = client.get("/v1/agents?limit=1000")
                     assert response.status_code == 200, response.text
-                    catalogs.append({a["name"] for a in response.json()["data"]})
+                    agents = response.json()["data"]
+                    catalogs.append({a["name"] for a in agents})
+                    if settings:
+                        by_name = {a["name"]: a for a in agents}
+                        assert by_name["custom-pi"]["display_name"] == "Team Assistant"
+                        assert by_name["reviewer"]["display_name"] == "Code Reviewer"
+                        defaults = [a for a in agents if a.get("default_for_new_sessions")]
+                        assert [a["name"] for a in defaults] == ["custom-pi"]
+                        assert by_name["custom-pi"]["id"] != by_name["reviewer"]["id"]
+                        # Exercise both the advertised default and an explicit profile choice.
+                        for selected in (defaults[0], by_name["reviewer"]):
+                            created = client.post(
+                                "/v1/sessions", json={"agent_id": selected["id"]}
+                            )
+                            assert created.status_code in (200, 201), created.text
+                            session_id = created.json()["id"]
+                            session = client.get(f"/v1/sessions/{session_id}")
+                            assert session.status_code == 200, session.text
+                            assert session.json()["agent_id"] == selected["id"]
             finally:
                 proc.terminate()
                 proc.wait(timeout=10)
     assert "custom-pi" in catalogs[0]
     assert len(catalogs[0]) > 1
-    assert catalogs[1] == {"custom-pi"}
+    assert catalogs[1] == {"custom-pi", "reviewer"}

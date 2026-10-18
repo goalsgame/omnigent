@@ -190,6 +190,7 @@ def create_runner_tunnel_router(
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    resolve_runner_placement: Callable[[str], tuple[str, str] | None] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
@@ -229,6 +230,8 @@ def create_runner_tunnel_router(
         runner-side analog of the host tunnel's ``resolve_launch_token``.
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
+    :param resolve_runner_placement: Placement of session-isolated runners, which
+        require a fresh host launch instead of adoption by unrelated sessions.
     :param mint_managed_runner_token: Accounts-mode issuer that validates the
         saved runner authority and mints under the account lock.
     :returns: A FastAPI router with the tunnel endpoint.
@@ -273,13 +276,16 @@ def create_runner_tunnel_router(
             # Scope listing to the caller's own runners.
             if user_id is not None and session.owner is not None and session.owner != user_id:
                 continue
-            data.append(
-                {
-                    "runner_id": runner_id,
-                    "online": True,
-                    "harnesses": list(session.hello.harnesses),
-                }
-            )
+            item: dict[str, object] = {
+                "runner_id": runner_id,
+                "online": True,
+                "harnesses": list(session.hello.harnesses),
+            }
+            if resolve_runner_placement is not None:
+                placement = await asyncio.to_thread(resolve_runner_placement, runner_id)
+                if placement is not None:
+                    item.update(reusable=False, host_id=placement[0], workspace=placement[1])
+            data.append(item)
         return {"data": data}
 
     @router.get("/runners/{runner_id}/status")

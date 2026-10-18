@@ -147,6 +147,7 @@ cockroachdb = [
 # CI / dev workflows still exercise.
 all = [
     "omnigent[gcp-kms]",
+    "omnigent[gcs]",
     "databricks-sdk>=0.56.0,<1",
     "opentelemetry-sdk>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
@@ -167,7 +168,8 @@ gcp-kms = ["google-cloud-kms>=3.0,<4", "google-crc32c>=1.6,<2"]
 # with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
 # lazily, so only users of this backend need the extra.
 s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
-vertex = ["google-auth>=2.0,<3"]
+gcs = ["google-cloud-storage>=3,<4"]
+vertex = ["google-auth[requests]>=2.0,<3"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
 # so only users of the provider need this extra.

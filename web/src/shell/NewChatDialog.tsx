@@ -929,7 +929,8 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  * Return true when ``url`` is acceptable as a sandbox repository URL.
  *
  * Mirrors the server's accepted forms (``parse_repo_workspace``):
- * ``https://<host>/<path>`` or scp-style ``git@<host>:<path>``. The
+ * ``https://<host>/<path>``, ``lores://<host>/<path>`` or scp-style
+ * ``git@<host>:<path>``. The
  * server is the authority — this only gates the submit button so an
  * obviously unusable value gets inline feedback instead of a 422.
  *
@@ -938,7 +939,7 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  */
 export function isValidSandboxRepoUrl(url: string): boolean {
   const t = url.trim();
-  return /^https:\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
+  return /^(?:https|lores):\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
 }
 
 /**
@@ -2162,6 +2163,7 @@ export function NewChatLandingScreen() {
     if (!c) return {};
     return {
       hostId: c.host_id,
+      sandboxProvider: c.sandbox_provider,
       workspace: c.workspace,
       agentId: c.agent_id,
       useWorktree: c.use_worktree,
@@ -4480,6 +4482,7 @@ export function NewChatLandingScreen() {
   // the workspace is in place.
   useEffect(() => {
     if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    if (prefillConfig?.hostId === SANDBOX_HOST_CHOICE && info === "loading") return;
     const step = projectPrefillStep(prefill, {
       hosts,
       // The pickable list, not the raw one — a hidden agent's id would seed
@@ -4497,7 +4500,12 @@ export function NewChatLandingScreen() {
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      const savedProvider = prefillConfig?.sandboxProvider;
+      setSandboxProvider(
+        savedProvider != null && sandboxProviderRows.includes(savedProvider)
+          ? savedProvider
+          : defaultSandboxProvider(),
+      );
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -4532,6 +4540,8 @@ export function NewChatLandingScreen() {
     pickedAgentId,
     prefillConfig,
     defaultSandboxProvider,
+    sandboxProviderRows,
+    info,
   ]);
 
   // Seed a fresh worktree branch once the workspace settles, from the effective

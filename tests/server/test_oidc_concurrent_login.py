@@ -101,3 +101,44 @@ def test_abandoned_pending_cookies_are_bounded(
     assert len(names) == 8
     assert first_name not in names
     assert "Max-Age=300" in response.headers["set-cookie"]
+
+
+def test_legacy_cookie_counts_toward_pending_flow_limit(callback_client) -> None:
+    client, _ = callback_client
+    client.cookies.set(
+        "ap_auth_state",
+        jwt.encode({"state": "old-login", "exp": 4102444800}, _TEST_SECRET, algorithm="HS256"),
+        domain="testserver.local",
+        path="/",
+    )
+    for _ in range(8):
+        client.get("/auth/login", follow_redirects=False)
+    names = [
+        name
+        for name in client.cookies
+        if name == "ap_auth_state" or name.startswith("ap_auth_state_")
+    ]
+    assert len(names) == 8
+    assert "ap_auth_state" not in names
+
+
+@pytest.mark.parametrize("callback_client", [{"flow_state_cookies": False}], indirect=True)
+def test_compatibility_mode_emits_legacy_cookie_readable_by_old_handlers(callback_client) -> None:
+    client, keys = callback_client
+    client.app.state.pending_id_token[0] = keys.sign_id_token(
+        {"email": "member@example.test", "email_verified": True}
+    )
+    login = client.get(
+        "/auth/login", params={"return_to": "/c/compatible"}, follow_redirects=False
+    )
+    assert list(login.cookies) == ["ap_auth_state"]
+    payload = jwt.decode(login.cookies["ap_auth_state"], _TEST_SECRET, algorithms=["HS256"])
+    state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+    assert payload["state"] == state
+    assert payload["code_verifier"]
+    response = client.get(
+        "/auth/callback", params={"state": state, "code": "c"}, follow_redirects=False
+    )
+    assert response.status_code == 302
+    assert response.headers["location"] == "/c/compatible"
+    assert "ap_auth_state" not in client.cookies

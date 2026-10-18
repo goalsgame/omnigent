@@ -30,6 +30,7 @@ def _conv(
     parent_id: str | None = None,
     root_id: str | None = None,
     labels: dict[str, str] | None = None,
+    host_id: str | None = None,
 ) -> Any:
     """Build a minimal conversation stand-in with the fields the helper reads."""
     return types.SimpleNamespace(
@@ -38,6 +39,7 @@ def _conv(
         parent_conversation_id=parent_id,
         root_conversation_id=root_id or conv_id,
         labels=labels or {},
+        host_id=host_id,
     )
 
 
@@ -351,3 +353,43 @@ async def test_recover_real_body_retry_resolves_healed_runner() -> None:
     # ...and the retry forwarded via the CHILD id, which the resolver — reading
     # the freshly healed runner_id — routed to the live runner.
     assert posted == ["/v1/sessions/conv_child/events"]
+
+
+@pytest.mark.parametrize("host_bound", [False, True])
+async def test_isolated_child_never_recovers_on_live_parent(
+    _patch_forward_and_wait: dict[str, Any], host_bound: bool
+) -> None:
+    from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+    from omnigent.server.routes._sessions.orchestration import (
+        _heal_subagent_runner_binding_via_parent,
+    )
+
+    child = _conv(
+        "managed_child",
+        runner_id="sandbox_runner_offline",
+        parent_id="parent",
+        host_id="sandbox_host" if host_bound else None,
+        labels={} if host_bound else {SEPARATE_INFERENCE_RUNNER_LABEL: "1"},
+    )
+    parent = _conv("parent", runner_id="workstation_runner_live", host_id="workstation_host")
+    store = _FakeStore(parent)
+    client = await _heal_subagent_runner_binding_via_parent(
+        child,
+        runner_router=None,
+        tunnel_registry=object(),
+        conversation_store=store,
+    )
+    assert client is None
+    result = await _recover_subagent_status_forward_via_parent(
+        child,
+        runner_router=None,
+        tunnel_registry=object(),
+        conversation_store=store,
+        forward_body={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+    assert result is None
+    assert child.runner_id == "sandbox_runner_offline"
+    assert child.host_id == ("sandbox_host" if host_bound else None)
+    assert store.rebinds == []
+    assert _patch_forward_and_wait["waited_for"] == []
+    assert _patch_forward_and_wait["forwarded_with"] == []

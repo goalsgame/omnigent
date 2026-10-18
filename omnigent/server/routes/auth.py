@@ -23,6 +23,7 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -456,12 +457,15 @@ def create_auth_router(
         pending = [
             name
             for name in request.cookies
-            if re.fullmatch(re.escape(_state_cookie) + r"_[0-9a-f]{64}", name)
+            if name == _state_cookie
+            or re.fullmatch(re.escape(_state_cookie) + r"_[0-9a-f]{64}", name)
         ]
-        for name in pending[:-7]:
+        cookie_name = _flow_cookie(state) if config.flow_state_cookies else _state_cookie
+        retained = [name for name in pending if name != cookie_name]
+        for name in retained[:-7]:
             response.delete_cookie(name, path="/", secure=_secure, httponly=True, samesite="lax")
         response.set_cookie(
-            key=_flow_cookie(state),
+            key=cookie_name,
             value=state_jwt,
             max_age=_AUTH_STATE_TTL_SECONDS,
             httponly=True,
@@ -669,6 +673,27 @@ def create_auth_router(
             if groups
             else None
         )
+
+        brokers = [
+            broker
+            for broker in (
+                getattr(request.app.state, "mcp_identity_broker", None),
+                getattr(request.app.state, "lore_identity_broker", None),
+            )
+            if broker is not None
+        ]
+        if brokers:
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            subject = claims.get("sub") if claims else None
+            access_token = token_json.get("access_token")
+            if not isinstance(subject, str) or not isinstance(access_token, str):
+                return fail(403, "Identity delegation requires a verified OIDC identity")
+            try:
+                for broker in brokers:
+                    await asyncio.to_thread(broker.capture, email, subject, access_token)
+            except DelegationUnavailable:
+                return fail(503, "Identity delegation unavailable; please retry sign-in")
 
         # A native sign-in gets a one-time code at its redirect URI;
         # the session is minted when the app exchanges it with its verifier.

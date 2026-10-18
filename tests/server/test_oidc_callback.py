@@ -51,6 +51,7 @@ _CLIENT_ID = "cid"
 def _oidc_config(
     skip_email_verification: bool = False,
     email_claim: str = "email",
+    flow_state_cookies: bool = True,
 ) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
@@ -80,6 +81,7 @@ def _oidc_config(
         allow_invites=False,
         skip_email_verification=skip_email_verification,
         email_claim=email_claim,
+        flow_state_cookies=flow_state_cookies,
     )
 
 

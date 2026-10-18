@@ -3,12 +3,12 @@ import { useMemo } from "react";
 import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { filterToAgentCatalog } from "@/lib/agentGrouping";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForAgentName,
-  nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
 import type { SkillSummary } from "@/lib/types";
 
@@ -16,6 +16,9 @@ export interface AvailableAgent {
   id: string;
   name: string;
   display_name: string;
+  operatorDisplayName?: boolean;
+  origin?: string | null;
+  default_for_new_sessions?: boolean;
   description: string | null;
   // Harness/kind from GET /v1/agents, e.g. "codex", "codex-native",
   // "claude-native", or "claude-sdk". null when the server couldn't load
@@ -68,9 +71,8 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+function displayNameForAgent(name: string): string {
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
     nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
@@ -82,7 +84,10 @@ function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const nativeIndex = new Map<string, number>();
   for (const agent of agents) {
     const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-    if (nativeAgent === undefined) {
+    if (
+      nativeAgent === undefined ||
+      nativeCodingAgentForAgentName(agentRootName(agent.name)) === undefined
+    ) {
       result.push(agent);
       continue;
     }
@@ -105,6 +110,8 @@ interface BuiltinAgentWire {
   id: string;
   name: string;
   description?: string | null;
+  display_name?: string | null;
+  default_for_new_sessions?: boolean;
   harness?: string | null;
   skills?: SkillSummary[];
   // True only for server-seeded built-ins (deterministic id). Absent on
@@ -115,6 +122,7 @@ interface BuiltinAgentWire {
 }
 
 interface BuiltinAgentsListWire {
+  agent_catalog_names?: string[] | null;
   data: BuiltinAgentWire[];
   has_more?: boolean;
   last_id?: string | null;
@@ -124,7 +132,13 @@ interface BuiltinAgentsListWire {
  * Fetch the built-in agents from the read-only list `GET /v1/agents`
  * (see designs/BUILTIN_AGENTS.md).
  */
-export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
+interface AgentCatalog {
+  agents: AvailableAgent[];
+  names?: string[];
+}
+
+export async function fetchAgentCatalog(): Promise<AgentCatalog> {
+  let names: string[] | undefined;
   const rows: BuiltinAgentWire[] = [];
   let after: string | null = null;
   // Each page provides the cursor for the next request.
@@ -136,19 +150,22 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     const res = await authenticatedFetch(url);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
+    if (Array.isArray(body.agent_catalog_names)) names = body.agent_catalog_names;
     rows.push(...body.data);
     after = body.has_more === true && body.last_id ? body.last_id : null;
   } while (after != null);
   /* oxlint-enable no-await-in-loop */
 
-  return rows.map(agentFromWire);
+  return { agents: rows.map(agentFromWire), names };
 }
 
 function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
   return {
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: a.display_name ?? displayNameForAgent(a.name),
+    ...(a.display_name != null ? { operatorDisplayName: true } : {}),
+    ...(a.default_for_new_sessions ? { default_for_new_sessions: true } : {}),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -215,6 +232,7 @@ export function useSessionAgents(enabled = true) {
       agents.set(row.agent_id, {
         id: row.agent_id,
         name: row.agent_name,
+        origin: row.agent_kind,
         display_name: displayNameForAgent(row.agent_name),
         description: null,
         harness: null,
@@ -265,7 +283,7 @@ export async function prefetchAvailableAgentDetails(
           ? a
           : {
               ...a,
-              display_name: displayNameForAgent(json.name, json.harness),
+              display_name: displayNameForAgent(json.name),
               description: json.description ?? null,
               harness: json.harness ?? null,
               skills: json.skills ?? [],
@@ -279,7 +297,7 @@ export async function prefetchAvailableAgentDetails(
       const enrichedKey = enrichedAgent
         ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
         : undefined;
-      if (enrichedKey) {
+      if (enrichedKey && !enrichedAgent?.mine && enrichedAgent?.origin !== "user") {
         const builtinExists = enriched.some(
           (a) => a.id !== agent.id && nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
         );
@@ -316,18 +334,19 @@ async function fetchAvailableAgents(
           .catch(() => [] as AvailableAgent[])
       : ([] as AvailableAgent[]),
   ]);
-  const discovered = sessionAgents.map((agent) => ({
+  const visibleSessionAgents = filterToAgentCatalog(sessionAgents, catalog.names);
+  const discovered = visibleSessionAgents.map((agent) => ({
     agentId: agent.id,
     agentName: agent.name,
     createdAt: agent.created_at ?? null,
     agent,
   }));
-  const merged = mergeAvailableAgents(catalog, discovered, userAgents);
+  const merged = mergeAvailableAgents(catalog.agents, discovered, userAgents);
   for (const id of pinnedAgentIds) {
     if (merged.some((agent) => agent.id === id)) continue;
     const agent =
-      sessionAgents.find((a) => a.id === id) ??
-      catalog.find((a) => a.id === id) ??
+      visibleSessionAgents.find((a) => a.id === id) ??
+      catalog.agents.find((a) => a.id === id) ??
       userAgents.find((a) => a.id === id);
     if (agent) merged.push(agent);
   }
@@ -385,7 +404,12 @@ function mergeAvailableAgents(
     if (userAgentIds.has(agent.agentId)) continue;
     // Seeded built-in name (incl. fork/switch clones): the built-in wins.
     if (seededNames.has(base)) continue;
-    if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
+    if (
+      hasKiroBuiltin &&
+      kiroLegacyNames.has(base.toLocaleLowerCase()) &&
+      agent.agent.origin !== "user"
+    )
+      continue;
     // Genuine custom upload (or a clone of one). Newest same-named row wins,
     // superseding an older user-registered template seeded above. Strict `>`
     // so equal recency keeps the FIRST seen — the discovery is newest-first, so
@@ -413,7 +437,7 @@ function mergeAvailableAgents(
     .map((c) => (c.template !== null ? c.template : sessionAgentFromDiscovery(c.discovered!)))
     .filter((agent) => {
       const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
-      return nativeKey !== "kiro" || !hasKiroBuiltin;
+      return agent.mine || agent.origin === "user" || nativeKey !== "kiro" || !hasKiroBuiltin;
     });
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names
@@ -463,10 +487,11 @@ function applyAcpHarnessCatalog(
     return {
       ...agent,
       acpHarness: true,
-      // The user's own agent keeps its own name rather than the vendor's.
-      display_name: agent.mine
-        ? agent.display_name
-        : (harnessLabels[harness] ?? agent.display_name),
+      // Explicit profile labels take precedence over the vendor harness label.
+      display_name:
+        agent.mine || agent.operatorDisplayName
+          ? agent.display_name
+          : (harnessLabels[harness] ?? agent.display_name),
     };
   });
 }
@@ -492,11 +517,6 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // stable identity and TanStack doesn't hand consumers a fresh array per render.
   const acpHarnessIds = useAcpHarnessIds(enabled);
   const harnessLabels = useHarnessLabels(enabled);
-  const select = useMemo(
-    () => (agents: AvailableAgent[]) =>
-      applyAcpHarnessCatalog(agents, acpHarnessIds, harnessLabels),
-    [acpHarnessIds, harnessLabels],
-  );
   const queryClient = useQueryClient();
   // The harness/built-in rows come entirely from GET /v1/agents, so they must
   // not wait for a slow Mine session load (managed deployments with
@@ -509,18 +529,34 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
     staleTime: AVAILABLE_AGENTS_STALE_MS,
   });
   const { data: catalog } = catalogQuery;
+  const catalogNames = catalog?.names;
+  const select = useMemo(
+    () => (agents: AvailableAgent[]) =>
+      applyAcpHarnessCatalog(
+        filterToAgentCatalog(agents, catalogNames),
+        acpHarnessIds,
+        harnessLabels,
+      ),
+    [acpHarnessIds, harnessLabels, catalogNames],
+  );
   // Catalog merged with an empty discovery — the same rows a failing discovery degrades
   // to — shown while the merged fetch is in flight and upgraded in place when
   // the discovery lands. Consumers that must not resolve stored ids against a
   // partial list read isPlaceholderData to tell this state apart.
   //
   const placeholderData = useMemo(
-    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
+    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog.agents, [])),
     [catalog],
   );
   const query = useQuery({
     // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
-    queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null, includeUserAgents],
+    queryKey: [
+      "available-agents",
+      pinnedKey,
+      sessionAgents.data ?? null,
+      includeUserAgents,
+      catalogNames,
+    ],
     // fetchQuery dedupes with the catalog query's in-flight fetch, so the
     // merged fetch reuses (not repeats) the catalog request.
     queryFn: () =>

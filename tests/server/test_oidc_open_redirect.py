@@ -72,6 +72,7 @@ def _oidc_config() -> OIDCConfig:
         jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
         userinfo_endpoint=None,
         allow_invites=False,
+        flow_state_cookies=True,
     )
 
 

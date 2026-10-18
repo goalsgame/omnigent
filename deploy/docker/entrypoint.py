@@ -157,14 +157,14 @@ def _resolve_config() -> _ResolvedConfig:
     port = int(cfg.get("port") or os.environ.get("PORT") or _DEFAULT_PORT)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    # Optional remote artifact store (S3 / Cloudflare R2 / MinIO / …). When set,
+    # Optional remote artifact store (GCS / S3 / Cloudflare R2 / MinIO / …). When set,
     # the artifact STORE is remote and durable; artifact_dir stays local for the
     # cookie secret and on-disk cache. Mirrors how DATABASE_URL selects the DB.
     artifact_store_uri = cfg.get("artifact_store_uri") or os.environ.get("OMNIGENT_ARTIFACT_URI")
-    if artifact_store_uri and not artifact_store_uri.startswith("s3://"):
+    if artifact_store_uri and not artifact_store_uri.startswith(("s3://", "gs://")):
         raise RuntimeError(
             "OMNIGENT_ARTIFACT_URI (or `artifact_store_uri:` in config) must be an "
-            f"'s3://bucket[/prefix]' URI, got: {artifact_store_uri!r}"
+            f"'s3://bucket[/prefix]' or 'gs://bucket[/prefix]' URI, got: {artifact_store_uri!r}"
         )
 
     logger.info(
@@ -247,10 +247,9 @@ def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
     """
     Pick the artifact store implementation from the resolved config.
 
-    An ``s3://bucket[/prefix]`` ``artifact_store_uri`` selects the remote,
-    durable :class:`~omnigent.stores.artifact_store.s3.S3ArtifactStore` (AWS S3,
-    Cloudflare R2, MinIO, …), which survives an ephemeral or multi-replica
-    deploy. Otherwise the local-filesystem store at ``artifact_dir`` is used.
+    An ``s3://bucket[/prefix]`` or ``gs://bucket[/prefix]`` URI selects durable
+    object storage, shared across server replicas. Otherwise the
+    local-filesystem store at ``artifact_dir`` is used.
     Mirrors how ``DATABASE_URL`` selects the database backend.
 
     :param resolved_config: The resolved startup configuration.
@@ -258,6 +257,13 @@ def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
         :class:`~omnigent.stores.artifact_store.ArtifactStore`.
     """
     from omnigent.stores.artifact_store.local import LocalArtifactStore
+
+    if resolved_config.artifact_store_uri and resolved_config.artifact_store_uri.startswith(
+        "gs://"
+    ):
+        from omnigent.stores.artifact_store.gcs import GCSArtifactStore
+
+        return GCSArtifactStore(resolved_config.artifact_store_uri)
 
     if resolved_config.artifact_store_uri:
         from omnigent.stores.artifact_store.s3 import S3ArtifactStore

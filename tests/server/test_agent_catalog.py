@@ -6,7 +6,7 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.agent_catalog import agent_catalog_names
+from omnigent.server.agent_catalog import agent_catalog_names, agent_catalog_presentation
 from omnigent.server.app import _ensure_default_agents
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -82,3 +82,114 @@ async def test_hidden_template_cannot_start_new_session_but_remains_readable(db_
         )
     assert exc.value.code == ErrorCode.FORBIDDEN
     assert store.get(agent.id) is not None
+
+
+def test_catalog_presentation() -> None:
+    assert agent_catalog_presentation({}) == (None, {})
+    assert agent_catalog_presentation(
+        {
+            "agents": {
+                "allowed_names": ["assistant", "reviewer"],
+                "default_name": "assistant",
+                "display_names": {"reviewer": "Code Reviewer"},
+            }
+        }
+    ) == ("assistant", {"reviewer": "Code Reviewer"})
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"default_name": ""},
+        {"display_names": []},
+        {"display_names": {"x": ""}},
+        {"display_names": {" assistant": "Assistant"}},
+        {"display_names": {"assistant ": "Assistant"}},
+        {"allowed_names": [], "default_name": "hidden"},
+        {"allowed_names": [], "display_names": {"hidden": "Hidden"}},
+    ],
+)
+def test_catalog_presentation_rejects_invalid_config(section: dict) -> None:
+    with pytest.raises(ValueError):
+        agent_catalog_presentation({"agents": section})
+
+
+@pytest.mark.asyncio
+async def test_catalog_presentation_is_exposed_on_discovery(db_uri: str, tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from omnigent.server.routes.builtin_agents import create_builtin_agents_router
+
+    store = SqlAlchemyAgentStore(db_uri)
+    store.create("a" * 32, "assistant", "missing/assistant")
+    store.create("b" * 32, "reviewer", "missing/reviewer")
+    cache = AgentCache(LocalArtifactStore(str(tmp_path)), tmp_path / "cache")
+    app = FastAPI()
+    app.include_router(
+        create_builtin_agents_router(
+            store,
+            cache,
+            default_agent_name="assistant",
+            agent_display_names={"assistant": "Pi", "reviewer": "Code Reviewer"},
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/agents")
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()["data"]}
+    assert rows["assistant"]["default_for_new_sessions"] is True
+    assert rows["reviewer"]["default_for_new_sessions"] is False
+    assert rows["reviewer"]["display_name"] == "Code Reviewer"
+
+
+@pytest.mark.asyncio
+async def test_session_list_exposes_origin_for_disabled_template_and_user_upload(client, db_uri):
+    store = SqlAlchemyAgentStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    server = store.create("a" * 32, "retired", "bundle/server")
+    user = store.create_user_agent("b" * 32, "custom-upload", "bundle/user", None)
+    conversations.create_conversation(conversation_id="c" * 32, agent_id=server.id)
+    conversations.create_conversation(conversation_id="d" * 32, agent_id=user.id)
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200
+    kinds = {row["agent_id"]: row["agent_kind"] for row in response.json()["data"]}
+    assert kinds == {server.id: "server", user.id: "user"}
+    assert store.get_kinds([]) == {}
+    assert store.get_kinds(["e" * 32]) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("names", [["private-project-reviewer"], []])
+async def test_catalog_names_require_authenticated_discovery(
+    db_uri, tmp_path, runtime_init, names
+):
+    from httpx import ASGITransport, AsyncClient
+
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifacts, tmp_path / "cache"),
+        auth_provider=UnifiedAuthProvider(
+            "header", local_single_user=False, header_name="X-Test-User"
+        ),
+        server_config={"agents": {"allowed_names": names}},
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        public = await client.get("/v1/info")
+        assert public.status_code == 200
+        assert "agent_catalog_names" not in public.json()
+        assert "private-project-reviewer" not in public.text
+        denied = await client.get("/v1/agents")
+        assert denied.status_code == 401
+        assert "private-project-reviewer" not in denied.text
+        catalog = await client.get("/v1/agents", headers={"X-Test-User": "person@example.test"})
+        assert catalog.status_code == 200, catalog.text
+        assert catalog.json()["agent_catalog_names"] == names

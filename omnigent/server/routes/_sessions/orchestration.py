@@ -1125,6 +1125,7 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    agent_kinds_by_id: Mapping[str, str] | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1181,6 +1182,7 @@ def _build_session_list_item(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
+        agent_kind=(agent_kinds_by_id or {}).get(conv.agent_id),
         status=_list_status_with_starting(
             _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
             conv.id,
@@ -3453,6 +3455,15 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
+    from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+    # Host-bound children recover on their own host, never an ancestor’s runner.
+    if (
+        child_conv.host_id is not None
+        or child_conv.labels.get(SEPARATE_INFERENCE_RUNNER_LABEL) == "1"
+    ):
+        return None
+
     # Walk the ancestor chain (immediate parent first, then root) to find a
     # live runner.  A single hop covers the common case; two hops cover nested
     # sub-agents where the immediate parent's runner is also stale but the root
@@ -10537,6 +10548,7 @@ async def _create_session_from_existing_agent(
         )
 
     inference_snapshot = None
+    inference_policy_labels: dict[str, str] = {}
     selection_spec = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
@@ -10583,7 +10595,11 @@ async def _create_session_from_existing_agent(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if selection_spec is not None:
-            inference_snapshot, model_override = await prepare_create_inference(
+            (
+                inference_snapshot,
+                model_override,
+                inference_policy_labels,
+            ) = await prepare_create_inference(
                 request,
                 body,
                 selection_spec,
@@ -10603,6 +10619,7 @@ async def _create_session_from_existing_agent(
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
+    separate_inference_runner = False
     inherited_runner_id: str | None = None
     if body.parent_session_id is not None:
         parent_conv = _parent_for_routing
@@ -10618,6 +10635,30 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+
+    # A requested sandbox has its own runner and repository workspace.
+    if body.host_type == "managed":
+        inherited_runner_id = None
+
+    from omnigent.server.routes._host_launch import independent_inference_child_host
+
+    independent_host = await independent_inference_child_host(
+        _parent_for_routing,
+        inherited_runner_id,
+        getattr(request.app.state, "host_registry", None),
+        conversation_store,
+        host_store=getattr(request.app.state, "host_store", None),
+        user_id=user_id,
+    )
+    if independent_host is not None:
+        separate_inference_runner = True
+        inherited_runner_id = None
+        body = body.model_copy(
+            update={
+                "host_id": body.host_id or independent_host[0],
+                "workspace": body.workspace or independent_host[1],
+            }
+        )
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must
@@ -10789,6 +10830,11 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    initial_labels.update(inference_policy_labels)
+    if separate_inference_runner:
+        from omnigent.inference_config import SEPARATE_INFERENCE_RUNNER_LABEL
+
+        initial_labels[SEPARATE_INFERENCE_RUNNER_LABEL] = "1"
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
@@ -12426,11 +12472,25 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    from omnigent.server.routes.sandbox_inference import configured_snapshot, inference_service
+    from omnigent.server.routes.sandbox_inference import (
+        configured_snapshot,
+        inference_service,
+        proxy_policy,
+        proxy_policy_catalog,
+    )
 
-    inference_configured = configured_snapshot(conv.inference_snapshot)
+    saved_proxy_policy = proxy_policy(conv)
+    inference_configured = (
+        configured_snapshot(conv.inference_snapshot) or saved_proxy_policy is not None
+    )
     inference_error = None
-    if inference_configured and conv.inference_snapshot is not None:
+    if saved_proxy_policy is not None:
+        catalog = proxy_policy_catalog(request, saved_proxy_policy)
+        model_options = catalog["models"]
+        inference_error = catalog.get("error")
+        if not conv.reported_model:
+            llm_model = conv.model_override or catalog.get("default_model")
+    elif inference_configured and conv.inference_snapshot is not None:
         catalog = (
             await inference_service(request).catalog(conv.inference_snapshot)
             if request is not None
@@ -12511,6 +12571,11 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+    )
+    from omnigent.runner.routing import routing_host_id
+
+    response.routing_host_id = await asyncio.to_thread(
+        routing_host_id, conv, conv_store, require_shared_runner=True
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error

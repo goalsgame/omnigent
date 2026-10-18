@@ -139,7 +139,8 @@ def test_https_and_source_required(oidc):
         UnifiedAuthProvider("accounts", human_verifier=OIDCHumanVerifier(config, oidc))
 
 
-def test_human_config_factory_and_overlap(oidc, tmp_path, monkeypatch):
+@pytest.mark.parametrize("exchanged", [False, True])
+def test_human_config_factory_and_overlap(oidc, tmp_path, monkeypatch, exchanged):
     import json
     from unittest.mock import patch
 
@@ -166,7 +167,8 @@ def test_human_config_factory_and_overlap(oidc, tmp_path, monkeypatch):
         "audience": "agent-api",
         "role_client": "web",
         "role": "automation",
-        "clients": {"connectors-exchange": "machine-subject"},
+        "clients": {"direct-machine" if exchanged else "connectors-exchange": "machine-subject"},
+        "exchange_clients": ["connectors-exchange"] if exchanged else [],
     }
     path.write_text(json.dumps(config))
     with patch.object(OIDCConfig, "from_env", return_value=oidc):
@@ -182,3 +184,26 @@ def test_human_rejections_do_not_log_email_claims(human, signing_key, caplog):
     assert human.authenticate(token) is None
     assert "private@example.test" not in caplog.text
     assert token not in caplog.text
+
+
+def test_exchanged_machine_dispatches_without_human_fallback(oidc, verifier, human, signing_key):
+    verifier.config = dataclasses.replace(
+        verifier.config, exchange_clients=frozenset({"machine-exchange"})
+    )
+    provider = UnifiedAuthProvider(
+        "oidc", oidc_config=oidc, machine_verifier=verifier, human_verifier=human
+    )
+    token = signed_token(signing_key, azp="machine-exchange")
+    assert provider.get_user_id(connection(token)) == "oidc-machine:ticket-worker"
+    assert provider.get_user_id(connection(token, websocket=True)) == "oidc-machine:ticket-worker"
+    assert (
+        provider.get_user_id(
+            connection(signed_token(signing_key, azp="machine-exchange", sub="wrong"))
+        )
+        is None
+    )
+    human.config = dataclasses.replace(human.config, clients=frozenset({"machine-exchange"}))
+    with pytest.raises(RuntimeError, match="overlap"):
+        UnifiedAuthProvider(
+            "oidc", oidc_config=oidc, machine_verifier=verifier, human_verifier=human
+        )

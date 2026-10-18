@@ -17,5 +17,24 @@ Supply their YAML definitions through `OMNIGENT_BUILTIN_AGENT_DIRS` as usual.
 
 Existing database records remain available to their sessions and history.
 Changing the list does not delete sessions, templates, or workspace data.
+The web picker filters history-derived server templates against this catalog.
+Session-list origin metadata preserves user-authored uploads and installed user
+agents, including those not named in the operator catalog.
 This setting curates templates; it does not disable session-scoped agents or
 user-authored session bundles.
+
+Operators can set `agents.default_name` to the default catalog agent for a new
+session and `agents.display_names` to a mapping of agent names to picker labels.
+Both must refer to allowed names when `allowed_names` is configured. For example:
+
+```yaml
+agents:
+  allowed_names: [assistant, reviewer]
+  default_name: assistant
+  display_names:
+    assistant: Pi
+    reviewer: Code Reviewer
+```
+
+Profiles using the same harness remain separate choices. The default is used
+when no valid remembered or project selection exists; explicit selections win.

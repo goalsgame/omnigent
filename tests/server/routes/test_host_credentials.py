@@ -257,3 +257,33 @@ def test_linked_account_refresh_failure_does_not_report_missing_connection(
     else:
         assert response.json()["token"] == "ghu_existing"
     assert store.get(owner) is not None
+
+
+def test_lore_credentials_bind_host_owner_and_repository() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    remote = "lores://lore.example.test/game"
+    app = FastAPI()
+    broker = SimpleNamespace(
+        lore_config=SimpleNamespace(repositories={remote: "/Content\n"}),
+        credential=Mock(return_value="short-lived"),
+    )
+    app.state.lore_identity_broker = broker
+    app.include_router(
+        create_host_credentials_router(_FakeHostStore("host1", "launch-tok", "alice@example.com")),
+        prefix="/v1",
+    )
+    client = TestClient(app)
+    endpoint = "/v1/hosts/host1/credentials/lore"
+    assert client.get(endpoint, params={"remote": remote}).status_code == 401
+    assert (
+        client.get(endpoint, params={"remote": "lores://evil.test/game"}, headers=_HDR).status_code
+        == 403
+    )
+    broker.credential.assert_not_called()
+    response = client.get(endpoint, params={"remote": remote}, headers=_HDR)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {"connected": True, "token": "short-lived", "view": "/Content\n"}
+    broker.credential.assert_called_once_with("alice@example.com")

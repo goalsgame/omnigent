@@ -85,6 +85,8 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.peer_messages import PEER_TOOL_NAMES, PEER_TOOL_TYPES
+from omnigent.tools.builtins.publish_artifact import PublishArtifactTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -253,6 +255,7 @@ _REST_TOOLS: frozenset[str] = frozenset()
 _FILE_TOOLS = frozenset(
     {
         UploadFileTool.name(),
+        PublishArtifactTool.name(),
         DownloadFileTool.name(),
         "list_files",  # from builtins registry; no standalone class
     }
@@ -464,7 +467,9 @@ _BROWSER_TIMEOUT_ERROR = (
 # ``os_env`` gate), so the native relay assembles them separately.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
+    | frozenset({PublishArtifactTool.name()})
     | _SESSION_QUERY_TOOLS
+    | PEER_TOOL_NAMES
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
@@ -581,6 +586,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
         for _cls in (
+            PublishArtifactTool,
+            *PEER_TOOL_TYPES,
             ListCommentsTool,
             UpdateCommentTool,
             SysSessionListTool,
@@ -863,6 +870,7 @@ _ALL_LOCAL_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
+    | PEER_TOOL_NAMES
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
@@ -6578,7 +6586,13 @@ async def execute_tool(
     )
     if disposable and (
         tool_name in _SKILL_TOOLS
-        or tool_name in {UploadFileTool.name(), "sys_agent_download", "sys_agent_list"}
+        or tool_name
+        in {
+            UploadFileTool.name(),
+            PublishArtifactTool.name(),
+            "sys_agent_download",
+            "sys_agent_list",
+        }
         or (tool_name == "sys_session_create" and args.get("config_path"))
     ):
         return json.dumps(
@@ -6678,6 +6692,10 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
             )
+        elif tool_name in PEER_TOOL_NAMES:
+            from omnigent.runner.peer_messages import execute_peer_tool
+
+            output = await execute_peer_tool(tool_name, args, conversation_id, server_client)
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
                 args,
@@ -7448,6 +7466,53 @@ async def _execute_file_tool(
     if conversation_id is None:
         return f"Error: {tool_name} requires a session id"
     files_path = f"/v1/sessions/{conversation_id}/resources/files"
+
+    if tool_name == PublishArtifactTool.name():
+        path, title = args.get("path"), args.get("title")
+        kind, days = args.get("kind", "file"), args.get("retention_days")
+        if not isinstance(path, str) or not path or not isinstance(title, str) or not title:
+            return "Error: publishing requires a workspace path and title"
+        if kind not in ("file", "html") or (
+            days is not None and (type(days) is not int or days <= 0)
+        ):
+            return "Error: invalid artifact kind or retention"
+        os_spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+        assert os_spec.cwd is not None
+        if (
+            os_spec.type != "caller_process"
+            or (os_spec.sandbox is not None and os_spec.sandbox.type != "none")
+            or os_spec.fork
+            or os_spec.start_in_scratch
+        ):
+            return "Error: publishing is unavailable for restricted OS environments"
+        from omnigent.runner.published_artifact_file import read_publication_file
+
+        try:
+            filename, content = await asyncio.to_thread(
+                read_publication_file, path, Path(os_spec.cwd), 50 * 1024 * 1024
+            )
+            data = {"title": title, "kind": kind}
+            if days is not None:
+                data["retention_days"] = str(days)
+            response = await server_client.post(
+                f"/v1/sessions/{conversation_id}/artifacts",
+                data=data,
+                files={"file": (filename, content)},
+                timeout=60.0,
+            )
+            if response.status_code != 201:
+                return f"Error: publication rejected (HTTP {response.status_code})"
+            result = response.json()
+            # API paths are deployment-relative; agents need a pasteable absolute link.
+            from urllib.parse import urljoin
+
+            for key in ("viewer_url", "download_url"):
+                result[key] = urljoin(str(server_client.base_url), result[key])
+            return json.dumps(result)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        except (OSError, httpx.HTTPError):
+            return "Error: artifact could not be read or published"
 
     if tool_name == UploadFileTool.name():
         path = args.get("path")

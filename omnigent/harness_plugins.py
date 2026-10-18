@@ -816,6 +816,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     },
     aliases={
         **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
+        "agents_sdk": "openai-agents",
+        "claude_sdk": "claude-sdk",
         "agy": "antigravity",
         "agy-native": "antigravity-native",
         "claude": "claude-sdk",

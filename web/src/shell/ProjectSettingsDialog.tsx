@@ -36,11 +36,13 @@ import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
+import { getCurrentUserId } from "@/lib/identity";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
-import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import { SANDBOX_HOST_CHOICE, readLastSandboxProvider } from "@/lib/hostPreferences";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isNativeCodingAgent,
@@ -120,7 +122,19 @@ export function ProjectSettingsDialog({
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
   // can only fail on create.
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
-  const sandboxProvider = info !== "loading" ? info.sandbox_provider : null;
+  const providers = info !== "loading" ? sandboxProviderOptions(info) : [];
+  const rememberedProvider = readLastSandboxProvider();
+  const savedProviderUnavailable =
+    info !== "loading" &&
+    stored?.sandbox_provider != null &&
+    !providers.includes(stored.sandbox_provider);
+  const sandboxProvider =
+    (stored?.sandbox_provider != null && providers.includes(stored.sandbox_provider)
+      ? stored.sandbox_provider
+      : null) ??
+    (rememberedProvider !== null && providers.includes(rememberedProvider)
+      ? rememberedProvider
+      : (providers[0] ?? null));
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
@@ -197,12 +211,22 @@ export function ProjectSettingsDialog({
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    if (
+      loadFailed ||
+      modelValidationPending ||
+      (hostId === SANDBOX_HOST_CHOICE && info === "loading")
+    )
+      return;
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
+    if (hostId === SANDBOX_HOST_CHOICE && sandboxProvider !== null) {
+      config.sandbox_provider = sandboxProvider;
+    } else {
+      delete config.sandbox_provider;
+    }
     // A workspace is host-relative and only meaningful with a concrete host —
     // don't persist a stale path from a since-cleared host, and drop it for the
     // sandbox (a sandbox create provisions its own workspace and ignores this).
@@ -230,8 +254,8 @@ export function ProjectSettingsDialog({
     // is unknowable — keep the stored model (already in the spread) so an
     // unrelated save during that window can't silently delete a valid default.
     const agentUnresolved = agentId != null && selectedAgent === null;
-    if (supportsModelDefault && model !== NONE) config.model = model;
-    else if (!agentUnresolved) delete config.model;
+    if (supportsModelDefault && effectiveModel !== NONE) config.model = effectiveModel;
+    else if (!agentUnresolved || (sandboxSelected && savedProviderUnavailable)) delete config.model;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -276,30 +300,93 @@ export function ProjectSettingsDialog({
   // else the first online host (the composer's auto-pick) — without the
   // fallback a Codex project (no static catalog) could never populate the
   // picker unless a host default was also stored.
-  const modelCatalogHostId = browsableHostId ?? onlineHosts[0]?.host_id ?? null;
+  const sandboxSelected = hostId === SANDBOX_HOST_CHOICE;
+  const modelCatalogHostId = sandboxSelected
+    ? null
+    : (browsableHostId ?? onlineHosts[0]?.host_id ?? null);
+  const previewHarness = selectedNativeSpec?.harness ?? selectedAgent?.harness ?? null;
+  const providerHasCatalog =
+    info !== "loading" &&
+    sandboxProvider !== null &&
+    info.sandbox_provider_capabilities?.[sandboxProvider]?.inference_models === true;
+  const sandboxProviderAvailable = managedSandboxesEnabled;
+  const sandboxCatalogEnabled =
+    open &&
+    sandboxSelected &&
+    managedSandboxesEnabled &&
+    sandboxProvider !== null &&
+    previewHarness !== null &&
+    harnessTakesModel &&
+    providerHasCatalog;
+  const sandboxModels = useSandboxModelOptions(
+    sandboxProvider,
+    previewHarness,
+    agentId,
+    getCurrentUserId(),
+    sandboxCatalogEnabled,
+  );
   const { data: hostModelOptions } = useHostModelOptions(
     modelCatalogHostId,
     selectedNativeSpec?.harness ?? "",
     harnessTakesModel && modelCatalogHostId !== null,
   );
+  const sandboxCatalogUsable =
+    sandboxCatalogEnabled && !sandboxModels.error && !sandboxModels.isLoading;
+  const staticSandboxClaudeModels =
+    sandboxSelected &&
+    sandboxProviderAvailable &&
+    !sandboxModels.error &&
+    selectedNativeSpec?.harness === "claude-native" &&
+    (!providerHasCatalog ||
+      (sandboxCatalogUsable && sandboxModels.data?.status === "unconfigured"));
+  const replacementCatalogResolved =
+    staticSandboxClaudeModels ||
+    (sandboxCatalogUsable &&
+      (sandboxModels.data?.status === "ready" || sandboxModels.data?.status === "empty"));
+  const modelValidationPending =
+    sandboxSelected &&
+    savedProviderUnavailable &&
+    model !== NONE &&
+    (harnessTakesModel || (agentId !== null && selectedAgent === null)) &&
+    !replacementCatalogResolved;
   const modelOptions = useMemo(() => {
-    const live = (hostModelOptions ?? []).map((o) => ({
+    const source = sandboxSelected
+      ? sandboxCatalogUsable && sandboxModels.data?.status === "ready"
+        ? sandboxModels.data.models
+        : []
+      : (hostModelOptions ?? []);
+    const live = source.map((o) => ({
       id: o.id,
       label: o.displayName ?? o.id,
     }));
-    if (live.length > 0) return live;
+    if (live.length > 0 || (sandboxSelected && !staticSandboxClaudeModels)) return live;
     return selectedNativeSpec?.harness === "claude-native"
       ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
       : [];
-  }, [hostModelOptions, selectedNativeSpec]);
+  }, [
+    hostModelOptions,
+    selectedNativeSpec,
+    sandboxSelected,
+    sandboxModels.data,
+    sandboxCatalogUsable,
+    staticSandboxClaudeModels,
+  ]);
   // Keep a stored model the current options don't list as a labeled fallback
   // item, so opening + saving the dialog doesn't silently drop the default.
-  const storedModelMissing = model !== NONE && !modelOptions.some((m) => m.id === model);
+  const effectiveModel =
+    sandboxSelected &&
+    savedProviderUnavailable &&
+    !modelValidationPending &&
+    !modelOptions.some((m) => m.id === model)
+      ? NONE
+      : model;
+  const storedModelMissing =
+    effectiveModel !== NONE && !modelOptions.some((m) => m.id === effectiveModel);
   // With no catalog resolved and nothing stored, the select could only offer
   // "No default" — an action it can't perform. Degrade honestly (documented
   // catalog gap for host-resolved harnesses): disable it and say why, rather
   // than hide the field the harness legitimately supports.
-  const modelPickerEmpty = modelOptions.length === 0 && model === NONE;
+  const modelPickerEmpty = modelOptions.length === 0 && effectiveModel === NONE;
   // Offer the control only for a model-taking harness; when it can only render
   // "No default" it stays visible but disabled with an explanatory hint.
   const supportsModelDefault = harnessTakesModel;
@@ -329,7 +416,9 @@ export function ProjectSettingsDialog({
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
-              onValueChange={setHostId}
+              onValueChange={(value) => {
+                if (value !== "") setHostId(value);
+              }}
               onOpenChange={onDropdownOpenChange}
               disabled={isLoading}
             >
@@ -341,6 +430,11 @@ export function ProjectSettingsDialog({
                 {managedSandboxesEnabled && (
                   <SelectItem value={SANDBOX_HOST_CHOICE}>
                     {sandboxOptionLabel(sandboxProvider)}
+                  </SelectItem>
+                )}
+                {!managedSandboxesEnabled && hostId === SANDBOX_HOST_CHOICE && (
+                  <SelectItem value={SANDBOX_HOST_CHOICE} disabled>
+                    Sandbox ({info === "loading" ? "loading…" : "unavailable"})
                   </SelectItem>
                 )}
                 {onlineHosts.map((h) => (
@@ -517,13 +611,19 @@ export function ProjectSettingsDialog({
             <Field
               label="Model"
               hint={
-                modelPickerEmpty
-                  ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
-                  : "Default model for new sessions with this agent"
+                sandboxSelected && modelPickerEmpty
+                  ? sandboxModels.isLoading
+                    ? "Loading sandbox models…"
+                    : (sandboxModels.error?.message ??
+                      sandboxModels.data?.error ??
+                      "No model catalog available for this sandbox and agent")
+                  : modelPickerEmpty
+                    ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
+                    : "Default model for new sessions with this agent"
               }
             >
               <Select
-                value={model}
+                value={effectiveModel}
                 onValueChange={setModel}
                 onOpenChange={onDropdownOpenChange}
                 disabled={isLoading || modelPickerEmpty}
@@ -544,6 +644,20 @@ export function ProjectSettingsDialog({
             </Field>
           )}
 
+          {sandboxSelected && savedProviderUnavailable && (
+            <p className="text-muted-foreground text-sm" role="status">
+              The saved sandbox provider is unavailable.{" "}
+              {sandboxProvider !== null
+                ? `Using ${sandboxOptionLabel(sandboxProvider)}; only models available from this provider can be kept.`
+                : "Choose another host before starting new sessions."}
+            </p>
+          )}
+          {modelValidationPending && (
+            <p className="text-muted-foreground text-sm" role="status">
+              The saved model cannot be validated yet. Wait for the model catalog, or choose No
+              default to discard the saved model before saving.
+            </p>
+          )}
           {loadFailed && (
             <p
               className="text-destructive text-ui"
@@ -573,7 +687,12 @@ export function ProjectSettingsDialog({
               type="submit"
               data-testid="project-settings-save"
               loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
+              disabled={
+                isLoading ||
+                loadFailed ||
+                modelValidationPending ||
+                (sandboxSelected && info === "loading")
+              }
             >
               Save
             </Button>

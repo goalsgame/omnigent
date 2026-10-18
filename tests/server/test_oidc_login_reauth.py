@@ -65,6 +65,7 @@ def _oidc_config() -> OIDCConfig:
         jwks_uri=f"{_ISSUER}/jwks",
         userinfo_endpoint=None,
         allow_invites=False,
+        flow_state_cookies=True,
         skip_email_verification=False,
         email_claim="email",
     )

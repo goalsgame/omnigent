@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
+  filterToAgentCatalog,
   isAcpHarnessAgent,
   partitionAgentsByKind,
   selectableSessionAgents,
@@ -19,6 +20,13 @@ function agent(overrides: Partial<AvailableAgent> & Pick<AvailableAgent, "name">
 }
 
 describe("selectableSessionAgents", () => {
+  it("puts the operator default before another profile on the same harness", () => {
+    const result = selectableSessionAgents([
+      agent({ name: "reviewer", harness: "pi-native" }),
+      agent({ name: "assistant", harness: "pi-native", default_for_new_sessions: true }),
+    ]);
+    expect(result.map((a) => a.name)).toEqual(["assistant", "reviewer"]);
+  });
   it("drops the hidden agents every session-creation surface must exclude", () => {
     // Shared by the composer picker AND project settings — filter parity is
     // what stops a project from pinning a default the composer can't show.
@@ -92,4 +100,21 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: null })).toBe(false);
     expect(isAcpHarnessAgent(null)).toBe(false);
   });
+});
+
+it("does not resurrect disabled templates from session history", () => {
+  const agents = [
+    agent({ name: "assistant" }),
+    agent({ name: "retired", sessionId: "old" }),
+    agent({ name: "personal", mine: true }),
+    agent({ name: "uploaded", sessionId: "custom-session", origin: "user" }),
+    agent({ name: "retired-server", sessionId: "old-server", origin: "server" }),
+  ];
+  expect(filterToAgentCatalog(agents, ["assistant"]).map((a) => a.name)).toEqual([
+    "assistant",
+    "personal",
+    "uploaded",
+  ]);
+  expect(filterToAgentCatalog(agents)).toEqual(agents);
+  expect(filterToAgentCatalog(agents, []).map((a) => a.name)).toEqual(["personal", "uploaded"]);
 });

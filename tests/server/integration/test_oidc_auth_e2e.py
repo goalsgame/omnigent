@@ -53,6 +53,7 @@ def _make_oidc_config() -> OIDCConfig:
         jwks_uri=None,
         userinfo_endpoint="https://api.github.com/user",
         allow_invites=False,
+        flow_state_cookies=True,
     )
 
 

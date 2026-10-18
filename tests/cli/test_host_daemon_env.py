@@ -425,3 +425,24 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     # Then
     assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+@pytest.mark.parametrize("opt_in", [None, "0", "1"])
+def test_server_inference_opt_in_reaches_host_daemon(
+    monkeypatch: pytest.MonkeyPatch, server_url: str | None, opt_in: str | None
+) -> None:
+    monkeypatch.delenv("OMNIGENT_SERVER_INFERENCE", raising=False)
+    if opt_in is not None:
+        monkeypatch.setenv("OMNIGENT_SERVER_INFERENCE", opt_in)
+    monkeypatch.setenv("OMNIGENT_SERVER_INFERENCE_SECRET", "must-not-forward")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-forward-to-remote")
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env.get("OMNIGENT_SERVER_INFERENCE") == opt_in
+    if opt_in is None:
+        assert "OMNIGENT_SERVER_INFERENCE" not in env
+    if server_url:
+        assert "OMNIGENT_SERVER_INFERENCE_SECRET" not in env
+        assert "OPENAI_API_KEY" not in env

@@ -809,10 +809,15 @@ async function postEventChecked(config, body, signal) {
     typeof fetch !== "function"
   )
     return;
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/events`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
   const request = {
     method: "POST",
-    headers: headers(config),
+    headers: relay
+      ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
+      : headers(config),
     body: JSON.stringify(body),
   };
   if (signal) request.signal = signal;

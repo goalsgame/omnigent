@@ -39,6 +39,33 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Shared artifacts
+
+The server stores agent bundles and uploaded files in its artifact store.
+By default these live on the local `/data` volume. To use Google Cloud Storage,
+install the optional `omnigent[gcs]` dependency in your server image and set:
+
+```yaml
+# Server config.yaml (also supported by `omnigent server -c config.yaml`)
+artifact_store_uri: gs://my-artifact-bucket/omnigent
+```
+
+Alternatively, set `OMNIGENT_ARTIFACT_URI` to the same URI. The YAML setting
+takes precedence. Authentication uses Application Default Credentials,
+including GKE Workload Identity; no storage access key is required. Create the
+bucket separately and grant the server identity bucket-scoped
+`roles/storage.objectUser`. `/data` remains local for caches; cookie-signing
+secrets must be configured consistently across replicas.
+
+Changing the URI does not copy existing artifacts. Before cutover, stop artifact
+writes and copy all artifact keys byte-for-byte to the configured bucket/prefix,
+then verify the copy. Preserve the original volume for rollback. Changing this
+setting while writes continue can leave artifacts missing from the new store.
+
+Shared artifacts remove the server's single-writer storage constraint. They do
+not by themselves make multiple server replicas safe: runner connection routing,
+background-job coordination and graceful inference draining are also required.
+
 ## Release features
 
 Release features are deployment-wide and off by default. Enable one or more
@@ -168,6 +195,9 @@ has native OIDC support — it handles the full
 login flow itself (`/auth/login`, `/auth/callback`, `/auth/logout`)
 with a signed session cookie. No extra container, no Caddy basic-auth
 shim, no oauth2-proxy.
+
+For independent state cookies during overlapping sign-ins, see the
+[concurrent-login setting and rollout requirements](../../docs/deployment/oidc-state-cookies.md).
 
 ### Walkthrough: GitHub OAuth (easiest to register)
 

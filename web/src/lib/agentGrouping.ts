@@ -4,6 +4,7 @@
  * (NewChatDialog) and the fork/switch picker (ForkSessionDialog) so the
  * two surfaces group and order agents identically.
  */
+import { agentRootName } from "@/lib/forkHarness";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { nativeAgentSortRank } from "@/lib/nativeCodingAgents";
 
@@ -89,6 +90,7 @@ function displayRank(name: string): number {
 export function sortAgentsForDisplay<T extends AvailableAgent>(agents: readonly T[]): T[] {
   return [...agents].sort(
     (a, b) =>
+      Number(b.default_for_new_sessions === true) - Number(a.default_for_new_sessions === true) ||
       nativeAgentSortRank(a) - nativeAgentSortRank(b) ||
       displayRank(a.display_name) - displayRank(b.display_name),
   );
@@ -136,4 +138,13 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
     builtins: sorted.filter(isBuiltin),
     customs: sorted.filter((a) => !isBuiltin(a)),
   };
+}
+
+/** Keep historical templates from reappearing after an operator disables them. */
+export function filterToAgentCatalog<T extends AvailableAgent>(agents: T[], names?: string[]): T[] {
+  if (names === undefined) return agents;
+  const allowed = new Set(names);
+  return agents.filter(
+    (agent) => agent.mine || agent.origin === "user" || allowed.has(agentRootName(agent.name)),
+  );
 }

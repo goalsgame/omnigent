@@ -560,6 +560,21 @@ describe("createSideChat", () => {
     labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
 
+  it("preserves an independent side-chat runner returned by the server", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(source)).mockResolvedValueOnce(
+      mockJsonResponse({
+        ...fork,
+        runner_id: "runner_side",
+        host_id: source.host_id,
+        workspace: source.workspace,
+      }),
+    );
+    await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe(`/v1/sessions/${source.id}/fork`);
+    expect(fetchMock.mock.calls.every(([, init]) => init?.method !== "PATCH")).toBe(true);
+  });
+
   it.each(["worktree-from-another-machine", "main", null])(
     "relaunches a stopped parent and reuses its runner without requiring saved branch %s",
     async (gitBranch) => {
