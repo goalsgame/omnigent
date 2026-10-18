@@ -86,7 +86,12 @@ class OIDCLoginBroker(OIDCLoginRevoker):
         self.client = httpx.Client(timeout=15, follow_redirects=False, trust_env=False)
 
     def _claims(self, token: str, subject: str, *, offline: bool = False) -> dict[str, Any]:
-        key = self.jwks.get_signing_key_from_jwt(token)
+        try:
+            key = self.jwks.get_signing_key_from_jwt(token)
+        except jwt.PyJWKClientConnectionError:
+            raise DelegationTemporarilyUnavailable(
+                "Identity signing keys temporarily unavailable"
+            ) from None
         claims = jwt.decode(
             token,
             key.key,
@@ -164,30 +169,48 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                 or float(meta.get("deadline", 0)) <= time.time()
             ):
                 raise DelegationUnavailable("Sign in again to renew identity delegation")
-            if float(secret.get("expires_at", 0)) > time.time() + 60:
+            pending = secret.get("pending_tokens")
+            if pending is None and float(secret.get("expires_at", 0)) > time.time() + 60:
                 return secret
+            tokens = pending
             try:
-                response = self.client.post(
-                    self.config.token_endpoint,
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": secret["refresh_token"],
-                        "client_id": self.config.client_id,
-                        "client_secret": self.config.client_secret,
-                    },
-                )
-                if response.status_code >= 500 or response.status_code in (408, 429):
-                    raise DelegationTemporarilyUnavailable(
-                        "Identity provider temporarily unavailable"
+                refresh_token = secret["refresh_token"]
+                if tokens is not None:
+                    rotated = tokens.get("refresh_token") or refresh_token
+                    self._claims(rotated, str(meta["subject"]), offline=True)
+                    try:
+                        self._claims(tokens["access_token"], str(meta["subject"]))
+                    except jwt.ExpiredSignatureError:
+                        # Only a verified offline token may renew an expired pending response.
+                        refresh_token = rotated
+                        tokens = None
+                if tokens is None:
+                    response = self.client.post(
+                        self.config.token_endpoint,
+                        data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh_token,
+                            "client_id": self.config.client_id,
+                            "client_secret": self.config.client_secret,
+                        },
                     )
-                response.raise_for_status()
-                tokens = response.json()
+                    if response.status_code >= 500 or response.status_code in (408, 429):
+                        raise DelegationTemporarilyUnavailable(
+                            "Identity provider temporarily unavailable"
+                        )
+                    response.raise_for_status()
+                    tokens = response.json()
+                rotated = tokens.get("refresh_token") or refresh_token
+                self._claims(rotated, str(meta["subject"]), offline=True)
                 claims = self._claims(tokens["access_token"], str(meta["subject"]))
                 if claims.get(self.config.email_claim, owner).lower() != owner:
                     raise ValueError("OIDC owner changed")
-                rotated = tokens.get("refresh_token") or secret["refresh_token"]
-                self._claims(rotated, str(meta["subject"]), offline=True)
                 return self._secret(tokens, claims, rotated)
+            except DelegationTemporarilyUnavailable:
+                if tokens is None:
+                    raise
+                # Keep rotated credentials encrypted, but never vend them before verification.
+                return {**secret, "pending_tokens": tokens}
             except httpx.TransportError:
                 raise DelegationTemporarilyUnavailable(
                     "Identity provider temporarily unavailable"
@@ -205,6 +228,8 @@ class OIDCLoginBroker(OIDCLoginRevoker):
         connection = self.store.refresh_locked(owner, PROVIDER, refresh)
         if connection is None or connection.secret is None:
             raise DelegationUnavailable("Sign in again to renew identity delegation")
+        if connection.secret.get("pending_tokens") is not None:
+            raise DelegationTemporarilyUnavailable("Identity signing keys temporarily unavailable")
         return {**connection.secret, **connection.metadata}
 
     def group_authority(self, state: dict[str, Any]) -> dict[str, Any]:

@@ -35,7 +35,7 @@ class _BoundedJWKClient(jwt.PyJWKClient):
                 cached = self.jwk_set_cache.get() if self.jwk_set_cache is not None else None
                 if cached is not None:
                     return cached
-                raise jwt.PyJWKClientError("JWKS refresh is temporarily rate limited")
+                raise jwt.PyJWKClientConnectionError("JWKS refresh is temporarily rate limited")
             self._next_fetch = now + 30
             return super().fetch_data()
 

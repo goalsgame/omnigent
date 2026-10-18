@@ -186,6 +186,13 @@ _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 15.0
 # the runner binding token; cached factory calls stay local and cheap.
 
 
+class _IdentityLoginRequired(RuntimeError):
+    """Client-safe recovery for missing connector identity during startup."""
+
+    def __init__(self) -> None:
+        super().__init__("Sign in again to restore connector access")
+
+
 class _CodexNativeModelOptionsNotReady(RuntimeError):
     """Raised when Codex model options are requested before bridge startup."""
 
@@ -2594,7 +2601,7 @@ async def _auto_create_pi_terminal(
                 )
     if identity_login_required:
         # Leave the pane uncreated so a renewed login can retry full tool discovery.
-        raise RuntimeError("Sign in again to restore connector access")
+        raise _IdentityLoginRequired()
     from omnigent.runtime.prompt import build_instructions_nullable
 
     system_prompt = (
@@ -7670,6 +7677,12 @@ def _native_terminal_start_error_payload(
         their safe message directly; other causes point to the runner log.
     """
     error_id = f"err_{uuid.uuid4().hex}"
+    if isinstance(exc, _IdentityLoginRequired):
+        return {
+            "code": "identity_login_required",
+            "error_id": error_id,
+            "message": "Sign in again to restore connector access",
+        }
     lifecycle_code = (
         exc.code
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES

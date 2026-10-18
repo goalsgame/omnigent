@@ -228,6 +228,8 @@ class MCPDelegationBroker:
             return str(tokens["access_token"])
 
         def refresh(connection: ProviderConnection) -> dict[str, Any]:
+            if "generation" in connection.metadata:
+                raise DelegationUnavailable("Sign in again to renew identity delegation")
             secret = connection.secret or {}
             if connection.metadata.get("issuer") != self.oidc.issuer:
                 raise DelegationUnavailable("MCP identity requires a new sign-in")

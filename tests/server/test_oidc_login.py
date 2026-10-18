@@ -637,6 +637,33 @@ async def test_logout_while_renewal_disabled_stays_revoked_after_reenable(
             assert broker.cookie_name in response.headers["set-cookie"]
             assert "Max-Age=0" in response.headers["set-cookie"]
         assert response.status_code in (200, 302)
+        from omnigent.server.oidc_mcp import MCPDelegationBroker, MCPDelegationConfig
+
+        for provider in ("oidc_mcp", "oidc_lore"):
+            broker.store.upsert(
+                OWNER,
+                provider,
+                secret={"access_token": "cached", "expires_at": time.time() + 300},
+                metadata={
+                    "issuer": broker.config.issuer,
+                    "subject": SUBJECT,
+                    "generation": state["generation"],
+                },
+            )
+            service = MCPDelegationBroker(
+                MCPDelegationConfig(
+                    "https://tools.example.test", "tools", "openid tools", "machine", "secret"
+                ),
+                broker.config,
+                broker.store,
+                auth,
+                provider=provider,
+            )
+            try:
+                with pytest.raises(DelegationUnavailable, match="Sign in again"):
+                    service.credential(OWNER)
+            finally:
+                service.client.close()
         auth.oidc_login_broker = broker
         app.state.oidc_login_broker = broker
         assert not broker.active(OWNER, state["generation"])
@@ -709,3 +736,143 @@ async def test_temporary_provider_failure_preserves_browser_and_native_renewal(
         assert broker.active(OWNER, state["generation"])
         assert (await renew()).status_code == 200
         assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("key_failure", ["network", "rate-limit"])
+async def test_signing_key_outage_preserves_rotated_response_until_verified(
+    login, db_uri, monkeypatch, signing_key, native, key_failure
+):
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.oidc_machine_auth import _BoundedJWKClient
+    from omnigent.server.routes.device_auth import create_oauth_token_router, issue_login_grant
+
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    rotated = tokens()
+    claims = jwt.decode(rotated["refresh_token"], options={"verify_signature": False})
+    claims["jti"] = "rotated-once"
+    rotated["refresh_token"] = jwt.encode(
+        claims, signing_key, algorithm="RS256", headers={"kid": "fixture"}
+    )
+    unavailable = [False]
+    original_key = broker.jwks.get_signing_key_from_jwt
+    limited = _BoundedJWKClient(broker.config.jwks_uri)
+    limited._next_fetch = time.monotonic() + 30
+
+    def key(token):
+        if unavailable[0]:
+            if key_failure == "rate-limit":
+                limited.fetch_data()
+            raise jwt.PyJWKClientConnectionError("temporary fetch failure")
+        return original_key(token)
+
+    monkeypatch.setattr(broker.jwks, "get_signing_key_from_jwt", key)
+    requests = []
+
+    def provider(request):
+        requests.append(request)
+        assert len(requests) == 1, "must retry verification without reusing rotated refresh token"
+        unavailable[0] = True
+        return httpx.Response(200, json=rotated)
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(provider))
+    auth = UnifiedAuthProvider("oidc", oidc_config=broker.config)
+    auth.oidc_login_broker = broker
+    grants = DeviceGrantStore(db_uri)
+    refresh = issue_login_grant(
+        grants,
+        user_id=OWNER,
+        cookie_secret=broker.config.cookie_secret,
+        oidc_login_generation=state["generation"],
+    )
+    app = FastAPI()
+    app.add_middleware(OIDCLoginMiddleware, broker=broker)
+    app.include_router(create_oauth_token_router(auth, grants))
+
+    @app.get("/v1/probe")
+    def probe():
+        return {"ok": True}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        if not native:
+            client.cookies.set(broker.cookie_name, broker.browser_cookie(OWNER, state))
+
+        async def renew():
+            if native:
+                return await client.post(
+                    "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+                )
+            return await client.get("/v1/probe")
+
+        for _ in range(2):
+            response = await renew()
+            assert response.status_code == 503
+            assert "set-cookie" not in response.headers
+            assert "access_token" not in response.json()
+        pending = broker.store.get(OWNER, PROVIDER, with_secret=True).secret
+        assert pending["refresh_token"] == state["refresh_token"]
+        assert pending["pending_tokens"]["refresh_token"] == rotated["refresh_token"]
+        unavailable[0] = False
+        assert (await renew()).status_code == 200
+        verified = broker.state(OWNER)
+        assert "pending_tokens" not in verified
+        assert verified["refresh_token"] == rotated["refresh_token"]
+        assert verified["generation"] == state["generation"]
+        assert len(requests) == 1
+
+
+def test_pending_rotated_response_never_accepts_wrong_identity(login, monkeypatch):
+    from omnigent.server.oidc_login import DelegationTemporarilyUnavailable
+
+    broker, token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    original = broker.jwks.get_signing_key_from_jwt
+    unavailable = [True]
+
+    def key(value):
+        if unavailable[0]:
+            raise jwt.PyJWKClientConnectionError("temporary failure")
+        return original(value)
+
+    monkeypatch.setattr(broker.jwks, "get_signing_key_from_jwt", key)
+    bad = {**tokens(), "access_token": token(subject="different-subject")}
+    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.client.close()
+    broker.client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=bad))
+    )
+    with pytest.raises(DelegationTemporarilyUnavailable):
+        broker.state(OWNER)
+    unavailable[0] = False
+    with pytest.raises(DelegationUnavailable):
+        broker.state(OWNER)
+
+
+def test_expired_pending_access_renews_with_verified_rotated_refresh(login, signing_key):
+    broker, _token, tokens, calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    pending = tokens()
+    access = jwt.decode(pending["access_token"], options={"verify_signature": False})
+    access["exp"] = int(time.time()) - 1
+    pending["access_token"] = jwt.encode(
+        access, signing_key, algorithm="RS256", headers={"kid": "fixture"}
+    )
+    refresh = jwt.decode(pending["refresh_token"], options={"verify_signature": False})
+    refresh["jti"] = "already-rotated"
+    pending["refresh_token"] = jwt.encode(
+        refresh, signing_key, algorithm="RS256", headers={"kid": "fixture"}
+    )
+    broker.store.update_secret(
+        OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
+    )
+    result = broker.state(OWNER)
+    assert "pending_tokens" not in result
+    assert calls[0]["refresh_token"] == [pending["refresh_token"]]
+    assert result["generation"] == state["generation"]

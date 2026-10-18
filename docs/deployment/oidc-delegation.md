@@ -24,7 +24,10 @@ renewal preserves the original authentication time and cannot satisfy a device
 consent flow's fresh-login requirement. A renewal
 never extends the original offline-delegation deadline. Provider timeouts, rate
 limits and server errors return a retryable 503 without clearing renewal
-credentials. Retry after the provider recovers.
+credentials. Retry after the provider recovers. Temporary signing-key fetch
+failures also remain retryable. If token rotation has already succeeded, the
+response stays encrypted and unavailable until its signatures and identity have
+been verified.
 
 New logins supersede the user's previous offline grant. Logout removes the stored
 grant, making tokens bound to that grant fail validation. Identity-provider

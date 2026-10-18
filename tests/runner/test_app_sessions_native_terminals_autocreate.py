@@ -307,7 +307,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     published: list[dict[str, Any]] = []
 
     if mcp_status == "needs_login":
-        with pytest.raises(RuntimeError, match="Sign in again to restore connector access"):
+        with pytest.raises(
+            RuntimeError, match="Sign in again to restore connector access"
+        ) as failure:
             await _auto_create_pi_terminal(
                 "47f049b9d13df4db397c7f46859b825f",
                 _FakeResourceRegistry(),
@@ -316,6 +318,15 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
                 agent_spec=mcp_spec,
             )
         assert "terminal_name" not in captured
+        error = _publish_native_terminal_start_error(
+            lambda _sid, event: published.append(event),
+            "47f049b9d13df4db397c7f46859b825f",
+            "Pi",
+            failure.value,
+        )
+        assert error["code"] == "identity_login_required"
+        assert error["message"] == "Sign in again to restore connector access"
+        assert published[-1] == {"type": "session.status", "status": "failed", "error": error}
         return
 
     await _auto_create_pi_terminal(
