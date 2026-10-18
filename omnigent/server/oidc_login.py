@@ -85,7 +85,7 @@ class OIDCLoginBroker(OIDCLoginRevoker):
         self.jwks = _BoundedJWKClient(config.jwks_uri)
         self.client = httpx.Client(timeout=15, follow_redirects=False, trust_env=False)
 
-    def _claims(self, token: str, subject: str, *, offline: bool = False) -> dict[str, Any]:
+    def _claims(self, token: str, subject: str, *, allow_expired: bool = False) -> dict[str, Any]:
         try:
             key = self.jwks.get_signing_key_from_jwt(token)
         except jwt.PyJWKClientError:
@@ -99,30 +99,50 @@ class OIDCLoginBroker(OIDCLoginRevoker):
             issuer=self.config.issuer,
             options={
                 "verify_aud": False,
-                "verify_exp": not offline,
-                "require": ["iss", "sub", "iat"],
+                "verify_exp": not allow_expired,
+                "require": ["iss", "sub", "iat", "exp"],
             },
         )
         if claims.get("sub") != subject or claims.get("azp") != self.config.client_id:
             raise ValueError("OIDC delegation identity changed")
-        if offline and claims.get("typ") != "Offline":
-            raise ValueError("An offline refresh token is required")
-        if not offline and claims.get("typ") != "Bearer":
+        if claims.get("typ") != "Bearer":
             raise ValueError("An access token is required")
+        return claims
+
+    @staticmethod
+    def _refresh_token(value: Any) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError("A refresh token is required")
+        return value
+
+    def _owner_claims(
+        self, tokens: dict[str, Any], owner: str, subject: str, *, allow_expired: bool = False
+    ) -> dict[str, Any]:
+        claims = self._claims(tokens["access_token"], subject, allow_expired=allow_expired)
+        email = claims.get(self.config.email_claim, owner)
+        if not isinstance(email, str) or email.lower() != owner:
+            raise ValueError("OIDC owner changed")
         return claims
 
     def capture(
         self, owner: str, subject: str, tokens: dict[str, Any], *, auth_time: int | None = None
     ) -> dict[str, Any]:
-        """Persist only a verified offline grant returned by the login code exchange."""
+        """Capture a refresh credential only from the trusted login code exchange."""
         try:
-            refresh = tokens["refresh_token"]
-            offline = self._claims(refresh, subject, offline=True)
-            claims = self._claims(tokens["access_token"], subject)
+            refresh = self._refresh_token(tokens["refresh_token"])
+            scope = tokens.get("scope", self.config.scopes)
+            if not isinstance(scope, str) or "offline_access" not in scope.split():
+                raise ValueError("Offline access was not granted")
+            claims = self._owner_claims(tokens, owner, subject)
             deadline = time.time() + self.ttl
-            exp = offline.get("exp", 0)
-            if isinstance(exp, (int, float)) and exp > 0:
-                deadline = min(deadline, exp)
+            refresh_lifetime = tokens.get("refresh_expires_in", 0)
+            if isinstance(refresh_lifetime, bool):
+                raise ValueError("Invalid refresh lifetime")
+            refresh_lifetime = float(refresh_lifetime)
+            if not math.isfinite(refresh_lifetime) or refresh_lifetime < 0:
+                raise ValueError("Invalid refresh lifetime")
+            if refresh_lifetime > 0:
+                deadline = min(deadline, time.time() + refresh_lifetime)
             if deadline <= time.time():
                 raise ValueError("Offline grant expired")
             secret = self._secret(tokens, claims, refresh)
@@ -174,17 +194,13 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                 return secret
             tokens = pending
             try:
-                refresh_token = secret["refresh_token"]
+                refresh_token = self._refresh_token(secret["refresh_token"])
                 if tokens is not None:
-                    rotated = tokens.get("refresh_token") or refresh_token
-                    self._claims(rotated, str(meta["subject"]), offline=True)
-                    try:
-                        pending_claims = self._claims(tokens["access_token"], str(meta["subject"]))
-                        if float(pending_claims["exp"]) <= time.time() + 60:
-                            refresh_token = rotated
-                            tokens = None
-                    except jwt.ExpiredSignatureError:
-                        # Only a verified offline token may renew an expired pending response.
+                    rotated = self._refresh_token(tokens.get("refresh_token", refresh_token))
+                    pending_claims = self._owner_claims(
+                        tokens, owner, str(meta["subject"]), allow_expired=True
+                    )
+                    if float(pending_claims["exp"]) <= time.time() + 60:
                         refresh_token = rotated
                         tokens = None
                 if tokens is None:
@@ -205,13 +221,12 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                     tokens = response.json()
                     tokens = {
                         **tokens,
-                        "refresh_token": tokens.get("refresh_token") or refresh_token,
+                        "refresh_token": self._refresh_token(
+                            tokens.get("refresh_token", refresh_token)
+                        ),
                     }
-                rotated = tokens.get("refresh_token") or refresh_token
-                self._claims(rotated, str(meta["subject"]), offline=True)
-                claims = self._claims(tokens["access_token"], str(meta["subject"]))
-                if claims.get(self.config.email_claim, owner).lower() != owner:
-                    raise ValueError("OIDC owner changed")
+                rotated = self._refresh_token(tokens.get("refresh_token", refresh_token))
+                claims = self._owner_claims(tokens, owner, str(meta["subject"]))
                 return self._secret(tokens, claims, rotated)
             except DelegationTemporarilyUnavailable:
                 if tokens is None:

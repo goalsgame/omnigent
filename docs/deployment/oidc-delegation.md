@@ -3,7 +3,7 @@
 Set `OMNIGENT_OIDC_DELEGATION_TTL_HOURS=168` and include `offline_access` in
 `OMNIGENT_OIDC_SCOPES` to enable a seven-day interactive login. The default is
 zero (disabled). This requires a confidential generic OIDC provider with RS256
-JWKS, offline refresh tokens, and encrypted credential storage. Configure the
+JWKS for its access tokens, offline refresh credentials, and encrypted storage. Configure the
 identity provider's client offline-session maximum and idle timeout to match.
 The maximum configurable application lifetime is 720 hours.
 
@@ -12,6 +12,15 @@ Lore share that login grant and obtain separate, audience-validated access
 tokens. Refresh-token rotation is serialized through the credential store;
 downstream exchanges request access tokens only. Machine identities retain their
 existing exchange and binding policies. No shared machine fallback is used.
+
+Refresh credentials are opaque, even when the provider encodes them as JWTs with
+an unpublished symmetric key. Only trusted authorization-code/token endpoint
+responses supply these credentials. The initial response must grant
+`offline_access`; an omitted scope retains the requested scopes under OAuth.
+Identity, issuer, client and group checks use the signed access token. An
+explicit positive `refresh_expires_in` further bounds the initial grant lifetime;
+the configured absolute cap always applies. Omnigent never uses refresh-token
+claims as authentication authority.
 
 Browser login issues an independent Secure/HttpOnly renewal cookie. Local access
 tokens expire within fifteen minutes and HTTP requests and browser WebSocket
