@@ -458,6 +458,8 @@ def create_oauth_token_router(
         # stays restricted to the delegated allowlist.
         scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
         login = getattr(auth_provider, "oidc_login_broker", None)
+        if grant.oidc_login_generation and login is None:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
         if (
             login is not None
             and _is_login_grant(client_id)
@@ -653,6 +655,14 @@ def create_oauth_token_router(
             # Idempotent: nothing to revoke is still "revoked" from the
             # caller's perspective. Don't leak which tokens exist.
             return JSONResponse(status_code=200, content={"revoked": True})
+        login = getattr(auth_provider, "oidc_login_broker", None)
+        if (
+            login is not None
+            and _is_login_grant(grant.client_id)
+            and grant.user_id is not None
+            and grant.oidc_login_generation
+        ):
+            await asyncio.to_thread(login.revoke, grant.user_id, grant.oidc_login_generation)
         device_grant_store.revoke(grant.id)
         _logger.info("oauth/revoke: revoked grant %s", grant.id)
         return JSONResponse(status_code=200, content={"revoked": True})

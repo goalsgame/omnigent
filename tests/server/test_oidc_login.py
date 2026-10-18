@@ -517,3 +517,82 @@ def test_websocket_can_authenticate_with_only_renewal_cookie(login, revoked):
         else:
             with client.websocket_connect("/v1/socket") as connection:
                 assert connection.receive_json() == {"user": OWNER}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_native_logout_revokes_only_original_login(login, db_uri, superseded):
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+    from omnigent.server.routes.device_auth import create_oauth_token_router, issue_login_grant
+
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    access = broker.session_token(OWNER, state)
+    auth = UnifiedAuthProvider("oidc", oidc_config=broker.config)
+    auth.oidc_login_broker = broker
+    grants = DeviceGrantStore(db_uri)
+    refresh = issue_login_grant(
+        grants,
+        user_id=OWNER,
+        cookie_secret=broker.config.cookie_secret,
+        oidc_login_generation=state["generation"],
+    )
+    current = broker.capture(OWNER, SUBJECT, tokens()) if superseded else state
+    app = FastAPI()
+    app.include_router(create_oauth_token_router(auth, grants))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        response = await client.post("/oauth/revoke", data={"refresh_token": refresh})
+        assert response.status_code == 200
+        assert not broker.active(OWNER, state["generation"])
+        assert broker.active(OWNER, current["generation"]) is superseded
+        assert (
+            grants.get_by_refresh_hash(hash_secret(refresh, broker.config.cookie_secret)) is None
+        )
+        from starlette.requests import Request as StarletteRequest
+
+        request = StarletteRequest(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/v1/me",
+                "headers": [(b"authorization", f"Bearer {access}".encode())],
+            }
+        )
+        assert auth.get_user_id(request) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ["active", "revoked", "superseded"])
+async def test_disabled_broker_cannot_unbind_native_refresh(login, db_uri, authority):
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.routes.device_auth import create_oauth_token_router, issue_login_grant
+
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    grants = DeviceGrantStore(db_uri)
+    refresh = issue_login_grant(
+        grants,
+        user_id=OWNER,
+        cookie_secret=broker.config.cookie_secret,
+        oidc_login_generation=state["generation"],
+    )
+    if authority == "revoked":
+        broker.revoke(OWNER, state["generation"])
+    elif authority == "superseded":
+        broker.capture(OWNER, SUBJECT, tokens())
+    auth = UnifiedAuthProvider("oidc", oidc_config=broker.config)
+    app = FastAPI()
+    app.include_router(create_oauth_token_router(auth, grants))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        response = await client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+        )
+        assert response.status_code == 400
+        assert response.json()["error"] == "invalid_grant"
+        assert "access_token" not in response.json()
