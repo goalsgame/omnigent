@@ -20,14 +20,21 @@ __all__ = ["oidc", "signing_key"]
 OWNER, SUBJECT = "person@example.test", "human-subject"
 
 
-@pytest.fixture
-def login(db_uri, monkeypatch, oidc, signing_key):
+@pytest.fixture(params=["opaque", "hs512"])
+def login(request, db_uri, monkeypatch, oidc, signing_key):
     config = dataclasses.replace(oidc, scopes="openid email profile offline_access")
     jwk = jwt.algorithms.RSAAlgorithm.to_jwk(signing_key.public_key(), as_dict=True)
     jwk.update(kid="fixture", alg="RS256", use="sig")
+
+    def public_key(self, value):
+        assert jwt.get_unverified_header(value)["alg"] == "RS256", (
+            "Refresh credentials must not use JWKS"
+        )
+        return jwt.PyJWK.from_dict(jwk)
+
     monkeypatch.setattr(
         "omnigent.server.oidc_login._BoundedJWKClient.get_signing_key_from_jwt",
-        lambda self, token: jwt.PyJWK.from_dict(jwk),
+        public_key,
     )
     broker = OIDCLoginBroker(config, CredentialStore(db_uri, _FakeCipher()), 168)
 
@@ -52,7 +59,21 @@ def login(db_uri, monkeypatch, oidc, signing_key):
         )
 
     def tokens():
-        return {"access_token": token(), "refresh_token": token("Offline"), "expires_in": 900}
+        refresh = "opaque-refresh-credential"
+        if request.param == "hs512":
+            refresh = jwt.encode(
+                {"typ": "Offline", "sub": SUBJECT, "iat": int(time.time()), "exp": 0},
+                "fixture-unpublished-refresh-signing-key-" * 3,
+                algorithm="HS512",
+                headers={"kid": "private-refresh-key"},
+            )
+        return {
+            "access_token": token(),
+            "refresh_token": refresh,
+            "expires_in": 900,
+            "scope": config.scopes,
+            "refresh_expires_in": 0,
+        }
 
     calls = []
 
@@ -86,11 +107,12 @@ def test_weekly_cap_and_shared_refresh(login):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("kind,subject", [("Refresh", SUBJECT), ("Offline", "other-person")])
-def test_reject_online_or_wrong_owner_grant(login, kind, subject):
+@pytest.mark.parametrize(
+    "scope,subject", [("openid email profile", SUBJECT), ("openid offline_access", "other-person")]
+)
+def test_reject_missing_offline_access_or_wrong_access_subject(login, scope, subject):
     broker, token, tokens, _calls = login
-    value = tokens()
-    value["refresh_token"] = token(kind, subject)
+    value = {**tokens(), "access_token": token(subject=subject), "scope": scope}
     with pytest.raises(DelegationUnavailable):
         broker.capture(OWNER, SUBJECT, value)
     assert broker.store.get(OWNER, PROVIDER) is None
@@ -753,11 +775,7 @@ async def test_signing_key_outage_preserves_rotated_response_until_verified(
     state = broker.capture(OWNER, SUBJECT, tokens())
     broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
     rotated = tokens()
-    claims = jwt.decode(rotated["refresh_token"], options={"verify_signature": False})
-    claims["jti"] = "rotated-once"
-    rotated["refresh_token"] = jwt.encode(
-        claims, signing_key, algorithm="RS256", headers={"kid": "fixture"}
-    )
+    rotated["refresh_token"] = "rotated-opaque-credential"
     unavailable = [False]
     original_key = broker.jwks.get_signing_key_from_jwt
     limited = _BoundedJWKClient(broker.config.jwks_uri)
@@ -867,11 +885,7 @@ def test_expired_pending_access_renews_with_verified_rotated_refresh(
     pending["access_token"] = jwt.encode(
         access, signing_key, algorithm="RS256", headers={"kid": "fixture"}
     )
-    refresh = jwt.decode(pending["refresh_token"], options={"verify_signature": False})
-    refresh["jti"] = "already-rotated"
-    pending["refresh_token"] = jwt.encode(
-        refresh, signing_key, algorithm="RS256", headers={"kid": "fixture"}
-    )
+    pending["refresh_token"] = "already-rotated"
     broker.store.update_secret(
         OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
     )
@@ -894,11 +908,7 @@ def test_pending_renewal_without_refresh_field_preserves_effective_token(
     pending["access_token"] = jwt.encode(
         access, signing_key, algorithm="RS256", headers={"kid": "fixture"}
     )
-    refresh = jwt.decode(pending["refresh_token"], options={"verify_signature": False})
-    refresh["jti"] = "rotated-refresh"
-    pending["refresh_token"] = jwt.encode(
-        refresh, signing_key, algorithm="RS256", headers={"kid": "fixture"}
-    )
+    pending["refresh_token"] = "rotated-refresh"
     broker.store.update_secret(
         OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
     )
@@ -949,7 +959,7 @@ def test_unknown_rotated_key_during_populated_cache_cooldown_is_retryable(
     state = broker.capture(OWNER, SUBJECT, tokens())
     broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
     rotated = tokens()
-    for field in ("access_token", "refresh_token"):
+    for field in ("access_token",):
         claims = jwt.decode(rotated[field], options={"verify_signature": False})
         rotated[field] = jwt.encode(
             claims, signing_key, algorithm="RS256", headers={"kid": "new-key"}
@@ -980,3 +990,81 @@ def test_unknown_rotated_key_during_populated_cache_cooldown_is_retryable(
     assert "pending_tokens" not in recovered
     assert len(requests) == 1
     assert not calls
+
+
+@pytest.mark.parametrize("refresh", [None, "", 42, {}, []])
+def test_login_rejects_missing_or_invalid_refresh_credential(login, refresh):
+    broker, _token, tokens, _calls = login
+    with pytest.raises(DelegationUnavailable):
+        broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_token": refresh})
+    assert broker.store.get(OWNER, PROVIDER) is None
+
+
+@pytest.mark.parametrize("lifetime", [0, 120, 999999])
+def test_trusted_refresh_lifetime_bounds_initial_deadline(login, lifetime):
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_expires_in": lifetime})
+    expected = min(lifetime or 604800, 604800)
+    assert expected - 5 < state["deadline"] - time.time() <= expected
+
+
+def test_omitted_scope_retains_requested_offline_scope(login):
+    broker, _token, tokens, _calls = login
+    response = tokens()
+    response.pop("scope")
+    assert broker.capture(OWNER, SUBJECT, response)["subject"] == SUBJECT
+
+
+@pytest.mark.asyncio
+async def test_browser_callback_accepts_provider_private_refresh_signature(offline_auth_app):
+    from urllib.parse import parse_qs, urlsplit
+
+    app, broker, _tokens = offline_auth_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        login_response = await client.get("/auth/login")
+        state = parse_qs(urlsplit(login_response.headers["location"]).query)["state"][0]
+        response = await client.get("/auth/callback", params={"state": state, "code": "fixture"})
+        assert response.status_code == 302
+        assert broker.cookie_name in response.headers["set-cookie"]
+        assert broker.browser_identity(client.cookies.get(broker.cookie_name))[0] == OWNER
+        assert broker.state(OWNER)["subject"] == SUBJECT
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("sub", "other-subject"),
+        ("email", "other@example.test"),
+        ("iss", "https://other.example.test"),
+        ("azp", "other-client"),
+        ("typ", "ID"),
+    ],
+)
+def test_expired_pending_access_must_still_match_identity_before_renewal(
+    login, signing_key, field, value
+):
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    pending = tokens()
+    claims = jwt.decode(pending["access_token"], options={"verify_signature": False})
+    claims.update({"exp": int(time.time()) - 1, field: value})
+    pending["access_token"] = jwt.encode(
+        claims, signing_key, algorithm="RS256", headers={"kid": "fixture"}
+    )
+    pending["refresh_token"] = "rotated-opaque-credential"
+    broker.store.update_secret(
+        OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
+    )
+    with pytest.raises(DelegationUnavailable):
+        broker.state(OWNER)
+    assert not _calls
+
+
+@pytest.mark.parametrize("lifetime", [-1, float("nan"), float("inf"), True])
+def test_invalid_refresh_lifetime_is_rejected(login, lifetime):
+    broker, _token, tokens, _calls = login
+    with pytest.raises(DelegationUnavailable):
+        broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_expires_in": lifetime})
+    assert broker.store.get(OWNER, PROVIDER) is None
