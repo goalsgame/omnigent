@@ -81,6 +81,7 @@ jobs:
         run: |
           uv sync --locked --group lint \
             --extra gcs \
+            --extra gcp-kms \
             --extra hindsight \
             --extra nimble \
             --extra s3 \

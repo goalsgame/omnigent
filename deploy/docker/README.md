@@ -196,6 +196,9 @@ login flow itself (`/auth/login`, `/auth/callback`, `/auth/logout`)
 with a signed session cookie. No extra container, no Caddy basic-auth
 shim, no oauth2-proxy.
 
+For independent state cookies during overlapping sign-ins, see the
+[concurrent-login setting and rollout requirements](../../docs/deployment/oidc-state-cookies.md).
+
 ### Walkthrough: GitHub OAuth (easiest to register)
 
 1. **Register the OAuth app.** Go to

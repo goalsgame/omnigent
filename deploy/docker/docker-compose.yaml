@@ -120,6 +120,8 @@ services:
       # IdPs (e.g. Microsoft Entra ID) that issue preferred_username
       # instead of email. Empty means the default (email); see .env.example.
       OMNIGENT_OIDC_EMAIL_CLAIM: "${OMNIGENT_OIDC_EMAIL_CLAIM:-}"
+      # Enable only after all callback handlers support per-flow state cookies.
+      OMNIGENT_OIDC_FLOW_STATE_COOKIES: "${OMNIGENT_OIDC_FLOW_STATE_COOKIES:-false}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

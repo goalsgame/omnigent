@@ -33,7 +33,9 @@ _VERIFIER = "v" * 64
 _NATIVE_STATE = "desktop-state-123"
 
 
-def _config(allowed_domains: frozenset[str] | None = None) -> OIDCConfig:
+def _config(
+    allowed_domains: frozenset[str] | None = None, *, flow_state_cookies: bool = True
+) -> OIDCConfig:
     """Build a GitHub-flavoured OIDC config whose IdP calls are mocked."""
     return OIDCConfig(
         issuer="https://github.com",
@@ -51,6 +53,7 @@ def _config(allowed_domains: frozenset[str] | None = None) -> OIDCConfig:
         jwks_uri=None,
         userinfo_endpoint="https://api.github.com/user",
         allow_invites=False,
+        flow_state_cookies=flow_state_cookies,
     )
 
 
@@ -58,11 +61,12 @@ def _transport(
     *,
     allowed_domains: frozenset[str] | None = None,
     device_grant_store: object | None = None,
+    flow_state_cookies: bool = True,
 ) -> httpx.ASGITransport:
     """Mount only the OIDC auth router on a bare FastAPI app."""
     from fastapi import FastAPI
 
-    config = _config(allowed_domains)
+    config = _config(allowed_domains, flow_state_cookies=flow_state_cookies)
     router = create_auth_router(
         auth_provider=UnifiedAuthProvider(source="oidc", oidc_config=config),
         permission_store=None,
@@ -101,28 +105,37 @@ def _native_params(**overrides: str) -> dict[str, str]:
     return params
 
 
-async def _start(client: httpx.AsyncClient, redirect: str = _REDIRECT) -> tuple[str, str]:
+async def _start(
+    client: httpx.AsyncClient, redirect: str = _REDIRECT
+) -> tuple[str, tuple[str, str]]:
     """Begin a native sign-in; return the IdP ``state`` and the state cookie."""
     resp = await client.get("/auth/login", params=_native_params(native_redirect_uri=redirect))
     assert resp.status_code == 302
     idp_state = parse_qs(urlparse(resp.headers["location"]).query)["state"][0]
-    return idp_state, resp.cookies["ap_auth_state"]
+    return idp_state, next(
+        (name, value) for name, value in resp.cookies.items() if name.startswith("ap_auth_state")
+    )
 
 
 async def _callback(
     client: httpx.AsyncClient,
     idp_state: str,
-    state_cookie: str,
+    state_cookie: tuple[str, str],
     idp: AsyncMock | None = None,
     params: dict[str, str] | None = None,
 ) -> httpx.Response:
+    original = next(iter(client.cookies.jar), None)
+    domain = original.domain if original is not None else "test.local"
     client.cookies.clear()
-    client.cookies.set("ap_auth_state", state_cookie)
+    client.cookies.set(*state_cookie, domain=domain, path="/")
     with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=idp or _idp_client()):
-        return await client.get(
+        response = await client.get(
             "/auth/callback",
             params=params if params is not None else {"code": "idp-code", "state": idp_state},
         )
+    if response.status_code == 302:
+        assert state_cookie[0] not in client.cookies
+    return response
 
 
 def _loopback_query(resp: httpx.Response) -> dict[str, str]:
@@ -191,7 +204,7 @@ async def test_native_sign_in_preserves_pkce_after_browser_cookie_retry(redirect
         assert not first.cookies
         match = re.search(r'<a id="continue-sign-in" href="([^"]+)"', first.text)
         assert match is not None
-        client.cookies.set("ap_auth_state", state_cookie)
+        client.cookies.set(*state_cookie)
         with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=_idp_client()):
             callback = await client.get(unescape(match[1]), headers={"Accept": "text/html"})
         query = _loopback_query(callback) if redirect == _REDIRECT else _ios_query(callback)
@@ -322,7 +335,11 @@ async def test_login_accepts_ipv6_loopback() -> None:
         resp = await client.get("/auth/login", params=_native_params(native_redirect_uri=redirect))
 
     assert resp.status_code == 302
-    state = jwt.decode(resp.cookies["ap_auth_state"], _TEST_SECRET, algorithms=["HS256"])
+    state = jwt.decode(
+        next(value for name, value in resp.cookies.items() if name.startswith("ap_auth_state_")),
+        _TEST_SECRET,
+        algorithms=["HS256"],
+    )
     assert state["native"]["redirect_uri"] == redirect
 
 
@@ -375,7 +392,7 @@ async def test_native_callback_reports_token_exchange_failure_to_loopback() -> N
 async def test_callback_without_valid_state_never_redirects_to_loopback() -> None:
     """A forged or missing state cookie can't steer the browser to a loopback."""
     async with _client(_transport()) as client:
-        idp_state, _ = await _start(client)
+        idp_state, state_cookie = await _start(client)
         forged = jwt.encode(
             {"state": idp_state, "native": {"redirect_uri": _REDIRECT}},
             b"x" * 32,
@@ -384,7 +401,7 @@ async def test_callback_without_valid_state_never_redirects_to_loopback() -> Non
         resp = await _callback(
             client,
             idp_state,
-            forged,
+            (state_cookie[0], forged),
             params={"error": "access_denied", "state": idp_state},
         )
 
@@ -397,7 +414,15 @@ async def test_browser_login_is_unchanged_by_native_support() -> None:
     async with _client(_transport()) as client:
         resp = await client.get("/auth/login", params={"return_to": "/c/1"})
         idp_state = parse_qs(urlparse(resp.headers["location"]).query)["state"][0]
-        callback = await _callback(client, idp_state, resp.cookies["ap_auth_state"])
+        callback = await _callback(
+            client,
+            idp_state,
+            next(
+                (name, value)
+                for name, value in resp.cookies.items()
+                if name.startswith("ap_auth_state")
+            ),
+        )
 
     assert callback.status_code == 302
     assert callback.headers["location"] == "/c/1"
@@ -415,7 +440,7 @@ async def test_ios_sign_in_delivers_code_to_app_scheme_and_exchanges() -> None:
     """The iOS app's private-use-scheme redirect runs the same flow as loopback."""
     async with _client(_transport()) as client:
         idp_state, state_cookie = await _start(client, _IOS_REDIRECT)
-        state = jwt.decode(state_cookie, _TEST_SECRET, algorithms=["HS256"])
+        state = jwt.decode(state_cookie[1], _TEST_SECRET, algorithms=["HS256"])
         callback = await _callback(client, idp_state, state_cookie)
         query = _ios_query(callback)
         resp = await _exchange(
@@ -492,3 +517,31 @@ async def test_native_exchange_requires_the_exact_redirect_uri(
 
     assert resp.status_code == 400
     assert resp.json() == {"error": "invalid_grant"}
+
+
+@pytest.mark.parametrize("legacy_writer", [False, True])
+async def test_native_login_accepts_legacy_cookie(legacy_writer: bool) -> None:
+    async with _client(_transport(flow_state_cookies=not legacy_writer)) as client:
+        state, cookie = await _start(client)
+        if legacy_writer:
+            assert cookie[0] == "ap_auth_state"
+        else:
+            assert cookie[0].startswith("ap_auth_state_")
+        response = await _callback(client, state, ("ap_auth_state", cookie[1]))
+        query = _loopback_query(response)
+        token = await _exchange(
+            client, code=query["code"], code_verifier=_VERIFIER, redirect_uri=_REDIRECT
+        )
+    assert token.status_code == 200
+    assert token.json()["user_id"] == "alice@example.com"
+
+
+async def test_compatibility_mode_accepts_flow_cookies_before_enabling_writer() -> None:
+    async with _client(_transport()) as writer:
+        state, cookie = await _start(writer)
+    async with _client(_transport(flow_state_cookies=False)) as reader:
+        query = _loopback_query(await _callback(reader, state, cookie))
+        response = await _exchange(
+            reader, code=query["code"], code_verifier=_VERIFIER, redirect_uri=_REDIRECT
+        )
+    assert response.status_code == 200

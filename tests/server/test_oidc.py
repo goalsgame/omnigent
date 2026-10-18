@@ -957,3 +957,22 @@ def test_oidc_redirect_uri_required_without_domain(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(RuntimeError, match="OMNIGENT_OIDC_REDIRECT_URI"):
         OIDCConfig.from_env()
+
+
+@pytest.mark.parametrize("issuer", ["https://github.com", "https://id.example.test"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_flow_state_cookie_writer_is_explicitly_enabled(monkeypatch, issuer, enabled) -> None:
+    monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", issuer)
+    monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_ID", "test-client")
+    monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_SECRET", "test-secret")
+    monkeypatch.setenv("OMNIGENT_OIDC_REDIRECT_URI", "https://app.example.test/auth/callback")
+    monkeypatch.setenv("OMNIGENT_OIDC_COOKIE_SECRET", "aa" * 32)
+    if enabled:
+        monkeypatch.setenv("OMNIGENT_OIDC_FLOW_STATE_COOKIES", "true")
+    else:
+        monkeypatch.delenv("OMNIGENT_OIDC_FLOW_STATE_COOKIES", raising=False)
+    if issuer != "https://github.com":
+        monkeypatch.setenv("OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT", issuer + "/authorize")
+        monkeypatch.setenv("OMNIGENT_OIDC_TOKEN_ENDPOINT", issuer + "/token")
+        monkeypatch.setenv("OMNIGENT_OIDC_JWKS_URI", issuer + "/jwks")
+    assert OIDCConfig.from_env().flow_state_cookies is enabled

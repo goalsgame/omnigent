@@ -53,6 +53,7 @@ def _make_oidc_config() -> OIDCConfig:
         jwks_uri=None,
         userinfo_endpoint="https://api.github.com/user",
         allow_invites=False,
+        flow_state_cookies=True,
     )
 
 
@@ -158,7 +159,7 @@ async def test_login_redirects_to_idp_with_pkce_params() -> None:
     assert "state" in params
     assert "code_challenge" in params
     # Auth state cookie must be set.
-    assert "ap_auth_state" in resp.cookies
+    assert any(name.startswith("ap_auth_state_") for name in resp.cookies)
 
 
 # ── 2. CLI login ───────────────────────────────────────────────────

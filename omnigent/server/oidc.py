@@ -184,6 +184,8 @@ class OIDCConfig:
         ``id_token`` email claim without requiring
         ``email_verified``. Only affects the generic-OIDC path;
         GitHub always requires a verified primary email.
+    :param flow_state_cookies: Issue independent state cookies for concurrent
+        logins. Enable only after every callback handler can read both formats.
     :param email_claim: Name of the ``id_token`` claim that carries
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
@@ -207,6 +209,7 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    flow_state_cookies: bool = False
 
     @property
     def base_url(self) -> str:
@@ -335,6 +338,7 @@ class OIDCConfig:
         from omnigent.server.auth import env_var_is_truthy
 
         allow_invites = env_var_is_truthy("OMNIGENT_OIDC_ALLOW_INVITES")
+        flow_state_cookies = env_var_is_truthy("OMNIGENT_OIDC_FLOW_STATE_COOKIES")
 
         # Some IdPs (e.g. Okta without custom API Access Management)
         # omit ``email_verified`` for directory-provisioned users even
@@ -429,6 +433,7 @@ class OIDCConfig:
                 userinfo_endpoint=_GITHUB_USERINFO_ENDPOINT,
                 allow_invites=allow_invites,
                 skip_email_verification=skip_email_verification,
+                flow_state_cookies=flow_state_cookies,
             )
 
         # Standard OIDC: fetch discovery document.
@@ -475,4 +480,5 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            flow_state_cookies=flow_state_cookies,
         )
