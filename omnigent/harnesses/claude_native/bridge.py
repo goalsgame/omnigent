@@ -6573,6 +6573,7 @@ def _tool_relay_handler_factory(
             if self.path not in (
                 "/tool",
                 "/events",
+                "/mcp",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
                 "/hook/observe-tool",
@@ -6585,6 +6586,9 @@ def _tool_relay_handler_factory(
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/mcp":
+                self._handle_mcp(payload)
                 return
             if self.path == "/events":
                 self._handle_native_event(payload)
@@ -6796,6 +6800,33 @@ def _tool_relay_handler_factory(
             self.end_headers()
             self.wfile.write(raw)
 
+        def _handle_mcp(self, payload: _JsonObject) -> None:
+            """Forward tool RPCs through renewable auth, bound to this relay's session."""
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            if payload.get("jsonrpc") != "2.0" or payload.get("method") != "tools/call":
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            import urllib.parse as _up
+
+            url = f"/v1/sessions/{_up.quote(session_id, safe='')}/mcp"
+            future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
+            try:
+                response = future.result(timeout=86400.0)
+            except Exception:  # noqa: BLE001 — a failed forward never executes locally
+                future.cancel()
+                self.send_error(HTTPStatus.BAD_GATEWAY)
+                return
+            raw = response.content
+            self.send_response(response.status_code)
+            content_type = response.headers.get("Content-Type")
+            if content_type is not None:
+                self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
@@ -6864,7 +6895,7 @@ def _tool_relay_handler_factory(
                 length = int(length_raw)
             except ValueError:
                 return None
-            if self.path == "/events" and not 0 <= length <= 16_777_216:
+            if self.path in ("/events", "/mcp") and not 0 <= length <= 16_777_216:
                 return None
             if self.path == "/hook/observe-tool" and not 0 <= length <= 1_048_576:
                 return None
