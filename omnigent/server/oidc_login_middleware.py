@@ -64,7 +64,15 @@ class OIDCLoginMiddleware:
                 },
                 status_code=401,
             )
-            if request.method == "GET" and request.url.path.startswith(("/c/", "/artifacts/")):
+            if (
+                request.method == "GET"
+                and not request.url.path.startswith(("/v1/", "/oauth/"))
+                and (
+                    request.url.path.startswith(("/c/", "/artifacts/"))
+                    or "text/html" in request.headers.get("accept", "")
+                    or request.headers.get("sec-fetch-dest") == "document"
+                )
+            ):
                 base = getattr(request.app.state, "base_path", "")
                 response = RedirectResponse(
                     base + "/auth/login?" + urlencode({"return_to": base + request.url.path}),

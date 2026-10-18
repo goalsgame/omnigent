@@ -110,3 +110,73 @@ async def test_failed_turn_log_keeps_source_code_and_harness(
     assert {key: value for key, value in attrs.items() if key.startswith("source_")} == expected
     assert "private prompt" not in json.dumps(attrs)
     assert "private failure detail" not in json.dumps(attrs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("needs_login", [True, False])
+async def test_identity_discovery_failure_aborts_stream_before_harness(monkeypatch, needs_login):
+    from omnigent.runner.mcp_manager import McpSchemasResult
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.spec.types import MCPServerConfig
+
+    harness = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "fixture"}})]
+    )
+
+    async def schemas(self, spec):
+        return McpSchemasResult(
+            schemas=[],
+            tool_names=set(),
+            failures={
+                "fixture": "Sign in again to restore connector access"
+                if needs_login
+                else "MCP server unavailable"
+            },
+        )
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+
+    async def resolve(agent_id, session_id=None):
+        return AgentSpec(
+            spec_version=1,
+            name="fixture",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+            mcp_servers=[
+                MCPServerConfig(
+                    name="fixture", transport="http", url="https://tools.example.test/mcp"
+                )
+            ],
+        )
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),
+        spec_resolver=resolve,
+        server_client=NullServerClient(),
+    )
+    sid = "a4f6a4f0f2f74d76a2e4c0c9a8e0f9aa"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": sid, "agent_id": "965906f5d9fb596610dda599a80faaee"},
+        )
+        assert created.status_code == 201
+        response = await client.post(
+            f"/v1/sessions/{sid}/events?stream=true",
+            json={
+                "type": "message",
+                "has_mcp_servers": True,
+                "role": "user",
+                "agent_id": "965906f5d9fb596610dda599a80faaee",
+                "model": "fixture",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "runner-test-default",
+            },
+        )
+        assert response.status_code == 200
+        if needs_login:
+            assert "identity_login_required" in response.text
+            assert "response.failed" in response.text
+            assert not harness.posted_bodies
+        else:
+            assert "identity_login_required" not in response.text
+            assert harness.posted_bodies

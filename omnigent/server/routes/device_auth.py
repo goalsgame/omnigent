@@ -203,6 +203,7 @@ def mint_delegated_token(
     account_generation: str | None = None,
     group_authority: dict[str, object] | None = None,
     oidc_grant_id: str | None = None,
+    auth_time: int | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -262,6 +263,8 @@ def mint_delegated_token(
         payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
+    if auth_time is not None:
+        payload["auth_time"] = auth_time
     if oidc_grant_id is not None:
         payload["oidc_grant_id"] = oidc_grant_id
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
@@ -344,6 +347,7 @@ def issue_login_grant(
     user_id: str,
     cookie_secret: bytes,
     group_authority: dict[str, object] | None = None,
+    oidc_login_generation: str | None = None,
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -366,6 +370,7 @@ def issue_login_grant(
         user_id=user_id,
         client_id=LOGIN_GRANT_CLIENT_ID,
         group_authority=group_authority,
+        oidc_login_generation=oidc_login_generation,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
         created_at=int(time.time()),
     )
@@ -453,9 +458,20 @@ def create_oauth_token_router(
         # stays restricted to the delegated allowlist.
         scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
         login = getattr(auth_provider, "oidc_login_broker", None)
+        if (
+            login is not None
+            and _is_login_grant(client_id)
+            and (
+                not grant.oidc_login_generation
+                or not login.active(user_id, grant.oidc_login_generation)
+            )
+        ):
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
         login_state = (
             login.state(user_id) if login is not None and _is_login_grant(client_id) else None
         )
+        if login_state is not None and login_state["generation"] != grant.oidc_login_generation:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
         return mint_delegated_token(
             user_id,
             cookie_secret,
@@ -470,6 +486,7 @@ def create_oauth_token_router(
             oidc_grant_id=login_state["generation"]
             if login_state is not None and login is not None
             else None,
+            auth_time=login_state["auth_time"] if login_state is not None else None,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -842,8 +859,8 @@ def create_device_auth_router(
             payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        iat = payload.get("iat")
-        return iat if isinstance(iat, int) else None
+        iat = payload.get("auth_time", payload.get("iat"))
+        return iat if isinstance(iat, int) and not isinstance(iat, bool) else None
 
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:

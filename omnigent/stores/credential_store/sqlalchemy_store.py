@@ -378,7 +378,14 @@ class CredentialStore:
             )
             return self._to_entity(row, with_secret=with_secret) if row is not None else None
 
-    def delete(self, user_id: str, provider: str, *, account_id: str = "") -> bool:
+    def delete(
+        self,
+        user_id: str,
+        provider: str,
+        *,
+        account_id: str = "",
+        expected_metadata: dict[str, Any] | None = None,
+    ) -> bool:
         """Remove a user's connection for *provider*. Returns ``True`` if a row went."""
 
         def write(session: Session) -> bool:
@@ -390,6 +397,11 @@ class CredentialStore:
                         SqlConnection.user_id == user_id,
                         SqlConnection.provider == provider,
                         SqlConnection.account_id == account_id,
+                        *(
+                            [SqlConnection.metadata_json == json.dumps(expected_metadata)]
+                            if expected_metadata is not None
+                            else []
+                        ),
                     )
                 ),
             )

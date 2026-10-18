@@ -15,9 +15,12 @@ existing exchange and binding policies. No shared machine fallback is used.
 
 Browser login issues an independent Secure/HttpOnly renewal cookie. Local access
 tokens expire within fifteen minutes and renew automatically from the bounded
-server-side grant. Native and CLI logins use the existing refresh-grant protocol;
+server-side grant. Native and CLI logins use the existing refresh-grant protocol, with each local
+refresh grant bound to its originating OIDC generation;
 set `OMNIGENT_GRANT_MAX_LIFETIME_DAYS=7` to bound those local grants as well.
-Identity-provider group claims are refreshed with the access token. A renewal
+Identity-provider group claims are refreshed with the access token. Silent
+renewal preserves the original authentication time and cannot satisfy a device
+consent flow's fresh-login requirement. A renewal
 never extends the original offline-delegation deadline.
 
 New logins supersede the user's previous offline grant. Logout removes the stored
@@ -29,7 +32,9 @@ rather than waiting for transport timeouts.
 
 Enable offline access at the identity provider before enabling the application
 setting. Existing local login tokens retain their previous lifetime but do not
-create offline delegation; users must complete a new interactive sign-in. This
+create offline delegation. Local refresh grants without an OIDC generation
+cannot renew after activation; users must complete a new interactive sign-in.
+The nullable generation column is added by the application database migration. This
 feature does not change the provider's realm-wide SSO session policy. To disable
 it, set the lifetime to zero and remove `offline_access` from the requested
 login scopes. Grant-bound tokens then require a fresh legacy login.

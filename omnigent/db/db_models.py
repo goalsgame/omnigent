@@ -665,6 +665,7 @@ class SqlDeviceGrant(OmnigentBase):
     """
 
     __tablename__ = "device_grants"
+    oidc_login_generation: Mapped[str | None] = mapped_column(String(48), nullable=True)
     group_authority_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 

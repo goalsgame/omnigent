@@ -61,7 +61,9 @@ class OIDCLoginBroker:
             raise ValueError("An access token is required")
         return claims
 
-    def capture(self, owner: str, subject: str, tokens: dict[str, Any]) -> dict[str, Any]:
+    def capture(
+        self, owner: str, subject: str, tokens: dict[str, Any], *, auth_time: int | None = None
+    ) -> dict[str, Any]:
         """Persist only a verified offline grant returned by the login code exchange."""
         try:
             refresh = tokens["refresh_token"]
@@ -74,6 +76,7 @@ class OIDCLoginBroker:
             if deadline <= time.time():
                 raise ValueError("Offline grant expired")
             secret = self._secret(tokens, claims, refresh)
+            generation = secrets.token_hex(24)
             self.store.upsert(
                 owner,
                 PROVIDER,
@@ -81,11 +84,15 @@ class OIDCLoginBroker:
                 metadata={
                     "issuer": self.config.issuer,
                     "subject": subject,
-                    "generation": secrets.token_hex(24),
+                    "generation": generation,
+                    "auth_time": auth_time if auth_time is not None else int(time.time()),
                     "deadline": deadline,
                 },
             )
-            return self.state(owner)
+            state = self.state(owner)
+            if state["generation"] != generation:
+                raise DelegationUnavailable("Sign in again to renew identity delegation")
+            return state
         except (jwt.PyJWTError, KeyError, TypeError, ValueError):
             raise DelegationUnavailable("Sign in again to renew identity delegation") from None
 
@@ -110,6 +117,12 @@ class OIDCLoginBroker:
             and connection.metadata.get("generation") == generation
             and float(connection.metadata.get("deadline", 0)) > time.time()
         )
+
+    def revoke(self, owner: str, generation: str) -> bool:
+        connection = self.store.get(owner, PROVIDER)
+        if connection is None or connection.metadata.get("generation") != generation:
+            return False
+        return self.store.delete(owner, PROVIDER, expected_metadata=connection.metadata)
 
     def state(self, owner: str) -> dict[str, Any]:
         """Refresh one shared login grant, never a copy per downstream service."""
@@ -170,6 +183,7 @@ class OIDCLoginBroker:
             self.config.provider_type,
             group_authority=self.group_authority(state),
             oidc_grant_id=state["generation"],
+            auth_time=state["auth_time"],
         )
 
     def access_ttl(self, state: dict[str, Any]) -> int:

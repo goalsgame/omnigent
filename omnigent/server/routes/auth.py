@@ -244,6 +244,7 @@ class _NativeCode:
     redirect_uri: str
     created_at: float = field(default_factory=time.time)
     group_authority: dict[str, object] | None = None
+    oidc_login_generation: str | None = None
 
 
 def create_auth_router(
@@ -710,9 +711,21 @@ def create_auth_router(
         if login_broker is not None:
             from omnigent.server.oidc_mcp import DelegationUnavailable
 
+            interactive_time = (claims or {}).get("auth_time", int(time.time()))
+            if (
+                not isinstance(interactive_time, int)
+                or isinstance(interactive_time, bool)
+                or interactive_time < 0
+                or interactive_time > time.time() + 60
+            ):
+                return fail(403, "Invalid interactive authentication time")
             try:
                 login_state = await asyncio.to_thread(
-                    login_broker.capture, email, str((claims or {})["sub"]), token_json
+                    login_broker.capture,
+                    email,
+                    str((claims or {})["sub"]),
+                    token_json,
+                    auth_time=interactive_time,
                 )
                 group_authority = login_broker.group_authority(login_state)
             except DelegationUnavailable:
@@ -750,6 +763,9 @@ def create_auth_router(
                 code_challenge=native["code_challenge"],
                 redirect_uri=native["redirect_uri"],
                 group_authority=group_authority,
+                oidc_login_generation=login_state["generation"]
+                if login_state is not None
+                else None,
             )
             response = _native_redirect(native, {"code": native_code})
             response.delete_cookie(
@@ -797,6 +813,9 @@ def create_auth_router(
                         device_grant_store,
                         user_id=email,
                         group_authority=group_authority,
+                        oidc_login_generation=login_state["generation"]
+                        if login_state is not None
+                        else None,
                         cookie_secret=config.cookie_secret,
                     )
                 except Exception:
@@ -934,11 +953,11 @@ def create_auth_router(
             from omnigent.server.oidc_mcp import DelegationUnavailable
 
             try:
-                owner, _ = await asyncio.to_thread(
+                owner, generation = await asyncio.to_thread(
                     login_broker.browser_identity,
                     request.cookies.get(login_broker.cookie_name, ""),
                 )
-                await asyncio.to_thread(login_broker.store.delete, owner, "oidc_login")
+                await asyncio.to_thread(login_broker.revoke, owner, generation)
             except DelegationUnavailable:
                 pass
             response.delete_cookie(
@@ -1093,6 +1112,8 @@ def create_auth_router(
 
             try:
                 login_state = await asyncio.to_thread(login_broker.state, pending.user_id)
+                if login_state["generation"] != pending.oidc_login_generation:
+                    return oauth_error("invalid_grant")
                 content["token"] = login_broker.session_token(pending.user_id, login_state)
                 content["expires_in"] = login_broker.access_ttl(login_state)
             except DelegationUnavailable:
@@ -1105,6 +1126,7 @@ def create_auth_router(
                     device_grant_store,
                     user_id=pending.user_id,
                     group_authority=pending.group_authority,
+                    oidc_login_generation=pending.oidc_login_generation,
                     cookie_secret=config.cookie_secret,
                 )
             except Exception:
