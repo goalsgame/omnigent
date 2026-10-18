@@ -124,8 +124,14 @@ export function ProjectSettingsDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const providers = info !== "loading" ? sandboxProviderOptions(info) : [];
   const rememberedProvider = readLastSandboxProvider();
+  const savedProviderUnavailable =
+    info !== "loading" &&
+    stored?.sandbox_provider != null &&
+    !providers.includes(stored.sandbox_provider);
   const sandboxProvider =
-    stored?.sandbox_provider ??
+    (stored?.sandbox_provider != null && providers.includes(stored.sandbox_provider)
+      ? stored.sandbox_provider
+      : null) ??
     (rememberedProvider !== null && providers.includes(rememberedProvider)
       ? rememberedProvider
       : (providers[0] ?? null));
@@ -205,7 +211,7 @@ export function ProjectSettingsDialog({
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    if (loadFailed || (hostId === SANDBOX_HOST_CHOICE && info === "loading")) return;
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
@@ -213,7 +219,7 @@ export function ProjectSettingsDialog({
     else delete config.host_id;
     if (hostId === SANDBOX_HOST_CHOICE && sandboxProvider !== null) {
       config.sandbox_provider = sandboxProvider;
-    } else if (hostId !== SANDBOX_HOST_CHOICE) {
+    } else {
       delete config.sandbox_provider;
     }
     // A workspace is host-relative and only meaningful with a concrete host —
@@ -243,8 +249,8 @@ export function ProjectSettingsDialog({
     // is unknowable — keep the stored model (already in the spread) so an
     // unrelated save during that window can't silently delete a valid default.
     const agentUnresolved = agentId != null && selectedAgent === null;
-    if (supportsModelDefault && model !== NONE) config.model = model;
-    else if (!agentUnresolved) delete config.model;
+    if (supportsModelDefault && effectiveModel !== NONE) config.model = effectiveModel;
+    else if (!agentUnresolved || (sandboxSelected && savedProviderUnavailable)) delete config.model;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -331,12 +337,17 @@ export function ProjectSettingsDialog({
   }, [hostModelOptions, selectedNativeSpec, sandboxSelected, sandboxModels.data]);
   // Keep a stored model the current options don't list as a labeled fallback
   // item, so opening + saving the dialog doesn't silently drop the default.
-  const storedModelMissing = model !== NONE && !modelOptions.some((m) => m.id === model);
+  const effectiveModel =
+    sandboxSelected && savedProviderUnavailable && !modelOptions.some((m) => m.id === model)
+      ? NONE
+      : model;
+  const storedModelMissing =
+    effectiveModel !== NONE && !modelOptions.some((m) => m.id === effectiveModel);
   // With no catalog resolved and nothing stored, the select could only offer
   // "No default" — an action it can't perform. Degrade honestly (documented
   // catalog gap for host-resolved harnesses): disable it and say why, rather
   // than hide the field the harness legitimately supports.
-  const modelPickerEmpty = modelOptions.length === 0 && model === NONE;
+  const modelPickerEmpty = modelOptions.length === 0 && effectiveModel === NONE;
   // Offer the control only for a model-taking harness; when it can only render
   // "No default" it stays visible but disabled with an explanatory hint.
   const supportsModelDefault = harnessTakesModel;
@@ -366,7 +377,9 @@ export function ProjectSettingsDialog({
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
-              onValueChange={setHostId}
+              onValueChange={(value) => {
+                if (value !== "") setHostId(value);
+              }}
               onOpenChange={onDropdownOpenChange}
               disabled={isLoading}
             >
@@ -378,6 +391,11 @@ export function ProjectSettingsDialog({
                 {managedSandboxesEnabled && (
                   <SelectItem value={SANDBOX_HOST_CHOICE}>
                     {sandboxOptionLabel(sandboxProvider)}
+                  </SelectItem>
+                )}
+                {!managedSandboxesEnabled && hostId === SANDBOX_HOST_CHOICE && (
+                  <SelectItem value={SANDBOX_HOST_CHOICE} disabled>
+                    Sandbox ({info === "loading" ? "loading…" : "unavailable"})
                   </SelectItem>
                 )}
                 {onlineHosts.map((h) => (
@@ -566,7 +584,7 @@ export function ProjectSettingsDialog({
               }
             >
               <Select
-                value={model}
+                value={effectiveModel}
                 onValueChange={setModel}
                 onOpenChange={onDropdownOpenChange}
                 disabled={isLoading || modelPickerEmpty}
@@ -587,6 +605,14 @@ export function ProjectSettingsDialog({
             </Field>
           )}
 
+          {sandboxSelected && savedProviderUnavailable && (
+            <p className="text-muted-foreground text-sm" role="status">
+              The saved sandbox provider is unavailable.{" "}
+              {sandboxProvider !== null
+                ? `Using ${sandboxOptionLabel(sandboxProvider)}; only models available from this provider can be kept.`
+                : "Choose another host before starting new sessions."}
+            </p>
+          )}
           {loadFailed && (
             <p
               className="text-destructive text-ui"
@@ -616,7 +642,7 @@ export function ProjectSettingsDialog({
               type="submit"
               data-testid="project-settings-save"
               loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
+              disabled={isLoading || loadFailed || (sandboxSelected && info === "loading")}
             >
               Save
             </Button>

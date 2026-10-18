@@ -4482,6 +4482,7 @@ export function NewChatLandingScreen() {
   // the workspace is in place.
   useEffect(() => {
     if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    if (prefillConfig?.hostId === SANDBOX_HOST_CHOICE && info === "loading") return;
     const step = projectPrefillStep(prefill, {
       hosts,
       // The pickable list, not the raw one — a hidden agent's id would seed
@@ -4499,7 +4500,12 @@ export function NewChatLandingScreen() {
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(prefillConfig?.sandboxProvider ?? defaultSandboxProvider());
+      const savedProvider = prefillConfig?.sandboxProvider;
+      setSandboxProvider(
+        savedProvider != null && sandboxProviderRows.includes(savedProvider)
+          ? savedProvider
+          : defaultSandboxProvider(),
+      );
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -4534,6 +4540,8 @@ export function NewChatLandingScreen() {
     pickedAgentId,
     prefillConfig,
     defaultSandboxProvider,
+    sandboxProviderRows,
+    info,
   ]);
 
   // Seed a fresh worktree branch once the workspace settles, from the effective
