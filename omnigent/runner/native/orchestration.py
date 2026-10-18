@@ -2559,6 +2559,7 @@ async def _auto_create_pi_terminal(
                 exc_info=True,
             )
     # External tools use the same authenticated, policy-enforcing MCP proxy.
+    identity_login_required = False
     with startup_span("pi.discover_mcp_tools", session_id=session_id):
         spec_for_mcp = _unwrap_resolved_spec(agent_spec)
         if server_client is not None and spec_for_mcp is not None and spec_for_mcp.mcp_servers:
@@ -2567,6 +2568,10 @@ async def _auto_create_pi_terminal(
 
                 mcp_result = await ProxyMcpManager(session_id, server_client).schemas_for(
                     spec_for_mcp
+                )
+                identity_login_required = any(
+                    "Sign in again to restore connector access" in error
+                    for error in mcp_result.failures.values()
                 )
                 registered_names = {tool["name"] for tool in pi_tools}
                 pi_tools.extend(
@@ -2587,6 +2592,9 @@ async def _auto_create_pi_terminal(
                     session_id,
                     exc_info=True,
                 )
+    if identity_login_required:
+        # Leave the pane uncreated so a renewed login can retry full tool discovery.
+        raise RuntimeError("Sign in again to restore connector access")
     from omnigent.runtime.prompt import build_instructions_nullable
 
     system_prompt = (

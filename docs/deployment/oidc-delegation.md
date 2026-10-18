@@ -30,8 +30,9 @@ rather than waiting for transport timeouts.
 Enable offline access at the identity provider before enabling the application
 setting. Existing local login tokens retain their previous lifetime but do not
 create offline delegation; users must complete a new interactive sign-in. This
-feature does not change the provider's realm-wide SSO session policy. Disabling
-it stops renewal; grant-bound tokens require a fresh legacy login.
+feature does not change the provider's realm-wide SSO session policy. To disable
+it, set the lifetime to zero and remove `offline_access` from the requested
+login scopes. Grant-bound tokens then require a fresh legacy login.
 
 Verify browser, native and CLI login and renewal, connectors and Lore access,
 concurrent refresh, group removal, logout/revocation, and absolute expiry. Keep

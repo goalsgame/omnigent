@@ -29,7 +29,9 @@ class OIDCLoginMiddleware:
         if (
             not renewal
             or request.headers.get("authorization")
-            or request.url.path.startswith(("/auth/", "/assets/"))
+            or request.url.path.startswith(("/auth/cli-", "/assets/"))
+            or request.url.path
+            in ("/auth/login", "/auth/callback", "/auth/logout", "/auth/native-token")
             or request.url.path == "/health"
         ):
             await self.app(scope, receive, send)
