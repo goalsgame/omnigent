@@ -487,7 +487,10 @@ function mcpContentTypeIsJson(resp) {
  *   returns as-is.
  */
 async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`;
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/mcp`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`;
   const body = JSON.stringify({
     jsonrpc: "2.0",
     id: rpcId,
@@ -497,10 +500,9 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...freshAuthHeaders(config.authHeaders),
-      },
+      headers: relay
+        ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
+        : { "content-type": "application/json", ...freshAuthHeaders(config.authHeaders) },
       body,
     });
     if (!resp.ok) {
@@ -549,9 +551,9 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
  * This is the SAME endpoint the runner's ``ProxyMcpManager`` uses: the Omnigent
  * server evaluates TOOL_CALL / TOOL_RESULT policy and then forwards execution
  * to the runner's ``/mcp/execute`` (which dispatches the real ``sys_*`` tool on
- * the correct machine with the session's terminal/workspace). The extension
- * already carries ``serverUrl`` + ``sessionId`` + ``authHeaders`` in its config,
- * so no extra relay process is needed.
+ * the correct machine with the session's terminal/workspace). When available,
+ * the runner-local relay forwards the same RPC using renewable server auth;
+ * otherwise the extension uses its configured server headers.
  *
  * **ASK policy / elicitation round-trip (MRTR).** When the tool is gated by an
  * ASK policy the proxy returns HTTP 200 with an ``input_required`` result

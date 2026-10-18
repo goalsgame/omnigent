@@ -970,7 +970,8 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_registers_omnigent_tools_and_execute_round_trips(tmp_path: Path) -> None:
+@pytest.mark.parametrize("use_relay", [False, True])
+def test_registers_omnigent_tools_and_execute_round_trips(tmp_path: Path, use_relay: bool) -> None:
     """The extension registers config.tools and execute() round-trips via /mcp.
 
     Drives the real JavaScript extension under Node with a config carrying a
@@ -998,6 +999,9 @@ const path = require("path");
 
 const extensionPath = process.argv[1];
 const tmpDir = process.argv[2];
+const useRelay = process.argv[3] === "true";
+const target = useRelay ? "http://127.0.0.1:12345" : "http://omnigent.test/v1/sessions/conv_abc";
+const expectedBearer = useRelay ? "Bearer local-relay-token" : "Bearer test";
 const inboxDir = path.join(tmpDir, "inbox");
 const configPath = path.join(tmpDir, "config.json");
 
@@ -1009,6 +1013,7 @@ fs.writeFileSync(
     sessionId: "conv_abc",
     inboxDir,
     authHeaders: { authorization: "Bearer test" },
+    ...(useRelay ? { relayUrl: target, relayToken: "local-relay-token" } : {}),
     tools: [
       {
         name: "sys_os_read",
@@ -1034,6 +1039,8 @@ process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 // a JSON-RPC tools/call and the right auth headers.
 const fetchCalls = [];
 global.fetch = async (url, request) => {
+  assert.equal(request.headers.authorization, expectedBearer);
+  assert.ok(url === `${target}/mcp` || url === `${target}/policies/evaluate`);
   fetchCalls.push({ url, request });
   // Mimic the Omnigent /mcp proxy success envelope.
   return {
@@ -1086,9 +1093,9 @@ require(extensionPath)(pi);
 
   assert.equal(fetchCalls.length, 1, JSON.stringify(fetchCalls));
   const call = fetchCalls[0];
-  assert.equal(call.url, "http://omnigent.test/v1/sessions/conv_abc/mcp");
+  assert.equal(call.url, `${target}/mcp`);
   assert.equal(call.request.method, "POST");
-  assert.equal(call.request.headers.authorization, "Bearer test");
+  assert.equal(call.request.headers.authorization, expectedBearer);
   const body = JSON.parse(call.request.body);
   assert.equal(body.jsonrpc, "2.0");
   assert.equal(body.method, "tools/call");
@@ -1107,7 +1114,7 @@ require(extensionPath)(pi);
 """
 
     result = subprocess.run(
-        [node, "-e", script, str(extension_path), str(tmp_path)],
+        [node, "-e", script, str(extension_path), str(tmp_path), str(use_relay).lower()],
         capture_output=True,
         check=False,
         text=True,
@@ -1220,7 +1227,8 @@ require(extensionPath)(pi);
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_input_required_approve_round_trips_then_executes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("use_relay", [False, True])
+def test_input_required_approve_round_trips_then_executes(tmp_path: Path, use_relay: bool) -> None:
     """An ASK-gated bridged tool resolves the elicitation and retries once.
 
     On the initial ``tools/call`` the /mcp proxy returns an MCP ``input_required``
@@ -1250,6 +1258,9 @@ const path = require("path");
 
 const extensionPath = process.argv[1];
 const tmpDir = process.argv[2];
+const useRelay = process.argv[3] === "true";
+const target = useRelay ? "http://127.0.0.1:12345" : "http://omnigent.test/v1/sessions/conv_abc";
+const expectedBearer = useRelay ? "Bearer local-relay-token" : "Bearer test";
 const inboxDir = path.join(tmpDir, "inbox");
 const configPath = path.join(tmpDir, "config.json");
 
@@ -1261,6 +1272,7 @@ fs.writeFileSync(
     sessionId: "conv_abc",
     inboxDir,
     authHeaders: { authorization: "Bearer test" },
+    ...(useRelay ? { relayUrl: target, relayToken: "local-relay-token" } : {}),
     tools: [
       {
         name: "sys_os_shell",
@@ -1279,6 +1291,8 @@ const REQUEST_STATE = JSON.stringify({ elicitation_id: ELICIT_ID, session_id: "c
 const mcpCalls = [];
 let mcpCallCount = 0;
 global.fetch = async (url, request) => {
+  assert.equal(request.headers.authorization, expectedBearer);
+  assert.ok(url === `${target}/mcp` || url === `${target}/policies/evaluate`);
   if (typeof url === "string" && url.indexOf("/policies/evaluate") !== -1) {
     // The server-side ASK park collapses to a hard ALLOW after the human approves.
     return { ok: true, async json() { return { result: "POLICY_ACTION_ALLOW" }; } };
@@ -1346,7 +1360,7 @@ require(extensionPath)(pi);
 """
 
     result = subprocess.run(
-        [node, "-e", script, str(extension_path), str(tmp_path)],
+        [node, "-e", script, str(extension_path), str(tmp_path), str(use_relay).lower()],
         capture_output=True,
         check=False,
         text=True,
