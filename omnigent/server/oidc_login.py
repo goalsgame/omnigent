@@ -88,7 +88,7 @@ class OIDCLoginBroker(OIDCLoginRevoker):
     def _claims(self, token: str, subject: str, *, offline: bool = False) -> dict[str, Any]:
         try:
             key = self.jwks.get_signing_key_from_jwt(token)
-        except jwt.PyJWKClientConnectionError:
+        except jwt.PyJWKClientError:
             raise DelegationTemporarilyUnavailable(
                 "Identity signing keys temporarily unavailable"
             ) from None
@@ -179,7 +179,10 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                     rotated = tokens.get("refresh_token") or refresh_token
                     self._claims(rotated, str(meta["subject"]), offline=True)
                     try:
-                        self._claims(tokens["access_token"], str(meta["subject"]))
+                        pending_claims = self._claims(tokens["access_token"], str(meta["subject"]))
+                        if float(pending_claims["exp"]) <= time.time() + 60:
+                            refresh_token = rotated
+                            tokens = None
                     except jwt.ExpiredSignatureError:
                         # Only a verified offline token may renew an expired pending response.
                         refresh_token = rotated
@@ -200,6 +203,10 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                         )
                     response.raise_for_status()
                     tokens = response.json()
+                    tokens = {
+                        **tokens,
+                        "refresh_token": tokens.get("refresh_token") or refresh_token,
+                    }
                 rotated = tokens.get("refresh_token") or refresh_token
                 self._claims(rotated, str(meta["subject"]), offline=True)
                 claims = self._claims(tokens["access_token"], str(meta["subject"]))

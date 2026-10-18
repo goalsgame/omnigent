@@ -855,12 +855,15 @@ def test_pending_rotated_response_never_accepts_wrong_identity(login, monkeypatc
         broker.state(OWNER)
 
 
-def test_expired_pending_access_renews_with_verified_rotated_refresh(login, signing_key):
+@pytest.mark.parametrize("remaining", [-1, 5, 10, 30])
+def test_expired_pending_access_renews_with_verified_rotated_refresh(
+    login, signing_key, remaining
+):
     broker, _token, tokens, calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
     pending = tokens()
     access = jwt.decode(pending["access_token"], options={"verify_signature": False})
-    access["exp"] = int(time.time()) - 1
+    access["exp"] = int(time.time()) + remaining
     pending["access_token"] = jwt.encode(
         access, signing_key, algorithm="RS256", headers={"kid": "fixture"}
     )
@@ -876,3 +879,104 @@ def test_expired_pending_access_renews_with_verified_rotated_refresh(login, sign
     assert "pending_tokens" not in result
     assert calls[0]["refresh_token"] == [pending["refresh_token"]]
     assert result["generation"] == state["generation"]
+
+
+def test_pending_renewal_without_refresh_field_preserves_effective_token(
+    login, signing_key, monkeypatch
+):
+    from omnigent.server.oidc_login import DelegationTemporarilyUnavailable
+
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    pending = tokens()
+    access = jwt.decode(pending["access_token"], options={"verify_signature": False})
+    access["exp"] = int(time.time()) - 1
+    pending["access_token"] = jwt.encode(
+        access, signing_key, algorithm="RS256", headers={"kid": "fixture"}
+    )
+    refresh = jwt.decode(pending["refresh_token"], options={"verify_signature": False})
+    refresh["jti"] = "rotated-refresh"
+    pending["refresh_token"] = jwt.encode(
+        refresh, signing_key, algorithm="RS256", headers={"kid": "fixture"}
+    )
+    broker.store.update_secret(
+        OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
+    )
+    unavailable = [False]
+    original = broker.jwks.get_signing_key_from_jwt
+
+    def key(value):
+        if unavailable[0]:
+            raise jwt.PyJWKClientConnectionError("key lookup failed")
+        return original(value)
+
+    monkeypatch.setattr(broker.jwks, "get_signing_key_from_jwt", key)
+    requests = []
+    response_tokens = tokens()
+    response_tokens.pop("refresh_token")
+
+    def provider(request):
+        requests.append(parse_qs(request.content.decode()))
+        assert requests[-1]["refresh_token"] == [pending["refresh_token"]]
+        unavailable[0] = True
+        return httpx.Response(200, json=response_tokens)
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(provider))
+    with pytest.raises(DelegationTemporarilyUnavailable):
+        broker.state(OWNER)
+    stored = broker.store.get(OWNER, PROVIDER, with_secret=True).secret
+    assert stored["pending_tokens"]["refresh_token"] == pending["refresh_token"]
+    unavailable[0] = False
+    recovered = broker.state(OWNER)
+    assert recovered["refresh_token"] == pending["refresh_token"]
+    assert "pending_tokens" not in recovered
+    assert len(requests) == 1
+    broker.store.update_secret(OWNER, PROVIDER, secret={**recovered, "expires_at": 0})
+    with pytest.raises(DelegationTemporarilyUnavailable):
+        broker.state(OWNER)
+    unavailable[0] = False
+    assert broker.state(OWNER)["refresh_token"] == pending["refresh_token"]
+    assert len(requests) == 2
+
+
+def test_unknown_rotated_key_during_populated_cache_cooldown_is_retryable(
+    login, signing_key, monkeypatch
+):
+    from omnigent.server.oidc_login import DelegationTemporarilyUnavailable
+
+    broker, _token, tokens, calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    rotated = tokens()
+    for field in ("access_token", "refresh_token"):
+        claims = jwt.decode(rotated[field], options={"verify_signature": False})
+        rotated[field] = jwt.encode(
+            claims, signing_key, algorithm="RS256", headers={"kid": "new-key"}
+        )
+    jwk = jwt.algorithms.RSAAlgorithm.to_jwk(signing_key.public_key(), as_dict=True)
+    jwk.update(kid="fixture", alg="RS256", use="sig")
+    broker.jwks.jwk_set_cache.put({"keys": [jwk]})
+    broker.jwks._next_fetch = time.monotonic() + 30
+    monkeypatch.setattr(
+        broker.jwks,
+        "get_signing_key_from_jwt",
+        jwt.PyJWKClient.get_signing_key_from_jwt.__get__(broker.jwks),
+    )
+    requests = []
+
+    def provider(request):
+        requests.append(request)
+        return httpx.Response(200, json=rotated)
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(provider))
+    with pytest.raises(DelegationTemporarilyUnavailable):
+        broker.state(OWNER)
+    assert broker.store.get(OWNER, PROVIDER, with_secret=True).secret["pending_tokens"] == rotated
+    broker.jwks.jwk_set_cache.put({"keys": [{**jwk, "kid": "new-key"}]})
+    recovered = broker.state(OWNER)
+    assert recovered["refresh_token"] == rotated["refresh_token"]
+    assert "pending_tokens" not in recovered
+    assert len(requests) == 1
+    assert not calls
