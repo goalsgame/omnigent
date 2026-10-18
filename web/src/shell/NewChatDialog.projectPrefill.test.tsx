@@ -1,3 +1,4 @@
+import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -213,7 +214,13 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
 }
 
 /** Same as renderLanding, but with the managed-sandbox host option enabled. */
-function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
+function renderSandboxLanding(
+  overrides: Partial<ServerInfo> = {},
+  loadingInitially = false,
+): {
+  rerender: (ui: ReactNode) => void;
+  resolveInfo: () => void;
+} {
   const info: ServerInfo = {
     accounts_enabled: false,
     single_user: false,
@@ -232,19 +239,27 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
+    ...overrides,
   };
+  let currentInfo: ServerInfo | "loading" = loadingInitially ? "loading" : info;
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>
+        <CapabilitiesProvider info={currentInfo}>
           <TooltipProvider>{children}</TooltipProvider>
         </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
   const { rerender } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
-  return { rerender };
+  return {
+    rerender,
+    resolveInfo: () => {
+      currentInfo = info;
+      rerender(<NewChatLandingScreen />);
+    },
+  };
 }
 
 /** Render with Smart Routing enabled so a routing-eligible native agent can turn it on. */
@@ -1126,4 +1141,73 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
   });
+});
+
+it("prefills the project's saved sandbox provider instead of the sticky last provider", async () => {
+  localStorage.setItem("omnigent:last-sandbox-provider", "kubernetes");
+  setProjectConfig({ host_id: "__sandbox__", sandbox_provider: "agent_sandbox", agent_id: "ag_1" });
+  renderSandboxLanding({
+    sandbox_provider: "kubernetes",
+    sandbox_providers: ["kubernetes", "agent_sandbox"],
+    sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
+  });
+  await waitFor(() =>
+    expect(
+      vi.mocked(useSandboxModelOptions).mock.calls.some((call) => call[0] === "agent_sandbox"),
+    ).toBe(true),
+  );
+});
+
+it("waits for server capabilities before seeding a project's sandbox provider", async () => {
+  vi.mocked(useAvailableAgents).mockReturnValue({
+    data: [agent({ id: "ag_1", harness: "pi-native" })],
+  } as ReturnType<typeof useAvailableAgents>);
+  localStorage.setItem("omnigent:last-sandbox-provider", "kubernetes");
+  setProjectConfig({ host_id: "__sandbox__", sandbox_provider: "agent_sandbox", agent_id: "ag_1" });
+  const view = renderSandboxLanding(
+    {
+      sandbox_provider: "kubernetes",
+      sandbox_providers: ["kubernetes", "agent_sandbox"],
+      sandbox_provider_capabilities: {
+        agent_sandbox: { inference_models: true },
+        kubernetes: { inference_models: true },
+      },
+    },
+    true,
+  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument());
+  view.resolveInfo();
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(useSandboxModelOptions)
+        .mock.calls.some((call) => call[0] === "agent_sandbox" && call[4] === true),
+    ).toBe(true),
+  );
+});
+
+it("falls back to an offered provider when the project's saved provider was removed", async () => {
+  vi.mocked(useAvailableAgents).mockReturnValue({
+    data: [agent({ id: "ag_1", harness: "pi-native" })],
+  } as ReturnType<typeof useAvailableAgents>);
+  setProjectConfig({
+    host_id: "__sandbox__",
+    sandbox_provider: "removed_provider",
+    agent_id: "ag_1",
+  });
+  renderSandboxLanding({
+    sandbox_provider: "agent_sandbox",
+    sandbox_providers: ["agent_sandbox"],
+    sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
+  });
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(useSandboxModelOptions)
+        .mock.calls.some((call) => call[0] === "agent_sandbox" && call[4] === true),
+    ).toBe(true),
+  );
+  expect(
+    vi.mocked(useSandboxModelOptions).mock.calls.some((call) => call[0] === "removed_provider"),
+  ).toBe(false);
 });
