@@ -51,3 +51,4 @@ class DeviceGrant:
     last_polled_at: int | None
     account_generation: str | None = None
     group_authority: dict[str, object] | None = None
+    oidc_login_generation: str | None = None

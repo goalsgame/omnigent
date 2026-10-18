@@ -152,3 +152,11 @@ async def test_non_session_writes_do_not_exchange(delegation_app, signing_key, m
         )
     assert exchanges == []
     assert broker.store.get("person@example.test", broker.provider) is None
+
+
+def test_disabled_renewal_keeps_revocation_available(delegation_app):
+    app = delegation_app
+    assert app.state.oidc_login_broker is None
+    revoker = app.state.oidc_login_revoker
+    assert revoker is not None
+    assert not hasattr(revoker, "state")

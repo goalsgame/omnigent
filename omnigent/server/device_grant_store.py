@@ -77,6 +77,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
         account_generation=row.account_generation,
+        oidc_login_generation=row.oidc_login_generation,
         group_authority=json.loads(row.group_authority_json) if row.group_authority_json else None,
     )
 
@@ -164,6 +165,7 @@ class DeviceGrantStore:
         refresh_token_hash: str,
         created_at: int,
         group_authority: dict[str, object] | None = None,
+        oidc_login_generation: str | None = None,
     ) -> DeviceGrant:
         """Persist a grant born ``redeemed`` — no device-code consent step.
 
@@ -193,6 +195,7 @@ class DeviceGrantStore:
         def write(session: Session) -> DeviceGrant:
             generation = require_active_account(session, user_id)
             row = SqlDeviceGrant(
+                oidc_login_generation=oidc_login_generation,
                 account_generation=generation,
                 group_authority_json=json.dumps(group_authority) if group_authority else None,
                 id=grant_id,

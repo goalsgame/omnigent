@@ -293,7 +293,9 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
-        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
+        raw_failures = _json_object(result.get("failures")) or {}
+        failures = {name: value for name, value in raw_failures.items() if isinstance(value, str)}
+        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
 
     async def call_tool(
         self,

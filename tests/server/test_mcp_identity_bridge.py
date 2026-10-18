@@ -74,3 +74,86 @@ async def test_stdio_bridge_initializes_lists_and_calls_tools(tmp_path):
         server.should_exit = True
         await asyncio.wait_for(task, timeout=10)
         sock.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("through_runner", [False, True])
+async def test_stdio_bridge_reports_expired_identity_without_timeout(
+    tmp_path, status, through_runner
+):
+    from fastapi import FastAPI
+    from starlette.responses import JSONResponse
+
+    app = FastAPI()
+
+    @app.post("/v1/hosts/host-one/mcp")
+    def reject():
+        return JSONResponse({"detail": "fixture identity expired"}, status_code=status)
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
+    task = asyncio.create_task(server.serve(sockets=[sock]))
+    try:
+        async with asyncio.timeout(10):
+            while not server.started:
+                await asyncio.sleep(0.01)
+            coords = tmp_path / "coords.json"
+            coords.write_text(
+                json.dumps(
+                    {
+                        "server": f"http://127.0.0.1:{sock.getsockname()[1]}",
+                        "host_id": "host-one",
+                        "host_token": "fixture",
+                    }
+                )
+            )
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-c",
+                    "import sys; from pathlib import Path; import anyio; "
+                    "import omnigent.host.mcp_identity as bridge; "
+                    "bridge._coords_path = lambda: Path(sys.argv[1]); anyio.run(bridge.main)",
+                    str(coords),
+                ],
+            )
+            if through_runner:
+                from omnigent.runner.mcp_manager import RunnerMcpManager
+                from omnigent.spec.types import AgentSpec, MCPServerConfig
+
+                manager = RunnerMcpManager(stdio_cwd=str(tmp_path))
+                spec = AgentSpec(
+                    spec_version=1,
+                    name="fixture",
+                    mcp_servers=[
+                        MCPServerConfig(
+                            name="identity",
+                            transport="stdio",
+                            command=params.command,
+                            args=params.args,
+                        )
+                    ],
+                )
+                try:
+                    result = await manager.schemas_for(spec)
+                    assert result.failures == {
+                        "identity": "Sign in again to restore connector access"
+                    }
+                finally:
+                    await manager.shutdown()
+                return
+            async with (
+                stdio_client(params) as (read, write),
+                ClientSession(read, write) as session,
+            ):
+                from mcp.shared.exceptions import McpError
+
+                with pytest.raises(McpError, match="Sign in again to restore connector access"):
+                    await session.initialize()
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=10)
+        sock.close()

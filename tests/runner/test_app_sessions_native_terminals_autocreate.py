@@ -168,7 +168,9 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ),
     ],
 )
-@pytest.mark.parametrize("mcp_status", ["absent", "available", "unavailable", "exception"])
+@pytest.mark.parametrize(
+    "mcp_status", ["absent", "available", "unavailable", "exception", "needs_login"]
+)
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -280,6 +282,12 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         assert spec is mcp_spec
         if mcp_status == "exception":
             raise RuntimeError("MCP discovery unavailable")
+        if mcp_status == "needs_login":
+            return McpSchemasResult(
+                schemas=[],
+                tool_names=set(),
+                failures={"search": "Sign in again to restore connector access"},
+            )
         if mcp_status == "unavailable":
             return McpSchemasResult(schemas=[], tool_names=set(), failures={"search": "offline"})
         return McpSchemasResult(
@@ -297,6 +305,29 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     monkeypatch.setattr(ProxyMcpManager, "schemas_for", _mcp_schemas)
     published: list[dict[str, Any]] = []
+
+    if mcp_status == "needs_login":
+        with pytest.raises(
+            RuntimeError, match="Sign in again to restore connector access"
+        ) as failure:
+            await _auto_create_pi_terminal(
+                "47f049b9d13df4db397c7f46859b825f",
+                _FakeResourceRegistry(),
+                lambda _sid, evt: published.append(evt),
+                server_client=NullServerClient(),
+                agent_spec=mcp_spec,
+            )
+        assert "terminal_name" not in captured
+        error = _publish_native_terminal_start_error(
+            lambda _sid, event: published.append(event),
+            "47f049b9d13df4db397c7f46859b825f",
+            "Pi",
+            failure.value,
+        )
+        assert error["code"] == "identity_login_required"
+        assert error["message"] == "Sign in again to restore connector access"
+        assert published[-1] == {"type": "session.status", "status": "failed", "error": error}
+        return
 
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",

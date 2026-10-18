@@ -355,3 +355,29 @@ async def test_relay_requires_live_managed_host(broker, db_uri, monkeypatch):
             )
             await request(401)
         assert len(calls) == 2
+
+
+@pytest.mark.parametrize("provider", ["oidc_mcp", "oidc_lore"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_legacy_credential_rejects_generation_bound_records(broker, provider, expired):
+    service, _claims, requests = broker
+    service.provider = provider
+    owner = "alice@example.com"
+    service.store.upsert(
+        owner,
+        provider,
+        secret={
+            "access_token": "cached",
+            "refresh_token": "old",
+            "expires_at": 0 if expired else time.time() + 300,
+        },
+        metadata={
+            "issuer": service.oidc.issuer,
+            "subject": "person-sub",
+            "generation": "logged-out-login",
+        },
+    )
+    assert service.login_broker is None
+    with pytest.raises(DelegationUnavailable, match="Sign in again"):
+        service.credential(owner)
+    assert not requests

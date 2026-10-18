@@ -121,6 +121,8 @@ services:
       # instead of email. Empty means the default (email); see .env.example.
       OMNIGENT_OIDC_EMAIL_CLAIM: "${OMNIGENT_OIDC_EMAIL_CLAIM:-}"
       # Enable only after all callback handlers support per-flow state cookies.
+      OMNIGENT_GRANT_MAX_LIFETIME_DAYS: "${OMNIGENT_GRANT_MAX_LIFETIME_DAYS:-30}"
+      OMNIGENT_OIDC_DELEGATION_TTL_HOURS: "${OMNIGENT_OIDC_DELEGATION_TTL_HOURS:-0}"
       OMNIGENT_OIDC_FLOW_STATE_COOKIES: "${OMNIGENT_OIDC_FLOW_STATE_COOKIES:-false}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional

@@ -1796,3 +1796,19 @@ def _format_content_block(block: ContentBlock) -> str:
         return block.text
     # All ContentBlock variants are Pydantic BaseModels.
     return json.dumps(block.model_dump())
+
+
+def mcp_connection_failure(error: BaseException) -> str:
+    """Preserve structured identity rejection across transport task-group wrappers."""
+
+    def needs_login(exc: BaseException) -> bool:
+        if isinstance(exc, BaseExceptionGroup):  # noqa: F821 — Python >=3.12
+            return any(needs_login(child) for child in exc.exceptions)
+        if isinstance(exc, McpError):
+            data = exc.error.data
+            return isinstance(data, dict) and data.get("identity_login_required") is True
+        return False
+
+    if needs_login(error):
+        return "Sign in again to restore connector access"
+    return f"{type(error).__name__}: {error}"

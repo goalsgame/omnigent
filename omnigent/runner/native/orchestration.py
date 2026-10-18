@@ -186,6 +186,13 @@ _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 15.0
 # the runner binding token; cached factory calls stay local and cheap.
 
 
+class _IdentityLoginRequired(RuntimeError):
+    """Client-safe recovery for missing connector identity during startup."""
+
+    def __init__(self) -> None:
+        super().__init__("Sign in again to restore connector access")
+
+
 class _CodexNativeModelOptionsNotReady(RuntimeError):
     """Raised when Codex model options are requested before bridge startup."""
 
@@ -2559,6 +2566,7 @@ async def _auto_create_pi_terminal(
                 exc_info=True,
             )
     # External tools use the same authenticated, policy-enforcing MCP proxy.
+    identity_login_required = False
     with startup_span("pi.discover_mcp_tools", session_id=session_id):
         spec_for_mcp = _unwrap_resolved_spec(agent_spec)
         if server_client is not None and spec_for_mcp is not None and spec_for_mcp.mcp_servers:
@@ -2567,6 +2575,10 @@ async def _auto_create_pi_terminal(
 
                 mcp_result = await ProxyMcpManager(session_id, server_client).schemas_for(
                     spec_for_mcp
+                )
+                identity_login_required = any(
+                    "Sign in again to restore connector access" in error
+                    for error in mcp_result.failures.values()
                 )
                 registered_names = {tool["name"] for tool in pi_tools}
                 pi_tools.extend(
@@ -2587,6 +2599,9 @@ async def _auto_create_pi_terminal(
                     session_id,
                     exc_info=True,
                 )
+    if identity_login_required:
+        # Leave the pane uncreated so a renewed login can retry full tool discovery.
+        raise _IdentityLoginRequired()
     from omnigent.runtime.prompt import build_instructions_nullable
 
     system_prompt = (
@@ -7662,6 +7677,12 @@ def _native_terminal_start_error_payload(
         their safe message directly; other causes point to the runner log.
     """
     error_id = f"err_{uuid.uuid4().hex}"
+    if isinstance(exc, _IdentityLoginRequired):
+        return {
+            "code": "identity_login_required",
+            "error_id": error_id,
+            "message": "Sign in again to restore connector access",
+        }
     lifecycle_code = (
         exc.code
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES

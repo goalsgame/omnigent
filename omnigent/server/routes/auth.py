@@ -244,6 +244,7 @@ class _NativeCode:
     redirect_uri: str
     created_at: float = field(default_factory=time.time)
     group_authority: dict[str, object] | None = None
+    oidc_login_generation: str | None = None
 
 
 def create_auth_router(
@@ -705,6 +706,31 @@ def create_auth_router(
             else None
         )
 
+        login_broker = getattr(request.app.state, "oidc_login_broker", None)
+        login_state = None
+        if login_broker is not None:
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            interactive_time = (claims or {}).get("auth_time", int(time.time()))
+            if (
+                not isinstance(interactive_time, int)
+                or isinstance(interactive_time, bool)
+                or interactive_time < 0
+                or interactive_time > time.time() + 60
+            ):
+                return fail(403, "Invalid interactive authentication time")
+            try:
+                login_state = await asyncio.to_thread(
+                    login_broker.capture,
+                    email,
+                    str((claims or {})["sub"]),
+                    token_json,
+                    auth_time=interactive_time,
+                )
+                group_authority = login_broker.group_authority(login_state)
+            except DelegationUnavailable:
+                return fail(503, "Identity delegation unavailable; please retry sign-in")
+
         brokers = [
             broker
             for broker in (
@@ -737,6 +763,9 @@ def create_auth_router(
                 code_challenge=native["code_challenge"],
                 redirect_uri=native["redirect_uri"],
                 group_authority=group_authority,
+                oidc_login_generation=login_state["generation"]
+                if login_state is not None
+                else None,
             )
             response = _native_redirect(native, {"code": native_code})
             response.delete_cookie(
@@ -752,6 +781,21 @@ def create_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
         )
+
+        if login_state is not None and login_broker is not None:
+            session_jwt = login_broker.session_token(email, login_state)
+
+        def set_login_cookie(response):
+            if login_state is not None and login_broker is not None:
+                response.set_cookie(
+                    login_broker.cookie_name,
+                    login_broker.browser_cookie(email, login_state),
+                    max_age=max(0, int(login_state["deadline"] - time.time())),
+                    secure=_secure,
+                    httponly=True,
+                    samesite="lax",
+                    path="/",
+                )
 
         # Check if this callback fulfills a CLI login ticket.
         ticket_id = state_payload.get("ticket")
@@ -769,6 +813,9 @@ def create_auth_router(
                         device_grant_store,
                         user_id=email,
                         group_authority=group_authority,
+                        oidc_login_generation=login_state["generation"]
+                        if login_state is not None
+                        else None,
                         cookie_secret=config.cookie_secret,
                     )
                 except Exception:
@@ -794,12 +841,15 @@ def create_auth_router(
             resp.set_cookie(
                 key=_session_cookie,
                 value=session_jwt,
-                max_age=config.session_ttl_hours * 3600,
+                max_age=login_broker.access_ttl(login_state)
+                if login_state is not None and login_broker is not None
+                else config.session_ttl_hours * 3600,
                 httponly=True,
                 secure=_secure,
                 samesite="lax",
                 path="/",
             )
+            set_login_cookie(resp)
             resp.delete_cookie(
                 key=cookie_name,
                 path="/",
@@ -814,12 +864,15 @@ def create_auth_router(
         response.set_cookie(
             key=_session_cookie,
             value=session_jwt,
-            max_age=config.session_ttl_hours * 3600,
+            max_age=login_broker.access_ttl(login_state)
+            if login_state is not None and login_broker is not None
+            else config.session_ttl_hours * 3600,
             httponly=True,
             secure=_secure,
             samesite="lax",
             path="/",
         )
+        set_login_cookie(response)
         # Clear the auth state cookie.
         response.delete_cookie(
             key=cookie_name,
@@ -895,6 +948,23 @@ def create_auth_router(
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
+        login_broker = getattr(request.app.state, "oidc_login_revoker", None) or getattr(
+            request.app.state, "oidc_login_broker", None
+        )
+        if login_broker is not None:
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            try:
+                owner, generation = await asyncio.to_thread(
+                    login_broker.browser_identity,
+                    request.cookies.get(login_broker.cookie_name, ""),
+                )
+                await asyncio.to_thread(login_broker.revoke, owner, generation)
+            except DelegationUnavailable:
+                pass
+            response.delete_cookie(
+                login_broker.cookie_name, path="/", secure=_secure, httponly=True, samesite="lax"
+            )
         response.delete_cookie(
             key=_session_cookie,
             path="/",
@@ -970,11 +1040,26 @@ def create_auth_router(
         user_id = ticket.user_id
         refresh_token = ticket.refresh_token
         del _cli_tickets[ticket_id]
-        content: dict[str, object] = {
-            "token": token,
-            "user_id": user_id,
-            "expires_in": config.session_ttl_hours * 3600,
-        }
+        expires_in = config.session_ttl_hours * 3600
+        if auth_provider.oidc_login_broker is not None:
+            try:
+                expires_in = int(
+                    jwt.decode(token, config.cookie_secret, algorithms=["HS256"])["exp"]
+                    - time.time()
+                )
+            except jwt.InvalidTokenError:
+                return JSONResponse(
+                    status_code=410,
+                    content={"error": "Ticket token expired"},
+                    headers={"Cache-Control": "no-store"},
+                )
+            if expires_in <= 0:
+                return JSONResponse(
+                    status_code=410,
+                    content={"error": "Ticket token expired"},
+                    headers={"Cache-Control": "no-store"},
+                )
+        content: dict[str, object] = {"token": token, "user_id": user_id, "expires_in": expires_in}
         # Only present when a grant store is wired — old CLIs ignore the
         # extra key, new CLIs against old servers see it absent.
         if refresh_token is not None:
@@ -1030,6 +1115,18 @@ def create_auth_router(
             "user_id": pending.user_id,
             "expires_in": config.session_ttl_hours * 3600,
         }
+        login_broker = getattr(request.app.state, "oidc_login_broker", None)
+        if login_broker is not None:
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            try:
+                login_state = await asyncio.to_thread(login_broker.state, pending.user_id)
+                if login_state["generation"] != pending.oidc_login_generation:
+                    return oauth_error("invalid_grant")
+                content["token"] = login_broker.session_token(pending.user_id, login_state)
+                content["expires_in"] = login_broker.access_ttl(login_state)
+            except DelegationUnavailable:
+                return oauth_error("invalid_grant")
         # The desktop renews from this grant instead of reopening the
         # browser when the session expires. Best-effort, as for CLI logins.
         if device_grant_store is not None:
@@ -1038,6 +1135,7 @@ def create_auth_router(
                     device_grant_store,
                     user_id=pending.user_id,
                     group_authority=pending.group_authority,
+                    oidc_login_generation=pending.oidc_login_generation,
                     cookie_secret=config.cookie_secret,
                 )
             except Exception:

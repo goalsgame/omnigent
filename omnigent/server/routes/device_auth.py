@@ -48,6 +48,7 @@ Refresh tokens: short access tokens + rotating, revocable refresh tokens.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import html
 import logging
@@ -64,6 +65,8 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.oidc_login import DelegationTemporarilyUnavailable
+from omnigent.server.oidc_mcp import DelegationUnavailable
 from omnigent.server.routes._oauth import (
     NO_STORE_HEADERS,
     RATE_LIMITER_MAX_KEYS,
@@ -200,6 +203,8 @@ def mint_delegated_token(
     scope: str | None = DELEGATED_SCOPE,
     account_generation: str | None = None,
     group_authority: dict[str, object] | None = None,
+    oidc_grant_id: str | None = None,
+    auth_time: int | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -259,6 +264,10 @@ def mint_delegated_token(
         payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
+    if auth_time is not None:
+        payload["auth_time"] = auth_time
+    if oidc_grant_id is not None:
+        payload["oidc_grant_id"] = oidc_grant_id
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -339,6 +348,7 @@ def issue_login_grant(
     user_id: str,
     cookie_secret: bytes,
     group_authority: dict[str, object] | None = None,
+    oidc_login_generation: str | None = None,
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -361,6 +371,7 @@ def issue_login_grant(
         user_id=user_id,
         client_id=LOGIN_GRANT_CLIENT_ID,
         group_authority=group_authority,
+        oidc_login_generation=oidc_login_generation,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
         created_at=int(time.time()),
     )
@@ -447,17 +458,49 @@ def create_oauth_token_router(
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
         scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
+        login = getattr(auth_provider, "oidc_login_broker", None)
+        if grant.oidc_login_generation and login is None:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        if (
+            login is not None
+            and _is_login_grant(client_id)
+            and (
+                not grant.oidc_login_generation
+                or not login.active(user_id, grant.oidc_login_generation)
+            )
+        ):
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        login_state = (
+            login.state(user_id) if login is not None and _is_login_grant(client_id) else None
+        )
+        if login_state is not None and login_state["generation"] != grant.oidc_login_generation:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
         return mint_delegated_token(
             user_id,
             cookie_secret,
-            _ACCESS_TOKEN_TTL_SECONDS,
+            login.access_ttl(login_state)
+            if login_state is not None and login is not None
+            else _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
-            group_authority=grant.group_authority,
+            group_authority=login.group_authority(login_state)
+            if login_state is not None and login is not None
+            else grant.group_authority,
+            oidc_grant_id=login_state["generation"]
+            if login_state is not None and login is not None
+            else None,
+            auth_time=login_state["auth_time"] if login_state is not None else None,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
             scope=scope,
+        )
+
+    def access_expiry(token: str) -> int:
+        if getattr(auth_provider, "oidc_login_broker", None) is None:
+            return _ACCESS_TOKEN_TTL_SECONDS
+        return max(
+            0, int(jwt.decode(token, cookie_secret, algorithms=["HS256"])["exp"] - time.time())
         )
 
     @router.post("/oauth/token", dependencies=[])
@@ -487,8 +530,12 @@ def create_oauth_token_router(
                 return _oauth_error("invalid_grant")
         if grant_type == "refresh_token":
             try:
-                return _handle_refresh_grant(str(form.get("refresh_token") or ""))
-            except OmnigentError:
+                return await asyncio.to_thread(
+                    _handle_refresh_grant, str(form.get("refresh_token") or "")
+                )
+            except DelegationTemporarilyUnavailable:
+                return _oauth_error("temporarily_unavailable", status_code=503)
+            except (OmnigentError, DelegationUnavailable):
                 return _oauth_error("invalid_grant")
         if grant_type == "client_credentials":
             # RFC 6749 §4.4: the machine client presents its OWN credential,
@@ -547,7 +594,7 @@ def create_oauth_token_router(
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                     "token_type": "Bearer",
-                    "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+                    "expires_in": access_expiry(access_token),
                 },
                 headers=NO_STORE_HEADERS,
             )
@@ -578,7 +625,7 @@ def create_oauth_token_router(
                 "access_token": access_token,
                 "refresh_token": new_refresh,
                 "token_type": "Bearer",
-                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+                "expires_in": access_expiry(access_token),
             },
             headers=NO_STORE_HEADERS,
         )
@@ -611,6 +658,16 @@ def create_oauth_token_router(
             # Idempotent: nothing to revoke is still "revoked" from the
             # caller's perspective. Don't leak which tokens exist.
             return JSONResponse(status_code=200, content={"revoked": True})
+        login = getattr(auth_provider, "oidc_login_revoker", None) or getattr(
+            auth_provider, "oidc_login_broker", None
+        )
+        if (
+            login is not None
+            and _is_login_grant(grant.client_id)
+            and grant.user_id is not None
+            and grant.oidc_login_generation
+        ):
+            await asyncio.to_thread(login.revoke, grant.user_id, grant.oidc_login_generation)
         device_grant_store.revoke(grant.id)
         _logger.info("oauth/revoke: revoked grant %s", grant.id)
         return JSONResponse(status_code=200, content={"revoked": True})
@@ -817,8 +874,8 @@ def create_device_auth_router(
             payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        iat = payload.get("iat")
-        return iat if isinstance(iat, int) else None
+        iat = payload.get("auth_time", payload.get("iat"))
+        return iat if isinstance(iat, int) and not isinstance(iat, bool) else None
 
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
