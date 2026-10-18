@@ -26,7 +26,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePath
 from typing import Any, Final, Literal, cast
 
@@ -1944,21 +1944,14 @@ def _resolve_harness_impl(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
         executor = loaded.spec.executor
-        # For a bundled-agent head sub-agent, report the HEAD's own harness,
-        # not the bundle brain's — `harness` is this session's provider family
-        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
-        # brain harness when the head declares none or can't be matched.
+        # A selected child uses its own executor configuration and type.
         if conv.sub_agent_name:
             from omnigent.runtime.workflow import _find_spec_by_name
 
             sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
-        harness = (
-            executor.config.get("harness")
-            or loaded.spec.executor.config.get("harness")
-            or executor.type
-        )
+        harness = executor.config.get("harness") or executor.type
         return canonicalize_harness(harness) or harness
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
     except (
@@ -6077,7 +6070,15 @@ async def _launch_runner_on_host_locked(
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.server.routes._host_launch import agent_has_explicit_auth
 
+    launch_conv = replace(conv, harness_override=None) if conv.harness_override == "auto" else conv
+    harness = _resolve_harness(launch_conv)
+    agent_has_auth = (
+        await agent_has_explicit_auth(conv)
+        if host_registry.server_inference_eligible(host_conn, harness)
+        else False
+    )
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
@@ -6130,6 +6131,9 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
+        from omnigent.server.routes._host_launch import remember_inference_host_policy
+
+        await remember_inference_host_policy(conv, host_conn, host_registry, conversation_store)
         request_id = secrets.token_hex(8)
         launch_future: asyncio.Future[dict[str, str | None]] = (
             asyncio.get_running_loop().create_future()
@@ -6144,9 +6148,14 @@ async def _launch_runner_on_host_locked(
                 # Canonical harness (see _resolve_harness) so the host runs the
                 # same configuration check it does at create-time launch. None
                 # (agent not resolvable) skips the host-side check — fail open.
-                harness=_resolve_harness(conv),
+                harness=harness,
                 inference_config=(
-                    conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
+                    host_registry.runner_inference_config(
+                        conv,
+                        new_runner_id,
+                        harness,
+                        agent_has_auth=agent_has_auth,
+                    )
                 ),
             )
         )
@@ -10272,8 +10281,19 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.inference_config import (
+        INFERENCE_HOST_POLICY_LABEL,
+        SEPARATE_INFERENCE_RUNNER_LABEL,
+    )
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
+
+    for key in (INFERENCE_HOST_POLICY_LABEL, SEPARATE_INFERENCE_RUNNER_LABEL):
+        if key in labels:
+            raise OmnigentError(
+                f"label {key!r} is server-internal and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     if SIDE_CHAT_SOURCE_LABEL_KEY in labels:
         raise OmnigentError(

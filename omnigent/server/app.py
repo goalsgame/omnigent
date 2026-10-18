@@ -1575,6 +1575,19 @@ def create_app(
     server_metrics = ServerPerformanceMetrics()
     server_metrics_otel = ServerMetricsOtelPublisher()
 
+    from omnigent.server.routes.published_artifacts import (
+        PublicationLimits,
+        collect_published_artifacts,
+        create_published_artifacts_router,
+    )
+    from omnigent.stores.published_artifact_store import PublishedArtifactStore
+
+    publication_uri = getattr(file_store, "storage_location", None)
+    publication_store = (
+        PublishedArtifactStore(publication_uri) if isinstance(publication_uri, str) else None
+    )
+    publication_limits = PublicationLimits.parse(resolved_server_config.get("published_artifacts"))
+
     @asynccontextmanager
     async def _lifespan(
         app_inst: FastAPI,
@@ -1794,9 +1807,21 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        publication_cleanup = (
+            asyncio.create_task(collect_published_artifacts(publication_store, artifact_store))
+            if publication_store is not None
+            else None
+        )
         try:
             yield
         finally:
+            if publication_cleanup is not None:
+                publication_cleanup.cancel()
+                with suppress(asyncio.CancelledError):
+                    await publication_cleanup
+            inference_proxy = getattr(app_inst.state, "inference_proxy", None)
+            if inference_proxy is not None:
+                await inference_proxy.aclose()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -1814,6 +1839,8 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            for broker in delegation_brokers:
+                await asyncio.to_thread(broker.client.close)
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1895,10 +1922,35 @@ def create_app(
         )
         app.include_router(create_mcp_identity_router(host_store, mcp_broker), prefix="/v1")
     app.state.mcp_identity_broker = mcp_broker
-    if mcp_broker is not None:
+    from omnigent.server.lore import LoreConfig, LoreDelegationBroker
+
+    lore_config = LoreConfig.parse(resolved_server_config.get("oidc_lore"))
+    lore_broker = None
+    if lore_config is not None:
+        from omnigent.stores.credential_store import CredentialStore, build_secret_cipher
+
+        oidc = getattr(auth_provider, "_oidc_config", None)
+        cipher = build_secret_cipher()
+        if (
+            not isinstance(auth_provider, UnifiedAuthProvider)
+            or oidc is None
+            or cipher is None
+            or host_store is None
+            or permission_store is None
+        ):
+            raise RuntimeError("oidc_lore requires OIDC, credential encryption and managed hosts")
+        lore_broker = LoreDelegationBroker(
+            lore_config,
+            oidc,
+            CredentialStore(permission_store.storage_location, cipher),
+            auth_provider,
+        )
+    app.state.lore_identity_broker = lore_broker
+    delegation_brokers = [broker for broker in (mcp_broker, lore_broker) if broker is not None]
+    if delegation_brokers:
 
         @app.middleware("http")
-        async def capture_mcp_identity(request: Request, call_next):
+        async def capture_delegated_identity(request: Request, call_next):
             from omnigent.server.oidc_mcp import DelegationUnavailable
 
             path = request.url.path.removeprefix(resolved_base_path)
@@ -1908,11 +1960,16 @@ def create_app(
                 and (path == "/v1/sessions" or path.startswith("/v1/sessions/"))
                 and bearer.lower().startswith("bearer ")
             ):
+                broker = None
                 try:
-                    await asyncio.to_thread(mcp_broker.capture_bearer, bearer[7:])
+                    for broker in delegation_brokers:
+                        await asyncio.to_thread(broker.capture_bearer, bearer[7:])
                 except DelegationUnavailable:
                     return JSONResponse(
-                        {"detail": "MCP identity delegation unavailable; renew your IdP session"},
+                        {
+                            "detail": ("Lore" if broker is lore_broker else "MCP")
+                            + " identity delegation unavailable; renew your IdP session"
+                        },
                         status_code=403,
                         headers={"Cache-Control": "no-store"},
                     )
@@ -2959,7 +3016,7 @@ def create_app(
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
-    async def info() -> ServerInfoResponse:
+    async def info(request: Request) -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -3039,6 +3096,16 @@ def create_app(
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+            proxy = getattr(app.state, "inference_proxy", None)
+            if proxy is not None and proxy.config.managed_sandboxes:
+                from omnigent.server.routes.sandbox_inference import managed_proxy_catalog
+
+                for provider in sandbox_providers:
+                    if any(
+                        managed_proxy_catalog(request, provider, harness) is not None
+                        for harness in proxy.config.harnesses
+                    ):
+                        sandbox_provider_capabilities[provider]["inference_models"] = True
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3215,6 +3282,33 @@ def create_app(
                 _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
         # Still report the list, so admin chrome shows even if promotion failed.
         return {"user_id": user_id, "is_admin": flagged or listed}
+
+    if isinstance(publication_uri, str):
+        from omnigent.server.routes.peer_messages import create_peer_messages_router
+        from omnigent.stores.peer_message_store import PeerMessageStore
+
+        app.include_router(
+            create_peer_messages_router(
+                PeerMessageStore(publication_uri),
+                conversation_store,
+                permission_store,
+                auth_provider,
+            ),
+            prefix="/v1",
+        )
+
+    if publication_store is not None:
+        app.include_router(
+            create_published_artifacts_router(
+                publication_store,
+                artifact_store,
+                conversation_store,
+                permission_store,
+                auth_provider,
+                publication_limits,
+            ),
+            prefix="/v1",
+        )
 
     app.include_router(
         create_sessions_router(
@@ -3861,6 +3955,19 @@ def create_app(
                 return owner
         return None
 
+    def _resolve_runner_placement(runner_id: str) -> tuple[str, str] | None:
+        from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+        if conversation_store is not None:
+            for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+                if (
+                    conv.host_id
+                    and conv.workspace
+                    and conv.labels.get(INFERENCE_HOST_POLICY_LABEL) == conv.host_id
+                ):
+                    return conv.host_id, conv.workspace
+        return None
+
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
         create_runner_tunnel_router(
@@ -3871,6 +3978,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            resolve_runner_placement=_resolve_runner_placement,
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
@@ -3946,6 +4054,27 @@ def create_app(
     openrouter_wif_broker = (
         OpenRouterWIFBroker(openrouter_wif_config) if openrouter_wif_config else None
     )
+
+    from omnigent.server.inference_proxy import InferenceProxy, InferenceProxyConfig
+
+    inference_proxy_config = InferenceProxyConfig.parse(
+        resolved_server_config.get("inference_proxy")
+    )
+    app.state.inference_proxy = None
+    if inference_proxy_config is not None:
+        if host_store is None or host_registry is None:
+            raise ValueError("inference_proxy requires hosts")
+        inference_proxy = InferenceProxy(
+            inference_proxy_config,
+            conversation_store,
+            host_store,
+            openrouter_wif_broker,
+            machine_allowed=machine_verifier.principal_allowed if machine_verifier else None,
+        )
+        app.state.inference_proxy = inference_proxy
+        host_registry.inference_config_resolver = inference_proxy.launch_config
+        host_registry.server_inference_harnesses = inference_proxy_config.harnesses
+        app.include_router(inference_proxy.router(), prefix="/v1", tags=["inference"])
 
     # Host tunnel + REST endpoints (DAEMON_API.md). Mounted only when a
     # host_store is configured: the routers call host_store on every

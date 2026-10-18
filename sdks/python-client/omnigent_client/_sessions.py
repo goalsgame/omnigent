@@ -144,6 +144,9 @@ class Session:
         when no labels have been written.
     :param runner_id: Runner currently bound to this session, e.g.
         ``"runner_abc123"``. ``None`` until the client binds one.
+    :param host_id: Host bound to the session, or ``None`` before placement.
+    :param workspace: Canonical directory on that host, or ``None``.
+    :param routing_host_id: Effective request-routing host, including shared runners.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
     :param items: Committed conversation items in chronological
@@ -201,6 +204,9 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    host_id: str | None = None
+    workspace: str | None = None
+    routing_host_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -227,6 +233,9 @@ class Session:
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
+            host_id=raw.get("host_id"),
+            workspace=raw.get("workspace"),
+            routing_host_id=raw.get("routing_host_id"),
             reasoning_effort=raw.get("reasoning_effort"),
             items=items_raw if isinstance(items_raw, list) else [],
             llm_model=raw.get("llm_model"),
@@ -381,6 +390,7 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_id: str | None = None,
         host_type: str = "external",
         sandbox_provider: str | None = None,
     ) -> Session:
@@ -402,6 +412,7 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param host_id: External host to launch a fresh runner on; requires ``workspace``.
         :param workspace: Optional starting workspace. For an external
             host (the default), an absolute cwd to record on the session,
             e.g. ``"/Users/corey/projects/myapp"`` — CLI-launched sessions
@@ -427,6 +438,8 @@ class SessionsNamespace:
             metadata["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             metadata["workspace"] = workspace
+        if host_id is not None:
+            metadata["host_id"] = host_id
         if host_type != "external":
             metadata["host_type"] = host_type
         if sandbox_provider is not None:
@@ -449,6 +462,7 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_id: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -467,6 +481,7 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param host_id: External host to launch a fresh runner on; requires ``workspace``.
         :param workspace: Optional absolute starting cwd to record on
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :returns: The newly created :class:`Session` snapshot.
@@ -482,6 +497,8 @@ class SessionsNamespace:
             body["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             body["workspace"] = workspace
+        if host_id is not None:
+            body["host_id"] = host_id
         resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
@@ -584,6 +601,8 @@ class SessionsNamespace:
         for item in data if isinstance(data, list) else []:
             if not isinstance(item, dict) or not item.get("online"):
                 continue
+            if item.get("reusable") is False:
+                continue
             runner_id = item.get("runner_id")
             if not isinstance(runner_id, str) or not runner_id:
                 continue
@@ -599,6 +618,44 @@ class SessionsNamespace:
             if wanted & names:
                 return runner_id
         return unknown_harness
+
+    async def resolve_online_host(
+        self,
+        *,
+        harness: str | None = None,
+        canonicalize: Callable[[str], str] | None = None,
+    ) -> tuple[str, str] | None:
+        """Find owned placement for a fresh launch when online runners are isolated."""
+        resp = await self._http.get(f"{self._base}/v1/runners")
+        raise_for_status(resp.status_code, response_body(resp))
+        data = require_json_object(resp, "GET /v1/runners").get("data", [])
+        wanted = canonicalize(harness) if harness and canonicalize else harness
+        for item in data if isinstance(data, list) else []:
+            if (
+                not isinstance(item, dict)
+                or not item.get("online")
+                or item.get("reusable") is not False
+            ):
+                continue
+            host, workspace = item.get("host_id"), item.get("workspace")
+            if (
+                not isinstance(host, str)
+                or not host
+                or not isinstance(workspace, str)
+                or not workspace
+            ):
+                continue
+            advertised = item.get("harnesses")
+            if wanted is not None and isinstance(advertised, list):
+                names = {
+                    canonicalize(name) if canonicalize else name
+                    for name in advertised
+                    if isinstance(name, str)
+                }
+                if wanted not in names:
+                    continue
+            return host, workspace
+        return None
 
     async def list(
         self,
@@ -708,6 +765,33 @@ class SessionsNamespace:
         return Session.from_dict(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
+
+    async def launch_runner(
+        self,
+        session_id: str,
+        *,
+        host_id: str,
+        workspace: str,
+        headers: dict[str, str] | None = None,
+    ) -> Session:
+        """Launch a session's own runner on an external host.
+
+        :param session_id: Existing unbound session to run.
+        :param host_id: Host owned by the caller.
+        :param workspace: Absolute directory on that host.
+        :param headers: Optional per-request routing headers for the host's replica.
+        :returns: The host-bound session snapshot.
+        """
+        from urllib.parse import quote
+
+        response = await self._http.post(
+            f"{self._base}/v1/hosts/{quote(host_id, safe='')}/runners",
+            json={"session_id": session_id, "workspace": workspace},
+            headers=headers,
+            timeout=60.0,
+        )
+        raise_for_status(response.status_code, response_body(response))
+        return await self.get(session_id)
 
     async def unbind_runner(self, session_id: str) -> Session:
         """

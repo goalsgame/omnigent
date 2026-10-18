@@ -148,6 +148,13 @@ export function CommandPalette({
         run: () => navigate("/inbox"),
       },
       {
+        id: "go-artifacts",
+        label: "Go to Artifacts",
+        icon: InboxIcon,
+        keywords: ["published", "files", "reports", "presentations"],
+        run: () => navigate("/artifacts"),
+      },
+      {
         id: "go-tasks",
         label: "Go to Automations",
         icon: CalendarClockIcon,

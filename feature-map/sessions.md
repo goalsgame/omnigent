@@ -25,9 +25,10 @@ the header menu), and each place is a separate entry point.
   view, which can be filtered by project and paged.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
-- `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
-  closing one stops only that chat. Starting one from a stopped generic hosted
-  parent relaunches the parent first, then shares its replacement runner.
+- `side-chat-lifecycle`: generic side chats reuse their parent's live runner,
+  while hosts opted into server inference give each side chat its own runner.
+  Closing one stops only that chat. Starting one from a stopped generic hosted
+  parent relaunches the parent first.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -128,7 +129,9 @@ a separate action that leaves the session connected.
 parent composer, or choose **Start a new side chat** from the composer's add
 tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
 side chats open in a drawer. A generic hosted parent can start a new side chat
-after stopping; this relaunches the parent and both use one runner. Close a side
+after stopping; this relaunches the parent. Hosts opted into server inference
+give side chats independent runners so both conversations can stream concurrently;
+other hosts share the source runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace.

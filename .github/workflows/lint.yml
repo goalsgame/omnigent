@@ -80,6 +80,7 @@ jobs:
         # runtime dependencies in the repository-only lint group.
         run: |
           uv sync --locked --group lint \
+            --extra gcs \
             --extra hindsight \
             --extra nimble \
             --extra s3 \

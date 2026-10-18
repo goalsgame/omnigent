@@ -87,6 +87,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Published artifacts](./published-artifacts.md) covers publishing, durable links,
+  isolated HTML viewing, downloads and independent user/group sharing.
+
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent

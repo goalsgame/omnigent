@@ -314,3 +314,23 @@ async def test_runner_router_existing_conversation_returns_none_when_unpinned() 
         assert router.client_for_existing_conversation("conv_test") is None
     finally:
         await router.aclose()
+
+
+@pytest.mark.parametrize("root_fallback", [False, True])
+@pytest.mark.parametrize("same_runner", [False, True])
+def test_strict_inherited_routing_requires_shared_runner(root_fallback, same_runner):
+    from dataclasses import replace
+
+    from omnigent.runner.routing import routing_host_id
+
+    root = replace(_conversation("root", runner_id="parent-runner"), host_id="parent-host")
+    child = replace(
+        _conversation("child", runner_id="parent-runner" if same_runner else "other-runner"),
+        kind="sub_agent",
+        parent_conversation_id="missing" if root_fallback else "root",
+        root_conversation_id="root",
+    )
+    store = _ConversationStore({"root": root, "child": child})
+    assert routing_host_id(child, store, require_shared_runner=True) == (
+        "parent-host" if same_runner else None
+    )

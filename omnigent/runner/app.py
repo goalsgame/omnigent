@@ -2110,6 +2110,22 @@ def create_runner_app(
 
                 validate_runner_inference_config(None)
             return await _load_legacy_session_init_context()
+        if envelope.session_id != session_id or envelope.agent_id != agent_id:
+            raise ValueError("session initialization envelope identity mismatch")
+        if envelope.snapshot.inference_config is None:
+            from omnigent.runner.session_init_protocol import (
+                verify_transient_runner_inference_config,
+            )
+
+            transient = await verify_transient_runner_inference_config(server_client, envelope)
+            if transient is not None:
+                envelope = envelope.model_copy(
+                    update={
+                        "snapshot": envelope.snapshot.model_copy(
+                            update={"inference_config": transient}
+                        )
+                    }
+                )
         body_sub_agent = body.get("sub_agent_name")
         if envelope.sub_agent_name != (
             body_sub_agent if isinstance(body_sub_agent, str) else None

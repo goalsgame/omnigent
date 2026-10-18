@@ -1468,3 +1468,62 @@ async def test_list_preserves_host_id_on_rows() -> None:
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"
+
+
+@pytest.mark.asyncio
+async def test_registered_create_forwards_host_placement_and_decodes_binding():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert json.loads(request.content) == {
+            "agent_id": "agent",
+            "host_id": "host",
+            "workspace": "/host/workspace",
+        }
+        return httpx.Response(
+            201,
+            json={
+                **_session_response_body(),
+                "host_id": "host",
+                "workspace": "/host/workspace",
+                "runner_id": "fresh-runner",
+            },
+        )
+
+    sessions, client = _make_namespace(handler)
+    async with client:
+        result = await sessions.create_from_agent_id(
+            "agent", host_id="host", workspace="/host/workspace"
+        )
+    assert result.host_id == "host" and result.workspace == "/host/workspace"
+    assert result.runner_id == "fresh-runner"
+
+
+@pytest.mark.asyncio
+async def test_launch_runner_posts_explicit_host_placement_and_returns_session():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            assert request.url.path == "/v1/hosts/host/runners"
+            assert request.headers["X-Test-Host"] == "host"
+            assert json.loads(request.content) == {"session_id": "conv_abc", "workspace": "/work"}
+            return httpx.Response(200, json={"runner_id": "fresh-runner"})
+        assert request.url.path == "/v1/sessions/conv_abc"
+        return httpx.Response(
+            200,
+            json={
+                **_session_response_body(),
+                "host_id": "host",
+                "workspace": "/work",
+                "runner_id": "fresh-runner",
+            },
+        )
+
+    sessions, client = _make_namespace(handler)
+    async with client:
+        result = await sessions.launch_runner(
+            "conv_abc", host_id="host", workspace="/work", headers={"X-Test-Host": "host"}
+        )
+    assert result.runner_id == "fresh-runner" and result.host_id == "host"
+    assert len(calls) == 2

@@ -3053,3 +3053,50 @@ def test_runner_global_cleanup_ownership_is_explicit(
         monkeypatch.setenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raw_value)
 
     assert _runner_host_owns_global_cleanup_from_env() is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "work_start,work_end,new_input,expected_shutdown",
+    [
+        (0, 30, None, 40),
+        (2, 3, None, 13),
+        (0, 30, 35, 45),
+    ],
+)
+async def test_idle_window_restarts_after_work_finishes(
+    monkeypatch,
+    work_start,
+    work_end,
+    new_input,
+    expected_shutdown,
+):
+    from types import SimpleNamespace
+
+    from omnigent.runner import _entry
+
+    now = 0.0
+    shutdowns = []
+
+    async def sleep(delay):
+        nonlocal now
+        now += delay
+        assert now <= 100, "watchdog never shut down"
+
+    # Replace only this module's asyncio reference; other tasks keep the real clock.
+    monkeypatch.setattr(
+        _entry,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: now),
+            sleep=sleep,
+        ),
+    )
+    await _entry._run_inactivity_monitor(
+        idle_timeout_s=10,
+        get_last_activity=lambda: new_input if new_input is not None and now >= new_input else 0,
+        has_active_work=lambda: work_start <= now < work_end,
+        request_shutdown=lambda: shutdowns.append(now),
+        poll_interval_s=1,
+    )
+    assert shutdowns == [expected_shutdown]

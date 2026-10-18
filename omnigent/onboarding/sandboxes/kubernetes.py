@@ -70,6 +70,7 @@ from omnigent.host.workspace_errors import (
     GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT,
     GITHUB_CHECKOUT_UNCONNECTED,
     GITHUB_CHECKOUT_UNCONNECTED_EXIT,
+    WORKSPACE_ERROR_CODES,
     WORKSPACE_ERROR_MESSAGES,
 )
 from omnigent.onboarding.sandboxes.base import (
@@ -551,7 +552,10 @@ def _render_workspace_prep_command(
         script += "pids=''\nwired=''\ncredential_config=''\n"
         script += (
             "cleanup_credentials() {\n"
-            '  if [ -n "$credential_config" ]; then rm -f -- "$credential_config"; fi\n'
+            "  cleanup_status=$?\n"
+            '  for p in $pids; do wait "$p" || :; done\n'
+            '  if [ -n "$credential_config" ]; then rm -f -- "$credential_config" || :; fi\n'
+            '  return "$cleanup_status"\n'
             "}\n"
             "trap cleanup_credentials EXIT\n"
         )
@@ -601,6 +605,25 @@ def _render_workspace_prep_command(
             staging_names.append(staging)
         for repo, dirname, staging in zip(repos, dirnames, staging_names, strict=True):
             clone_dir = f"{workspace}/{dirname}"
+            if repo.url.startswith("lores://"):
+                args = [
+                    "python3",
+                    "-I",
+                    "-m",
+                    "omnigent.lore_checkout",
+                    "--server",
+                    server_url,
+                    "--host-id",
+                    host_id,
+                    "--remote",
+                    repo.url,
+                    "--target",
+                    clone_dir,
+                ]
+                if repo.branch:
+                    args += ["--ref", repo.branch]
+                script += shlex.join(args) + ' & pids="$pids $!"\n'
+                continue
             staging_dir = f"{workspace}/{staging}"
             clone = shlex.join(
                 [
@@ -675,10 +698,8 @@ def _render_workspace_prep_command(
             )
             script += "fi\n"
         script += 'rc=0\nfor p in $pids; do wait "$p" || { child_rc=$?; '
-        script += (
-            f'[ "$rc" -eq {GITHUB_CHECKOUT_UNCONNECTED_EXIT} ] || '
-            f'[ "$rc" -eq {GITHUB_CHECKOUT_MACHINE_UNAVAILABLE_EXIT} ] || rc=$child_rc; '
-        )
+        script += " || ".join(f'[ "$rc" -eq {code} ]' for code in WORKSPACE_ERROR_CODES)
+        script += " || rc=$child_rc; "
         script += "} ; done\n"
         script += '[ "$rc" -eq 0 ] || exit "$rc"\n'
     if host_config is not None:

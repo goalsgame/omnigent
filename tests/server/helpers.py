@@ -843,6 +843,11 @@ def build_agent_bundle(
                 # ``sa["executor"]``.
                 "executor": sa.get("executor", {"config": {"harness": "claude-sdk"}}),
             }
+            if "llm" in sa:
+                if sa["llm"] is None:
+                    sa_config.pop("llm", None)
+                else:
+                    sa_config["llm"] = sa["llm"]
             if "description" in sa:
                 sa_config["description"] = sa["description"]
             sa_bytes = yaml.dump(sa_config).encode()

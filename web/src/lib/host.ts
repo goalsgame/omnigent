@@ -112,6 +112,12 @@ export interface OmnigentHostConfig {
    * mount. Omitted by older hosts, which retain the sandboxed srcdoc preview.
    */
   htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
+  /**
+   * Browser-navigable URL for the credential-free artifact renderer. Hosts that
+   * install a fetcher must map this route too and preserve its CSP headers and
+   * separate HTTP document. No artifact bytes or credentials belong in the URL.
+   */
+  resolveArtifactRendererUrl?: (path: string) => string;
   /** Stable server/workspace identity used to scope browser-local extension storage. */
   serverIdentity?: string;
   /**
@@ -193,6 +199,14 @@ let embedScopeRoot: HTMLElement | null = null;
 
 export function getOmnigentHtmlPreviewFrame(): OmnigentHostConfig["htmlPreviewFrame"] {
   return hostConfig.htmlPreviewFrame;
+}
+
+export function resolveArtifactRendererUrl(serverUrl?: string): string | null {
+  if (hostConfig.resolveArtifactRendererUrl) {
+    return hostConfig.resolveArtifactRendererUrl("/v1/artifact-renderer");
+  }
+  if (hostConfig.fetcher) return null;
+  return serverUrl ?? withBasePath("/v1/artifact-renderer");
 }
 
 export function getOmnigentServerIdentity(): string | null {

@@ -453,6 +453,10 @@ class ToolManager:
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
         """
+        from omnigent.tools.builtins.publish_artifact import PublishArtifactTool
+
+        self._tools[PublishArtifactTool.name()] = PublishArtifactTool()
+
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
@@ -501,6 +505,11 @@ class ToolManager:
 
     def _register_session_tools(self) -> None:
         """Register framework-owned tools for the current session."""
+        from omnigent.tools.builtins.peer_messages import PEER_TOOL_TYPES
+
+        for tool_type in PEER_TOOL_TYPES:
+            self._tools[tool_type.name()] = tool_type()
+
         self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
 
     def _register_agent_mgmt_tools(self) -> None:

@@ -6572,6 +6572,7 @@ def _tool_relay_handler_factory(
             """
             if self.path not in (
                 "/tool",
+                "/events",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
                 "/hook/observe-tool",
@@ -6584,6 +6585,9 @@ def _tool_relay_handler_factory(
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/events":
+                self._handle_native_event(payload)
                 return
             if self.path == "/hook/observe-tool":
                 from omnigent.runner.pr_observer import observe_hook
@@ -6748,6 +6752,50 @@ def _tool_relay_handler_factory(
                 )
             self._respond_hook_output(hook_output)
 
+        def _handle_native_event(self, payload: _JsonObject) -> None:
+            """Forward native telemetry through the runner's refresh-capable client."""
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            event_type = payload.get("type")
+            if (
+                not isinstance(event_type, str)
+                or event_type
+                not in {
+                    "external_conversation_item",
+                    "external_compaction_status",
+                    "external_reasoning_effort_change",
+                    "external_model_options",
+                    "external_session_todos",
+                    "external_session_usage",
+                    "external_output_reasoning_delta",
+                    "external_output_text_delta",
+                    "external_session_status",
+                    "external_model_change",
+                }
+                or not isinstance(payload.get("data"), dict)
+            ):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            import urllib.parse as _up
+
+            url = f"/v1/sessions/{_up.quote(session_id, safe='')}/events"
+            future = asyncio.run_coroutine_threadsafe(
+                policy_client.post(url, json=payload, timeout=4.0), loop
+            )
+            try:
+                response = future.result(timeout=4.5)
+            except Exception:  # noqa: BLE001 — transport failures remain retryable
+                future.cancel()
+                self.send_error(HTTPStatus.BAD_GATEWAY)
+                return
+            raw = b"" if response.status_code in (204, 304) else b"{}"
+            self.send_response(response.status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
@@ -6815,6 +6863,8 @@ def _tool_relay_handler_factory(
             try:
                 length = int(length_raw)
             except ValueError:
+                return None
+            if self.path == "/events" and not 0 <= length <= 16_777_216:
                 return None
             if self.path == "/hook/observe-tool" and not 0 <= length <= 1_048_576:
                 return None

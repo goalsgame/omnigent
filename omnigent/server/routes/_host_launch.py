@@ -18,6 +18,7 @@ Centralizing the checks here keeps the two call sites from drifting
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import importlib.util
 from dataclasses import dataclass
@@ -26,10 +27,13 @@ from fastapi import HTTPException
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
+from omnigent.spec import ExecutorSpec
 from omnigent.stores import ConversationStore
+from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
@@ -211,3 +215,142 @@ def resolve_host_launch(
             raise HTTPException(status_code=404, detail="session not found")
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
+
+
+async def remember_inference_host_policy(
+    conv: Conversation, conn: HostConnection, registry: HostRegistry, store: ConversationStore
+) -> None:
+    """Remember opt-in placement across host tunnel gaps and server restarts."""
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+
+    if not registry.server_inference_harnesses:
+        return
+    policy = conn.host_id if "server-inference-v1" in conn.hello.capabilities else ""
+    if conv.labels.get(INFERENCE_HOST_POLICY_LABEL, "") != policy:
+        await asyncio.to_thread(store.set_labels, conv.id, {INFERENCE_HOST_POLICY_LABEL: policy})
+        conv.labels[INFERENCE_HOST_POLICY_LABEL] = policy
+
+
+def inherited_inference_host_policy(
+    parent: Conversation, store: ConversationStore, host_id: str
+) -> bool:
+    from omnigent.inference_config import INFERENCE_HOST_POLICY_LABEL
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+
+    current = parent
+    visited: set[str] = set()
+    for _ in range(16):
+        if current.id in visited:
+            break
+        visited.add(current.id)
+        if current.host_id is not None:
+            return (
+                current.host_id == host_id
+                and current.labels.get(INFERENCE_HOST_POLICY_LABEL) == host_id
+            )
+        ancestor_id = (
+            current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if current.kind == "default" and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+            else current.parent_conversation_id
+        )
+        ancestor = store.get_conversation(ancestor_id) if ancestor_id else None
+        if ancestor is None:
+            break
+        current = ancestor
+    return False
+
+
+async def independent_inference_child_host(
+    parent: Conversation | None,
+    inherited_runner_id: str | None,
+    registry: HostRegistry | None,
+    store: ConversationStore,
+    *,
+    host_store: HostStore | None,
+    user_id: str | None,
+) -> tuple[str, str | None] | None:
+    """Keep each child’s process-wide provider configuration independent."""
+    from omnigent.runner.routing import routing_host_id
+
+    if parent is None or inherited_runner_id is None or registry is None:
+        return None
+    if parent.inference_snapshot or not registry.server_inference_harnesses:
+        return None
+    host_id = await asyncio.to_thread(routing_host_id, parent, store)
+    conn = registry.get(host_id) if host_id else None
+    if host_id is not None and conn is None:
+        if not await asyncio.to_thread(inherited_inference_host_policy, parent, store, host_id):
+            return None
+        if host_store is not None:
+            host = await asyncio.to_thread(
+                resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+            )
+            raise host_absent_error(host)
+        raise HTTPException(
+            409, "Parent host is reconnecting; retry child creation once connected"
+        )
+    if conn is None or "server-inference-v1" not in conn.hello.capabilities:
+        return None
+    assert host_id is not None
+    workspace = await asyncio.to_thread(inherited_runner_workspace, parent, store, host_id)
+    return host_id, workspace
+
+
+def inherited_runner_workspace(
+    parent: Conversation, store: ConversationStore, host_id: str
+) -> str | None:
+    """Find the shared runner's workspace without crossing an explicit host boundary."""
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+
+    current = parent
+    visited: set[str] = set()
+    for _ in range(16):
+        if current.id in visited or current.host_id not in (None, host_id):
+            return None
+        visited.add(current.id)
+        if current.workspace:
+            return current.workspace
+        ancestor_id = (
+            current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if current.kind == "default" and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+            else current.parent_conversation_id
+        )
+        if not ancestor_id:
+            return None
+        ancestor = store.get_conversation(ancestor_id)
+        if ancestor is None:
+            return None
+        current = ancestor
+    return None
+
+
+async def agent_has_explicit_auth(
+    conv: Conversation,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+) -> bool:
+    """Preserve agent-owned authentication when selecting a host inference route."""
+    from omnigent.runtime import get_agent_cache, get_agent_store
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    if conv.agent_id is None:
+        return True
+    store = agent_store if agent_store is not None else get_agent_store()
+    cache = agent_cache if agent_cache is not None else get_agent_cache()
+    agent = await asyncio.to_thread(store.get, conv.agent_id)
+    if agent is None or agent.bundle_location is None:
+        return True
+    loaded = await asyncio.to_thread(cache.load, agent.id, agent.bundle_location, expand_env=False)
+    spec = loaded.spec
+    if conv.sub_agent_name:
+        spec = _find_spec_by_name(spec, conv.sub_agent_name) or spec
+    return executor_has_explicit_auth(spec.executor)
+
+
+def executor_has_explicit_auth(executor: ExecutorSpec) -> bool:
+    """Recognize both current and legacy agent-owned authentication."""
+    return (
+        executor.auth is not None
+        or bool(getattr(executor, "profile", None))
+        or bool(executor.config.get("profile"))
+    )

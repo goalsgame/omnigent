@@ -250,8 +250,8 @@ async def _run_inactivity_monitor(
 
     The monitor only shuts down when there has been no real runner work for
     ``idle_timeout_s`` and no agent work is active. If the timeout expires
-    while an agent turn is running, the monitor keeps waiting and exits soon
-    after the active work clears unless new activity resets the timer.
+    while agent work is running, the monitor waits and starts a fresh idle
+    window after that work clears.
 
     :param idle_timeout_s: Idle window in seconds, e.g. ``3600.0``. ``0``
         disables the monitor.
@@ -273,12 +273,18 @@ async def _run_inactivity_monitor(
             _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S,
             max(1.0, idle_timeout_s / 30.0),
         )
+    was_active = False
+    last_work_finished = float("-inf")
     while True:
-        elapsed_s = loop.time() - get_last_activity()
+        if has_active_work():
+            was_active = True
+            await asyncio.sleep(poll_interval_s)
+            continue
+        if was_active:
+            last_work_finished = loop.time()
+            was_active = False
+        elapsed_s = loop.time() - max(get_last_activity(), last_work_finished)
         if elapsed_s >= idle_timeout_s:
-            if has_active_work():
-                await asyncio.sleep(poll_interval_s)
-                continue
             _logger.info(
                 "runner idle timeout reached after %.1fs with no active work; shutting down",
                 elapsed_s,

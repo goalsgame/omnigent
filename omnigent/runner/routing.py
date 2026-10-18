@@ -74,6 +74,7 @@ def routing_host_id(
     conversation_store: ConversationStore,
     *,
     max_ancestor_reads: int = 16,
+    require_shared_runner: bool = False,
 ) -> str | None:
     """
     Return the host whose replica serves *conv*'s runner tunnel.
@@ -86,6 +87,7 @@ def routing_host_id(
     :param conv: Conversation whose runner is being routed.
     :param conversation_store: Store used to read the ancestor rows.
     :param max_ancestor_reads: Read budget, including the root fallback.
+    :param require_shared_runner: Require matching runner IDs for inherited placement.
     :returns: The routing host id, or ``None`` when no host is bound anywhere
         in the chain or the read budget is exhausted.
     """
@@ -120,6 +122,10 @@ def routing_host_id(
         ancestor = conversation_store.get_conversation(ancestor_id)
         if ancestor is None:
             break
+        if require_shared_runner and (
+            conv.runner_id is None or ancestor.runner_id != conv.runner_id
+        ):
+            return None
         if (
             is_side_chat
             and current.runner_id is not None
@@ -135,7 +141,10 @@ def routing_host_id(
         if reads >= max_ancestor_reads:
             return None
         root = conversation_store.get_conversation(root_id)
-        if root is not None:
+        if root is not None and (
+            not require_shared_runner
+            or (conv.runner_id is not None and root.runner_id == conv.runner_id)
+        ):
             return root.host_id
     return None
 

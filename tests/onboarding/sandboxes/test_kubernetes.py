@@ -2162,3 +2162,89 @@ def test_multi_repo_clone_preserves_actionable_github_failure(
     assert all(not Path(path).exists() for path in paths)
     assert not (tmp_path / "home/workspace/private").exists()
     assert not (tmp_path / "home/workspace/other").exists()
+
+
+@pytest.mark.parametrize("lore_first", [False, True])
+@pytest.mark.parametrize("git_failure", [False, True])
+def test_mixed_checkout_waits_before_credential_cleanup(
+    tmp_path: Path, lore_first: bool, git_failure: bool
+) -> None:
+    repos = [
+        RepoWorkspace(url="https://git.example.test/team/git", branch=None, repo_name="git"),
+        RepoWorkspace(url="lores://lore.example.test/game", branch=None, repo_name="game"),
+    ]
+    if lore_first:
+        repos.reverse()
+    command = k8s._render_workspace_prep_command(str(tmp_path / "workspace"), repos, ":", "host")
+    root = shlex.quote(str(tmp_path))
+    python = shlex.quote(sys.executable)
+    prefix = f"""
+root={root}
+python3() {{
+    if [ "$1" = "-c" ]; then return 0; fi
+    if [ "$1" = "-I" ]; then
+        for i in {{1..100}}; do [ ! -f "$root/git-started" ] || break; sleep 0.01; done
+        touch "$root/lore-failed"
+        return 86
+    fi
+    {python} "$@"
+}}
+git() {{
+    touch "$root/git-started"
+    for i in {{1..100}}; do [ ! -f "$root/lore-failed" ] || break; sleep 0.01; done
+    sleep 0.2
+    if [ ! -f "$GIT_CONFIG_GLOBAL" ]; then
+        touch "$root/credentials-removed-early"
+        return 70
+    fi
+    touch "$root/git-finished"
+    mkdir -p "${{@: -1}}/.git"
+    return {1 if git_failure else 0}
+}}
+"""
+    result = subprocess.run(
+        ["bash", "-c", prefix + command[-1]], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 86, result.stderr
+    assert (tmp_path / "git-finished").exists()
+    assert not (tmp_path / "credentials-removed-early").exists()
+
+
+@pytest.mark.parametrize("failure", ["conflict", "credentials"])
+def test_foreground_preparation_failure_drains_lore_child(tmp_path: Path, failure: str) -> None:
+    workspace = tmp_path / "workspace"
+    if failure == "conflict":
+        destination = workspace / "git"
+        destination.mkdir(parents=True)
+        (destination / "preserve.txt").write_text("unsaved")
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [
+            RepoWorkspace(url="lores://lore.example.test/game", branch=None, repo_name="game"),
+            RepoWorkspace(url="https://git.example.test/team/git", branch=None, repo_name="git"),
+        ],
+        ":",
+        "host",
+    )
+    root = shlex.quote(str(tmp_path))
+    python = shlex.quote(sys.executable)
+    prefix = f"""
+root={root}
+python3() {{
+    if [ "$1" = "-I" ]; then
+        exec >/dev/null 2>&1
+        sleep 0.3
+        touch "$root/lore-finished"
+        return 0
+    fi
+    if [ "$1" = "-c" ]; then return 2; fi
+    {python} "$@"
+}}
+"""
+    result = subprocess.run(
+        ["bash", "-c", prefix + command[-1]], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == (1 if failure == "conflict" else 2), result.stderr
+    assert (tmp_path / "lore-finished").exists()
+    if failure == "conflict":
+        assert (workspace / "git/preserve.txt").read_text() == "unsaved"
