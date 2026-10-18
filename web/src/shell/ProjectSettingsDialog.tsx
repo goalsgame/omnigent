@@ -211,7 +211,12 @@ export function ProjectSettingsDialog({
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed || (hostId === SANDBOX_HOST_CHOICE && info === "loading")) return;
+    if (
+      loadFailed ||
+      modelValidationPending ||
+      (hostId === SANDBOX_HOST_CHOICE && info === "loading")
+    )
+      return;
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
@@ -300,6 +305,11 @@ export function ProjectSettingsDialog({
     ? null
     : (browsableHostId ?? onlineHosts[0]?.host_id ?? null);
   const previewHarness = selectedNativeSpec?.harness ?? selectedAgent?.harness ?? null;
+  const providerHasCatalog =
+    info !== "loading" &&
+    sandboxProvider !== null &&
+    info.sandbox_provider_capabilities?.[sandboxProvider]?.inference_models === true;
+  const sandboxProviderAvailable = managedSandboxesEnabled && sandboxProvider !== null;
   const sandboxCatalogEnabled =
     open &&
     sandboxSelected &&
@@ -307,7 +317,7 @@ export function ProjectSettingsDialog({
     sandboxProvider !== null &&
     previewHarness !== null &&
     harnessTakesModel &&
-    info.sandbox_provider_capabilities?.[sandboxProvider]?.inference_models === true;
+    providerHasCatalog;
   const sandboxModels = useSandboxModelOptions(
     sandboxProvider,
     previewHarness,
@@ -320,9 +330,24 @@ export function ProjectSettingsDialog({
     selectedNativeSpec?.harness ?? "",
     harnessTakesModel && modelCatalogHostId !== null,
   );
+  const sandboxCatalogUsable =
+    sandboxCatalogEnabled && !sandboxModels.error && !sandboxModels.isLoading;
+  const staticSandboxClaudeModels =
+    sandboxSelected &&
+    sandboxProviderAvailable &&
+    !sandboxModels.error &&
+    selectedNativeSpec?.harness === "claude-native" &&
+    (!providerHasCatalog ||
+      (sandboxCatalogUsable && sandboxModels.data?.status === "unconfigured"));
+  const replacementCatalogResolved =
+    staticSandboxClaudeModels ||
+    (sandboxCatalogUsable &&
+      (sandboxModels.data?.status === "ready" || sandboxModels.data?.status === "empty"));
+  const modelValidationPending =
+    sandboxSelected && savedProviderUnavailable && model !== NONE && !replacementCatalogResolved;
   const modelOptions = useMemo(() => {
     const source = sandboxSelected
-      ? sandboxModels.data?.status === "ready"
+      ? sandboxCatalogUsable && sandboxModels.data?.status === "ready"
         ? sandboxModels.data.models
         : []
       : (hostModelOptions ?? []);
@@ -330,15 +355,25 @@ export function ProjectSettingsDialog({
       id: o.id,
       label: o.displayName ?? o.id,
     }));
-    if (live.length > 0 || sandboxSelected) return live;
+    if (live.length > 0 || (sandboxSelected && !staticSandboxClaudeModels)) return live;
     return selectedNativeSpec?.harness === "claude-native"
       ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
       : [];
-  }, [hostModelOptions, selectedNativeSpec, sandboxSelected, sandboxModels.data]);
+  }, [
+    hostModelOptions,
+    selectedNativeSpec,
+    sandboxSelected,
+    sandboxModels.data,
+    sandboxCatalogUsable,
+    staticSandboxClaudeModels,
+  ]);
   // Keep a stored model the current options don't list as a labeled fallback
   // item, so opening + saving the dialog doesn't silently drop the default.
   const effectiveModel =
-    sandboxSelected && savedProviderUnavailable && !modelOptions.some((m) => m.id === model)
+    sandboxSelected &&
+    savedProviderUnavailable &&
+    !modelValidationPending &&
+    !modelOptions.some((m) => m.id === model)
       ? NONE
       : model;
   const storedModelMissing =
@@ -613,6 +648,12 @@ export function ProjectSettingsDialog({
                 : "Choose another host before starting new sessions."}
             </p>
           )}
+          {modelValidationPending && (
+            <p className="text-muted-foreground text-sm" role="status">
+              The saved model cannot be validated yet. Wait for the model catalog, or choose No
+              default to discard the saved model before saving.
+            </p>
+          )}
           {loadFailed && (
             <p
               className="text-destructive text-ui"
@@ -642,7 +683,12 @@ export function ProjectSettingsDialog({
               type="submit"
               data-testid="project-settings-save"
               loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed || (sandboxSelected && info === "loading")}
+              disabled={
+                isLoading ||
+                loadFailed ||
+                modelValidationPending ||
+                (sandboxSelected && info === "loading")
+              }
             >
               Save
             </Button>

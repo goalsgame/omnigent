@@ -64,7 +64,7 @@ const createMock = vi.mocked(createProject);
 
 function renderDialog(projectId: string | null = "p_1") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const content = () => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <ProjectSettingsDialog
@@ -74,8 +74,10 @@ function renderDialog(projectId: string | null = "p_1") {
           projectName="Work"
         />
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const view = render(content());
+  return { ...view, refresh: () => view.rerender(content()) };
 }
 
 beforeEach(() => {
@@ -683,8 +685,159 @@ it("does not preserve a removed provider when no sandboxes are available", async
   });
   renderDialog();
   await screen.findByText(/saved sandbox provider is unavailable/);
+  expect(screen.getByTestId("project-settings-save")).toBeDisabled();
+  fireEvent.click(screen.getByTestId("project-settings-model"));
+  fireEvent.click(await screen.findByRole("option", { name: "No default" }));
   fireEvent.click(screen.getByTestId("project-settings-save"));
   await waitFor(() =>
     expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "__sandbox__", agent_id: "ag_pi" }),
   );
 });
+
+it.each(["loading", "error", "unavailable"])(
+  "preserves a saved model while the replacement catalog is %s",
+  async (state) => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
+    });
+    availableAgentsMock.mockReturnValue({
+      data: [pickerAgent({ id: "ag_pi", harness: "pi-native" })],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        host_id: "__sandbox__",
+        sandbox_provider: "removed",
+        agent_id: "ag_pi",
+        model: "provider/saved",
+      },
+    });
+    sandboxModelsMock.mockReturnValue(
+      state === "loading"
+        ? { data: undefined, isLoading: true }
+        : state === "error"
+          ? { data: undefined, isLoading: false, error: new Error("catalog unavailable") }
+          : { data: { status: "unavailable", configured: true, models: [] }, isLoading: false },
+    );
+    const view = renderDialog();
+    await screen.findByText(/saved model cannot be validated/);
+    expect(screen.getByTestId("project-settings-model")).toHaveTextContent("provider/saved");
+    expect(screen.getByTestId("project-settings-save")).toBeDisabled();
+    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+    expect(updateMock).not.toHaveBeenCalled();
+    sandboxModelsMock.mockReturnValue({
+      data: { status: "ready", configured: true, models: [{ id: "provider/saved" }] },
+      isLoading: false,
+    });
+    view.refresh();
+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        host_id: "__sandbox__",
+        sandbox_provider: "agent_sandbox",
+        agent_id: "ag_pi",
+        model: "provider/saved",
+      }),
+    );
+  },
+);
+
+it("allows explicit model discard when the replacement catalog fails", async () => {
+  serverInfoMock.mockReturnValue({
+    managed_sandboxes_enabled: true,
+    sandbox_provider: "agent_sandbox",
+    sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
+  });
+  availableAgentsMock.mockReturnValue({
+    data: [pickerAgent({ id: "ag_pi", harness: "pi-native" })],
+  });
+  getProjectMock.mockResolvedValue({
+    id: "p_1",
+    name: "Work",
+    config: {
+      host_id: "__sandbox__",
+      sandbox_provider: "removed",
+      agent_id: "ag_pi",
+      model: "provider/saved",
+    },
+  });
+  sandboxModelsMock.mockReturnValue({
+    data: undefined,
+    isLoading: false,
+    error: new Error("catalog unavailable"),
+  });
+  renderDialog();
+  await screen.findByText(/saved model cannot be validated/);
+  fireEvent.click(screen.getByTestId("project-settings-model"));
+  fireEvent.click(await screen.findByRole("option", { name: "No default" }));
+  expect(screen.getByTestId("project-settings-save")).toBeEnabled();
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() =>
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      host_id: "__sandbox__",
+      sandbox_provider: "agent_sandbox",
+      agent_id: "ag_pi",
+    }),
+  );
+});
+
+it.each(["unsupported", "unconfigured", "loading", "error", "unavailable", "ready-empty"])(
+  "handles static Claude aliases for sandbox catalog state %s",
+  async (state) => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: {
+        agent_sandbox: { inference_models: state !== "unsupported" },
+      },
+    });
+    availableAgentsMock.mockReturnValue({
+      data: [pickerAgent({ id: "ag_claude", name: "claude", harness: "claude-native" })],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { host_id: "__sandbox__", agent_id: "ag_claude" },
+    });
+    const fallback = state === "unsupported" || state === "unconfigured";
+    sandboxModelsMock.mockReturnValue(
+      state === "loading"
+        ? { data: undefined, isLoading: true }
+        : state === "error"
+          ? { data: undefined, isLoading: false, error: new Error("catalog failed") }
+          : {
+              data: {
+                status: state === "ready-empty" ? "ready" : state,
+                configured: state !== "unconfigured",
+                models: [],
+              },
+              isLoading: false,
+            },
+    );
+    hostModelOptionsMock.mockReturnValue({ data: [{ id: "local-only" }] });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
+    if (!fallback) {
+      expect(screen.getByTestId("project-settings-model")).toBeDisabled();
+      return;
+    }
+    expect(screen.getByTestId("project-settings-model")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    expect(await screen.findByRole("option", { name: "Sonnet" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "local-only" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "Sonnet" }));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        host_id: "__sandbox__",
+        sandbox_provider: "agent_sandbox",
+        agent_id: "ag_claude",
+        model: "sonnet",
+      }),
+    );
+  },
+);
