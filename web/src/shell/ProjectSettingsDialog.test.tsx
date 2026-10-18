@@ -841,3 +841,105 @@ it.each(["unsupported", "unconfigured", "loading", "error", "unavailable", "read
     );
   },
 );
+
+it("offers Claude aliases for managed sandboxes without a named provider", async () => {
+  serverInfoMock.mockReturnValue({ managed_sandboxes_enabled: true, sandbox_provider: null });
+  availableAgentsMock.mockReturnValue({
+    data: [pickerAgent({ id: "ag_claude", harness: "claude-native" })],
+  });
+  getProjectMock.mockResolvedValue({
+    id: "p_1",
+    name: "Work",
+    config: { host_id: "__sandbox__", agent_id: "ag_claude" },
+  });
+  renderDialog();
+  await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeEnabled());
+  expect(sandboxModelsMock).toHaveBeenLastCalledWith(
+    null,
+    "claude-native",
+    "ag_claude",
+    null,
+    false,
+  );
+  fireEvent.click(screen.getByTestId("project-settings-model"));
+  fireEvent.click(await screen.findByRole("option", { name: "Sonnet" }));
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() =>
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      host_id: "__sandbox__",
+      agent_id: "ag_claude",
+      model: "sonnet",
+    }),
+  );
+});
+
+it.each([false, true])(
+  "discards stale models without requiring a catalog when no model-capable agent is selected (SDK agent: %s)",
+  async (sdkAgent) => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+    });
+    availableAgentsMock.mockReturnValue({
+      data: [pickerAgent({ id: "ag_sdk", harness: "claude-sdk" })],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        host_id: "__sandbox__",
+        sandbox_provider: "removed_provider",
+        model: "provider/stale",
+        ...(sdkAgent ? { agent_id: "ag_sdk" } : {}),
+      },
+    });
+    renderDialog();
+    await screen.findByText(/saved sandbox provider is unavailable/);
+    expect(screen.queryByTestId("project-settings-model")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-save")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        host_id: "__sandbox__",
+        sandbox_provider: "agent_sandbox",
+        ...(sdkAgent ? { agent_id: "ag_sdk" } : {}),
+      }),
+    );
+  },
+);
+
+it("keeps stale-model validation blocked until the selected agent resolves", async () => {
+  serverInfoMock.mockReturnValue({
+    managed_sandboxes_enabled: true,
+    sandbox_provider: "agent_sandbox",
+  });
+  availableAgentsMock.mockReturnValue({ data: [] });
+  getProjectMock.mockResolvedValue({
+    id: "p_1",
+    name: "Work",
+    config: {
+      host_id: "__sandbox__",
+      sandbox_provider: "removed_provider",
+      agent_id: "ag_sdk",
+      model: "provider/stale",
+    },
+  });
+  const view = renderDialog();
+  await screen.findByText(/saved model cannot be validated/);
+  expect(screen.getByTestId("project-settings-save")).toBeDisabled();
+  fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+  expect(updateMock).not.toHaveBeenCalled();
+  availableAgentsMock.mockReturnValue({
+    data: [pickerAgent({ id: "ag_sdk", harness: "claude-sdk" })],
+  });
+  view.refresh();
+  await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() =>
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      host_id: "__sandbox__",
+      sandbox_provider: "agent_sandbox",
+      agent_id: "ag_sdk",
+    }),
+  );
+});

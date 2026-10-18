@@ -309,7 +309,7 @@ export function ProjectSettingsDialog({
     info !== "loading" &&
     sandboxProvider !== null &&
     info.sandbox_provider_capabilities?.[sandboxProvider]?.inference_models === true;
-  const sandboxProviderAvailable = managedSandboxesEnabled && sandboxProvider !== null;
+  const sandboxProviderAvailable = managedSandboxesEnabled;
   const sandboxCatalogEnabled =
     open &&
     sandboxSelected &&
@@ -344,7 +344,11 @@ export function ProjectSettingsDialog({
     (sandboxCatalogUsable &&
       (sandboxModels.data?.status === "ready" || sandboxModels.data?.status === "empty"));
   const modelValidationPending =
-    sandboxSelected && savedProviderUnavailable && model !== NONE && !replacementCatalogResolved;
+    sandboxSelected &&
+    savedProviderUnavailable &&
+    model !== NONE &&
+    (harnessTakesModel || (agentId !== null && selectedAgent === null)) &&
+    !replacementCatalogResolved;
   const modelOptions = useMemo(() => {
     const source = sandboxSelected
       ? sandboxCatalogUsable && sandboxModels.data?.status === "ready"
