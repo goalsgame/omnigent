@@ -48,6 +48,7 @@ Refresh tokens: short access tokens + rotating, revocable refresh tokens.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import html
 import logging
@@ -64,6 +65,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.oidc_mcp import DelegationUnavailable
 from omnigent.server.routes._oauth import (
     NO_STORE_HEADERS,
     RATE_LIMITER_MAX_KEYS,
@@ -200,6 +202,7 @@ def mint_delegated_token(
     scope: str | None = DELEGATED_SCOPE,
     account_generation: str | None = None,
     group_authority: dict[str, object] | None = None,
+    oidc_grant_id: str | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -259,6 +262,8 @@ def mint_delegated_token(
         payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
+    if oidc_grant_id is not None:
+        payload["oidc_grant_id"] = oidc_grant_id
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -447,17 +452,35 @@ def create_oauth_token_router(
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
         scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
+        login = getattr(auth_provider, "oidc_login_broker", None)
+        login_state = (
+            login.state(user_id) if login is not None and _is_login_grant(client_id) else None
+        )
         return mint_delegated_token(
             user_id,
             cookie_secret,
-            _ACCESS_TOKEN_TTL_SECONDS,
+            login.access_ttl(login_state)
+            if login_state is not None and login is not None
+            else _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
-            group_authority=grant.group_authority,
+            group_authority=login.group_authority(login_state)
+            if login_state is not None and login is not None
+            else grant.group_authority,
+            oidc_grant_id=login_state["generation"]
+            if login_state is not None and login is not None
+            else None,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
             scope=scope,
+        )
+
+    def access_expiry(token: str) -> int:
+        if getattr(auth_provider, "oidc_login_broker", None) is None:
+            return _ACCESS_TOKEN_TTL_SECONDS
+        return max(
+            0, int(jwt.decode(token, cookie_secret, algorithms=["HS256"])["exp"] - time.time())
         )
 
     @router.post("/oauth/token", dependencies=[])
@@ -487,8 +510,10 @@ def create_oauth_token_router(
                 return _oauth_error("invalid_grant")
         if grant_type == "refresh_token":
             try:
-                return _handle_refresh_grant(str(form.get("refresh_token") or ""))
-            except OmnigentError:
+                return await asyncio.to_thread(
+                    _handle_refresh_grant, str(form.get("refresh_token") or "")
+                )
+            except (OmnigentError, DelegationUnavailable):
                 return _oauth_error("invalid_grant")
         if grant_type == "client_credentials":
             # RFC 6749 §4.4: the machine client presents its OWN credential,
@@ -547,7 +572,7 @@ def create_oauth_token_router(
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                     "token_type": "Bearer",
-                    "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+                    "expires_in": access_expiry(access_token),
                 },
                 headers=NO_STORE_HEADERS,
             )
@@ -578,7 +603,7 @@ def create_oauth_token_router(
                 "access_token": access_token,
                 "refresh_token": new_refresh,
                 "token_type": "Bearer",
-                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+                "expires_in": access_expiry(access_token),
             },
             headers=NO_STORE_HEADERS,
         )

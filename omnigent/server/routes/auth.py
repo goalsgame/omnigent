@@ -705,6 +705,19 @@ def create_auth_router(
             else None
         )
 
+        login_broker = getattr(request.app.state, "oidc_login_broker", None)
+        login_state = None
+        if login_broker is not None:
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            try:
+                login_state = await asyncio.to_thread(
+                    login_broker.capture, email, str((claims or {})["sub"]), token_json
+                )
+                group_authority = login_broker.group_authority(login_state)
+            except DelegationUnavailable:
+                return fail(503, "Identity delegation unavailable; please retry sign-in")
+
         brokers = [
             broker
             for broker in (
@@ -753,6 +766,21 @@ def create_auth_router(
             provider=config.provider_type,
         )
 
+        if login_state is not None and login_broker is not None:
+            session_jwt = login_broker.session_token(email, login_state)
+
+        def set_login_cookie(response):
+            if login_state is not None and login_broker is not None:
+                response.set_cookie(
+                    login_broker.cookie_name,
+                    login_broker.browser_cookie(email, login_state),
+                    max_age=max(0, int(login_state["deadline"] - time.time())),
+                    secure=_secure,
+                    httponly=True,
+                    samesite="lax",
+                    path="/",
+                )
+
         # Check if this callback fulfills a CLI login ticket.
         ticket_id = state_payload.get("ticket")
         if ticket_id and ticket_id in _cli_tickets:
@@ -794,12 +822,15 @@ def create_auth_router(
             resp.set_cookie(
                 key=_session_cookie,
                 value=session_jwt,
-                max_age=config.session_ttl_hours * 3600,
+                max_age=login_broker.access_ttl(login_state)
+                if login_state is not None and login_broker is not None
+                else config.session_ttl_hours * 3600,
                 httponly=True,
                 secure=_secure,
                 samesite="lax",
                 path="/",
             )
+            set_login_cookie(resp)
             resp.delete_cookie(
                 key=cookie_name,
                 path="/",
@@ -814,12 +845,15 @@ def create_auth_router(
         response.set_cookie(
             key=_session_cookie,
             value=session_jwt,
-            max_age=config.session_ttl_hours * 3600,
+            max_age=login_broker.access_ttl(login_state)
+            if login_state is not None and login_broker is not None
+            else config.session_ttl_hours * 3600,
             httponly=True,
             secure=_secure,
             samesite="lax",
             path="/",
         )
+        set_login_cookie(response)
         # Clear the auth state cookie.
         response.delete_cookie(
             key=cookie_name,
@@ -895,6 +929,21 @@ def create_auth_router(
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
+        login_broker = getattr(request.app.state, "oidc_login_broker", None)
+        if login_broker is not None:
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            try:
+                owner, _ = await asyncio.to_thread(
+                    login_broker.browser_identity,
+                    request.cookies.get(login_broker.cookie_name, ""),
+                )
+                await asyncio.to_thread(login_broker.store.delete, owner, "oidc_login")
+            except DelegationUnavailable:
+                pass
+            response.delete_cookie(
+                login_broker.cookie_name, path="/", secure=_secure, httponly=True, samesite="lax"
+            )
         response.delete_cookie(
             key=_session_cookie,
             path="/",
@@ -973,7 +1022,15 @@ def create_auth_router(
         content: dict[str, object] = {
             "token": token,
             "user_id": user_id,
-            "expires_in": config.session_ttl_hours * 3600,
+            "expires_in": max(
+                0,
+                int(
+                    jwt.decode(ticket.token, config.cookie_secret, algorithms=["HS256"])["exp"]
+                    - time.time()
+                ),
+            )
+            if auth_provider.oidc_login_broker is not None
+            else config.session_ttl_hours * 3600,
         }
         # Only present when a grant store is wired — old CLIs ignore the
         # extra key, new CLIs against old servers see it absent.
@@ -1030,6 +1087,16 @@ def create_auth_router(
             "user_id": pending.user_id,
             "expires_in": config.session_ttl_hours * 3600,
         }
+        login_broker = getattr(request.app.state, "oidc_login_broker", None)
+        if login_broker is not None:
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            try:
+                login_state = await asyncio.to_thread(login_broker.state, pending.user_id)
+                content["token"] = login_broker.session_token(pending.user_id, login_state)
+                content["expires_in"] = login_broker.access_ttl(login_state)
+            except DelegationUnavailable:
+                return oauth_error("invalid_grant")
         # The desktop renews from this grant instead of reopening the
         # browser when the session expires. Best-effort, as for CLI logins.
         if device_grant_store is not None:

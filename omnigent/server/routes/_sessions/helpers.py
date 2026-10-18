@@ -11314,7 +11314,15 @@ async def _handle_mcp_tools_list(
         len(failures),
         extra={"session_id": session_id},
     )
-    return _mcp_ok_response(rpc_id, {"tools": tools})
+    public_failures = {
+        name: (
+            "Sign in again to restore connector access"
+            if "Sign in again to restore connector access" in message
+            else "MCP server unavailable"
+        )
+        for name, message in failures.items()
+    }
+    return _mcp_ok_response(rpc_id, {"tools": tools, "failures": public_failures})
 
 
 async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:

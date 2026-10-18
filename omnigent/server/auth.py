@@ -485,6 +485,7 @@ class UnifiedAuthProvider(AuthProvider):
         machine_verifier: OIDCMachineVerifier | None = None,
         human_verifier: OIDCHumanVerifier | None = None,
     ) -> None:
+        self.oidc_login_broker: OIDCLoginBroker | None = None
         self._source = source
         self._oidc_config = oidc_config
         self._accounts_config = accounts_config
@@ -730,6 +731,7 @@ class UnifiedAuthProvider(AuthProvider):
         if (
             not credential_authority
             and self._account_check is None
+            and self.oidc_login_broker is None
             and cached is not None
             and cached[1] > time.monotonic()
         ):
@@ -764,6 +766,14 @@ class UnifiedAuthProvider(AuthProvider):
             or not user_id
             or user_id in _RESERVED_USERS
             or user_id.startswith(GROUP_PRINCIPAL_PREFIX)
+        ):
+            return None
+
+        generation = payload.get("oidc_grant_id")
+        if generation is not None and (
+            self.oidc_login_broker is None
+            or not isinstance(generation, str)
+            or not self.oidc_login_broker.active(user_id, generation)
         ):
             return None
 
@@ -832,6 +842,7 @@ class UnifiedAuthProvider(AuthProvider):
             and not is_machine
             and grant_id is None
             and scope is None
+            and "oidc_grant_id" not in payload
             and "group_authority" not in payload
         ):
             remaining = payload.get("exp", 0) - time.time()
@@ -1090,4 +1101,5 @@ if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig
     from omnigent.server.oidc_human_auth import OIDCHumanVerifier
+    from omnigent.server.oidc_login import OIDCLoginBroker
     from omnigent.server.oidc_machine_auth import OIDCMachineVerifier

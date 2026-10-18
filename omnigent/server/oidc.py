@@ -59,6 +59,7 @@ def mint_session_token(
     *,
     account_generation: str | None = None,
     credential_delegate: bool = False,
+    oidc_grant_id: str | None = None,
     group_authority: dict[str, object] | None = None,
 ) -> str:
     """
@@ -87,6 +88,8 @@ def mint_session_token(
     }
     if group_authority is not None:
         payload["group_authority"] = group_authority
+    if oidc_grant_id is not None:
+        payload["oidc_grant_id"] = oidc_grant_id
     if credential_delegate:
         payload["credential_delegate"] = True
     if account_generation is not None:

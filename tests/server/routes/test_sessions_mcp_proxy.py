@@ -79,3 +79,35 @@ async def test_mcp_tools_list_runner_failure_is_genericized(
     # ...but IS logged server-side for operators (the other half of the
     # contract — if missing, the failure has no diagnostic record).
     assert _RaisingRunnerClient.raw_error in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_list_preserves_identity_failure_but_sanitizes_details():
+    from types import SimpleNamespace
+
+    class Client:
+        async def post(self, *args, **kwargs):
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "http://runner/mcp"),
+                json={
+                    "result": {
+                        "schemas": [],
+                        "failures": {
+                            "identity": "McpError: Sign in again to restore connector access",
+                            "other": "private transport detail",
+                        },
+                    }
+                },
+            )
+
+    router = SimpleNamespace(
+        client_for_session_resources=lambda sid: RoutedRunner(runner_id="fixture", client=Client())
+    )
+    response = await _handle_mcp_tools_list(rpc_id=1, session_id="fixture", runner_router=router)
+    body = json.loads(bytes(response.body))
+    assert body["result"]["failures"] == {
+        "identity": "Sign in again to restore connector access",
+        "other": "MCP server unavailable",
+    }
+    assert "private transport detail" not in json.dumps(body)

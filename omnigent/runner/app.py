@@ -5535,6 +5535,14 @@ def create_runner_app(
                     _mcp = await _turn_mcp.schemas_for(cast(AgentSpec, _turn_spec))
                     _mcp_schemas = _mcp.schemas
                     _mcp_tool_names = _mcp.tool_names
+                    if any(
+                        "Sign in again to restore connector access" in error
+                        for error in _mcp.failures.values()
+                    ):
+                        _eager_spec_error = (
+                            "identity_login_required",
+                            "Sign in again to restore connector access",
+                        )
                     for _srv, _err in _mcp.failures.items():
                         _logger.warning(
                             "runner MCP %r unavailable for this turn: %s",

@@ -1856,6 +1856,8 @@ def create_app(
             # endpoint. Best-effort — individual close failures are logged
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
+            if login_broker is not None:
+                await asyncio.to_thread(login_broker.client.close)
             if mcp_broker is not None:
                 await asyncio.to_thread(mcp_broker.client.close)
 
@@ -1922,6 +1924,32 @@ def create_app(
         )
         app.include_router(create_mcp_identity_router(host_store, mcp_broker), prefix="/v1")
     app.state.mcp_identity_broker = mcp_broker
+    login_broker = None
+    delegation_hours = int(os.environ.get("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", "0"))
+    if delegation_hours:
+        from omnigent.server.oidc_login import OIDCLoginBroker
+        from omnigent.stores.credential_store import CredentialStore, build_secret_cipher
+
+        cipher = build_secret_cipher()
+        if (
+            not isinstance(auth_provider, UnifiedAuthProvider)
+            or auth_provider._oidc_config is None
+            or permission_store is None
+            or cipher is None
+        ):
+            raise RuntimeError(
+                "Offline OIDC delegation requires OIDC and encrypted credential storage"
+            )
+        login_broker = OIDCLoginBroker(
+            auth_provider._oidc_config,
+            CredentialStore(permission_store.storage_location, cipher),
+            delegation_hours,
+        )
+        auth_provider.oidc_login_broker = login_broker
+        if mcp_broker is not None:
+            mcp_broker.login_broker = login_broker
+    app.state.oidc_login_broker = login_broker
+
     from omnigent.server.lore import LoreConfig, LoreDelegationBroker
 
     lore_config = LoreConfig.parse(resolved_server_config.get("oidc_lore"))
@@ -1946,6 +1974,8 @@ def create_app(
             auth_provider,
         )
     app.state.lore_identity_broker = lore_broker
+    if lore_broker is not None:
+        lore_broker.login_broker = login_broker
     delegation_brokers = [broker for broker in (mcp_broker, lore_broker) if broker is not None]
     if delegation_brokers:
 
@@ -4458,6 +4488,10 @@ def create_app(
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
+    if login_broker is not None:
+        from omnigent.server.oidc_login_middleware import OIDCLoginMiddleware
+
+        app.add_middleware(OIDCLoginMiddleware, broker=login_broker)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -14,6 +14,9 @@ from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig
 from omnigent.server.oidc_machine_auth import _BoundedJWKClient, verify_access_token
 from omnigent.stores.credential_store import CredentialStore
+
+if TYPE_CHECKING:
+    from omnigent.server.oidc_login import OIDCLoginBroker
 
 _PROVIDER = "oidc_mcp"
 _TOKEN_TYPE = "urn:ietf:params:oauth:token-type:"
@@ -105,6 +108,7 @@ class MCPDelegationBroker:
         if oidc.provider_type != "oidc" or not oidc.jwks_uri or not oidc.client_secret:
             raise ValueError(f"{provider} requires a confidential OIDC login client with JWKS")
         self.config, self.oidc, self.store, self.auth = config, oidc, store, auth
+        self.login_broker: OIDCLoginBroker | None = None
         self.provider = provider
         self.client = client or httpx.Client(timeout=15, follow_redirects=False, trust_env=False)
         self.jwks = _BoundedJWKClient(oidc.jwks_uri)
@@ -153,6 +157,11 @@ class MCPDelegationBroker:
 
     def capture(self, owner: str, subject: str, token: str) -> None:
         """Persist a grant only after the caller's IdP token and owner have been verified."""
+        if self.login_broker is not None and not owner.startswith("oidc-machine:"):
+            if self.login_broker.state(owner)["subject"] != subject:
+                raise DelegationUnavailable("Sign in again to renew identity delegation")
+            self.credential(owner)
+            return
         tokens = self._tokens(
             owner,
             subject,
@@ -179,6 +188,44 @@ class MCPDelegationBroker:
     def credential(self, owner: str) -> str:
         """Resolve only the stored owner's grant and serialize refresh across replicas."""
         self._client_credentials(owner)
+        if self.login_broker is not None and not owner.startswith("oidc-machine:"):
+            state = self.login_broker.state(owner)
+            # Only short-lived access tokens leave the shared offline login broker.
+            current = self.store.get(owner, self.provider, with_secret=True)
+            if (
+                current is not None
+                and current.secret is not None
+                and current.metadata.get("generation") == state["generation"]
+                and float(current.secret.get("expires_at", 0)) > time.time() + 30
+            ):
+                if not self.login_broker.active(owner, state["generation"]):
+                    raise DelegationUnavailable("Sign in again to renew identity delegation")
+                return str(current.secret["access_token"])
+            tokens = self._tokens(
+                owner,
+                state["subject"],
+                {
+                    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "subject_token_type": _TOKEN_TYPE + "access_token",
+                    "subject_token": state["access_token"],
+                    "requested_token_type": _TOKEN_TYPE + "access_token",
+                    "scope": self.config.scope,
+                },
+            )
+            tokens.pop("refresh_token", None)
+            self.store.upsert(
+                owner,
+                self.provider,
+                secret=tokens,
+                metadata={
+                    "issuer": self.oidc.issuer,
+                    "subject": state["subject"],
+                    "generation": state["generation"],
+                },
+            )
+            if not self.login_broker.active(owner, state["generation"]):
+                raise DelegationUnavailable("Sign in again to renew identity delegation")
+            return str(tokens["access_token"])
 
         def refresh(connection: ProviderConnection) -> dict[str, Any]:
             secret = connection.secret or {}

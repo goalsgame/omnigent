@@ -34,8 +34,9 @@ __all__ = ["mock_llm", "oidc", "runtime_init", "signing_key"]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("offline", [False, True])
 async def test_login_owner_invokes_mcp_from_managed_stdio_host(
-    db_uri, tmp_path, monkeypatch, runtime_init, oidc, signing_key
+    db_uri, tmp_path, monkeypatch, runtime_init, oidc, signing_key, offline
 ):
     owner, subject = "person@example.test", "person-subject"
     host_id = uuid.uuid4().hex
@@ -44,8 +45,17 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
     sock.listen()
     base = f"http://127.0.0.1:{sock.getsockname()[1]}"
     oidc = dataclasses.replace(oidc, redirect_uri=base + "/auth/callback")
+    if offline:
+        oidc = dataclasses.replace(oidc, scopes=oidc.scopes + " offline_access")
+        monkeypatch.setenv("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", "168")
+
     jwk = jwt.algorithms.RSAAlgorithm.to_jwk(signing_key.public_key(), as_dict=True)
     jwk.update(kid="fixture", alg="RS256", use="sig")
+    monkeypatch.setattr(
+        "omnigent.server.oidc_login._BoundedJWKClient.get_signing_key_from_jwt",
+        lambda self, token: jwt.PyJWK.from_dict(jwk),
+    )
+
     monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda self: {"keys": [jwk]})
     monkeypatch.setattr(
         "omnigent.stores.credential_store.build_secret_cipher", lambda: _FakeCipher()
@@ -73,7 +83,7 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
         },
     )
 
-    def signed(audience):
+    def signed(audience, kind=None):
         now = int(time.time())
         return jwt.encode(
             {
@@ -81,7 +91,7 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
                 "aud": audience,
                 "sub": subject,
                 "azp": oidc.client_id,
-                "typ": "ID" if audience == oidc.client_id else "Bearer",
+                "typ": kind or ("ID" if audience == oidc.client_id else "Bearer"),
                 "iat": now,
                 "exp": now + 300,
                 "email": owner,
@@ -98,7 +108,13 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
         if str(url) == oidc.token_endpoint:
             assert kwargs["data"]["grant_type"] == "authorization_code"
             return httpx.Response(
-                200, json={"id_token": signed(oidc.client_id), "access_token": "login-access"}
+                200,
+                json={
+                    "id_token": signed(oidc.client_id),
+                    "access_token": signed("login-api") if offline else "login-access",
+                    "refresh_token": signed(oidc.client_id, "Offline"),
+                    "expires_in": 300,
+                },
             )
         return await original_post(client, url, **kwargs)
 
@@ -106,7 +122,12 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
 
     def exchange(request):
         form = parse_qs(request.content.decode())
-        assert form["subject_token"] == ["login-access"]
+        if not offline:
+            assert form["subject_token"] == ["login-access"]
+        if offline:
+            assert form["requested_token_type"] == [
+                "urn:ietf:params:oauth:token-type:access_token"
+            ]
         assert form["client_id"] == [oidc.client_id]
         return httpx.Response(
             200,
@@ -189,6 +210,8 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
                 )
                 assert callback.status_code == 302, callback.text
                 assert callback.cookies.get("ap_session")
+                if offline:
+                    assert callback.cookies.get("ap_oidc_renewal")
             hosts.register_managed_host(
                 host_id=host_id,
                 name="fixture",

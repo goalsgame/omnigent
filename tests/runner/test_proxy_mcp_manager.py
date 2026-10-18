@@ -713,3 +713,23 @@ async def test_call_tool_uses_configured_read_timeout() -> None:
         "otherwise call_tool may regress to httpx's shorter default."
     )
     assert timeout["connect"] == 10.0, "Connect timeout stays short to fail fast on a dead server"
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_retains_actionable_identity_failures():
+    transport = _StubTransport(
+        [
+            _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "tools": [],
+                        "failures": {"tools": "Sign in again to restore connector access"},
+                    },
+                }
+            )
+        ]
+    )
+    result = await _make_manager(transport).schemas_for(_make_spec("tools"))
+    assert result.failures == {"tools": "Sign in again to restore connector access"}
