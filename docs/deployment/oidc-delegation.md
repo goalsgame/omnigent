@@ -22,7 +22,9 @@ set `OMNIGENT_GRANT_MAX_LIFETIME_DAYS=7` to bound those local grants as well.
 Identity-provider group claims are refreshed with the access token. Silent
 renewal preserves the original authentication time and cannot satisfy a device
 consent flow's fresh-login requirement. A renewal
-never extends the original offline-delegation deadline.
+never extends the original offline-delegation deadline. Provider timeouts, rate
+limits and server errors return a retryable 503 without clearing renewal
+credentials. Retry after the provider recovers.
 
 New logins supersede the user's previous offline grant. Logout removes the stored
 grant, making tokens bound to that grant fail validation. Identity-provider
@@ -38,7 +40,10 @@ cannot renew after activation; users must complete a new interactive sign-in.
 The nullable generation column is added by the application database migration. This
 feature does not change the provider's realm-wide SSO session policy. To disable
 it, set the lifetime to zero and remove `offline_access` from the requested
-login scopes. Grant-bound tokens then require a fresh legacy login.
+login scopes. Grant-bound tokens then require a fresh legacy login. Browser and
+native logout continue to revoke their original stored generation while renewal
+is disabled; browser logout also clears the renewal cookie. Retain the encrypted
+credential store and cookie signing key to support this cleanup.
 
 Verify browser, native and CLI login and renewal, connectors and Lore access,
 concurrent refresh, group removal, logout/revocation, and absolute expiry. Keep

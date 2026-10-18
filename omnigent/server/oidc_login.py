@@ -21,7 +21,56 @@ from omnigent.stores.credential_store import CredentialStore
 PROVIDER = "oidc_login"
 
 
-class OIDCLoginBroker:
+class DelegationTemporarilyUnavailable(Exception):
+    """The identity provider is unavailable; retain credentials for retry."""
+
+
+class OIDCLoginRevoker:
+    """Keep logout available independently of offline renewal configuration."""
+
+    def __init__(self, config: OIDCConfig, store: CredentialStore) -> None:
+        self.config, self.store = config, store
+        self.cookie_key = hmac.new(
+            config.cookie_secret, b"oidc-browser-renewal-v1", hashlib.sha256
+        ).digest()
+        self.cookie_name = "__Host-ap_oidc_renewal" if config.secure_cookies else "ap_oidc_renewal"
+
+    def active(self, owner: str, generation: str) -> bool:
+        connection = self.store.get(owner, PROVIDER)
+        return bool(
+            connection
+            and connection.metadata.get("issuer") == self.config.issuer
+            and connection.metadata.get("generation") == generation
+            and float(connection.metadata.get("deadline", 0)) > time.time()
+        )
+
+    def revoke(self, owner: str, generation: str) -> bool:
+        connection = self.store.get(owner, PROVIDER)
+        if connection is None or connection.metadata.get("generation") != generation:
+            return False
+        return self.store.delete(owner, PROVIDER, expected_metadata=connection.metadata)
+
+    def browser_identity(self, token: str) -> tuple[str, str]:
+        try:
+            claims = jwt.decode(
+                token,
+                self.cookie_key,
+                algorithms=["HS256"],
+                options={"require": ["sub", "generation", "exp"]},
+            )
+            owner, generation = claims["sub"], claims["generation"]
+            if (
+                not isinstance(owner, str)
+                or not isinstance(generation, str)
+                or not self.active(owner, generation)
+            ):
+                raise ValueError("Login revoked")
+            return owner, generation
+        except (jwt.PyJWTError, ValueError, TypeError):
+            raise DelegationUnavailable("Sign in again to renew identity delegation") from None
+
+
+class OIDCLoginBroker(OIDCLoginRevoker):
     """Serialize offline-token rotation and cap every login at an absolute deadline."""
 
     def __init__(self, config: OIDCConfig, store: CredentialStore, ttl_hours: int) -> None:
@@ -31,14 +80,10 @@ class OIDCLoginBroker:
             raise ValueError(
                 "Offline delegation requires offline_access and a 1–720 hour lifetime"
             )
-        self.config, self.store = config, store
+        super().__init__(config, store)
         self.ttl = ttl_hours * 3600
         self.jwks = _BoundedJWKClient(config.jwks_uri)
         self.client = httpx.Client(timeout=15, follow_redirects=False, trust_env=False)
-        self.cookie_key = hmac.new(
-            config.cookie_secret, b"oidc-browser-renewal-v1", hashlib.sha256
-        ).digest()
-        self.cookie_name = "__Host-ap_oidc_renewal" if config.secure_cookies else "ap_oidc_renewal"
 
     def _claims(self, token: str, subject: str, *, offline: bool = False) -> dict[str, Any]:
         key = self.jwks.get_signing_key_from_jwt(token)
@@ -109,21 +154,6 @@ class OIDCLoginBroker:
             "groups": [group_name(g) for g in verified_groups(claims.get("groups"))],
         }
 
-    def active(self, owner: str, generation: str) -> bool:
-        connection = self.store.get(owner, PROVIDER)
-        return bool(
-            connection
-            and connection.metadata.get("issuer") == self.config.issuer
-            and connection.metadata.get("generation") == generation
-            and float(connection.metadata.get("deadline", 0)) > time.time()
-        )
-
-    def revoke(self, owner: str, generation: str) -> bool:
-        connection = self.store.get(owner, PROVIDER)
-        if connection is None or connection.metadata.get("generation") != generation:
-            return False
-        return self.store.delete(owner, PROVIDER, expected_metadata=connection.metadata)
-
     def state(self, owner: str) -> dict[str, Any]:
         """Refresh one shared login grant, never a copy per downstream service."""
 
@@ -146,6 +176,10 @@ class OIDCLoginBroker:
                         "client_secret": self.config.client_secret,
                     },
                 )
+                if response.status_code >= 500 or response.status_code in (408, 429):
+                    raise DelegationTemporarilyUnavailable(
+                        "Identity provider temporarily unavailable"
+                    )
                 response.raise_for_status()
                 tokens = response.json()
                 claims = self._claims(tokens["access_token"], str(meta["subject"]))
@@ -154,6 +188,10 @@ class OIDCLoginBroker:
                 rotated = tokens.get("refresh_token") or secret["refresh_token"]
                 self._claims(rotated, str(meta["subject"]), offline=True)
                 return self._secret(tokens, claims, rotated)
+            except httpx.TransportError:
+                raise DelegationTemporarilyUnavailable(
+                    "Identity provider temporarily unavailable"
+                ) from None
             except (
                 httpx.HTTPError,
                 jwt.PyJWTError,
@@ -197,22 +235,3 @@ class OIDCLoginBroker:
             self.cookie_key,
             algorithm="HS256",
         )
-
-    def browser_identity(self, token: str) -> tuple[str, str]:
-        try:
-            claims = jwt.decode(
-                token,
-                self.cookie_key,
-                algorithms=["HS256"],
-                options={"require": ["sub", "generation", "exp"]},
-            )
-            owner, generation = claims["sub"], claims["generation"]
-            if (
-                not isinstance(owner, str)
-                or not isinstance(generation, str)
-                or not self.active(owner, generation)
-            ):
-                raise ValueError("Login revoked")
-            return owner, generation
-        except (jwt.PyJWTError, ValueError, TypeError):
-            raise DelegationUnavailable("Sign in again to renew identity delegation") from None

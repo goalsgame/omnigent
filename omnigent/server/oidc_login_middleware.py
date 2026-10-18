@@ -12,7 +12,7 @@ from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from omnigent.server.oidc_login import OIDCLoginBroker
+from omnigent.server.oidc_login import DelegationTemporarilyUnavailable, OIDCLoginBroker
 from omnigent.server.oidc_mcp import DelegationUnavailable
 
 
@@ -56,6 +56,19 @@ class OIDCLoginMiddleware:
             if state["generation"] != generation:
                 raise DelegationUnavailable("Sign in again to renew identity delegation")
             token = self.broker.session_token(owner, state)
+        except DelegationTemporarilyUnavailable:
+            if scope["type"] == "websocket":
+                await send(
+                    {"type": "websocket.close", "code": 1013, "reason": "Retry authentication"}
+                )
+            else:
+                response = JSONResponse(
+                    {"error": "temporarily_unavailable"},
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "5"},
+                )
+                await response(scope, receive, send)
+            return
         except DelegationUnavailable:
             if scope["type"] == "websocket":
                 await send(

@@ -596,3 +596,116 @@ async def test_disabled_broker_cannot_unbind_native_refresh(login, db_uri, autho
         assert response.status_code == 400
         assert response.json()["error"] == "invalid_grant"
         assert "access_token" not in response.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+async def test_logout_while_renewal_disabled_stays_revoked_after_reenable(
+    offline_auth_app, db_uri, native
+):
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.oidc_login import OIDCLoginRevoker
+    from omnigent.server.routes.device_auth import create_oauth_token_router, issue_login_grant
+
+    app, broker, tokens = offline_auth_app
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    cookie = broker.browser_cookie(OWNER, state)
+    revoker = OIDCLoginRevoker(
+        dataclasses.replace(broker.config, scopes="openid email profile"), broker.store
+    )
+    app.state.oidc_login_broker = None
+    app.state.oidc_login_revoker = revoker
+    auth = UnifiedAuthProvider("oidc", oidc_config=broker.config)
+    auth.oidc_login_revoker = revoker
+    grants = DeviceGrantStore(db_uri)
+    refresh = issue_login_grant(
+        grants,
+        user_id=OWNER,
+        cookie_secret=broker.config.cookie_secret,
+        oidc_login_generation=state["generation"],
+    )
+    app.include_router(create_oauth_token_router(auth, grants))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        client.cookies.set(broker.cookie_name, cookie)
+        if native:
+            response = await client.post("/oauth/revoke", data={"refresh_token": refresh})
+        else:
+            response = await client.get("/auth/logout")
+            assert broker.cookie_name in response.headers["set-cookie"]
+            assert "Max-Age=0" in response.headers["set-cookie"]
+        assert response.status_code in (200, 302)
+        auth.oidc_login_broker = broker
+        app.state.oidc_login_broker = broker
+        assert not broker.active(OWNER, state["generation"])
+        with pytest.raises(DelegationUnavailable):
+            broker.browser_identity(cookie)
+        response = await client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+        )
+        assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("failure", [503, 429, "timeout"])
+async def test_temporary_provider_failure_preserves_browser_and_native_renewal(
+    login, db_uri, native, failure
+):
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.routes.device_auth import create_oauth_token_router, issue_login_grant
+
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    calls = []
+
+    def provider(request):
+        calls.append(request)
+        if len(calls) == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("provider unavailable", request=request)
+            return httpx.Response(failure)
+        return httpx.Response(200, json=tokens())
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(provider))
+    auth = UnifiedAuthProvider("oidc", oidc_config=broker.config)
+    auth.oidc_login_broker = broker
+    refresh = issue_login_grant(
+        DeviceGrantStore(db_uri),
+        user_id=OWNER,
+        cookie_secret=broker.config.cookie_secret,
+        oidc_login_generation=state["generation"],
+    )
+    app = FastAPI()
+    app.add_middleware(OIDCLoginMiddleware, broker=broker)
+    app.include_router(create_oauth_token_router(auth, DeviceGrantStore(db_uri)))
+
+    @app.get("/v1/probe")
+    def probe():
+        return {"ok": True}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        if not native:
+            client.cookies.set(broker.cookie_name, broker.browser_cookie(OWNER, state))
+
+        async def renew():
+            if native:
+                return await client.post(
+                    "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
+                )
+            return await client.get("/v1/probe")
+
+        response = await renew()
+        assert response.status_code == 503
+        assert response.json()["error"] == "temporarily_unavailable"
+        assert "set-cookie" not in response.headers
+        assert broker.active(OWNER, state["generation"])
+        assert (await renew()).status_code == 200
+        assert len(calls) == 2

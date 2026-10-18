@@ -65,6 +65,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.oidc_login import DelegationTemporarilyUnavailable
 from omnigent.server.oidc_mcp import DelegationUnavailable
 from omnigent.server.routes._oauth import (
     NO_STORE_HEADERS,
@@ -532,6 +533,8 @@ def create_oauth_token_router(
                 return await asyncio.to_thread(
                     _handle_refresh_grant, str(form.get("refresh_token") or "")
                 )
+            except DelegationTemporarilyUnavailable:
+                return _oauth_error("temporarily_unavailable", status_code=503)
             except (OmnigentError, DelegationUnavailable):
                 return _oauth_error("invalid_grant")
         if grant_type == "client_credentials":
@@ -655,7 +658,9 @@ def create_oauth_token_router(
             # Idempotent: nothing to revoke is still "revoked" from the
             # caller's perspective. Don't leak which tokens exist.
             return JSONResponse(status_code=200, content={"revoked": True})
-        login = getattr(auth_provider, "oidc_login_broker", None)
+        login = getattr(auth_provider, "oidc_login_revoker", None) or getattr(
+            auth_provider, "oidc_login_broker", None
+        )
         if (
             login is not None
             and _is_login_grant(grant.client_id)

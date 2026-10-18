@@ -1950,6 +1950,37 @@ def create_app(
             mcp_broker.login_broker = login_broker
     app.state.oidc_login_broker = login_broker
 
+    from omnigent.server.oidc_login import DelegationTemporarilyUnavailable, OIDCLoginRevoker
+    from omnigent.stores.credential_store import CredentialStore, build_secret_cipher
+
+    login_revoker = login_broker
+    if (
+        login_revoker is None
+        and isinstance(auth_provider, UnifiedAuthProvider)
+        and auth_provider._oidc_config is not None
+        and permission_store is not None
+    ):
+        cipher = build_secret_cipher()
+        if cipher is not None:
+            login_revoker = OIDCLoginRevoker(
+                auth_provider._oidc_config,
+                CredentialStore(permission_store.storage_location, cipher),
+            )
+
+    @app.exception_handler(DelegationTemporarilyUnavailable)
+    async def temporary_identity_failure(
+        _request: Request, _exc: DelegationTemporarilyUnavailable
+    ):
+        return JSONResponse(
+            {"error": "temporarily_unavailable"},
+            status_code=503,
+            headers={"Cache-Control": "no-store", "Retry-After": "5"},
+        )
+
+    app.state.oidc_login_revoker = login_revoker
+    if isinstance(auth_provider, UnifiedAuthProvider):
+        auth_provider.oidc_login_revoker = login_revoker
+
     from omnigent.server.lore import LoreConfig, LoreDelegationBroker
 
     lore_config = LoreConfig.parse(resolved_server_config.get("oidc_lore"))
@@ -1994,6 +2025,12 @@ def create_app(
                 try:
                     for broker in delegation_brokers:
                         await asyncio.to_thread(broker.capture_bearer, bearer[7:])
+                except DelegationTemporarilyUnavailable:
+                    return JSONResponse(
+                        {"error": "temporarily_unavailable"},
+                        status_code=503,
+                        headers={"Cache-Control": "no-store", "Retry-After": "5"},
+                    )
                 except DelegationUnavailable:
                     return JSONResponse(
                         {

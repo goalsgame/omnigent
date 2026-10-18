@@ -486,6 +486,7 @@ class UnifiedAuthProvider(AuthProvider):
         human_verifier: OIDCHumanVerifier | None = None,
     ) -> None:
         self.oidc_login_broker: OIDCLoginBroker | None = None
+        self.oidc_login_revoker: OIDCLoginRevoker | None = None
         self._source = source
         self._oidc_config = oidc_config
         self._accounts_config = accounts_config
@@ -1101,5 +1102,5 @@ if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig
     from omnigent.server.oidc_human_auth import OIDCHumanVerifier
-    from omnigent.server.oidc_login import OIDCLoginBroker
+    from omnigent.server.oidc_login import OIDCLoginBroker, OIDCLoginRevoker
     from omnigent.server.oidc_machine_auth import OIDCMachineVerifier

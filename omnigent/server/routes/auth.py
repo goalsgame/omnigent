@@ -948,7 +948,9 @@ def create_auth_router(
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
-        login_broker = getattr(request.app.state, "oidc_login_broker", None)
+        login_broker = getattr(request.app.state, "oidc_login_revoker", None) or getattr(
+            request.app.state, "oidc_login_broker", None
+        )
         if login_broker is not None:
             from omnigent.server.oidc_mcp import DelegationUnavailable
 
