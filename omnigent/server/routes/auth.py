@@ -65,6 +65,10 @@ _logger = logging.getLogger(__name__)
 _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
+_AUTH_STATE_MAX_COOKIES = 8
+_AUTH_STATE_MAX_COOKIE_BYTES = 3800
+_AUTH_STATE_HEADER_BUDGET = 4096
+_AUTH_COOKIE_HEADER_BUDGET = 6144
 _AUTH_STATE_RETRY_PARAM = "_ap_cookie_retry"
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
 # A native sign-in code is exchanged by the app right after the browser
@@ -461,8 +465,35 @@ def create_auth_router(
             or re.fullmatch(re.escape(_state_cookie) + r"_[0-9a-f]{64}", name)
         ]
         cookie_name = _flow_cookie(state) if config.flow_state_cookies else _state_cookie
+
+        def cookie_bytes(name: str, value: str) -> int:
+            return len(f"{name}={value}; ".encode())
+
+        new_bytes = cookie_bytes(cookie_name, state_jwt)
+        pending_bytes = sum(cookie_bytes(name, request.cookies[name]) - 2 for name in pending)
+        other_bytes = max(0, len(request.headers.get("cookie", "").encode()) - pending_bytes)
+        budget = min(_AUTH_STATE_HEADER_BUDGET, _AUTH_COOKIE_HEADER_BUDGET - other_bytes)
+        if new_bytes > _AUTH_STATE_MAX_COOKIE_BYTES or new_bytes > budget:
+            return JSONResponse(
+                status_code=400,
+                headers=NO_STORE_HEADERS,
+                content={
+                    "error": (
+                        "Sign-in request is too large. "
+                        "Shorten the return URL or clear site cookies and try again."
+                    )
+                },
+            )
         retained = [name for name in pending if name != cookie_name]
-        for name in retained[:-7]:
+        total_bytes = new_bytes + sum(
+            cookie_bytes(name, request.cookies[name]) for name in retained
+        )
+        evicted = []
+        while len(retained) >= _AUTH_STATE_MAX_COOKIES or total_bytes > budget:
+            name = retained.pop(0)
+            total_bytes -= cookie_bytes(name, request.cookies[name])
+            evicted.append(name)
+        for name in evicted:
             response.delete_cookie(name, path="/", secure=_secure, httponly=True, samesite="lax")
         response.set_cookie(
             key=cookie_name,

@@ -142,3 +142,59 @@ def test_compatibility_mode_emits_legacy_cookie_readable_by_old_handlers(callbac
     assert response.status_code == 302
     assert response.headers["location"] == "/c/compatible"
     assert "ap_auth_state" not in client.cookies
+
+
+@pytest.mark.parametrize(
+    ("other_cookie_bytes", "path_length"), [(0, 1800), (2200, 1800), (5000, 100)]
+)
+def test_large_return_paths_fit_the_aggregate_cookie_budget(
+    callback_client, other_cookie_bytes, path_length
+) -> None:
+    client, keys = callback_client
+    client.app.state.pending_id_token[0] = keys.sign_id_token(
+        {"email": "member@example.test", "email_verified": True}
+    )
+    if other_cookie_bytes:
+        client.cookies.set("other", "x" * other_cookie_bytes, domain="testserver.local", path="/")
+    last = None
+    for index in range(6):
+        target = "/c/" + "x" * path_length + str(index)
+        login = client.get("/auth/login", params={"return_to": target}, follow_redirects=False)
+        assert login.status_code == 302
+        cookie_header = client.build_request("GET", "/auth/callback").headers.get("cookie", "")
+        assert len(cookie_header.encode()) <= 6144
+        name, value = next((name, value) for name, value in login.cookies.items() if value)
+        assert len(f"{name}={value}; ".encode()) <= 3800
+        payload = jwt.decode(value, _TEST_SECRET, algorithms=["HS256"])
+        assert payload["return_to"] == target
+        last = (payload["state"], target)
+    assert last is not None
+    callback = client.get(
+        "/auth/callback", params={"code": "c", "state": last[0]}, follow_redirects=False
+    )
+    assert callback.status_code == 302
+    assert callback.headers["location"] == last[1]
+
+
+def test_oversized_state_is_rejected_without_discarding_pending_login(callback_client) -> None:
+    client, _ = callback_client
+    login = client.get("/auth/login", follow_redirects=False)
+    name, value = next(iter(login.cookies.items()))
+    response = client.get(
+        "/auth/login", params={"return_to": "/" + "x" * 5000}, follow_redirects=False
+    )
+    assert response.status_code == 400
+    assert "too large" in response.json()["error"]
+    assert response.headers["cache-control"] == "no-store"
+    assert "location" not in response.headers
+    assert not response.cookies
+    assert client.cookies[name] == value
+
+
+def test_large_other_cookies_leave_no_room_for_new_state(callback_client) -> None:
+    client, _ = callback_client
+    client.cookies.set("other", "x" * 6000, domain="testserver.local", path="/")
+    response = client.get("/auth/login", follow_redirects=False)
+    assert response.status_code == 400
+    assert not response.cookies
+    assert "location" not in response.headers

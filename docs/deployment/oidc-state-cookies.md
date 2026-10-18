@@ -5,7 +5,14 @@ sign-in its own signed, HttpOnly state cookie. This prevents another tab from
 overwriting its state or PKCE verifier. State signatures, expiry, state matching
 and PKCE verification remain required. Pending state expires after five minutes;
 new login responses retain at most eight visible pending cookies, including a
-legacy cookie. Simultaneous login responses cannot see each other's cookies, so
+legacy cookie. Pending state cookies also share a 4 KiB byte budget; the login
+response evicts older state as needed and reserves room for session/other cookies
+within a 6 KiB Cookie-header budget. A single state cookie is capped at 3,800 bytes
+before attributes, leaving room below browsers' 4 KiB cookie limit. Requests that
+cannot fit even after evicting old state fail before redirecting to the IdP;
+shorten the return URL or clear site cookies before retrying.
+
+Simultaneous login responses cannot see each other's cookies, so
 the limit is enforced against the cookies present on each incoming login request.
 
 The setting defaults to false: servers issue the legacy single state cookie and
