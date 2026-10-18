@@ -49,6 +49,6 @@ class DeviceGrant:
     expires_at: int
     approved_at: int | None
     last_polled_at: int | None
-    oidc_login_generation: str | None = None
     account_generation: str | None = None
     group_authority: dict[str, object] | None = None
+    oidc_login_generation: str | None = None

@@ -14,7 +14,8 @@ downstream exchanges request access tokens only. Machine identities retain their
 existing exchange and binding policies. No shared machine fallback is used.
 
 Browser login issues an independent Secure/HttpOnly renewal cookie. Local access
-tokens expire within fifteen minutes and renew automatically from the bounded
+tokens expire within fifteen minutes and HTTP requests and browser WebSocket
+handshakes renew automatically from the bounded
 server-side grant. Native and CLI logins use the existing refresh-grant protocol, with each local
 refresh grant bound to its originating OIDC generation;
 set `OMNIGENT_GRANT_MAX_LIFETIME_DAYS=7` to bound those local grants as well.

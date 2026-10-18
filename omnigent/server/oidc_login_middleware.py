@@ -8,7 +8,7 @@ from http.cookies import SimpleCookie
 from urllib.parse import urlencode
 
 import jwt
-from starlette.requests import Request
+from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -21,10 +21,10 @@ class OIDCLoginMiddleware:
         self.app, self.broker = app, broker
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
-        request = Request(scope)
+        request = HTTPConnection(scope)
         renewal = request.cookies.get(self.broker.cookie_name)
         if (
             not renewal
@@ -57,6 +57,15 @@ class OIDCLoginMiddleware:
                 raise DelegationUnavailable("Sign in again to renew identity delegation")
             token = self.broker.session_token(owner, state)
         except DelegationUnavailable:
+            if scope["type"] == "websocket":
+                await send(
+                    {
+                        "type": "websocket.close",
+                        "code": 4401,
+                        "reason": "Sign in again to restore connector access",
+                    }
+                )
+                return
             response = JSONResponse(
                 {
                     "detail": "Sign in again to restore connector and repository access",
@@ -65,17 +74,29 @@ class OIDCLoginMiddleware:
                 status_code=401,
             )
             if (
-                request.method == "GET"
-                and not request.url.path.startswith(("/v1/", "/oauth/"))
+                scope.get("method") == "GET"
+                and (
+                    not request.url.path.startswith(("/v1/", "/oauth/"))
+                    or request.url.path == "/oauth/device"
+                )
                 and (
                     request.url.path.startswith(("/c/", "/artifacts/"))
+                    or request.url.path == "/oauth/device"
                     or "text/html" in request.headers.get("accept", "")
                     or request.headers.get("sec-fetch-dest") == "document"
                 )
             ):
                 base = getattr(request.app.state, "base_path", "")
                 response = RedirectResponse(
-                    base + "/auth/login?" + urlencode({"return_to": base + request.url.path}),
+                    base
+                    + "/auth/login?"
+                    + urlencode(
+                        {
+                            "return_to": base
+                            + request.url.path
+                            + ("?" + request.url.query if request.url.query else "")
+                        }
+                    ),
                     status_code=302,
                 )
             response.delete_cookie(
@@ -101,6 +122,9 @@ class OIDCLoginMiddleware:
         headers = [(k, v) for k, v in scope["headers"] if k.lower() != b"cookie"]
         headers.append((b"cookie", cookies.output(header="", sep=";").strip().encode("latin-1")))
         scope = {**scope, "headers": headers}
+        if scope["type"] == "websocket":
+            await self.app(scope, receive, send)
+            return
         cookie_response = Response()
         cookie_response.set_cookie(
             self.broker.config.session_cookie_name,

@@ -18,7 +18,7 @@ from mcp.types import Tool as McpToolDef
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
-from omnigent.tools.mcp import McpServerConnection
+from omnigent.tools.mcp import McpServerConnection, mcp_connection_failure
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -819,7 +819,7 @@ class RunnerMcpManager:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     async with self._lock:
-                        server.error = f"{type(exc).__name__}: {exc}"
+                        server.error = mcp_connection_failure(exc)
                         server.connection = None
                         server.tools = []
                     _logger.warning(

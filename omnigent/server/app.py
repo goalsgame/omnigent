@@ -2151,6 +2151,10 @@ def create_app(
     # route accepts them. Added after the metrics middleware so it is the
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
+    if login_broker is not None:
+        from omnigent.server.oidc_login_middleware import OIDCLoginMiddleware
+
+        app.add_middleware(OIDCLoginMiddleware, broker=login_broker)
     app.add_middleware(WebSocketOriginMiddleware)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
@@ -4488,10 +4492,6 @@ def create_app(
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
-    if login_broker is not None:
-        from omnigent.server.oidc_login_middleware import OIDCLoginMiddleware
-
-        app.add_middleware(OIDCLoginMiddleware, broker=login_broker)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.

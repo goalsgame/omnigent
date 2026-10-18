@@ -361,16 +361,11 @@ async def test_silent_browser_renewal_does_not_satisfy_device_reauthentication(
         assert "session is too old" in response.text
 
 
-@pytest.mark.asyncio
-async def test_native_code_cannot_redeem_replacement_generation(
-    login, db_uri, tmp_path, monkeypatch
-):
-    from urllib.parse import parse_qs, urlsplit
-
+@pytest.fixture
+def offline_auth_app(login, db_uri, tmp_path, monkeypatch):
     from omnigent.server.admin_list import AdminList
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.server.device_grant_store import DeviceGrantStore
-    from omnigent.server.oidc import derive_code_challenge
     from omnigent.server.routes.auth import create_auth_router
 
     broker, token, tokens, _calls = login
@@ -397,6 +392,16 @@ async def test_native_code_cannot_redeem_replacement_generation(
         "get_signing_key_from_jwt",
         lambda self, value: broker.jwks.get_signing_key_from_jwt(value),
     )
+    return app, broker, tokens
+
+
+@pytest.mark.asyncio
+async def test_native_code_cannot_redeem_replacement_generation(offline_auth_app):
+    from urllib.parse import parse_qs, urlsplit
+
+    from omnigent.server.oidc import derive_code_challenge
+
+    app, broker, tokens = offline_auth_app
     verifier = "x" * 43
     redirect = "http://127.0.0.1:1234/callback"
     async with httpx.AsyncClient(
@@ -422,3 +427,93 @@ async def test_native_code_cannot_redeem_replacement_generation(
         )
         assert response.status_code == 400
         assert response.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_expired_cli_access_ticket_returns_controlled_expiry(offline_auth_app, monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    app, broker, _tokens = offline_auth_app
+    expired = jwt.encode(
+        {"sub": OWNER, "iat": int(time.time()) - 120, "exp": int(time.time()) - 1},
+        broker.config.cookie_secret,
+        algorithm="HS256",
+    )
+    monkeypatch.setattr(broker, "session_token", lambda owner, state: expired)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        ticket = (await client.post("/auth/cli-login")).json()["ticket"]
+        login_response = await client.get("/auth/login", params={"ticket": ticket})
+        state = parse_qs(urlsplit(login_response.headers["location"]).query)["state"][0]
+        callback = await client.get("/auth/callback", params={"state": state, "code": "fixture"})
+        assert callback.status_code == 200
+        response = await client.get("/auth/cli-poll", params={"ticket": ticket})
+        assert response.status_code == 410
+        assert response.json() == {"error": "Ticket token expired"}
+        assert "refresh_token" not in response.json()
+
+
+@pytest.mark.asyncio
+async def test_stale_device_consent_cookie_redirect_preserves_user_code(login):
+    from urllib.parse import parse_qs, urlsplit
+
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    cookie = broker.browser_cookie(OWNER, state)
+    broker.revoke(OWNER, state["generation"])
+    app = FastAPI()
+    app.add_middleware(OIDCLoginMiddleware, broker=broker)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        client.cookies.set(broker.cookie_name, cookie)
+        response = await client.get("/oauth/device", params={"user_code": "FIXTURE-CODE"})
+        assert response.status_code == 302
+        assert parse_qs(urlsplit(response.headers["location"]).query)["return_to"] == [
+            "/oauth/device?user_code=FIXTURE-CODE"
+        ]
+        client.cookies.set(broker.cookie_name, cookie)
+        response = await client.post("/oauth/token", data={"grant_type": "refresh_token"})
+        assert response.status_code == 401
+        assert response.json()["code"] == "identity_login_required"
+
+
+@pytest.mark.parametrize("revoked", [False, True])
+def test_websocket_can_authenticate_with_only_renewal_cookie(login, revoked):
+    from fastapi import WebSocket
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    broker, _token, tokens, _calls = login
+    state = broker.capture(OWNER, SUBJECT, tokens())
+    auth = UnifiedAuthProvider("oidc", oidc_config=broker.config)
+    auth.oidc_login_broker = broker
+    cookie = broker.browser_cookie(OWNER, state)
+    if revoked:
+        broker.revoke(OWNER, state["generation"])
+    app = FastAPI()
+    app.add_middleware(OIDCLoginMiddleware, broker=broker)
+
+    @app.websocket("/v1/socket")
+    async def socket(websocket: WebSocket):
+        user = auth.get_user_id(websocket)
+        assert user == OWNER
+        await websocket.accept()
+        await websocket.send_json({"user": user})
+        await websocket.close()
+
+    with TestClient(app) as client:
+        client.cookies.set(broker.cookie_name, cookie)
+        if revoked:
+            with (
+                pytest.raises(WebSocketDisconnect) as failure,
+                client.websocket_connect("/v1/socket"),
+            ):
+                pass
+            assert failure.value.code == 4401
+        else:
+            with client.websocket_connect("/v1/socket") as connection:
+                assert connection.receive_json() == {"user": OWNER}

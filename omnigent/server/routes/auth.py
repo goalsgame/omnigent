@@ -1038,19 +1038,26 @@ def create_auth_router(
         user_id = ticket.user_id
         refresh_token = ticket.refresh_token
         del _cli_tickets[ticket_id]
-        content: dict[str, object] = {
-            "token": token,
-            "user_id": user_id,
-            "expires_in": max(
-                0,
-                int(
-                    jwt.decode(ticket.token, config.cookie_secret, algorithms=["HS256"])["exp"]
+        expires_in = config.session_ttl_hours * 3600
+        if auth_provider.oidc_login_broker is not None:
+            try:
+                expires_in = int(
+                    jwt.decode(token, config.cookie_secret, algorithms=["HS256"])["exp"]
                     - time.time()
-                ),
-            )
-            if auth_provider.oidc_login_broker is not None
-            else config.session_ttl_hours * 3600,
-        }
+                )
+            except jwt.InvalidTokenError:
+                return JSONResponse(
+                    status_code=410,
+                    content={"error": "Ticket token expired"},
+                    headers={"Cache-Control": "no-store"},
+                )
+            if expires_in <= 0:
+                return JSONResponse(
+                    status_code=410,
+                    content={"error": "Ticket token expired"},
+                    headers={"Cache-Control": "no-store"},
+                )
+        content: dict[str, object] = {"token": token, "user_id": user_id, "expires_in": expires_in}
         # Only present when a grant store is wired — old CLIs ignore the
         # extra key, new CLIs against old servers see it absent.
         if refresh_token is not None:

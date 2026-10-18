@@ -27,7 +27,7 @@ from omnigent.runner.mcp_manager import (  # noqa: F401 — McpSchemasResult re-
 )
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 from omnigent.tools.base import is_valid_tool_name
-from omnigent.tools.mcp import McpServerConnection
+from omnigent.tools.mcp import McpServerConnection, mcp_connection_failure
 
 _logger = logging.getLogger(__name__)
 
@@ -359,7 +359,7 @@ class ServerMcpPool:
             server.tools = list(tools)
             server.error = None
         except Exception as exc:
-            server.error = f"{type(exc).__name__}: {exc}"
+            server.error = mcp_connection_failure(exc)
             _logger.exception(
                 "MCP server %r failed to connect in ServerMcpPool",
                 server.config.name,

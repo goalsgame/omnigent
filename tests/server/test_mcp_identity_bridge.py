@@ -78,7 +78,10 @@ async def test_stdio_bridge_initializes_lists_and_calls_tools(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [401, 403])
-async def test_stdio_bridge_reports_expired_identity_without_timeout(tmp_path, status):
+@pytest.mark.parametrize("through_runner", [False, True])
+async def test_stdio_bridge_reports_expired_identity_without_timeout(
+    tmp_path, status, through_runner
+):
     from fastapi import FastAPI
     from starlette.responses import JSONResponse
 
@@ -117,6 +120,31 @@ async def test_stdio_bridge_reports_expired_identity_without_timeout(tmp_path, s
                     str(coords),
                 ],
             )
+            if through_runner:
+                from omnigent.runner.mcp_manager import RunnerMcpManager
+                from omnigent.spec.types import AgentSpec, MCPServerConfig
+
+                manager = RunnerMcpManager(stdio_cwd=str(tmp_path))
+                spec = AgentSpec(
+                    spec_version=1,
+                    name="fixture",
+                    mcp_servers=[
+                        MCPServerConfig(
+                            name="identity",
+                            transport="stdio",
+                            command=params.command,
+                            args=params.args,
+                        )
+                    ],
+                )
+                try:
+                    result = await manager.schemas_for(spec)
+                    assert result.failures == {
+                        "identity": "Sign in again to restore connector access"
+                    }
+                finally:
+                    await manager.shutdown()
+                return
             async with (
                 stdio_client(params) as (read, write),
                 ClientSession(read, write) as session,
