@@ -41,7 +41,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.async_utils import run_sync_cleanup
-from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.inner.sandbox import contained_realpath, containment_prefix, uses_windows_jobobject
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
@@ -954,6 +954,19 @@ class SessionResourceRegistry:
 
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
 
+    def resolve_execution_environment(self, session_id: str, spec: OSEnvSpec) -> OSEnvironment:
+        """Resolve the execution spec even when no authored agent spec is available."""
+        return self._resolve_primary(session_id, None, os_env_spec=spec)
+
+    def uses_windows_jobobject(self, session_id: str) -> bool:
+        """Retain policy validation after a later caller requests a different backend."""
+        with self._lock:
+            environment = self._primary_envs.get(session_id)
+            return (
+                getattr(getattr(environment, "sandbox", None), "backend_type", None)
+                == "windows_jobobject"
+            )
+
     def uses_copy_on_write(self, session_id: str) -> bool:
         """Preserve disposable semantics if a later spec lookup is unavailable."""
         with self._lock:
@@ -994,10 +1007,8 @@ class SessionResourceRegistry:
                 cached_cow = bool(
                     getattr(getattr(cached, "sandbox", None), "copy_on_write_roots", None)
                 )
-                requested_windows_job = (
-                    requested_spec is not None
-                    and requested_spec.sandbox is not None
-                    and requested_spec.sandbox.type == "windows_jobobject"
+                requested_windows_job = requested_spec is not None and uses_windows_jobobject(
+                    requested_spec
                 )
                 cached_windows_job = (
                     getattr(getattr(cached, "sandbox", None), "backend_type", None)
