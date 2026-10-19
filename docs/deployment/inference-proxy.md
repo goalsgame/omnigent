@@ -211,7 +211,11 @@ For listed owners, the proxy checks persisted session spend before each model
 request, returning HTTP 402 when the session reaches its limit. Token usage with
 no usable cost returns HTTP 503 rather than silently allowing unpriced inference.
 Previously priced totals do not authorize later unpriced usage; the incomplete
-pricing marker persists until the usage is reconciled.
+pricing marker persists until the usage is reconciled. An authoritative
+`cumulative_cost_usd` update must include input and output counters covering the
+recorded usage to clear it; stale or cost-only updates cannot prove coverage.
+Existing approval-based cost policies keep enforcing their known-spend limits
+independently of this proxy guard.
 Owners absent from the mapping have no proxy budget. Limits apply to each session
 separately, including newly created review sessions; they do not form a daily
 owner or organization budget. Usage must be reported by the runner. Reporting delays can allow multiple model calls or an entire tool loop to run

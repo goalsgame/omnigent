@@ -12874,3 +12874,58 @@ async def test_priced_then_unpriced_usage_preserves_incomplete_marker(
     with pytest.raises(HTTPException) as error:
         proxy._check_cost_limit(store.get_conversation(session["id"]))
     assert error.value.status_code == 503
+
+
+async def test_replayed_native_snapshot_does_not_make_priced_usage_incomplete(
+    client, db_uri, monkeypatch
+):
+    rate = [ModelPricing(input_per_token=0.001, output_per_token=0.001)]
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: rate[0])
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    data = {"cumulative_input_tokens": 10, "cumulative_output_tokens": 1, "model": "test"}
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202
+    rate[0] = None
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["total_cost_usd"] == pytest.approx(0.011)
+    assert not usage.get("unpriced_tokens")
+
+
+async def test_only_complete_authoritative_native_snapshot_clears_unpriced_usage(
+    client, db_uri, monkeypatch
+):
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: None)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def report(data):
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_usage", "data": {"model": "test", **data}},
+        )
+        assert response.status_code == 202
+        return _read_session_usage(db_uri, session["id"])
+
+    usage = await report({"cumulative_input_tokens": 20, "cumulative_output_tokens": 2})
+    assert usage["unpriced_tokens"] > 0
+    for data in [
+        {"cumulative_cost_usd": 0.1},
+        {"cumulative_cost_usd": 0.2, "cumulative_input_tokens": 10, "cumulative_output_tokens": 1},
+        {"cumulative_cost_usd": 0.3, "cumulative_input_tokens": 10, "cumulative_output_tokens": 1},
+        {"cumulative_cost_usd": 0.2, "cumulative_input_tokens": 20, "cumulative_output_tokens": 2},
+    ]:
+        assert (await report(data))["unpriced_tokens"] > 0
+    usage = await report(
+        {"cumulative_cost_usd": 0.4, "cumulative_input_tokens": 20, "cumulative_output_tokens": 2}
+    )
+    assert not usage.get("unpriced_tokens")
+    assert usage["total_cost_usd"] == pytest.approx(0.4)

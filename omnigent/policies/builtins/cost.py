@@ -129,8 +129,6 @@ def _usage_is_unpriced(usage: Mapping[str, object]) -> bool:
     :returns: ``True`` when enforcement should fail closed due to missing
         pricing.
     """
-    if usage.get("unpriced_tokens"):
-        return True
     if "total_cost_usd" in usage:
         return False
     return bool(
