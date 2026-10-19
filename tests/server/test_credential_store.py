@@ -153,3 +153,72 @@ def test_non_empty_account_id(db_uri: str) -> None:
     # The default-account view ("") is a distinct, absent row.
     assert store.get("alice", "github") is None
     assert len(store.list_for_user("alice")) == 2
+
+
+def test_locked_refresh_selects_exact_account_and_cipher_context(db_uri):
+    store = _store(db_uri)
+    for account in ("", "desktop", "cli"):
+        store.upsert(
+            "person",
+            "oidc_login",
+            account_id=account,
+            secret={"refresh_token": account or "legacy"},
+            metadata={},
+        )
+    seen = []
+
+    def rotate(connection):
+        seen.append((connection.account_id, connection.secret["refresh_token"]))
+        return {"refresh_token": "rotated"}
+
+    result = store.refresh_locked("person", "oidc_login", rotate, account_id="desktop")
+    assert result.secret == {"refresh_token": "rotated"}
+    assert seen == [("desktop", "desktop")]
+    assert (
+        store.get("person", "oidc_login", account_id="desktop", with_secret=True).secret
+        == result.secret
+    )
+    assert store.get("person", "oidc_login", account_id="cli", with_secret=True).secret == {
+        "refresh_token": "cli"
+    }
+    assert store.get("person", "oidc_login", with_secret=True).secret == {
+        "refresh_token": "legacy"
+    }
+    assert store.refresh_locked("person", "oidc_login", rotate, account_id="absent") is None
+    assert len(seen) == 1
+
+
+def test_sqlite_refresh_obeys_lock_held_by_legacy_worker(db_uri):
+    import hashlib
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    from threading import Event
+
+    import pytest
+    from filelock import FileLock
+
+    from omnigent.db.db_models import current_workspace_id
+
+    store = _store(db_uri)
+    if store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite file-lock compatibility")
+    store.upsert("person", "provider", secret={"token": "old"}, metadata={})
+    lock_directory = Path(str(Path(store._engine.url.database).resolve()) + ".credential-locks")
+    lock_directory.mkdir()
+    # This is the lock protocol used by the previous application version.
+    legacy_key = hashlib.sha256(
+        json.dumps([current_workspace_id(), "person", "provider"]).encode()
+    ).hexdigest()
+    legacy_lock = FileLock(str(lock_directory / (legacy_key + ".lock")))
+    called = Event()
+
+    def refresh(connection):
+        called.set()
+        return {"token": "rotated"}
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with legacy_lock:
+            future = pool.submit(store.refresh_locked, "person", "provider", refresh)
+            assert not called.wait(0.2), "A new worker bypassed the legacy refresh lock"
+        assert future.result(timeout=10).secret == {"token": "rotated"}
+    assert called.is_set()

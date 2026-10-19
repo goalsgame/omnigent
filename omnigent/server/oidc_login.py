@@ -25,6 +25,10 @@ class DelegationTemporarilyUnavailable(Exception):
     """The identity provider is unavailable; retain credentials for retry."""
 
 
+class _LoginRefreshRejected(DelegationUnavailable):
+    """The provider permanently rejected this login's refresh credential."""
+
+
 class OIDCLoginRevoker:
     """Keep logout available independently of offline renewal configuration."""
 
@@ -35,22 +39,47 @@ class OIDCLoginRevoker:
         ).digest()
         self.cookie_name = "__Host-ap_oidc_renewal" if config.secure_cookies else "ap_oidc_renewal"
 
+    def _connection(self, owner: str, generation: str, *, require_current_identity: bool = True):
+        if not isinstance(generation, str) or not generation or generation == "current":
+            return None
+        connection = self.store.get(owner, PROVIDER, account_id=generation)
+        if connection is None:
+            # Existing installations kept their sole grant in the default slot.
+            connection = self.store.get(owner, PROVIDER)
+        if connection is None or connection.metadata.get("generation") != generation:
+            return None
+        current = self.store.get(owner, PROVIDER, account_id="current")
+        if (
+            require_current_identity
+            and current is not None
+            and (
+                current.metadata.get("issuer") != connection.metadata.get("issuer")
+                or current.metadata.get("subject") != connection.metadata.get("subject")
+            )
+        ):
+            return None
+        return connection
+
     def active(self, owner: str, generation: str) -> bool:
-        connection = self.store.get(owner, PROVIDER)
+        connection = self._connection(owner, generation)
         return bool(
             connection
             and connection.metadata.get("issuer") == self.config.issuer
-            and connection.metadata.get("generation") == generation
             and float(connection.metadata.get("deadline", 0)) > time.time()
         )
 
     def revoke(self, owner: str, generation: str) -> bool:
-        connection = self.store.get(owner, PROVIDER)
-        if connection is None or connection.metadata.get("generation") != generation:
+        connection = self._connection(owner, generation, require_current_identity=False)
+        if connection is None:
             return False
-        return self.store.delete(owner, PROVIDER, expected_metadata=connection.metadata)
+        return self.store.delete(
+            owner,
+            PROVIDER,
+            account_id=connection.account_id,
+            expected_metadata=connection.metadata,
+        )
 
-    def browser_identity(self, token: str) -> tuple[str, str]:
+    def browser_identity(self, token: str, *, require_active: bool = True) -> tuple[str, str]:
         try:
             claims = jwt.decode(
                 token,
@@ -62,7 +91,7 @@ class OIDCLoginRevoker:
             if (
                 not isinstance(owner, str)
                 or not isinstance(generation, str)
-                or not self.active(owner, generation)
+                or (require_active and not self.active(owner, generation))
             ):
                 raise ValueError("Login revoked")
             return owner, generation
@@ -150,6 +179,7 @@ class OIDCLoginBroker(OIDCLoginRevoker):
             self.store.upsert(
                 owner,
                 PROVIDER,
+                account_id=generation,
                 secret=secret,
                 metadata={
                     "issuer": self.config.issuer,
@@ -159,7 +189,30 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                     "deadline": deadline,
                 },
             )
-            state = self.state(owner)
+            self.store.upsert(
+                owner,
+                PROVIDER,
+                account_id="current",
+                secret={},
+                metadata={
+                    "generation": generation,
+                    "issuer": self.config.issuer,
+                    "subject": subject,
+                },
+            )
+            for previous in self.store.list_for_user(owner):
+                if (
+                    previous.provider == PROVIDER
+                    and previous.account_id != "current"
+                    and float(previous.metadata.get("deadline", 0)) <= time.time()
+                ):
+                    self.store.delete(
+                        owner,
+                        PROVIDER,
+                        account_id=previous.account_id,
+                        expected_metadata=previous.metadata,
+                    )
+            state = self.state(owner, generation)
             if state["generation"] != generation:
                 raise DelegationUnavailable("Sign in again to renew identity delegation")
             return state
@@ -179,13 +232,46 @@ class OIDCLoginBroker(OIDCLoginRevoker):
             "groups": [group_name(g) for g in verified_groups(claims.get("groups"))],
         }
 
-    def state(self, owner: str) -> dict[str, Any]:
-        """Refresh one shared login grant, never a copy per downstream service."""
+    def state(self, owner: str, generation: str | None = None) -> dict[str, Any]:
+        """Renew a client grant, or select a working grant for downstream delegation."""
+        if generation is not None:
+            return self._state(owner, generation)
+        current = self.store.get(owner, PROVIDER, account_id="current")
+        if current is None:
+            current = self.store.get(owner, PROVIDER)
+        if current is None:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        candidates = [
+            current,
+            *sorted(
+                self.store.list_for_user(owner), key=lambda item: item.created_at, reverse=True
+            ),
+        ]
+        seen = set()
+        for candidate in candidates:
+            value = candidate.metadata.get("generation")
+            if candidate.provider != PROVIDER or not isinstance(value, str) or value in seen:
+                continue
+            seen.add(value)
+            if self.active(owner, value):
+                try:
+                    return self._state(owner, value)
+                except DelegationUnavailable:
+                    continue
+        raise DelegationUnavailable("Sign in again to renew identity delegation")
+
+    def _state(self, owner: str, generation: str) -> dict[str, Any]:
+        if not isinstance(generation, str):
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        connection = self._connection(owner, generation)
+        if connection is None:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
 
         def refresh(connection):
             meta, secret = connection.metadata, connection.secret or {}
             if (
-                meta.get("issuer") != self.config.issuer
+                meta.get("generation") != generation
+                or meta.get("issuer") != self.config.issuer
                 or float(meta.get("deadline", 0)) <= time.time()
             ):
                 raise DelegationUnavailable("Sign in again to renew identity delegation")
@@ -217,6 +303,15 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                         raise DelegationTemporarilyUnavailable(
                             "Identity provider temporarily unavailable"
                         )
+                    if response.status_code == 400:
+                        try:
+                            error = response.json()
+                        except ValueError:
+                            error = {}
+                        if isinstance(error, dict) and error.get("error") == "invalid_grant":
+                            raise _LoginRefreshRejected(
+                                "Sign in again to renew identity delegation"
+                            )
                     response.raise_for_status()
                     tokens = response.json()
                     tokens = {
@@ -247,8 +342,14 @@ class OIDCLoginBroker(OIDCLoginRevoker):
             ):
                 raise DelegationUnavailable("Sign in again to renew identity delegation") from None
 
-        connection = self.store.refresh_locked(owner, PROVIDER, refresh)
-        if connection is None or connection.secret is None:
+        try:
+            connection = self.store.refresh_locked(
+                owner, PROVIDER, refresh, account_id=connection.account_id
+            )
+        except _LoginRefreshRejected:
+            self.revoke(owner, generation)
+            raise DelegationUnavailable("Sign in again to renew identity delegation") from None
+        if connection is None or connection.secret is None or not self.active(owner, generation):
             raise DelegationUnavailable("Sign in again to renew identity delegation")
         if connection.secret.get("pending_tokens") is not None:
             raise DelegationTemporarilyUnavailable("Identity signing keys temporarily unavailable")

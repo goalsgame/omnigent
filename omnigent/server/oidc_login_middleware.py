@@ -52,7 +52,7 @@ class OIDCLoginMiddleware:
             ):
                 await self.app(scope, receive, send)
                 return
-            state = await asyncio.to_thread(self.broker.state, owner)
+            state = await asyncio.to_thread(self.broker.state, owner, generation)
             if state["generation"] != generation:
                 raise DelegationUnavailable("Sign in again to renew identity delegation")
             token = self.broker.session_token(owner, state)
