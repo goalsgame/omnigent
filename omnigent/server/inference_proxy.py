@@ -396,7 +396,9 @@ class InferenceProxy:
             return
         usage = conv.session_usage or {}
         cost = usage.get("total_cost_usd")
-        if usage.get("unpriced_tokens"):
+        from omnigent.stores.conversation_store import has_ambiguous_zero_pricing
+
+        if usage.get("unpriced_tokens") or has_ambiguous_zero_pricing(usage):
             raise HTTPException(
                 503, "Session has unpriced usage; inference paused to enforce budget"
             )

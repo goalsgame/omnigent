@@ -1969,7 +1969,10 @@ def test_record_usage_preserves_tree_enforcement_totals(
         assert "policy_cost_usd" not in child_usage
 
 
-def test_priced_policy_delta_keeps_legacy_child_history_unpriced(conversation_store, monkeypatch):
+@pytest.mark.parametrize("legacy_zero", [False, True])
+def test_priced_policy_delta_keeps_legacy_child_history_unpriced(
+    conversation_store, monkeypatch, legacy_zero
+):
     from omnigent.llms import context_window
 
     monkeypatch.setattr(
@@ -1994,7 +1997,8 @@ def test_priced_policy_delta_keeps_legacy_child_history_unpriced(conversation_st
         "cache_creation_input_tokens": 0,
     }
     conversation_store.set_session_usage(parent.id, {**counts, "total_cost_usd": 8.0})
-    conversation_store.set_session_usage(child.id, counts)
+    own_usage = {**counts, **({"total_cost_usd": 0} if legacy_zero else {})}
+    conversation_store.set_session_usage(child.id, own_usage)
     engine = build_policy_engine(
         spec=AgentSpec(spec_version=1, name="child", llm=LLMConfig(model="test-model")),
         conversation_id=child.id,
@@ -2058,6 +2062,7 @@ def test_explicitly_free_usage_retains_priced_zero_after_rebuild(conversation_st
     engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
     current = conversation_store.get_conversation(conv.id).session_usage
     assert current["total_cost_usd"] == 0
+    assert current["pricing_recorded"] is True
     assert not _usage_is_unpriced(current)
     rebuilt = build_policy_engine(
         spec=spec, conversation_id=conv.id, conversation_store=conversation_store

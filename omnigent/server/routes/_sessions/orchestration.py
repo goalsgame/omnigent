@@ -1707,6 +1707,8 @@ def _accumulate_session_usage(
         if priced and "policy_cost_usd" in current:
             updates["policy_cost_usd"] = cost_delta
         apply_session_usage_delta(current, updates)
+        if priced:
+            current["pricing_recorded"] = True
 
     new_current = conversation_store.mutate_session_usage(session_id, merge)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
@@ -1904,12 +1906,9 @@ def _persist_native_cumulative_usage(
             int(current.get("cumulative_cache_write_high_water", 0)),
             old_tokens["cache_creation_input_tokens"],
         )
-        if "total_cost_usd" not in current and input_high_water + output_high_water:
-            # Existing unpriced snapshots cannot become a priced history merely
-            # because the newly arriving delta has a known rate.
-            current["unpriced_tokens"] = max(
-                int(current.get("unpriced_tokens", 0)), input_high_water + output_high_water
-            )
+        from omnigent.stores.conversation_store import mark_unpriced_usage_history
+
+        mark_unpriced_usage_history(current, minimum_tokens=input_high_water + output_high_water)
         current["cumulative_input_high_water"] = max(input_high_water, int(cin or 0))
         current["cumulative_output_high_water"] = max(output_high_water, int(cout or 0))
         if cin is not None:
@@ -1954,6 +1953,19 @@ def _persist_native_cumulative_usage(
                 + int(current.get("output_tokens", 0))
             )
 
+        new_cached = min(
+            input_growth,
+            max(
+                0,
+                int(current.get("cache_read_input_tokens", 0)) - cache_read_high_water,
+            ),
+        )
+        observed_write_growth = max(
+            0,
+            int(current.get("cache_creation_input_tokens", 0)) - cache_write_high_water,
+        )
+        new_written = min(input_growth - new_cached, observed_write_growth)
+        late_writes = observed_write_growth - new_written
         current["cumulative_cache_read_high_water"] = max(
             cache_read_high_water, int(current.get("cache_read_input_tokens", 0))
         )
@@ -1978,21 +1990,6 @@ def _persist_native_cumulative_usage(
                 ):
                     # Only new tokens use the current route's rate. Repricing
                     # the entire history would erase spend after a cheaper reroute.
-                    new_cached = min(
-                        input_growth,
-                        max(
-                            0,
-                            int(current.get("cache_read_input_tokens", 0)) - cache_read_high_water,
-                        ),
-                    )
-                    new_written = min(
-                        input_growth - new_cached,
-                        max(
-                            0,
-                            int(current.get("cache_creation_input_tokens", 0))
-                            - cache_write_high_water,
-                        ),
-                    )
                     current["total_cost_usd"] = old_cost + compute_llm_cost(
                         {
                             "input_tokens": input_growth - new_cached - new_written,
@@ -2005,6 +2002,12 @@ def _persist_native_cumulative_usage(
                     )
                     fully_priced = True
 
+        if fully_priced:
+            current["pricing_recorded"] = True
+        if cost is None and late_writes:
+            # These writes reclassify previously priced input. Its historical
+            # write rate is unknown, so do not silently discard the premium.
+            current["unpriced_tokens"] = max(int(current.get("unpriced_tokens", 0)), late_writes)
         if token_growth and not fully_priced:
             current["unpriced_tokens"] = int(current.get("unpriced_tokens", 0)) + token_growth
         # Reconciliation must cover both counters, including any earlier peak.

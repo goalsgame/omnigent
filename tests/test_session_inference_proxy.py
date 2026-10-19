@@ -1641,3 +1641,25 @@ async def test_identity_route_refreshes_previous_pricing_attribution(routed, leg
         assert (await invoke()).status_code == 200
         assert resolve_pricing_model("model-a", conv.labels) == "model-a"
         assert json.loads(calls[-1].content)["model"] == "model-a"
+
+
+@pytest.mark.parametrize("verified", [False, True])
+async def test_zero_cost_budget_requires_server_pricing_provenance(setup, verified):
+    from dataclasses import replace
+
+    service, app, conv, _, calls = setup
+    service.config = replace(service.config, session_cost_limits={"alice": 10})
+    conv.session_usage = {"total_tokens": 100, "total_cost_usd": 0}
+    if verified:
+        conv.session_usage["pricing_recorded"] = True
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "model-a", "stream": True},
+        )
+    assert response.status_code == (200 if verified else 503)
+    assert len(calls) == (1 if verified else 0)

@@ -215,6 +215,10 @@ session_cost_limits:
 For listed owners, the proxy checks persisted session spend before each model
 request, returning HTTP 402 when the session reaches its limit. Token usage with
 no usable cost returns HTTP 503 rather than silently allowing unpriced inference.
+Legacy zero-cost records containing tokens but no server-written pricing
+provenance are incomplete until trusted joint cost/counter reconciliation.
+Explicitly priced free usage remains valid. Late cache-write details that affect
+historical tokens also remain incomplete rather than silently losing the premium.
 Previously priced totals do not authorize later unpriced usage; the incomplete
 pricing marker persists until the usage is reconciled. An authoritative
 `cumulative_cost_usd` update must include input and output counters covering the

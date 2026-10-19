@@ -655,7 +655,8 @@ def test_routed_alias_prices_only_new_usage_and_enforces_budget(db_uri, monkeypa
     )
 
 
-def test_known_delta_cannot_price_unpriced_legacy_history(db_uri, monkeypatch):
+@pytest.mark.parametrize("legacy_zero", [False, True])
+def test_known_delta_cannot_price_unpriced_legacy_history(db_uri, monkeypatch, legacy_zero):
     from omnigent.llms import context_window
 
     store = SqlAlchemyConversationStore(db_uri)
@@ -663,6 +664,10 @@ def test_known_delta_cannot_price_unpriced_legacy_history(db_uri, monkeypatch):
     store.set_session_usage(
         conv.id, {"input_tokens": 100, "output_tokens": 0, "total_tokens": 100}
     )
+    if legacy_zero:
+        seed = _usage(store, conv.id)
+        seed["total_cost_usd"] = 0
+        store.set_session_usage(conv.id, seed)
     monkeypatch.setattr(
         context_window,
         "fetch_model_pricing_with_provider",
@@ -844,3 +849,96 @@ def test_catalog_recovery_replay_does_not_create_a_priced_zero(db_uri, monkeypat
     assert _usage_is_unpriced(_usage(store, conv.id))
     assert "total_cost_usd" not in _usage(store, conv.id)
     assert _usage(store, conv.id)["unpriced_tokens"] == 100
+
+
+def test_late_cache_writes_require_joint_reconciliation(db_uri, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.llms import context_window
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="late-cache-writes", agent_id=_AGENT_ID)
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=1e-6,
+            output_per_token=1e-6,
+            cache_write_per_token=1.25e-6,
+        ),
+    )
+    data = {
+        "model": "priced-model",
+        "cumulative_input_tokens": 1000000,
+        "cumulative_output_tokens": 0,
+    }
+    _persist_native_cumulative_usage(conv.id, data, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1)
+    data["cumulative_cache_creation_input_tokens"] = 1000000
+    for _ in range(2):
+        _persist_native_cumulative_usage(conv.id, data, store)
+        usage = _usage(store, conv.id)
+        assert usage["total_cost_usd"] == pytest.approx(1)
+        assert usage["unpriced_tokens"] == 1000000
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": 2.4}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 503
+    _persist_native_cumulative_usage(conv.id, {**data, "cumulative_cost_usd": 1.25}, store)
+    assert "unpriced_tokens" not in _usage(store, conv.id)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.25)
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            **data,
+            "cumulative_input_tokens": 2000000,
+            "cumulative_cache_creation_input_tokens": 2000000,
+        },
+        store,
+    )
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(2.5)
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 402
+
+
+def test_trusted_free_reconciliation_resolves_legacy_zero(db_uri):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="legacy-free", agent_id=_AGENT_ID)
+    store.set_session_usage(
+        conv.id, {"input_tokens": 100, "total_tokens": 100, "total_cost_usd": 0}
+    )
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": 1}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 503
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "free-model",
+            "cumulative_input_tokens": 100,
+            "cumulative_output_tokens": 0,
+            "cumulative_cost_usd": 0,
+        },
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["pricing_recorded"] is True
+    assert usage["total_cost_usd"] == 0
+    assert "unpriced_tokens" not in usage
+    InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))

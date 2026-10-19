@@ -1437,6 +1437,13 @@ def _sum_subtree_usage(
         if tree_conv.id not in subtree_ids:
             continue
         session_usage = tree_conv.session_usage
+        from omnigent.stores.conversation_store import has_ambiguous_zero_pricing
+
+        if has_ambiguous_zero_pricing(session_usage):
+            session_usage = dict(session_usage)
+            session_usage.pop("total_cost_usd", None)
+            if session_usage.get("policy_cost_usd") == 0:
+                session_usage.pop("policy_cost_usd", None)
         for key in _SUMMABLE_USAGE_KEYS:
             value = session_usage.get(key)
             if value is not None:

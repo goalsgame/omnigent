@@ -808,6 +808,8 @@ class PolicyEngine:
             if "policy_cost_usd" in current:
                 updates["policy_cost_usd"] = delta_cost
             apply_session_usage_delta(current, updates)
+            if priced_delta:
+                current["pricing_recorded"] = True
 
         self._store.mutate_session_usage(self._conversation_id, merge)
         if legacy_added:

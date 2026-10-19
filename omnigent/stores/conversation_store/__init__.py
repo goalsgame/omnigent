@@ -370,18 +370,15 @@ def _is_addable_usage_increment(value: Any) -> bool:
     return math.isfinite(value) and value >= 0
 
 
-def mark_unpriced_usage_history(current: dict[str, Any]) -> int:
-    """Mark legacy tokens lacking a cost before applying a newly priced delta.
-
-    Return the newly marked count so an engine can update aggregate hot counters
-    without replacing them with conversation-local persisted totals.
-    """
-    if "total_cost_usd" in current:
-        return 0
-    tokens = max(
-        int(current.get("total_tokens", 0) or 0),
+def usage_token_count(usage: Mapping[str, Any]) -> int:
+    """Count observed tokens, retaining cumulative peaks across old snapshots."""
+    return max(
+        0,
+        int(usage.get("total_tokens", 0) or 0),
+        int(usage.get("cumulative_input_high_water", 0) or 0)
+        + int(usage.get("cumulative_output_high_water", 0) or 0),
         sum(
-            int(current.get(key, 0) or 0)
+            int(usage.get(key, 0) or 0)
             for key in (
                 "input_tokens",
                 "output_tokens",
@@ -390,6 +387,25 @@ def mark_unpriced_usage_history(current: dict[str, Any]) -> int:
             )
         ),
     )
+
+
+def has_ambiguous_zero_pricing(usage: Mapping[str, Any]) -> bool:
+    return (
+        usage.get("total_cost_usd") == 0
+        and not usage.get("pricing_recorded")
+        and usage_token_count(usage) > 0
+    )
+
+
+def mark_unpriced_usage_history(current: dict[str, Any], *, minimum_tokens: int = 0) -> int:
+    """Mark legacy unknown/zero-priced history before applying a usage delta.
+
+    Return newly marked tokens so hot aggregate counters can preserve tree totals.
+    Only server-priced or trusted authoritative reports stamp pricing_recorded.
+    """
+    if "total_cost_usd" in current and not has_ambiguous_zero_pricing(current):
+        return 0
+    tokens = max(minimum_tokens, usage_token_count(current))
     old = int(current.get("unpriced_tokens", 0) or 0)
     if tokens > old:
         current["unpriced_tokens"] = tokens
