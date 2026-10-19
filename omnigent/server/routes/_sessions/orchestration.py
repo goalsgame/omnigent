@@ -1827,17 +1827,19 @@ def _persist_native_cumulative_usage(
     # per-model attribution can add only this report's growth (new - old).
     old_tokens = {key: int(current.get(key, 0) or 0) for key in _MODEL_TOKEN_KEYS}
     input_high_water = max(
-        int(current.get("unpriced_input_high_water", 0)),
+        int(current.get("cumulative_input_high_water", 0)),
         old_tokens["input_tokens"]
         + old_tokens["cache_read_input_tokens"]
         + old_tokens["cache_creation_input_tokens"],
     )
     output_high_water = max(
-        int(current.get("unpriced_output_high_water", 0)), old_tokens["output_tokens"]
+        int(current.get("cumulative_output_high_water", 0)), old_tokens["output_tokens"]
     )
     token_growth = max(0, int(cin or 0) - input_high_water) + max(
         0, int(cout or 0) - output_high_water
     )
+    current["cumulative_input_high_water"] = max(input_high_water, int(cin or 0))
+    current["cumulative_output_high_water"] = max(output_high_water, int(cout or 0))
     if cin is not None:
         # The reported input total is INCLUSIVE of cached tokens (codex's
         # ``inputTokens`` counts cache reads). Split the cached portion into
@@ -1942,8 +1944,6 @@ def _persist_native_cumulative_usage(
         current["unpriced_tokens"] = int(current.get("unpriced_tokens", 0)) + token_growth
     if current.get("unpriced_tokens"):
         # Reconciliation must cover both counters, including any earlier peak.
-        current["unpriced_input_high_water"] = max(input_high_water, int(cin or 0))
-        current["unpriced_output_high_water"] = max(output_high_water, int(cout or 0))
         if (
             fully_priced
             and cost is not None
@@ -1952,12 +1952,7 @@ def _persist_native_cumulative_usage(
             and int(cin) >= input_high_water
             and int(cout) >= output_high_water
         ):
-            for key in (
-                "unpriced_tokens",
-                "unpriced_input_high_water",
-                "unpriced_output_high_water",
-            ):
-                current.pop(key, None)
+            current.pop("unpriced_tokens", None)
 
     # ADD this report's growth (new - old) to the active model, not the whole
     # cumulative total, so per-model buckets sum to the flat total across model

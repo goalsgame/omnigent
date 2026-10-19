@@ -12929,3 +12929,37 @@ async def test_only_complete_authoritative_native_snapshot_clears_unpriced_usage
     )
     assert not usage.get("unpriced_tokens")
     assert usage["total_cost_usd"] == pytest.approx(0.4)
+
+
+async def test_native_token_peaks_survive_stale_reports_and_pricing_outage(
+    client, db_uri, monkeypatch
+):
+    rate = [ModelPricing(input_per_token=0.001, output_per_token=0.001)]
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: rate[0])
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def report(tokens):
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_usage",
+                "data": {
+                    "model": "test",
+                    "cumulative_input_tokens": tokens,
+                    "cumulative_output_tokens": tokens // 10,
+                },
+            },
+        )
+        assert response.status_code == 202
+        return _read_session_usage(db_uri, session["id"])
+
+    await report(100)
+    await report(10)
+    rate[0] = None
+    usage = await report(100)
+    assert not usage.get("unpriced_tokens")
+    assert usage["cumulative_input_high_water"] == 100
+    assert usage["cumulative_output_high_water"] == 10
+    assert usage["total_cost_usd"] == pytest.approx(0.11)
+    assert (await report(110))["unpriced_tokens"] == 11
