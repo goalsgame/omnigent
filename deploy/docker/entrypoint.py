@@ -36,7 +36,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -394,7 +393,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyScheduledTaskStore,
     )
 
-    telemetry.init()
+    telemetry.init("omni-server")
 
     agent_store = SqlAlchemyAgentStore(database_url)
     file_store = SqlAlchemyFileStore(database_url)
@@ -557,6 +556,9 @@ def main() -> None:
     the process holds open briefly for log capture before exiting
     non-zero — the orchestrator then restarts us.
     """
+    from omnigent.runtime import telemetry
+
+    telemetry.init("omni-server")
     try:
         resolved_config = _resolve_config()
 
@@ -565,6 +567,10 @@ def main() -> None:
         # stores refuse to start on a stale schema.
         run_migrations(resolved_config.database_url)
 
+        # Alembic configures root logging; restore the server's requested level.
+        from omnigent.process_logging import effective_log_level
+
+        logging.getLogger().setLevel(effective_log_level())
         resolved = build_app(resolved_config)
 
         import uvicorn
@@ -576,13 +582,16 @@ def main() -> None:
             resolved.app,
             host=resolved.host,
             port=resolved.port,
+            # Preserve the root OTLP bridge and route Uvicorn errors through it.
+            log_config=None,
             # This image serves external runners only, so every session rides a
             # tunnel: without the keepalive budget uvicorn's 20 s default closes
             # a busy-but-healthy one with 1011 after a client-path stall.
             **uvicorn_tunnel_kwargs(),
         )
-    except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
-        logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
+    except Exception:
+        telemetry.init("omni-server")
+        logger.exception("FATAL: omnigent server failed to start")
         # Keep the process alive briefly so the container log capture has time
         # to flush before the orchestrator restarts us.
         import time  # deferred — keeps module inert

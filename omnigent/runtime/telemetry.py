@@ -30,9 +30,11 @@ concerns:
 from __future__ import annotations
 
 import contextvars
+import copy
 import logging
 import os
 import re
+import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
@@ -58,6 +60,7 @@ _capture_content: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
 _logs_initialized: bool = False
+_log_provider: Any = None
 
 # Session (conversation) id for the current execution context. Set once at a
 # session boundary (request hook, executor turn, forwarder task); the
@@ -1018,6 +1021,72 @@ def _create_otlp_metric_exporter() -> MetricExporter:
     return GrpcOTLPMetricExporter()
 
 
+_resource_instance: tuple[int, str] | None = None
+
+
+def _otel_resource() -> Any:
+    """Use one instance identity across signals, renewed after a process fork."""
+    from opentelemetry.sdk.resources import Resource
+
+    global _resource_instance
+    pid = os.getpid()
+    if _resource_instance is None or _resource_instance[0] != pid:
+        _resource_instance = (pid, str(uuid.uuid4()))
+    return Resource.create(
+        {
+            "service.name": os.environ.get("OTEL_SERVICE_NAME", "omnigent"),
+            "service.instance.id": _resource_instance[1],
+        }
+    )
+
+
+class _SafeLogFilter(logging.Filter):
+    """Redact a private record copy before the OTLP bridge sees it."""
+
+    def filter(self, record: logging.LogRecord) -> logging.LogRecord | bool:
+        from omnigent.process_logging import redact_log_text
+
+        # Export failures stay in local logs rather than feeding the failing exporter.
+        if record.name.startswith("opentelemetry."):
+            return False
+
+        def safe(value: Any, key: str = "", depth: int = 0) -> Any:
+            if depth > 8:
+                return "[REDACTED]"
+            if any(part in key.lower() for part in _REDACT_KEY_SUBSTRINGS):
+                return "[REDACTED]"
+            if isinstance(value, str):
+                return redact_log_text(value)
+            if isinstance(value, bytes):
+                return redact_log_text(value.decode("utf-8", errors="replace"))
+            if isinstance(value, Mapping):
+                return {k: safe(v, str(k), depth + 1) for k, v in value.items()}
+            if isinstance(value, (tuple, list)):
+                return tuple(safe(v, depth=depth + 1) for v in value)
+            return value
+
+        cleaned = copy.copy(record)
+        cleaned.msg = redact_log_text(record.getMessage())
+        cleaned.args = ()
+        if record.exc_info and record.exc_info[1] is not None:
+            cleaned.__dict__["exception.type"] = type(record.exc_info[1]).__name__
+            cleaned.__dict__["exception.message"] = redact_log_text(str(record.exc_info[1]))
+            cleaned.__dict__["exception.stacktrace"] = redact_log_text(
+                logging.Formatter().formatException(record.exc_info)
+            )
+        cleaned.exc_info = None
+        cleaned.exc_text = None
+        if cleaned.stack_info:
+            cleaned.stack_info = redact_log_text(cleaned.stack_info)
+        for key, value in list(cleaned.__dict__.items()):
+            if key not in ("msg", "args", "exc_info", "exc_text"):
+                cleaned.__dict__[key] = safe(value, key)
+        session_id = current_session_id()
+        if session_id:
+            cleaned.__dict__["session.id"] = session_id
+        return cleaned
+
+
 def _init_otel_traces(endpoint: str) -> None:
     """
     Initialize the OpenTelemetry SDK tracer provider.
@@ -1032,12 +1101,10 @@ def _init_otel_traces(endpoint: str) -> None:
     try:
         if endpoint:
             from opentelemetry import trace
-            from opentelemetry.sdk.resources import SERVICE_NAME, Resource
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-            service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
-            provider = TracerProvider(resource=Resource.create({SERVICE_NAME: service_name}))
+            provider = TracerProvider(resource=_otel_resource())
             # Enrich every span with session.id from the active context (set via
             # session_scope at the request hook / executor turn / forwarder).
             provider.add_span_processor(_make_session_id_processor())
@@ -1080,14 +1147,12 @@ def _init_otel_metrics() -> None:
         from opentelemetry import metrics as otel_metrics
         from opentelemetry.sdk.metrics import MeterProvider
         from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-        from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 
         exporter = _create_otlp_metric_exporter()
         reader = PeriodicExportingMetricReader(exporter)
-        service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
         provider = MeterProvider(
             metric_readers=[reader],
-            resource=Resource.create({SERVICE_NAME: service_name}),
+            resource=_otel_resource(),
         )
         otel_metrics.set_meter_provider(provider)
         _metrics_initialized = True
@@ -1137,6 +1202,26 @@ def _create_otlp_log_exporter() -> LogRecordExporter:
     return GrpcOTLPLogExporter()
 
 
+def _attach_log_bridge(provider: Any) -> None:
+    from opentelemetry.sdk._logs import LoggingHandler
+
+    targets = [logging.getLogger()]
+    package_logger = logging.getLogger("omnigent")
+    if not package_logger.propagate:
+        targets.append(package_logger)
+    for target in targets:
+        existing = [h for h in target.handlers if h.get_name() == "omnigent-otel-log-bridge"]
+        if any(getattr(h, "_logger_provider", None) is provider for h in existing):
+            continue
+        for handler in existing:
+            target.removeHandler(handler)
+            handler.close()
+        handler = LoggingHandler(logger_provider=provider)
+        handler.addFilter(_SafeLogFilter())
+        handler.set_name("omnigent-otel-log-bridge")
+        target.addHandler(handler)
+
+
 def _init_otel_logs() -> None:
     """
     Initialize the OpenTelemetry LoggerProvider when configured.
@@ -1152,13 +1237,16 @@ def _init_otel_logs() -> None:
     installed on the root logger so any ``logging.getLogger`` call
     in the runtime flows through the bridge.
     """
-    global _logs_initialized
+    global _logs_initialized, _log_provider
 
     if _logs_initialized:
+        if _log_provider is not None:
+            _attach_log_bridge(_log_provider)
         return
 
     exporter_name = _logs_exporter_name()
     if exporter_name == "none":
+        _log_provider = None
         _logs_initialized = True
         return
     if exporter_name != "otlp":
@@ -1171,27 +1259,16 @@ def _init_otel_logs() -> None:
 
     try:
         from opentelemetry._logs import set_logger_provider
-        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs import LoggerProvider
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-        from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 
-        service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
-        provider = LoggerProvider(
-            resource=Resource.create({SERVICE_NAME: service_name}),
-        )
+        provider = LoggerProvider(resource=_otel_resource())
         exporter = _create_otlp_log_exporter()
         provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
         set_logger_provider(provider)
 
-        handler = LoggingHandler(logger_provider=provider)
-        root_logger = logging.getLogger()
-        # Mark the handler so re-init does not stack duplicates on
-        # the root logger when init() runs again after a flag reset.
-        handler.set_name("omnigent-otel-log-bridge")
-        for existing in root_logger.handlers:
-            if existing.get_name() == "omnigent-otel-log-bridge":
-                root_logger.removeHandler(existing)
-        root_logger.addHandler(handler)
+        _log_provider = provider
+        _attach_log_bridge(provider)
         _logs_initialized = True
     except Exception:
         _logger.exception("failed to initialize OpenTelemetry logs")
@@ -1244,6 +1321,8 @@ def init(service_name: str | None = None) -> None:
     _capture_content = _env_bool("OMNIGENT_OTEL_CAPTURE_CONTENT")
 
     if _initialized:
+        # Logging configuration (for example migrations) can replace root handlers.
+        _init_otel_logs()
         return
 
     # Per-component service identity. The trace / metrics / logs
