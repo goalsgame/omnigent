@@ -1794,6 +1794,9 @@ def _persist_native_cumulative_usage(
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
     ccache = _coerce_cumulative_field(data, "cumulative_cache_read_input_tokens", numeric=False)
+    cwrite = _coerce_cumulative_field(
+        data, "cumulative_cache_creation_input_tokens", numeric=False
+    )
     if cost is None and policy_cost is None and cin is None and cout is None:
         return None
 
@@ -1845,8 +1848,12 @@ def _persist_native_cumulative_usage(
                 int(cin),
                 session_id,
             )
+        if cwrite is None:
+            cwrite = int(current.get("cache_creation_input_tokens", 0) or 0)
+        written = min(int(cwrite), int(cin) - cached)
         current["cache_read_input_tokens"] = cached
-        current["input_tokens"] = int(cin) - cached
+        current["cache_creation_input_tokens"] = written
+        current["input_tokens"] = int(cin) - cached - written
     if cout is not None:
         current["output_tokens"] = cout
     if cin is not None or cout is not None:
@@ -1855,6 +1862,7 @@ def _persist_native_cumulative_usage(
         current["total_tokens"] = (
             int(current.get("input_tokens", 0))
             + int(current.get("cache_read_input_tokens", 0))
+            + int(current.get("cache_creation_input_tokens", 0))
             + int(current.get("output_tokens", 0))
         )
 

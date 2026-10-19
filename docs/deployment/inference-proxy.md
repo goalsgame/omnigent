@@ -182,3 +182,35 @@ Clients must retain the replay metadata in assistant history, including after
 compaction and sleep/wake; missing signatures can cause Vertex to reject tool
 follow-up requests. The proxy restores signatures to the matching tool call
 without caching them on the server or changing OpenRouter responses.
+
+
+### Caching and session budgets
+
+OpenRouter Claude requests without explicit cache settings receive automatic
+five-minute prompt caching from the backend. This also works for clients that
+register the proxy under a custom provider name. Existing `cache_control` and
+Responses `prompt_cache_breakpoint` settings are preserved; other upstreams and
+models are unchanged.
+
+Models unresolved by the shared pricing catalog can use exact public OpenRouter
+model prices, cached for five minutes. Input, output, cache reads and cache writes
+are counted separately. These are estimates, not provider invoices. Catalog
+failures, invalid rates and context-tier prices that require per-request usage
+remain unpriced.
+
+Set `inference_proxy.session_cost_limits` to a mapping of session-owner subject
+IDs to positive USD amounts, for example:
+
+```yaml
+session_cost_limits:
+  oidc-machine:reviewer: 10.0
+```
+
+For listed owners, the proxy checks persisted session spend before each model
+request, returning HTTP 402 when the session reaches its limit. Token usage with
+no usable cost returns HTTP 503 rather than silently allowing unpriced inference.
+Owners absent from the mapping have no proxy budget. Limits apply to each session
+separately, including newly created review sessions; they do not form a daily
+owner or organization budget. Usage must be reported by the runner. A model call
+already in flight can overshoot the limit before its usage is persisted. Retain
+provider-side budgets as the independent billing backstop.

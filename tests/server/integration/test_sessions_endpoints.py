@@ -12773,3 +12773,42 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+async def test_external_pi_usage_prices_cache_writes_separately(client, db_uri, monkeypatch):
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(
+            input_per_token=1e-6,
+            output_per_token=2e-6,
+            cache_read_per_token=1e-7,
+            cache_write_per_token=1.25e-6,
+        ),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    data = {
+        "cumulative_input_tokens": 1000,
+        "cumulative_output_tokens": 100,
+        "cumulative_cache_read_input_tokens": 700,
+        "cumulative_cache_creation_input_tokens": 200,
+        "model": "anthropic/test",
+    }
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202, response.text
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["input_tokens"] == 100
+    assert usage["cache_creation_input_tokens"] == 200
+    assert usage["cache_read_input_tokens"] == 700
+    assert usage["total_tokens"] == 1100
+    assert usage["total_cost_usd"] == pytest.approx(0.00062)
+    # Repeated cumulative posts must not bill the same cache write twice.
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202
+    assert _read_session_usage(db_uri, session["id"])["total_cost_usd"] == pytest.approx(0.00062)

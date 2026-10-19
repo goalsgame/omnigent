@@ -1530,3 +1530,64 @@ async def test_vertex_tool_signature_survives_proxy_and_replay(routed, streaming
         == "opaque-replay-data"
     )
     assert service.active_requests == 0
+
+
+@pytest.mark.parametrize(
+    "cost,status", [(9, 200), (10, 402), (11, 402), (None, 503), (float("nan"), 503)]
+)
+async def test_owner_session_budget_gates_each_model_request(setup, cost, status):
+    from dataclasses import replace
+
+    service, app, conv, _host, calls = setup
+    service.config = replace(service.config, session_cost_limits={"alice": 10})
+    conv.session_usage = {"total_tokens": 100, "total_cost_usd": cost}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "model-a", "stream": True},
+        )
+    assert response.status_code == status
+    assert len(calls) == (1 if status == 200 else 0)
+    assert service.active_requests == 0
+
+
+async def test_budget_allows_first_call_and_does_not_affect_other_owners(setup):
+    from dataclasses import replace
+
+    service, _app, conv, _host, _calls = setup
+    conv.session_usage = {}
+    service.config = replace(service.config, session_cost_limits={"alice": 10})
+    service._check_cost_limit(conv)
+    service.config = replace(service.config, session_cost_limits={"bob": 10})
+    conv.session_usage = {"total_tokens": 100}
+    service._check_cost_limit(conv)
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        None,
+        [],
+        {"alice": 0},
+        {"alice": -1},
+        {"alice": True},
+        {"alice": "10"},
+        {"alice": float("nan")},
+        {"alice": float("inf")},
+    ],
+)
+def test_session_cost_limits_reject_invalid_config(monkeypatch, limits):
+    monkeypatch.setenv("INFERENCE_TEST_KEY", "k" * 32)
+    with pytest.raises(ValueError, match="session_cost_limits"):
+        InferenceProxyConfig.parse(
+            {
+                "public_url": "https://server.example",
+                "models": ["test"],
+                "signing_key_env": "INFERENCE_TEST_KEY",
+                "session_cost_limits": limits,
+            }
+        )

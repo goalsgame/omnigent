@@ -117,7 +117,24 @@ class InferenceUpstream:
             return f"{self.base_url}/endpoints/openapi/{endpoint}", restore_thought_signatures(
                 body
             )
+        if self.kind == "openrouter" and model.startswith("anthropic/"):
+            # Preserve explicit cache settings, including per-block breakpoints.
+            if not _has_cache_control(body):
+                body["cache_control"] = {"type": "ephemeral"}
         return f"{self.base_url}/{endpoint}", body
+
+
+def _has_cache_control(value: Any) -> bool:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            if "cache_control" in item or "prompt_cache_breakpoint" in item:
+                return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
 
 
 @dataclass(frozen=True)

@@ -206,7 +206,7 @@ class ModelPricing:
 
 def fetch_model_pricing(model: str) -> ModelPricing | None:
     """
-    Look up per-token pricing for *model* from the MLflow catalog.
+    Look up catalog pricing, then exact OpenRouter prices for unresolved models.
 
     Returns prices per token (not per million), including cache-read /
     cache-write rates when the catalog publishes them. Uses the same
@@ -243,7 +243,17 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
     prices = {price for info in matches if (price := _extract(info)) is not None}
     if len(prices) == 1:
         return next(iter(prices))
-    # Contradictory or unpriced catalog metadata is authoritative uncertainty.
+    from omnigent.llms.openrouter_pricing import model_rates
+
+    rates = model_rates(model)
+    if rates is not None:
+        return ModelPricing(
+            input_per_token=rates["prompt"],
+            output_per_token=rates["completion"],
+            cache_read_per_token=rates.get("input_cache_read"),
+            cache_write_per_token=rates.get("input_cache_write"),
+        )
+    # No exact public price: ambiguous or missing metadata stays unpriced.
     return None
 
 
