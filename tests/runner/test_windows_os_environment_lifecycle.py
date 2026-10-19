@@ -461,3 +461,157 @@ async def test_native_windows_scratch_shell_to_file_round_trip(tmp_path: Path) -
         assert (await environment.read("note.txt"))["content"].strip() == "scratch-ok"
     finally:
         environment.close()
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_interrupts_blocked_windows_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import io
+    import threading
+
+    from omnigent.inner.os_env import CallerProcessOSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    started, released = threading.Event(), threading.Event()
+    starts = []
+
+    class Output:
+        def readline(self) -> str:
+            started.set()
+            assert released.wait(5), "Session cleanup did not interrupt the shell"
+            return ""
+
+        def close(self) -> None:
+            pass
+
+    class Process:
+        pid = None
+        stdin = io.StringIO()
+        stdout = Output()
+        stderr = io.StringIO()
+
+        def poll(self) -> int | None:
+            return 0 if released.is_set() else None
+
+    class Handle:
+        def close(self) -> None:
+            released.set()
+
+    environment = CallerProcessOSEnvironment(
+        spec=OSEnvSpec(),
+        cwd=tmp_path,
+        shell_path="cmd.exe",
+        sandbox=SandboxPolicy(
+            backend_type="windows_jobobject",
+            active=False,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    helper = environment._shell_helper
+    helper._proc = Process()
+    helper._sandbox_handle = Handle()
+    monkeypatch.setattr(helper, "_ensure_started_locked", lambda: starts.append(True))
+    registry = SessionResourceRegistry()
+    registry._primary_envs["session-a"] = environment
+    command = asyncio.create_task(environment.shell("blocked"))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 2), 3)
+        await asyncio.wait_for(registry.cleanup_session("session-a"), 2)
+        result = await asyncio.wait_for(command, 2)
+        assert "error" in result
+        assert starts == [True], "Interrupted commands must not be retried"
+    finally:
+        released.set()
+        await command
+        environment.close()
+
+
+@pytest.mark.asyncio
+async def test_windows_command_cancellation_allows_next_call_and_preserves_prior_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import sys
+
+    import psutil
+
+    from omnigent.inner.os_env import CallerProcessOSEnvironment, _run_windows_shell
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    environment = CallerProcessOSEnvironment(
+        spec=OSEnvSpec(),
+        cwd=tmp_path,
+        shell_path=sys.executable,
+        sandbox=SandboxPolicy(
+            backend_type="windows_jobobject",
+            active=False,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    helper = environment._shell_helper
+
+    def request(payload: dict) -> dict:
+        with helper._lock:
+            try:
+                result = _run_windows_shell(
+                    [sys.executable, "-c", payload["command"]],
+                    cwd=tmp_path,
+                    timeout=60,
+                    cancel_path=Path(payload["cancel_path"]),
+                )
+                return {"stdout": result.stdout, "exit_code": result.returncode}
+            except InterruptedError:
+                return {"error": "cancelled"}
+
+    monkeypatch.setattr(helper, "request", request)
+    earlier = None
+    active = None
+    try:
+        result = await environment.shell(
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); print(p.pid)"
+        )
+        earlier = psutil.Process(int(result["stdout"].strip()))
+        marker = tmp_path / "active.pid"
+        active = asyncio.create_task(
+            environment.shell(
+                "import os,time; from pathlib import Path; "
+                f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)"
+            )
+        )
+        async with asyncio.timeout(5):
+            while not marker.exists():
+                await asyncio.sleep(0.01)
+        active_pid = int(marker.read_text())
+        active.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(active, 3)
+        result = await asyncio.wait_for(environment.shell("print('next-call-ok')"), 3)
+        assert result["stdout"].strip() == "next-call-ok"
+        assert earlier.is_running() and earlier.status() != psutil.STATUS_ZOMBIE
+        assert (
+            not psutil.pid_exists(active_pid)
+            or psutil.Process(active_pid).status() == psutil.STATUS_ZOMBIE
+        )
+        assert not list(environment._command_control_dir.iterdir())
+    finally:
+        if active is not None and not active.done():
+            active.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+        environment.close()
+        if earlier is not None:
+            try:
+                earlier.kill()
+                earlier.wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass

@@ -604,3 +604,33 @@ def test_windows_shell_waits_for_containment_before_starting(
             os_env._run_windows_shell(argv, cwd=tmp_path, timeout=5)
         assert not marker.exists()
         assert events == ["attach"]
+
+
+def test_windows_timeout_retains_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from omnigent.inner import os_env
+
+    class Job:
+        def release_processes(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(os_env, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent.inner.windows_jobobject_sandbox.create_process_job", lambda pid: Job()
+    )
+    result = os_env._shell_impl(
+        command=(
+            "import sys,time; print('before-timeout',flush=True); "
+            "print('diagnostic',file=sys.stderr,flush=True); time.sleep(60)"
+        ),
+        shell_path=sys.executable,
+        cwd=tmp_path,
+        timeout=1,
+    )
+    assert result["timed_out"] is True
+    assert result["stdout"].strip() == "before-timeout"
+    assert result["stderr"].strip() == "diagnostic"

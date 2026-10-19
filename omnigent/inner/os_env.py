@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import base64
 import codecs
@@ -13,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -29,7 +32,7 @@ from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEn
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import strip_desktop_session_env
-from .async_utils import run_sync_on_thread
+from .async_utils import run_sync_cleanup, run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
@@ -52,8 +55,6 @@ from .sandbox import (
 )
 
 if TYPE_CHECKING:
-    import asyncio
-
     from .egress import EgressProxyHandle
     from .egress.proxy import EgressProxy
 from .sandbox import (
@@ -429,12 +430,34 @@ class _HelperProcessClient:
         atexit.register(self.close)
 
     def request(self, payload: OpRequest) -> OpResult:
-        with self._lock:
+        cancel_path = payload.get("cancel_path")
+        while not self._lock.acquire(timeout=0.1):
+            if self._closed or (isinstance(cancel_path, str) and Path(cancel_path).exists()):
+                return {"error": "OS environment request cancelled"}
+        try:
+            if isinstance(cancel_path, str) and Path(cancel_path).exists():
+                return {"error": "OS environment request cancelled"}
             return self._request_locked(payload, allow_retry=True)
+        finally:
+            self._lock.release()
 
     def close(self) -> None:
+        # Interrupt a blocked response read before waiting for its request lock.
+        self._closed = True
+        handle, proc = self._sandbox_handle, self._proc
+        if handle is not None and self.sandbox.backend_type == "windows_jobobject":
+            handle.close()
+        if (
+            self.sandbox.backend_type == "windows_jobobject"
+            and proc is not None
+            and proc.poll() is None
+        ):
+            from ._proc import kill_tree
+
+            kill_tree(proc)
+            with contextlib.suppress(OSError):
+                proc.kill()
         with self._lock:
-            self._closed = True
             self._stop_locked()
 
     def _request_locked(
@@ -447,6 +470,9 @@ class _HelperProcessClient:
             return {"error": "OS environment helper is closed"}
 
         self._ensure_started_locked()
+        if self._closed:
+            self._stop_locked()
+            return {"error": "OS environment helper is closed"}
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
@@ -896,6 +922,9 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 self.sandbox.copy_on_write_roots
             )
             self._owns_copy_on_write = True
+        self._command_control_dir = (
+            create_private_tmpdir() if self.sandbox.backend_type == "windows_jobobject" else None
+        )
         self._shared_scratch = (
             create_private_tmpdir()
             if self._start_in_scratch and self.sandbox.backend_type == "windows_jobobject"
@@ -1007,13 +1036,36 @@ class CallerProcessOSEnvironment(OSEnvironment):
         }
         if max_output is not None:
             request["max_output"] = max_output
-        result = await run_sync_on_thread(helper.request, request)
-        return cast(OpResult, result)
+        if self._command_control_dir is None:
+            return cast(OpResult, await run_sync_on_thread(helper.request, request))
+        cancel_path = self._command_control_dir / uuid.uuid4().hex
+        request["cancel_path"] = str(cancel_path)
+        finished = threading.Event()
+
+        def run_request() -> OpResult:
+            try:
+                return helper.request(request)
+            finally:
+                cancel_path.unlink(missing_ok=True)
+                finished.set()
+
+        try:
+            return cast(OpResult, await run_sync_on_thread(run_request))
+        except asyncio.CancelledError:
+            with contextlib.suppress(FileNotFoundError):
+                cancel_path.touch()
+            try:
+                await run_sync_cleanup(finished.wait, component="windows-command-cancel")
+            finally:
+                cancel_path.unlink(missing_ok=True)
+            raise
 
     def close(self) -> None:
         self._helper.close()
         if self._shell_helper is not self._helper:
             self._shell_helper.close()
+        cleanup_private_tmpdir(self._command_control_dir)
+        self._command_control_dir = None
         cleanup_private_tmpdir(self._shared_scratch)
         self._shared_scratch = None
         if self._owns_copy_on_write and self._copy_on_write_environment is not None:
@@ -1180,6 +1232,11 @@ def _handle_helper_request(
             shell_path=shell_path,
             cwd=cwd,
             max_output=max_output,
+            cancel_path=(
+                Path(request["cancel_path"])
+                if isinstance(request.get("cancel_path"), str)
+                else None
+            ),
         )
 
     return {"error": f"Unsupported os_env helper operation: {op!r}"}
@@ -1557,6 +1614,7 @@ def _shell_impl(
     shell_path: str,
     cwd: Path,
     max_output: int = _MAX_TOOL_OUTPUT_CHARS,
+    cancel_path: Path | None = None,
 ) -> OpResult:
     """
     Execute a shell command and return its output.
@@ -1576,7 +1634,7 @@ def _shell_impl(
     argv = _shell_argv(shell_path, command)
     try:
         if IS_WINDOWS:
-            completed = _run_windows_shell(argv, cwd=cwd, timeout=timeout)
+            completed = _run_windows_shell(argv, cwd=cwd, timeout=timeout, cancel_path=cancel_path)
         else:
             completed = subprocess.run(
                 argv,
@@ -1591,8 +1649,16 @@ def _shell_impl(
         # | None`` from the stdlib; widening the op result at this boundary
         # would leak ``None`` into a JSON-serialized field that downstream
         # consumers treat as a plain string.
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        stdout = (
+            exc.stdout.decode("utf-8", errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else exc.stdout or ""
+        )
+        stderr = (
+            exc.stderr.decode("utf-8", errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else exc.stderr or ""
+        )
         return {
             "stdout": _truncate_output(stdout, "stdout", max_output),
             "stderr": _truncate_output(stderr, "stderr", max_output),
@@ -1625,7 +1691,7 @@ def _shell_impl(
 
 
 def _run_windows_shell(
-    argv: list[str] | str, *, cwd: Path, timeout: int
+    argv: list[str] | str, *, cwd: Path, timeout: int, cancel_path: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Use command-local containment for timeout cleanup, preserving earlier calls."""
     from ._proc import kill_tree
@@ -1653,7 +1719,31 @@ def _run_windows_shell(
                 job = create_process_job(process.pid)
                 if job is None:
                     raise OSError("Could not establish Windows command containment")
-            stdout, stderr = process.communicate(input="1", timeout=timeout)
+            deadline = time.monotonic() + timeout
+            first = True
+            while True:
+                if cancel_path is not None and cancel_path.exists():
+                    raise InterruptedError("Windows command cancelled")
+                try:
+                    stdout, stderr = process.communicate(
+                        input="1" if first else None,
+                        timeout=min(0.1, max(0.001, deadline - time.monotonic())),
+                    )
+                    break
+                except subprocess.TimeoutExpired as exc:
+                    if time.monotonic() >= deadline:
+                        if job is not None:
+                            job.close()
+                        if process.poll() is None:
+                            kill_tree(process)
+                            process.kill()
+                        stdout, stderr = process.communicate(timeout=5)
+                        exc.output = stdout.encode("utf-8")
+                        exc.stderr = stderr.encode("utf-8")
+                        exc.timeout = timeout
+                        raise
+                finally:
+                    first = False
             if job is not None:
                 job.release_processes()
             return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
