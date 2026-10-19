@@ -1060,7 +1060,8 @@ class _SafeLogFilter(logging.Filter):
         def safe(value: Any, key: str = "", depth: int = 0) -> Any:
             if depth > 8:
                 return "[REDACTED]"
-            if any(part in key.lower() for part in _REDACT_KEY_SUBSTRINGS):
+            normalized_key = re.sub(r"[\s_-]+", "", key.lower())
+            if any(part.replace("_", "") in normalized_key for part in _REDACT_KEY_SUBSTRINGS):
                 return "[REDACTED]"
             if isinstance(value, str):
                 return redact_log_text(value)

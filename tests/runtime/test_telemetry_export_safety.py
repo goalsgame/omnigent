@@ -6,6 +6,7 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
 
@@ -50,6 +51,21 @@ def test_log_export_redacts_body_exception_and_nested_attributes(monkeypatch) ->
         assert record.details["password"] == "attribute-secret"
     finally:
         provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    "key", ["api-key", "api key", "x-api-key", "API   Key", "api_key", "apiKey"]
+)
+def test_structured_api_key_separators_are_redacted(key) -> None:
+    record = logging.LogRecord("test", logging.ERROR, __file__, 1, "failed", (), None)
+    record.__dict__[key] = "plain-credential"
+    record.headers = {key: "nested-credential"}
+    cleaned = telemetry._SafeLogFilter().filter(record)
+    assert isinstance(cleaned, logging.LogRecord)
+    assert cleaned.__dict__[key] == "[REDACTED]"
+    assert cleaned.headers == {key: "[REDACTED]"}
+    assert record.__dict__[key] == "plain-credential"
+    assert record.headers[key] == "nested-credential"
 
 
 def test_resource_instance_shared_across_signals_but_renewed_after_fork(monkeypatch) -> None:
@@ -105,8 +121,6 @@ def test_docker_startup_failure_is_instrumented_before_config(monkeypatch, caplo
 
     monkeypatch.setattr(entrypoint, "_resolve_config", fail_config)
     monkeypatch.setattr("time.sleep", lambda _: None)
-    import pytest
-
     entrypoint.logger.addHandler(caplog.handler)
     try:
         with caplog.at_level(logging.ERROR), pytest.raises(SystemExit, match="1"):
