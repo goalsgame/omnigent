@@ -2057,10 +2057,8 @@ def create_runner_app(
         return None
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
-        workspace = await _session_workspace_value(session_id)
-        if workspace and workspace.strip():
-            return Path(workspace.strip()).expanduser().resolve()
-        return runner_workspace.resolve() if runner_workspace is not None else None
+        await _session_workspace_value(session_id)
+        return resource_registry.workspace_for_session(session_id)
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
         await _get_server_version(server_client)
@@ -2156,11 +2154,11 @@ def create_runner_app(
         if session_id in _session_fs_registries:
             return _session_fs_registries[session_id]
 
-        session_workspace = await _session_workspace_value(session_id)
-        if session_workspace is None:
+        session_ws_path = await _session_runtime_cwd(session_id)
+        if session_ws_path is None or session_id not in _session_workspace_cache:
+            # A failed snapshot must not cache the fallback as the session's root.
             return filesystem_registry
 
-        session_ws_path = Path(session_workspace).resolve()
         runner_ws_resolved = runner_workspace.resolve() if runner_workspace is not None else None
         if runner_ws_resolved is not None and session_ws_path == runner_ws_resolved:
             return filesystem_registry
@@ -5940,6 +5938,9 @@ def create_runner_app(
                                             _spec_for_dispatch_entry
                                         )
                                         _dispatch_workspace = await _session_runtime_cwd(conv_id)
+                                        _dispatch_fs_registry = await _resolve_session_fs_registry(
+                                            conv_id
+                                        )
                                         event[_RUNNER_DISPATCHED_FIELD] = True
                                         raw_sse_bytes = _encode_sse_event(event)
                                         _agent_id_for_dispatch = cast(
@@ -5977,7 +5978,7 @@ def create_runner_app(
                                                         conv_id
                                                     ),
                                                     publish_event=_publish_event,
-                                                    filesystem_registry=filesystem_registry,
+                                                    filesystem_registry=_dispatch_fs_registry,
                                                     effective_harness=_session_harness_name(
                                                         conv_id
                                                     ),

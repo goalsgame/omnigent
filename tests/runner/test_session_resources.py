@@ -139,6 +139,9 @@ class _CapturingResourceRegistry:
     def set_session_workspace_resolver(self, resolver: Callable[[str], Path | None]) -> None:
         self._session_workspace_resolver = resolver
 
+    def workspace_for_session(self, session_id: str) -> Path | None:
+        return self._session_workspace_resolver(session_id) or self._runner_workspace
+
     def set_terminal_activity_publisher(
         self,
         publisher: Callable[[str, str], None],
@@ -2581,9 +2584,11 @@ async def test_claude_terminal_ensure_concurrent_calls_create_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("isolate", [False, True])
 async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    isolate: bool,
 ) -> None:
     """
     Never-retried-because-already-present scenario:
@@ -2661,6 +2666,7 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     app = create_runner_app(
         runner_workspace=runner_ws,
         server_client=server_client,
+        per_session_workspace=isolate,
     )
     # The shared default registry is created eagerly at app-build time,
     # watched at the runner root — this is registry_calls[0], not part of
@@ -2688,7 +2694,8 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     # workspace, must be created once the snapshot succeeds — a value of
     # [runner_ws] only (no session_ws entry) means the failed first fetch
     # permanently pinned workspace=None and the second call never re-asked.
-    assert session_ws.resolve() in registry_calls, (
+    expected_workspace = session_ws / conv if isolate else session_ws
+    assert expected_workspace.resolve() in registry_calls, (
         f"expected a per-session filesystem registry watching {session_ws!r} "
         f"after the snapshot recovered — got registry_calls={registry_calls!r}. "
         f"Only the startup entry means the failed first snapshot pinned this "

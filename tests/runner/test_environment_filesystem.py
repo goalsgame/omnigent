@@ -2518,7 +2518,11 @@ async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_cold_filesystem_write_uses_selected_project(tmp_path: Path) -> None:
+@pytest.mark.parametrize("isolate", [False, True])
+async def test_selected_workspace_is_shared_by_resources_runtime_and_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolate: bool
+) -> None:
+    from omnigent.runner.background_titles import BackgroundTitleContext
     from omnigent.spec.types import AgentSpec
 
     launch = tmp_path / "runner-launch"
@@ -2540,7 +2544,20 @@ async def test_cold_filesystem_write_uses_selected_project(tmp_path: Path) -> No
             )
         return httpx.Response(404, json={})
 
-    registry = SessionResourceRegistry(runner_workspace=launch)
+    expected_root = selected / "cold-session" if isolate else selected
+    runtime_roots = []
+
+    async def harness_config(**kwargs: object) -> tuple[str, dict[str, str]]:
+        runtime_roots.append(kwargs["cwd"])
+        return "codex", {}
+
+    async def title(context: BackgroundTitleContext) -> str:
+        assert context.cwd == expected_root
+        return "Workspace check"
+
+    monkeypatch.setattr("omnigent.runner.app._resolve_harness_config", harness_config)
+    monkeypatch.setattr("omnigent.runner.app.run_background_title", title)
+    registry = SessionResourceRegistry(runner_workspace=launch, per_session_workspace=isolate)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(metadata), base_url="http://server"
     ) as server:
@@ -2549,7 +2566,8 @@ async def test_cold_filesystem_write_uses_selected_project(tmp_path: Path) -> No
             spec_resolver=resolve,
             resource_registry=registry,
             runner_workspace=launch,
-            per_session_workspace=False,
+            per_session_workspace=isolate,
+            process_manager=SimpleNamespace(),
         )
         try:
             async with httpx.AsyncClient(
@@ -2559,8 +2577,20 @@ async def test_cold_filesystem_write_uses_selected_project(tmp_path: Path) -> No
                     f"/v1/sessions/cold-session/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/new.txt",
                     json={"content": "selected-project-ok", "encoding": "utf-8"},
                 )
-            assert response.status_code == 200, response.text
-            assert (selected / "new.txt").read_text() == "selected-project-ok"
-            assert not (launch / "new.txt").exists()
+                assert response.status_code == 200, response.text
+                assert (expected_root / "new.txt").read_text() == "selected-project-ok"
+                assert not (launch / "new.txt").exists()
+                title_response = await client.post(
+                    "/v1/sessions/cold-session/background-title",
+                    json={"prompt": "Check workspace", "agent_id": "test-agent"},
+                )
+                assert title_response.status_code == 200, title_response.text
+                assert runtime_roots == [expected_root]
+                subprocess.run(["git", "init"], cwd=expected_root, check=True, capture_output=True)
+                changes = await client.get(
+                    f"/v1/sessions/cold-session/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+                )
+                assert changes.status_code == 200, changes.text
+                assert [entry["path"] for entry in changes.json()["data"]] == ["new.txt"]
         finally:
             await registry.cleanup_session("cold-session")

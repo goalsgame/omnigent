@@ -1703,8 +1703,11 @@ def _run_windows_shell(
         "sys.exit(subprocess.call(json.loads(sys.argv[1]), stdin=subprocess.DEVNULL))"
     )
     job = None
+    # The Windows venv redirector can spawn the interpreter before job assignment.
+    # The gate needs only the standard library, so start the base interpreter directly.
+    gate_python = getattr(sys, "_base_executable", None) or sys.executable
     with subprocess.Popen(
-        [sys.executable, "-c", gate, json.dumps(argv)],
+        [gate_python, "-c", gate, json.dumps(argv)],
         cwd=str(cwd),
         env=_child_shell_env(),
         text=True,
