@@ -1120,7 +1120,9 @@ def create_auth_router(
             from omnigent.server.oidc_mcp import DelegationUnavailable
 
             try:
-                login_state = await asyncio.to_thread(login_broker.state, pending.user_id)
+                login_state = await asyncio.to_thread(
+                    login_broker.state, pending.user_id, pending.oidc_login_generation
+                )
                 if login_state["generation"] != pending.oidc_login_generation:
                     return oauth_error("invalid_grant")
                 content["token"] = login_broker.session_token(pending.user_id, login_state)

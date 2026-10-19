@@ -471,7 +471,9 @@ def create_oauth_token_router(
         ):
             raise DelegationUnavailable("Sign in again to renew identity delegation")
         login_state = (
-            login.state(user_id) if login is not None and _is_login_grant(client_id) else None
+            login.state(user_id, grant.oidc_login_generation)
+            if login is not None and _is_login_grant(client_id)
+            else None
         )
         if login_state is not None and login_state["generation"] != grant.oidc_login_generation:
             raise DelegationUnavailable("Sign in again to renew identity delegation")

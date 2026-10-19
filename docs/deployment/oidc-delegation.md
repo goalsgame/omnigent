@@ -38,8 +38,12 @@ failures also remain retryable. If token rotation has already succeeded, the
 response stays encrypted and unavailable until its signatures and identity have
 been verified.
 
-New logins supersede the user's previous offline grant. Logout removes the stored
-grant, making tokens bound to that grant fail validation. Identity-provider
+Each browser, native or CLI sign-in has its own stored offline grant and absolute
+deadline. Signing in on another client preserves existing logins. Logout removes
+only the originating grant, making its tokens fail validation while other
+logins remain usable. Connectors and Lore use an active grant for the same
+verified account identity. Existing grants remain usable across upgrades; expired
+grant records are pruned during subsequent sign-ins. Identity-provider
 revocation is detected when refreshing access. Existing short-lived tokens can
 remain usable until that refresh/expiry boundary. Once the grant expires, the
 user must sign in again; MCP authentication rejections return an actionable error

@@ -153,3 +153,36 @@ def test_non_empty_account_id(db_uri: str) -> None:
     # The default-account view ("") is a distinct, absent row.
     assert store.get("alice", "github") is None
     assert len(store.list_for_user("alice")) == 2
+
+
+def test_locked_refresh_selects_exact_account_and_cipher_context(db_uri):
+    store = _store(db_uri)
+    for account in ("", "desktop", "cli"):
+        store.upsert(
+            "person",
+            "oidc_login",
+            account_id=account,
+            secret={"refresh_token": account or "legacy"},
+            metadata={},
+        )
+    seen = []
+
+    def rotate(connection):
+        seen.append((connection.account_id, connection.secret["refresh_token"]))
+        return {"refresh_token": "rotated"}
+
+    result = store.refresh_locked("person", "oidc_login", rotate, account_id="desktop")
+    assert result.secret == {"refresh_token": "rotated"}
+    assert seen == [("desktop", "desktop")]
+    assert (
+        store.get("person", "oidc_login", account_id="desktop", with_secret=True).secret
+        == result.secret
+    )
+    assert store.get("person", "oidc_login", account_id="cli", with_secret=True).secret == {
+        "refresh_token": "cli"
+    }
+    assert store.get("person", "oidc_login", with_secret=True).secret == {
+        "refresh_token": "legacy"
+    }
+    assert store.refresh_locked("person", "oidc_login", rotate, account_id="absent") is None
+    assert len(seen) == 1

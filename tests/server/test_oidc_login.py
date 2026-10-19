@@ -20,6 +20,11 @@ __all__ = ["oidc", "signing_key"]
 OWNER, SUBJECT = "person@example.test", "human-subject"
 
 
+def _account_id(broker):
+    current = broker.store.get(OWNER, PROVIDER, account_id="current")
+    return current.metadata["generation"] if current else ""
+
+
 @pytest.fixture(params=["opaque", "hs512"])
 def login(request, db_uri, monkeypatch, oidc, signing_key):
     config = dataclasses.replace(oidc, scopes="openid email profile offline_access")
@@ -93,14 +98,20 @@ def test_weekly_cap_and_shared_refresh(login):
     broker, _token, tokens, calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
     assert 604790 < state["deadline"] - time.time() <= 604800
-    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**state, "expires_at": 0}
+    )
     renewed = broker.state(OWNER)
     assert len(calls) == 1
     assert renewed["deadline"] == state["deadline"]
     assert broker.state(OWNER)["access_token"] == renewed["access_token"]
     assert len(calls) == 1
     broker.store.upsert(
-        OWNER, PROVIDER, secret=renewed, metadata={**renewed, "deadline": time.time() - 1}
+        OWNER,
+        PROVIDER,
+        account_id=_account_id(broker),
+        secret=renewed,
+        metadata={**renewed, "deadline": time.time() - 1},
     )
     with pytest.raises(DelegationUnavailable):
         broker.state(OWNER)
@@ -115,7 +126,7 @@ def test_reject_missing_offline_access_or_wrong_access_subject(login, scope, sub
     value = {**tokens(), "access_token": token(subject=subject), "scope": scope}
     with pytest.raises(DelegationUnavailable):
         broker.capture(OWNER, SUBJECT, value)
-    assert broker.store.get(OWNER, PROVIDER) is None
+    assert broker.store.get(OWNER, PROVIDER, account_id=_account_id(broker)) is None
 
 
 def test_isolation_revocation_and_generation(login):
@@ -126,9 +137,8 @@ def test_isolation_revocation_and_generation(login):
         broker.state("someone-else@example.test")
     second = broker.capture(OWNER, SUBJECT, tokens())
     assert first["generation"] != second["generation"]
-    with pytest.raises(DelegationUnavailable):
-        broker.browser_identity(cookie)
-    broker.store.delete(OWNER, PROVIDER)
+    assert broker.browser_identity(cookie) == (OWNER, first["generation"])
+    broker.store.delete(OWNER, PROVIDER, account_id=_account_id(broker))
     assert not broker.active(OWNER, second["generation"])
 
 
@@ -159,7 +169,7 @@ async def test_browser_renews_short_token_and_fails_after_revocation(login):
         assert claims["group_authority"]["groups"] == ["engineers"]
         cookie = response.headers["set-cookie"]
         assert "Secure" in cookie and "HttpOnly" in cookie
-        broker.store.delete(OWNER, PROVIDER)
+        broker.store.delete(OWNER, PROVIDER, account_id=_account_id(broker))
         response = await client.get("/v1/probe")
         assert response.status_code == 401
         assert response.json()["code"] == "identity_login_required"
@@ -197,7 +207,7 @@ async def test_native_refresh_uses_login_deadline_and_current_groups(login, db_u
         assert claims["group_authority"]["groups"] == ["engineers"]
         assert 0 < response.json()["expires_in"] <= 900
         assert broker.active(OWNER, claims["oidc_grant_id"])
-        broker.store.delete(OWNER, PROVIDER)
+        broker.store.delete(OWNER, PROVIDER, account_id=_account_id(broker))
         response = await client.post(
             "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
         )
@@ -216,7 +226,9 @@ def test_concurrent_refresh_rotates_the_single_shared_grant(login):
 
     broker, _token, tokens, calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
-    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**state, "expires_at": 0}
+    )
     with ThreadPoolExecutor(max_workers=2) as pool:
         states = list(pool.map(lambda _: broker.state(OWNER), range(2)))
     assert len(calls) == 1
@@ -252,7 +264,7 @@ def test_renewal_cookie_is_not_an_access_token(login):
         }
     )
     assert auth.get_user_id(request) == OWNER
-    broker.store.delete(OWNER, PROVIDER)
+    broker.store.delete(OWNER, PROVIDER, account_id=_account_id(broker))
     assert auth.get_user_id(request) is None
 
 
@@ -261,7 +273,7 @@ async def test_expired_chat_link_redirects_back_to_login(login):
     broker, _token, tokens, _calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
     cookie = broker.browser_cookie(OWNER, state)
-    broker.store.delete(OWNER, PROVIDER)
+    broker.store.delete(OWNER, PROVIDER, account_id=_account_id(broker))
     app = FastAPI()
     app.add_middleware(OIDCLoginMiddleware, broker=broker)
     async with httpx.AsyncClient(
@@ -277,7 +289,9 @@ async def test_expired_chat_link_redirects_back_to_login(login):
 def test_refresh_removes_group_authority(login):
     broker, token, tokens, _calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
-    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**state, "expires_at": 0}
+    )
     broker.client.close()
     broker.client = httpx.Client(
         transport=httpx.MockTransport(
@@ -306,6 +320,7 @@ def test_capture_rejects_replaced_generation(login, monkeypatch):
             provider,
             secret=kwargs["secret"],
             metadata={**kwargs["metadata"], "generation": "replacement"},
+            account_id=kwargs.get("account_id", ""),
         )
 
     monkeypatch.setattr(broker.store, "upsert", replacing)
@@ -324,7 +339,8 @@ def test_logout_cannot_delete_concurrently_replaced_login(login, monkeypatch):
         return original(owner, provider, **kwargs)
 
     monkeypatch.setattr(broker.store, "delete", replacing)
-    assert not broker.revoke(OWNER, first["generation"])
+    assert broker.revoke(OWNER, first["generation"])
+    assert not broker.active(OWNER, first["generation"])
     assert broker.active(OWNER, replacement["generation"])
 
 
@@ -334,7 +350,7 @@ async def test_revoked_browser_document_redirects_but_api_stays_json(login, path
     broker, _token, tokens, _calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
     cookie = broker.browser_cookie(OWNER, state)
-    broker.store.delete(OWNER, PROVIDER)
+    broker.store.delete(OWNER, PROVIDER, account_id=_account_id(broker))
     app = FastAPI()
     app.add_middleware(OIDCLoginMiddleware, broker=broker)
     async with httpx.AsyncClient(
@@ -418,7 +434,8 @@ def offline_auth_app(login, db_uri, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_native_code_cannot_redeem_replacement_generation(offline_auth_app):
+@pytest.mark.parametrize("revoke_original", [False, True])
+async def test_native_code_stays_bound_to_its_login(offline_auth_app, revoke_original):
     from urllib.parse import parse_qs, urlsplit
 
     from omnigent.server.oidc import derive_code_challenge
@@ -442,13 +459,24 @@ async def test_native_code_cannot_redeem_replacement_generation(offline_auth_app
         callback = await client.get("/auth/callback", params={"state": state, "code": "fixture"})
         assert callback.status_code == 302, callback.text
         code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
-        broker.capture(OWNER, SUBJECT, tokens())
+        original = broker.state(OWNER)
+        newer = broker.capture(OWNER, SUBJECT, tokens())
+        if revoke_original:
+            assert broker.revoke(OWNER, original["generation"])
         response = await client.post(
             "/auth/native-token",
             data={"code": code, "code_verifier": verifier, "redirect_uri": redirect},
         )
-        assert response.status_code == 400
-        assert response.json()["error"] == "invalid_grant"
+        if revoke_original:
+            assert response.status_code == 400
+            assert response.json()["error"] == "invalid_grant"
+        else:
+            assert response.status_code == 200
+            claims = jwt.decode(
+                response.json()["token"], broker.config.cookie_secret, algorithms=["HS256"]
+            )
+            assert claims["oidc_grant_id"] == original["generation"]
+            assert claims["oidc_grant_id"] != newer["generation"]
 
 
 @pytest.mark.asyncio
@@ -709,7 +737,9 @@ async def test_temporary_provider_failure_preserves_browser_and_native_renewal(
 
     broker, _token, tokens, _calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
-    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**state, "expires_at": 0}
+    )
     calls = []
 
     def provider(request):
@@ -773,7 +803,9 @@ async def test_signing_key_outage_preserves_rotated_response_until_verified(
 
     broker, _token, tokens, _calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
-    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**state, "expires_at": 0}
+    )
     rotated = tokens()
     rotated["refresh_token"] = "rotated-opaque-credential"
     unavailable = [False]
@@ -834,7 +866,9 @@ async def test_signing_key_outage_preserves_rotated_response_until_verified(
             assert response.status_code == 503
             assert "set-cookie" not in response.headers
             assert "access_token" not in response.json()
-        pending = broker.store.get(OWNER, PROVIDER, with_secret=True).secret
+        pending = broker.store.get(
+            OWNER, PROVIDER, account_id=_account_id(broker), with_secret=True
+        ).secret
         assert pending["refresh_token"] == state["refresh_token"]
         assert pending["pending_tokens"]["refresh_token"] == rotated["refresh_token"]
         unavailable[0] = False
@@ -861,7 +895,9 @@ def test_pending_rotated_response_never_accepts_wrong_identity(login, monkeypatc
 
     monkeypatch.setattr(broker.jwks, "get_signing_key_from_jwt", key)
     bad = {**tokens(), "access_token": token(subject="different-subject")}
-    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**state, "expires_at": 0}
+    )
     broker.client.close()
     broker.client = httpx.Client(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json=bad))
@@ -887,7 +923,10 @@ def test_expired_pending_access_renews_with_verified_rotated_refresh(
     )
     pending["refresh_token"] = "already-rotated"
     broker.store.update_secret(
-        OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
+        OWNER,
+        PROVIDER,
+        account_id=_account_id(broker),
+        secret={**state, "expires_at": 0, "pending_tokens": pending},
     )
     result = broker.state(OWNER)
     assert "pending_tokens" not in result
@@ -910,7 +949,10 @@ def test_pending_renewal_without_refresh_field_preserves_effective_token(
     )
     pending["refresh_token"] = "rotated-refresh"
     broker.store.update_secret(
-        OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
+        OWNER,
+        PROVIDER,
+        account_id=_account_id(broker),
+        secret={**state, "expires_at": 0, "pending_tokens": pending},
     )
     unavailable = [False]
     original = broker.jwks.get_signing_key_from_jwt
@@ -935,14 +977,18 @@ def test_pending_renewal_without_refresh_field_preserves_effective_token(
     broker.client = httpx.Client(transport=httpx.MockTransport(provider))
     with pytest.raises(DelegationTemporarilyUnavailable):
         broker.state(OWNER)
-    stored = broker.store.get(OWNER, PROVIDER, with_secret=True).secret
+    stored = broker.store.get(
+        OWNER, PROVIDER, account_id=_account_id(broker), with_secret=True
+    ).secret
     assert stored["pending_tokens"]["refresh_token"] == pending["refresh_token"]
     unavailable[0] = False
     recovered = broker.state(OWNER)
     assert recovered["refresh_token"] == pending["refresh_token"]
     assert "pending_tokens" not in recovered
     assert len(requests) == 1
-    broker.store.update_secret(OWNER, PROVIDER, secret={**recovered, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**recovered, "expires_at": 0}
+    )
     with pytest.raises(DelegationTemporarilyUnavailable):
         broker.state(OWNER)
     unavailable[0] = False
@@ -957,7 +1003,9 @@ def test_unknown_rotated_key_during_populated_cache_cooldown_is_retryable(
 
     broker, _token, tokens, calls = login
     state = broker.capture(OWNER, SUBJECT, tokens())
-    broker.store.update_secret(OWNER, PROVIDER, secret={**state, "expires_at": 0})
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=_account_id(broker), secret={**state, "expires_at": 0}
+    )
     rotated = tokens()
     for field in ("access_token",):
         claims = jwt.decode(rotated[field], options={"verify_signature": False})
@@ -983,7 +1031,12 @@ def test_unknown_rotated_key_during_populated_cache_cooldown_is_retryable(
     broker.client = httpx.Client(transport=httpx.MockTransport(provider))
     with pytest.raises(DelegationTemporarilyUnavailable):
         broker.state(OWNER)
-    assert broker.store.get(OWNER, PROVIDER, with_secret=True).secret["pending_tokens"] == rotated
+    assert (
+        broker.store.get(OWNER, PROVIDER, account_id=_account_id(broker), with_secret=True).secret[
+            "pending_tokens"
+        ]
+        == rotated
+    )
     broker.jwks.jwk_set_cache.put({"keys": [{**jwk, "kid": "new-key"}]})
     recovered = broker.state(OWNER)
     assert recovered["refresh_token"] == rotated["refresh_token"]
@@ -997,7 +1050,7 @@ def test_login_rejects_missing_or_invalid_refresh_credential(login, refresh):
     broker, _token, tokens, _calls = login
     with pytest.raises(DelegationUnavailable):
         broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_token": refresh})
-    assert broker.store.get(OWNER, PROVIDER) is None
+    assert broker.store.get(OWNER, PROVIDER, account_id=_account_id(broker)) is None
 
 
 @pytest.mark.parametrize("lifetime", [0, 120, 999999])
@@ -1055,7 +1108,10 @@ def test_expired_pending_access_must_still_match_identity_before_renewal(
     )
     pending["refresh_token"] = "rotated-opaque-credential"
     broker.store.update_secret(
-        OWNER, PROVIDER, secret={**state, "expires_at": 0, "pending_tokens": pending}
+        OWNER,
+        PROVIDER,
+        account_id=_account_id(broker),
+        secret={**state, "expires_at": 0, "pending_tokens": pending},
     )
     with pytest.raises(DelegationUnavailable):
         broker.state(OWNER)
@@ -1067,4 +1123,130 @@ def test_invalid_refresh_lifetime_is_rejected(login, lifetime):
     broker, _token, tokens, _calls = login
     with pytest.raises(DelegationUnavailable):
         broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_expires_in": lifetime})
-    assert broker.store.get(OWNER, PROVIDER) is None
+    assert broker.store.get(OWNER, PROVIDER, account_id=_account_id(broker)) is None
+
+
+@pytest.mark.asyncio
+async def test_browser_and_native_renew_independently_after_cli_signin(login, db_uri):
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.routes.device_auth import create_oauth_token_router, issue_login_grant
+
+    broker, _token, tokens, _calls = login
+    desktop = broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_expires_in": 120})
+    desktop_cookie = broker.browser_cookie(OWNER, desktop)
+    grants = DeviceGrantStore(db_uri)
+    desktop_refresh = issue_login_grant(
+        grants,
+        user_id=OWNER,
+        cookie_secret=broker.config.cookie_secret,
+        oidc_login_generation=desktop["generation"],
+    )
+    cli = broker.capture(OWNER, SUBJECT, tokens())
+    auth = UnifiedAuthProvider("oidc", oidc_config=broker.config)
+    auth.oidc_login_broker = broker
+    app = FastAPI()
+    app.add_middleware(OIDCLoginMiddleware, broker=broker)
+    app.include_router(create_oauth_token_router(auth, grants))
+
+    @app.get("/probe")
+    def probe(request: Request):
+        return jwt.decode(
+            request.cookies[broker.config.session_cookie_name],
+            broker.config.cookie_secret,
+            algorithms=["HS256"],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+    ) as client:
+        client.cookies.set(broker.cookie_name, desktop_cookie)
+        browser = await client.get("/probe")
+        assert browser.status_code == 200
+        assert browser.json()["oidc_grant_id"] == desktop["generation"]
+        assert browser.json()["exp"] <= int(desktop["deadline"])
+        native = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": desktop_refresh,
+            },
+        )
+        assert native.status_code == 200
+        claims = jwt.decode(
+            native.json()["access_token"], broker.config.cookie_secret, algorithms=["HS256"]
+        )
+        assert claims["oidc_grant_id"] == desktop["generation"]
+        assert claims["exp"] <= int(desktop["deadline"])
+        assert broker.revoke(OWNER, cli["generation"])
+        assert broker.active(OWNER, desktop["generation"])
+        assert not broker.active(OWNER, cli["generation"])
+        assert broker.state(OWNER)["generation"] == desktop["generation"]
+        assert broker.revoke(OWNER, desktop["generation"])
+        assert (await client.get("/probe")).status_code == 401
+        client.cookies.clear()
+        assert (
+            await client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": desktop_refresh,
+                },
+            )
+        ).status_code == 400
+
+
+def test_legacy_grant_survives_new_login_without_copying_refresh_token(login):
+    broker, _token, tokens, _calls = login
+    old = broker.capture(OWNER, SUBJECT, tokens())
+    record = broker.store.get(OWNER, PROVIDER, account_id=old["generation"], with_secret=True)
+    broker.store.upsert(OWNER, PROVIDER, secret=record.secret, metadata=record.metadata)
+    broker.store.delete(OWNER, PROVIDER, account_id=old["generation"])
+    broker.store.delete(OWNER, PROVIDER, account_id="current")
+    newer = broker.capture(OWNER, SUBJECT, tokens())
+    assert broker.active(OWNER, old["generation"])
+    assert broker.state(OWNER, old["generation"])["generation"] == old["generation"]
+    assert broker.store.get(OWNER, PROVIDER, account_id=old["generation"]) is None
+    assert broker.revoke(OWNER, newer["generation"])
+    assert broker.state(OWNER)["generation"] == old["generation"]
+    assert broker.revoke(OWNER, old["generation"])
+    assert not broker.active(OWNER, old["generation"])
+
+
+def test_login_cleanup_removes_only_expired_grants(login):
+    broker, _token, tokens, _calls = login
+    expired = broker.capture(OWNER, SUBJECT, tokens())
+    broker.store.update_secret(
+        OWNER,
+        PROVIDER,
+        account_id=expired["generation"],
+        secret=expired,
+        metadata={**expired, "deadline": time.time() - 1},
+    )
+    current = broker.capture(OWNER, SUBJECT, tokens())
+    assert broker.store.get(OWNER, PROVIDER, account_id=expired["generation"]) is None
+    assert broker.active(OWNER, current["generation"])
+
+
+def test_different_verified_subject_cannot_inherit_prior_logins(login):
+    broker, token, tokens, _calls = login
+    old = broker.capture(OWNER, SUBJECT, tokens())
+    newer = broker.capture(
+        OWNER, "new-subject", {**tokens(), "access_token": token(subject="new-subject")}
+    )
+    assert not broker.active(OWNER, old["generation"])
+    assert broker.active(OWNER, newer["generation"])
+    with pytest.raises(DelegationUnavailable):
+        broker.state(OWNER, old["generation"])
+
+
+def test_concurrent_signins_keep_both_generations(login):
+    from concurrent.futures import ThreadPoolExecutor
+
+    broker, _token, tokens, _calls = login
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        states = list(pool.map(lambda _: broker.capture(OWNER, SUBJECT, tokens()), range(2)))
+    assert states[0]["generation"] != states[1]["generation"]
+    for state in states:
+        assert broker.active(OWNER, state["generation"])
+        assert broker.state(OWNER, state["generation"])["deadline"] == state["deadline"]

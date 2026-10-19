@@ -254,6 +254,8 @@ class CredentialStore:
         user_id: str,
         provider: str,
         refresh: Callable[[ProviderConnection], dict[str, Any]],
+        *,
+        account_id: str = "",
     ) -> ProviderConnection | None:
         """Serialize token rotation against reconnect/delete across database replicas.
 
@@ -262,7 +264,7 @@ class CredentialStore:
         with a file lock and compare-and-swap, outside database transactions.
         """
         if self._engine.dialect.name == "sqlite":
-            return self._refresh_sqlite(user_id, provider, refresh)
+            return self._refresh_sqlite(user_id, provider, refresh, account_id=account_id)
         workspace_id = current_workspace_id()
 
         def write(session: Session) -> ProviderConnection | None:
@@ -273,7 +275,7 @@ class CredentialStore:
                     SqlConnection.workspace_id == workspace_id,
                     SqlConnection.user_id == user_id,
                     SqlConnection.provider == provider,
-                    SqlConnection.account_id == "",
+                    SqlConnection.account_id == account_id,
                 )
                 .with_for_update()
             )
@@ -288,7 +290,7 @@ class CredentialStore:
                         workspace_id,
                         user_id,
                         provider,
-                        "",
+                        account_id,
                     ),
                 )
                 row.updated_at = now_epoch()
@@ -303,6 +305,8 @@ class CredentialStore:
         user_id: str,
         provider: str,
         refresh: Callable[[ProviderConnection], dict[str, Any]],
+        *,
+        account_id: str = "",
     ) -> ProviderConnection | None:
         """Serialize rotating grants without holding SQLite's global writer lock."""
         workspace_id = current_workspace_id()
@@ -315,12 +319,14 @@ class CredentialStore:
                 / f"omnigent-credentials-{os.getpid()}-{id(self._engine)}"
             )
         lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        key = hashlib.sha256(json.dumps([workspace_id, user_id, provider]).encode()).hexdigest()
+        key = hashlib.sha256(
+            json.dumps([workspace_id, user_id, provider, account_id]).encode()
+        ).hexdigest()
         identity = (
             SqlConnection.workspace_id == workspace_id,
             SqlConnection.user_id == user_id,
             SqlConnection.provider == provider,
-            SqlConnection.account_id == "",
+            SqlConnection.account_id == account_id,
         )
         try:
             with FileLock(str(lock_dir / (key + ".lock")), timeout=30):
@@ -336,7 +342,8 @@ class CredentialStore:
                 if secret == connection.secret:
                     return connection
                 encrypted = self._cipher.encrypt(
-                    json.dumps(secret), context=_enc_context(workspace_id, user_id, provider, "")
+                    json.dumps(secret),
+                    context=_enc_context(workspace_id, user_id, provider, account_id),
                 )
                 with self._session_immediate("refresh_compare_swap") as session:
                     require_active_account(session, user_id)
