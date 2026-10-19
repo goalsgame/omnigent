@@ -13,7 +13,9 @@ from omnigent.server.inference_proxy import InferenceProxy, InferenceProxyConfig
 
 @pytest.fixture
 def setup():
-    conv = SimpleNamespace(id="session", host_id="host", runner_id="runner", archived=False)
+    conv = SimpleNamespace(
+        id="session", host_id="host", runner_id="runner", archived=False, labels={}
+    )
     host = SimpleNamespace(
         user_id="alice",
         account_generation="generation",
@@ -21,6 +23,7 @@ def setup():
         updated_at=int(time.time()),
     )
     conversations = SimpleNamespace(
+        set_labels=lambda sid, values: conv.labels.update(values),
         get_conversation=lambda sid: conv if sid == conv.id else None,
         get_session_owner_authority=lambda sid, owner_only: SimpleNamespace(
             user_id="alice", generation="generation"
@@ -1530,3 +1533,133 @@ async def test_vertex_tool_signature_survives_proxy_and_replay(routed, streaming
         == "opaque-replay-data"
     )
     assert service.active_requests == 0
+
+
+@pytest.mark.parametrize(
+    "cost,status", [(9, 200), (10, 402), (11, 402), (None, 503), (float("nan"), 503)]
+)
+async def test_owner_session_budget_gates_each_model_request(setup, cost, status):
+    from dataclasses import replace
+
+    service, app, conv, _host, calls = setup
+    service.config = replace(service.config, session_cost_limits={"alice": 10})
+    conv.session_usage = {"total_tokens": 100, "total_cost_usd": cost}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "model-a", "stream": True},
+        )
+    assert response.status_code == status
+    assert len(calls) == (1 if status == 200 else 0)
+    assert service.active_requests == 0
+
+
+async def test_budget_allows_first_call_and_does_not_affect_other_owners(setup):
+    from dataclasses import replace
+
+    service, _app, conv, _host, _calls = setup
+    conv.session_usage = {}
+    service.config = replace(service.config, session_cost_limits={"alice": 10})
+    service._check_cost_limit(conv)
+    service.config = replace(service.config, session_cost_limits={"bob": 10})
+    conv.session_usage = {"total_tokens": 100}
+    service._check_cost_limit(conv)
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        None,
+        [],
+        {"alice": 0},
+        {"alice": -1},
+        {"alice": True},
+        {"alice": "10"},
+        {"alice": float("nan")},
+        {"alice": float("inf")},
+    ],
+)
+def test_session_cost_limits_reject_invalid_config(monkeypatch, limits):
+    monkeypatch.setenv("INFERENCE_TEST_KEY", "k" * 32)
+    with pytest.raises(ValueError, match="session_cost_limits"):
+        InferenceProxyConfig.parse(
+            {
+                "public_url": "https://server.example",
+                "models": ["test"],
+                "signing_key_env": "INFERENCE_TEST_KEY",
+                "session_cost_limits": limits,
+            }
+        )
+
+
+async def test_openrouter_uses_server_bound_session_for_sticky_routing(setup):
+    service, app, conv, _host, calls = setup
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "model-a", "session_id": "caller-supplied", "stream": True},
+        )
+    assert response.status_code == 200
+    assert json.loads(calls[0].content)["session_id"] == "omnigent:0:session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_identity_route_refreshes_previous_pricing_attribution(routed, legacy):
+    from omnigent.inference_pricing import pricing_model_label, resolve_pricing_model
+
+    service, app, conv, _, calls = routed
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+
+        async def invoke():
+            return await client.post(
+                "/v1/inference/sessions/session/chat/completions",
+                headers={"Authorization": "Bearer " + token},
+                json={"model": "model-a", "stream": True},
+            )
+
+        assert (await invoke()).status_code == 200
+        assert conv.labels[pricing_model_label("model-a")] == "openai/model-a"
+        raw = _multi_upstream_raw()
+        raw["model_routes"]["model-a"]["model"] = "model-a"
+        service.config = InferenceProxyConfig.parse(raw)
+        if legacy:
+            from dataclasses import replace
+
+            service.config = replace(service.config, upstreams={}, model_routes={})
+        assert (await invoke()).status_code == 200
+        assert resolve_pricing_model("model-a", conv.labels) == "model-a"
+        assert json.loads(calls[-1].content)["model"] == "model-a"
+
+
+@pytest.mark.parametrize("verified", [False, True])
+async def test_zero_cost_budget_requires_server_pricing_provenance(setup, verified):
+    from dataclasses import replace
+
+    service, app, conv, _, calls = setup
+    service.config = replace(service.config, session_cost_limits={"alice": 10})
+    conv.session_usage = {"total_tokens": 100, "total_cost_usd": 0}
+    if verified:
+        conv.session_usage["pricing_recorded"] = True
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "model-a", "stream": True},
+        )
+    assert response.status_code == (200 if verified else 503)
+    assert len(calls) == (1 if verified else 0)

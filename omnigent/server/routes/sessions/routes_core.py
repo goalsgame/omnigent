@@ -3637,6 +3637,11 @@ def register_core_routes(
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        from omnigent.inference_pricing import PRICING_MODEL_LABEL_PREFIX
+
+        dropped_label_keys_set.update(
+            key for key in source.labels if key.startswith(PRICING_MODEL_LABEL_PREFIX)
+        )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always

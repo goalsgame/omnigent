@@ -130,13 +130,17 @@ async def _verify_repl_rotation(base, cert, session_id, runner_id, bundle, mock_
                 await sdk.sessions.post_event(sid, {"type": "stop_session", "data": {}})
 
 
-@pytest.mark.parametrize(("workspace", "named_route"), [(0, False), (42, False), (42, True)])
+@pytest.mark.parametrize(
+    ("workspace", "named_route", "budget_test"),
+    [(0, False, False), (42, False, False), (42, True, False), (0, False, True), (0, True, True)],
+)
 def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     tmp_path: Path,
     unused_tcp_port: int,
     isolated_mock_llm_server_url: str,
     workspace: int,
     named_route: bool,
+    budget_test: bool,
 ) -> None:
     root = Path(__file__).resolve().parents[2]
     # Authentication must never import dependencies from the runner workspace.
@@ -194,11 +198,34 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
         "OMNIGENT_E2E_SIGNING_KEY": "s" * 32,
         "OMNIGENT_E2E_WORKSPACE": str(workspace),
         "OMNIGENT_E2E_NAMED_ROUTE": "1" if named_route else "0",
+        "OMNIGENT_E2E_BUDGET": "1" if budget_test else "0",
         "OMNIGENT_DATA_DIR": str(tmp_path / "server-data"),
     }
     marker = "INFERENCE_PROXY_HOST_TURN_OK"
     set_mock_served_models(isolated_mock_llm_server_url, ["test-model"])
-    configure_mock_llm(isolated_mock_llm_server_url, [{"text": marker}])
+    configure_mock_llm(
+        isolated_mock_llm_server_url,
+        [
+            {
+                "text": marker,
+                **(
+                    {
+                        "usage": {
+                            "prompt_tokens": 1000,
+                            "completion_tokens": 5,
+                            "total_tokens": 1005,
+                            "prompt_tokens_details": {
+                                "cached_tokens": 200,
+                                "cache_write_tokens": 300,
+                            },
+                        }
+                    }
+                    if budget_test
+                    else {}
+                ),
+            }
+        ],
+    )
     base = f"https://127.0.0.1:{unused_tcp_port}"
     processes = []
     session_id = None
@@ -276,14 +303,15 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 initialized = client.post(f"/v1/_e2e/sessions/{session_id}/initialize").json()
                 assert initialized["status"] == 201, initialized
                 assert initialized["payload"]["inference_config_verified"] is True
-                generation = initialized["generation"]
-                recycled = client.post(
-                    f"/v1/_e2e/sessions/{session_id}/recycle", timeout=40
-                ).json()
-                assert recycled["generation"] != generation
-                recovered = client.post(f"/v1/_e2e/sessions/{session_id}/initialize").json()
-                assert recovered["status"] == 201, recovered
-                assert recovered["payload"]["inference_config_verified"] is True
+                if not budget_test:
+                    generation = initialized["generation"]
+                    recycled = client.post(
+                        f"/v1/_e2e/sessions/{session_id}/recycle", timeout=40
+                    ).json()
+                    assert recycled["generation"] != generation
+                    recovered = client.post(f"/v1/_e2e/sessions/{session_id}/initialize").json()
+                    assert recovered["status"] == 201, recovered
+                    assert recovered["payload"]["inference_config_verified"] is True
                 response_id = send_user_message_to_session(
                     client, session_id=session_id, content="Reply briefly."
                 )
@@ -295,11 +323,38 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 ledger = client.get("/v1/_e2e/proxy_requests").json()
                 assert ledger["calls"] and all(call["authorized"] for call in ledger["calls"])
                 assert all(call["model"] == "test-model" for call in ledger["calls"])
-                assert all(call["vertex"] == named_route for call in ledger["calls"])
+                assert all(
+                    call["vertex"] == (named_route and not budget_test) for call in ledger["calls"]
+                )
                 assert ledger["active"] == 0
                 assert "server-only-provider" not in "".join(
                     path.read_text() for path in host_root.rglob("*.json")
                 )
+                if budget_test:
+                    usage_deadline = time.monotonic() + 15
+                    while True:
+                        snapshot = client.get(f"/v1/sessions/{session_id}").json()
+                        if snapshot.get("total_cost_usd") is not None:
+                            break
+                        assert time.monotonic() < usage_deadline, snapshot
+                        time.sleep(0.1)
+                    assert snapshot["total_cost_usd"] == pytest.approx(0.9), snapshot
+                    previous_calls = len(ledger["calls"])
+                    response_id = send_user_message_to_session(
+                        client,
+                        session_id=session_id,
+                        content="This request must not reach the provider.",
+                    )
+                    blocked = poll_session_until_terminal(
+                        client, session_id=session_id, response_id=response_id, timeout=60
+                    )
+                    assert blocked["status"] == "failed", blocked
+                    assert "budget exhausted" in json.dumps(blocked).lower(), blocked
+                    assert (
+                        len(client.get("/v1/_e2e/proxy_requests").json()["calls"])
+                        == previous_calls
+                    )
+                    return
                 # The generic /side path receives an independent proxy-backed runner.
                 fork = client.post(
                     f"/v1/sessions/{session_id}/fork",

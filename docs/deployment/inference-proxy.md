@@ -182,3 +182,60 @@ Clients must retain the replay metadata in assistant history, including after
 compaction and sleep/wake; missing signatures can cause Vertex to reject tool
 follow-up requests. The proxy restores signatures to the matching tool call
 without caching them on the server or changing OpenRouter responses.
+
+
+### Caching and session budgets
+
+OpenRouter Claude requests without explicit cache settings receive automatic
+five-minute prompt caching from the backend. This also works for clients that
+register the proxy under a custom provider name. Existing `cache_control` and
+Responses `prompt_cache_breakpoint` settings are preserved; other upstreams and
+models are unchanged. OpenRouter requests carry a server-bound workspace/session
+identifier for provider stickiness and per-session usage attribution.
+
+Models unresolved by the shared pricing catalog can use exact public OpenRouter
+model prices, cached for five minutes. Input, output, cache reads and cache writes
+are counted separately, including cache writes preserved through the OpenAI Agents
+SDK. For model aliases, accounting uses the upstream model recorded by the proxy
+for that session. Cumulative native reports price only newly observed tokens,
+so route changes preserve historical spend and replays do not add cost. These are
+estimates, not provider invoices. Catalog
+failures, invalid rates and context-tier prices that require per-request usage
+remain unpriced. A replay after pricing recovers does not turn previously
+unpriced history into a priced zero.
+
+Set `inference_proxy.session_cost_limits` to a mapping of session-owner subject
+IDs to positive USD amounts, for example:
+
+```yaml
+session_cost_limits:
+  oidc-machine:reviewer: 10.0
+```
+
+For listed owners, the proxy checks persisted session spend before each model
+request, returning HTTP 402 when the session reaches its limit. Token usage with
+no usable cost returns HTTP 503 rather than silently allowing unpriced inference.
+Legacy zero-cost records containing tokens but no server-written pricing
+provenance are incomplete until trusted joint cost/counter reconciliation.
+Explicitly priced free usage remains valid. Late cache-write details that affect
+historical tokens also remain incomplete rather than silently losing the premium.
+Previously priced totals do not authorize later unpriced usage; the incomplete
+pricing marker persists until the usage is reconciled. An authoritative
+`cumulative_cost_usd` update must include input and output counters covering the
+recorded usage to clear it; stale or cost-only updates cannot prove coverage.
+When cost-only and token-only reports overlap, the backend preserves the reported
+cost and marks ambiguous token coverage incomplete until a joint cost/counter
+report reconciles it, rather than adding potentially duplicate estimates.
+On authenticated servers, cumulative billing reports require the session's bound
+runner authority through the event tunnel or runner-binding header. Ordinary
+session editors can update context-display fields without advancing billing
+baselines or reconciling unpriced usage.
+
+Existing approval-based cost policies keep enforcing their known-spend limits
+independently of this proxy guard.
+Owners absent from the mapping have no proxy budget. Limits apply to each session
+separately, including newly created review sessions; they do not form a daily
+owner or organization budget. Usage must be reported by the runner. Reporting delays can allow multiple model calls or an entire tool loop to run
+before usage is persisted, particularly with harnesses that report only at turn
+completion. The proxy is a recorded-spend gate, not a strict billing ceiling. Retain
+provider-side budgets as the independent billing backstop.

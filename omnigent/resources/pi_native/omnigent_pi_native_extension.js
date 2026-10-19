@@ -1692,6 +1692,7 @@ module.exports = function (pi) {
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
   let cumulativeCacheReadTokens = 0;
+  let cumulativeCacheWriteTokens = 0;
   let usageModel = null;
   let lastPostedUsageKey = "";
 
@@ -1727,16 +1728,11 @@ module.exports = function (pi) {
     const key = usageMessageKey(message, usage);
     if (countedUsageMessages.has(key)) return false;
     countedUsageMessages.add(key);
-    // The server's ``cumulative_input_tokens`` is INCLUSIVE of cache reads (it
-    // splits the cache portion back out and prices it at the cache-read rate),
-    // so add cacheRead into the input total. ``cacheWrite`` (cache creation)
-    // has no dedicated cumulative field on the server, so fold it into the
-    // input total too — it is then priced at the input rate rather than the
-    // ~1.25x cache-write rate, a small, documented approximation that never
-    // drops the tokens.
+    // Input totals include both cache buckets; the server prices each separately.
     cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
+    cumulativeCacheWriteTokens += usage.cacheWrite;
     if (usage.model) usageModel = usage.model;
     return true;
   }
@@ -1747,13 +1743,14 @@ module.exports = function (pi) {
   // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
   async function postSessionUsage() {
     if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
-    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${cumulativeCacheWriteTokens}-${usageModel || ""}`;
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
     const data = {
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+      cumulative_cache_creation_input_tokens: cumulativeCacheWriteTokens,
     };
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });

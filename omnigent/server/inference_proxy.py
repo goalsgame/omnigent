@@ -65,6 +65,7 @@ class InferenceProxyConfig:
     model_limits: dict[str, dict[str, int]] = field(default_factory=dict)
     managed_sandboxes: bool = False
     model_reasoning: dict[str, bool] = field(default_factory=dict)
+    session_cost_limits: dict[str, float] = field(default_factory=dict)
 
     @property
     def needs_openrouter(self) -> bool:
@@ -99,6 +100,7 @@ class InferenceProxyConfig:
             "model_limits",
             "managed_sandboxes",
             "model_reasoning",
+            "session_cost_limits",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ValueError("Invalid inference_proxy configuration")
@@ -156,6 +158,17 @@ class InferenceProxyConfig:
             limits[name] = value
         if type(raw.get("managed_sandboxes", False)) is not bool:
             raise ValueError("inference_proxy.managed_sandboxes must be a boolean")
+        cost_limits = raw.get("session_cost_limits", {})
+        if not isinstance(cost_limits, dict) or any(
+            not isinstance(owner, str)
+            or not owner
+            or isinstance(limit, bool)
+            or not isinstance(limit, (int, float))
+            or not math.isfinite(limit)
+            or limit <= 0
+            for owner, limit in cost_limits.items()
+        ):
+            raise ValueError("session_cost_limits requires owners and positive finite USD limits")
         upstreams, routes = parse_upstreams(raw, tuple(models))
         limits_raw = raw.get("model_limits", {})
         from omnigent.inference_config import parse_inference_config
@@ -185,6 +198,7 @@ class InferenceProxyConfig:
             managed_sandboxes=raw.get("managed_sandboxes", False),
             model_limits={model: dict(limits) for model, limits in limits_raw.items()},
             model_reasoning=dict(raw.get("model_reasoning", {})),
+            session_cost_limits=dict(cost_limits),
             **limits,
         )
         config.validate_harnesses()
@@ -372,6 +386,37 @@ class InferenceProxy:
         ):
             raise HTTPException(401, "Inference session unavailable")
         return conv, owner
+
+    def _check_cost_limit(self, conv: Any) -> None:
+        if not self.config.session_cost_limits:
+            return
+        owner = self._owner_authority(conv)
+        limit = self.config.session_cost_limits.get(owner.user_id) if owner else None
+        if limit is None:
+            return
+        usage = conv.session_usage or {}
+        cost = usage.get("total_cost_usd")
+        from omnigent.stores.conversation_store import has_ambiguous_zero_pricing
+
+        if usage.get("unpriced_tokens") or has_ambiguous_zero_pricing(usage):
+            raise HTTPException(
+                503, "Session has unpriced usage; inference paused to enforce budget"
+            )
+        if cost is None and not any(
+            usage.get(key) for key in ("input_tokens", "output_tokens", "total_tokens")
+        ):
+            return
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (float, int))
+            or not math.isfinite(cost)
+            or cost < 0
+        ):
+            raise HTTPException(
+                503, "Session cost unavailable; inference paused to enforce budget"
+            )
+        if cost >= limit:
+            raise HTTPException(402, "Session inference budget exhausted")
 
     def _verify_runner_lineage(self, binding: Any, target_id: str) -> None:
         """Require the target and its ancestor binding to share runner and ownership."""
@@ -567,7 +612,9 @@ class InferenceProxy:
                 raise HTTPException(404, "Unsupported inference endpoint")
             workspace = self._request_workspace(session_id, workspace_route)
             access = bearer(request)
-            await self.authorize(session_id, access, workspace_id=workspace)
+            conv, _ = await self.authorize(session_id, access, workspace_id=workspace)
+            with workspace_scope(workspace):
+                await asyncio.to_thread(self._check_cost_limit, conv)
             if request.headers.get("content-encoding", "identity") != "identity":
                 raise HTTPException(415, "Compressed requests are unsupported")
             session_key = (workspace, session_id)
@@ -628,6 +675,19 @@ class InferenceProxy:
                     )
                 except ValueError as exc:
                     raise HTTPException(400, str(exc)) from None
+                if selected.kind == "openrouter":
+                    upstream_payload["session_id"] = f"omnigent:{workspace}:{session_id}"
+                from omnigent.inference_pricing import pricing_model_label
+
+                key = pricing_model_label(payload["model"])
+                previous_target = (getattr(conv, "labels", None) or {}).get(key)
+                if previous_target != target_model and (
+                    previous_target is not None or target_model != payload["model"]
+                ):
+                    with workspace_scope(workspace):
+                        await asyncio.to_thread(
+                            self.conversations.set_labels, session_id, {key: target_model}
+                        )
                 provider_headers = {}
                 if selected.kind == "vertex-anthropic" and "anthropic-beta" in request.headers:
                     beta = request.headers["anthropic-beta"]
@@ -654,7 +714,9 @@ class InferenceProxy:
                                 raise ValueError("Upstream credential unavailable")
                     except Exception:  # noqa: BLE001 — authentication errors may contain credentials
                         raise HTTPException(502, "Inference authentication unavailable") from None
-                    await self.authorize(session_id, access, workspace_id=workspace)
+                    conv, _ = await self.authorize(session_id, access, workspace_id=workspace)
+                    with workspace_scope(workspace):
+                        await asyncio.to_thread(self._check_cost_limit, conv)
                     upstream = await client.send(
                         client.build_request(
                             "POST",

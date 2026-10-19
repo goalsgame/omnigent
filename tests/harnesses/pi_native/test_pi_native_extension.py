@@ -257,6 +257,7 @@ def test_message_end_posts_external_session_usage(tmp_path: Path) -> None:
   assert.equal(data.cumulative_input_tokens, 140);
   assert.equal(data.cumulative_output_tokens, 40);
   assert.equal(data.cumulative_cache_read_input_tokens, 30);
+  assert.equal(data.cumulative_cache_creation_input_tokens, 10);
   assert.equal(data.model, "databricks-claude-sonnet-4-6");
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);

@@ -40,6 +40,15 @@ def main() -> None:
         artifact_store=artifacts,
     )
     named_route = os.environ.get("OMNIGENT_E2E_NAMED_ROUTE") == "1"
+    budget_test = os.environ.get("OMNIGENT_E2E_BUDGET") == "1"
+    if budget_test:
+        from omnigent.llms import context_window
+
+        context_window.fetch_model_pricing = lambda model: (
+            context_window.ModelPricing(input_per_token=0.001, output_per_token=0.001)
+            if model == "test-model"
+            else None
+        )
     app = create_app(
         agent_store=agent_store,
         file_store=files,
@@ -55,6 +64,7 @@ def main() -> None:
                 "public_url": f"https://127.0.0.1:{port}",
                 "signing_key_env": "OMNIGENT_E2E_SIGNING_KEY",
                 "models": ["friendly-alias" if named_route else "test-model"],
+                **({"session_cost_limits": {"local": 0.001}} if budget_test else {}),
                 **(
                     {
                         "upstreams": {
@@ -66,6 +76,13 @@ def main() -> None:
                         },
                         "model_routes": {
                             "friendly-alias": {"upstream": "vertex", "model": "test-model"}
+                        },
+                    }
+                    if named_route and not budget_test
+                    else {
+                        "upstreams": {"router": {"kind": "openrouter"}},
+                        "model_routes": {
+                            "friendly-alias": {"upstream": "router", "model": "test-model"}
                         },
                     }
                     if named_route
@@ -87,7 +104,7 @@ def main() -> None:
         async def handle_async_request(self, request):
             expected_url = (
                 "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/endpoints/openapi/chat/completions"
-                if named_route
+                if named_route and not budget_test
                 else "https://openrouter.ai/api/v1/chat/completions"
             )
             assert str(request.url) == expected_url
@@ -96,7 +113,7 @@ def main() -> None:
                     "authorized": request.headers["authorization"]
                     == "Bearer server-only-provider",
                     "model": json.loads(request.content)["model"],
-                    "vertex": named_route,
+                    "vertex": named_route and not budget_test,
                 }
             )
             request.url = httpx.URL(os.environ["OMNIGENT_E2E_PROVIDER"] + "/v1/chat/completions")
@@ -128,6 +145,12 @@ def main() -> None:
             timeout=20,
             suppress_recovery_turn=True,
         )
+        if budget_test:
+            from omnigent.server.routes import sessions
+
+            await sessions._ensure_runner_relay_ready(
+                sid, conv.runner_id, routed.client, conversations, conversation=conv
+            )
         connection = app.state.tunnel_registry.get(conv.runner_id)
         return {
             "status": response.status_code,

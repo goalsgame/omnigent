@@ -130,7 +130,8 @@ def _usage_is_unpriced(usage: Mapping[str, object]) -> bool:
         pricing.
     """
     if "total_cost_usd" in usage:
-        return False
+        # A partial priced zero cannot cover any older unknown consumption.
+        return usage.get("total_cost_usd") == 0 and bool(usage.get("unpriced_tokens"))
     return bool(
         usage.get("input_tokens") or usage.get("output_tokens") or usage.get("total_tokens")
     )
