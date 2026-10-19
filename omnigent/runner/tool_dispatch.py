@@ -7217,12 +7217,13 @@ async def _execute_os_env_tool(
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
         )
-        needs_shared_environment = effective_spec.sandbox is not None and any(
-            p.copy_on_write for p in effective_spec.sandbox.write_path_specs
+        needs_shared_environment = effective_spec.sandbox is not None and (
+            effective_spec.sandbox.type == "windows_jobobject"
+            or any(p.copy_on_write for p in effective_spec.sandbox.write_path_specs)
         )
         if needs_shared_environment:
             if resource_registry is None or conversation_id is None:
-                raise ValueError("copy_on_write tools require a session resource registry")
+                raise ValueError("Session-owned OS tools require a session resource registry")
             from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 
             os_env = resource_registry.resolve_environment(

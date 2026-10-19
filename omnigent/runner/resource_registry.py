@@ -994,16 +994,31 @@ class SessionResourceRegistry:
                 cached_cow = bool(
                     getattr(getattr(cached, "sandbox", None), "copy_on_write_roots", None)
                 )
-                if requested_spec is not None and (requested_cow or cached_cow):
-                    if previous_spec is None and not cached_cow:
+                requested_windows_job = (
+                    requested_spec is not None
+                    and requested_spec.sandbox is not None
+                    and requested_spec.sandbox.type == "windows_jobobject"
+                )
+                cached_windows_job = (
+                    getattr(getattr(cached, "sandbox", None), "backend_type", None)
+                    == "windows_jobobject"
+                )
+                if requested_spec is not None and (
+                    requested_cow or cached_cow or requested_windows_job or cached_windows_job
+                ):
+                    if previous_spec is None and not (cached_cow or cached_windows_job):
                         # The filesystem panel may create a host read view before
                         # the agent's sandbox configuration becomes available.
                         cached.close()
                         self._primary_envs.pop(session_id)
                     elif previous_spec != requested_spec:
+                        kind = (
+                            "copy-on-write"
+                            if requested_cow or cached_cow
+                            else "Windows Job Object"
+                        )
                         raise ValueError(
-                            "Cannot change an active copy-on-write environment; "
-                            "start a new session"
+                            f"Cannot change an active {kind} environment; start a new session"
                         )
                     else:
                         return cached
