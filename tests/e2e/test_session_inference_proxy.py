@@ -132,7 +132,7 @@ async def _verify_repl_rotation(base, cert, session_id, runner_id, bundle, mock_
 
 @pytest.mark.parametrize(
     ("workspace", "named_route", "budget_test"),
-    [(0, False, False), (42, False, False), (42, True, False), (0, False, True)],
+    [(0, False, False), (42, False, False), (42, True, False), (0, False, True), (0, True, True)],
 )
 def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     tmp_path: Path,
@@ -203,7 +203,29 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
     }
     marker = "INFERENCE_PROXY_HOST_TURN_OK"
     set_mock_served_models(isolated_mock_llm_server_url, ["test-model"])
-    configure_mock_llm(isolated_mock_llm_server_url, [{"text": marker}])
+    configure_mock_llm(
+        isolated_mock_llm_server_url,
+        [
+            {
+                "text": marker,
+                **(
+                    {
+                        "usage": {
+                            "prompt_tokens": 1000,
+                            "completion_tokens": 5,
+                            "total_tokens": 1005,
+                            "prompt_tokens_details": {
+                                "cached_tokens": 200,
+                                "cache_write_tokens": 300,
+                            },
+                        }
+                    }
+                    if budget_test
+                    else {}
+                ),
+            }
+        ],
+    )
     base = f"https://127.0.0.1:{unused_tcp_port}"
     processes = []
     session_id = None
@@ -301,7 +323,9 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                 ledger = client.get("/v1/_e2e/proxy_requests").json()
                 assert ledger["calls"] and all(call["authorized"] for call in ledger["calls"])
                 assert all(call["model"] == "test-model" for call in ledger["calls"])
-                assert all(call["vertex"] == named_route for call in ledger["calls"])
+                assert all(
+                    call["vertex"] == (named_route and not budget_test) for call in ledger["calls"]
+                )
                 assert ledger["active"] == 0
                 assert "server-only-provider" not in "".join(
                     path.read_text() for path in host_root.rglob("*.json")
@@ -314,7 +338,7 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                             break
                         assert time.monotonic() < usage_deadline, snapshot
                         time.sleep(0.1)
-                    assert snapshot["total_cost_usd"] >= 0.001, snapshot
+                    assert snapshot["total_cost_usd"] == pytest.approx(0.9), snapshot
                     previous_calls = len(ledger["calls"])
                     response_id = send_user_message_to_session(
                         client,

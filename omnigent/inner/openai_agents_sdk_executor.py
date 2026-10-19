@@ -20,6 +20,7 @@ import os
 import subprocess
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Literal, Protocol, TypeAlias, cast
@@ -847,6 +848,76 @@ def _is_databricks_openai_client(client: AsyncOpenAIClient) -> bool:
     return "/ai-gateway/" in str(getattr(client, "base_url", ""))
 
 
+_cache_write_capture: ContextVar[dict[str, int] | None] = ContextVar(
+    "sdk_cache_write_usage", default=None
+)
+
+
+def _capture_cache_write_usage(response: Any) -> None:
+    capture = _cache_write_capture.get()
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "prompt_tokens_details", None)
+    value = (
+        details.get("cache_write_tokens", 0)
+        if isinstance(details, dict)
+        else getattr(details, "cache_write_tokens", 0)
+    )
+    if capture is not None and isinstance(value, int) and not isinstance(value, bool):
+        capture["writes"] = max(0, value)
+
+
+def _attach_cache_write_usage(usage: Any, count: int) -> None:
+    if usage is None or not count:
+        return
+    from openai.types.responses.response_usage import InputTokensDetails
+
+    details = getattr(usage, "input_tokens_details", None)
+    values = details.model_dump() if hasattr(details, "model_dump") else {}
+    usage.input_tokens_details = InputTokensDetails.model_validate(
+        {**values, "cache_write_tokens": count}
+    )
+
+
+class _CacheWriteModel:
+    def __init__(self, model: Any) -> None:
+        self._model = model
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+        capture = {"writes": 0}
+        token = _cache_write_capture.set(capture)
+        try:
+            result = await self._model.get_response(*args, **kwargs)
+            _attach_cache_write_usage(result.usage, capture["writes"])
+            return result
+        finally:
+            _cache_write_capture.reset(token)
+
+    async def stream_response(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        capture = {"writes": 0}
+        token = _cache_write_capture.set(capture)
+        try:
+            async for event in self._model.stream_response(*args, **kwargs):
+                if getattr(event, "type", None) == "response.completed":
+                    _attach_cache_write_usage(event.response.usage, capture["writes"])
+                yield event
+        finally:
+            _cache_write_capture.reset(token)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model, name)
+
+
+class _CacheWriteProvider:
+    def __init__(self, provider: Any) -> None:
+        self._provider = provider
+
+    def get_model(self, name: str | None) -> Any:
+        return _CacheWriteModel(self._provider.get_model(name))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._provider, name)
+
+
 class _ReasoningBlockFilterStream:
     """Async stream wrapper that converts list-type ``delta.content`` to ``None``.
 
@@ -882,6 +953,7 @@ class _ReasoningBlockFilterStream:
         :raises StopAsyncIteration: When the underlying stream is exhausted.
         """
         chunk = await self._stream.__anext__()
+        _capture_cache_write_usage(chunk)
         for choice in chunk.choices:
             if isinstance(getattr(choice.delta, "content", None), list):
                 # Bypass Pydantic's __setattr__ validation — the field type
@@ -926,6 +998,7 @@ class _ReasoningBlockFilterCompletions:
             otherwise the raw ``ChatCompletion`` response.
         """
         result = await self._completions.create(**kwargs)
+        _capture_cache_write_usage(result)
         if kwargs.get("stream") and hasattr(result, "__anext__"):
             return _ReasoningBlockFilterStream(result)
         return result
@@ -1622,6 +1695,8 @@ class OpenAIAgentsSDKExecutor(Executor):
             openai_client=self._client,
             use_responses=self._use_responses,
         )
+        if not self._use_responses:
+            provider = _CacheWriteProvider(provider)
         agent = self._get_or_create_agent(
             agents_sdk,
             state,
@@ -1950,8 +2025,9 @@ class OpenAIAgentsSDKExecutor(Executor):
             total_tok = sum(getattr(r.usage, "total_tokens", 0) or 0 for r in raw_responses)
             # SDK ``input_tokens`` INCLUDES cached tokens; ``compute_llm_cost`` expects
             # Anthropic semantics (non-cached input + additive cache_read), so subtract
-            # ``Usage.input_tokens_details.cached_tokens`` (its only cache field).
+            # both cache reads and the preserved provider cache-write counts.
             cached_tok = 0
+            written_tok = 0
             for r in raw_responses:
                 details = getattr(r.usage, "input_tokens_details", None)
                 if details is not None:
@@ -1960,7 +2036,14 @@ class OpenAIAgentsSDKExecutor(Executor):
                         cached = details.get("cached_tokens")
                     # Clamp per response to [0, input] so malformed counts never go negative.
                     r_in = getattr(r.usage, "input_tokens", 0) or 0
-                    cached_tok += min(max(cached or 0, 0), r_in)
+                    read = min(max(cached or 0, 0), r_in)
+                    cached_tok += read
+                    written = (
+                        details.get("cache_write_tokens", 0)
+                        if isinstance(details, dict)
+                        else getattr(details, "cache_write_tokens", 0)
+                    )
+                    written_tok += min(max(written or 0, 0), max(0, r_in - read))
             last_r = raw_responses[-1]
             last_in = getattr(last_r.usage, "input_tokens", 0) or 0
             last_out = getattr(last_r.usage, "output_tokens", 0) or 0
@@ -1968,7 +2051,7 @@ class OpenAIAgentsSDKExecutor(Executor):
             context_tok = last_total if last_total else last_in + last_out
             if in_tok or out_tok:
                 turn_usage = {
-                    "input_tokens": in_tok - cached_tok,  # non-cached portion
+                    "input_tokens": in_tok - cached_tok - written_tok,  # non-cached portion
                     "output_tokens": out_tok,
                     "total_tokens": total_tok if total_tok else in_tok + out_tok,
                     "context_tokens": context_tok,
@@ -1977,6 +2060,8 @@ class OpenAIAgentsSDKExecutor(Executor):
                 }
                 if cached_tok:
                     turn_usage["cache_read_input_tokens"] = cached_tok
+                if written_tok:
+                    turn_usage["cache_creation_input_tokens"] = written_tok
         _notify_usage_from_dict(model=model, usage=turn_usage)
 
         # Emit CompactionComplete if the SDK compacted this turn.

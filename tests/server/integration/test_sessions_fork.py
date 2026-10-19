@@ -209,6 +209,22 @@ async def test_fork_preserves_labels(
     )
 
 
+async def test_fork_drops_server_routed_pricing_labels(client, db_uri):
+    from omnigent.inference_pricing import pricing_model_label
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], labels={"team": "test"})
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(session["id"], {pricing_model_label("friendly-alias"): "provider/model"})
+    response = await _fork_session(client, session["id"])
+    assert response.status_code == 201, response.text
+    assert response.json()["labels"] == {"team": "test"}
+    assert (
+        store.get_conversation(session["id"]).labels[pricing_model_label("friendly-alias")]
+        == "provider/model"
+    )
+
+
 async def test_fork_coding_session_stamps_fork_source_label(
     client: httpx.AsyncClient,
 ) -> None:

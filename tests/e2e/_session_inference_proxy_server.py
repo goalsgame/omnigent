@@ -44,8 +44,10 @@ def main() -> None:
     if budget_test:
         from omnigent.llms import context_window
 
-        context_window.fetch_model_pricing = lambda _: context_window.ModelPricing(
-            input_per_token=0.001, output_per_token=0.001
+        context_window.fetch_model_pricing = lambda model: (
+            context_window.ModelPricing(input_per_token=0.001, output_per_token=0.001)
+            if model == "test-model"
+            else None
         )
     app = create_app(
         agent_store=agent_store,
@@ -76,6 +78,13 @@ def main() -> None:
                             "friendly-alias": {"upstream": "vertex", "model": "test-model"}
                         },
                     }
+                    if named_route and not budget_test
+                    else {
+                        "upstreams": {"router": {"kind": "openrouter"}},
+                        "model_routes": {
+                            "friendly-alias": {"upstream": "router", "model": "test-model"}
+                        },
+                    }
                     if named_route
                     else {}
                 ),
@@ -95,7 +104,7 @@ def main() -> None:
         async def handle_async_request(self, request):
             expected_url = (
                 "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/endpoints/openapi/chat/completions"
-                if named_route
+                if named_route and not budget_test
                 else "https://openrouter.ai/api/v1/chat/completions"
             )
             assert str(request.url) == expected_url
@@ -104,7 +113,7 @@ def main() -> None:
                     "authorized": request.headers["authorization"]
                     == "Bearer server-only-provider",
                     "model": json.loads(request.content)["model"],
-                    "vertex": named_route,
+                    "vertex": named_route and not budget_test,
                 }
             )
             request.url = httpx.URL(os.environ["OMNIGENT_E2E_PROVIDER"] + "/v1/chat/completions")

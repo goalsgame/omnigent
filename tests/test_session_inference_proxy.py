@@ -13,7 +13,9 @@ from omnigent.server.inference_proxy import InferenceProxy, InferenceProxyConfig
 
 @pytest.fixture
 def setup():
-    conv = SimpleNamespace(id="session", host_id="host", runner_id="runner", archived=False)
+    conv = SimpleNamespace(
+        id="session", host_id="host", runner_id="runner", archived=False, labels={}
+    )
     host = SimpleNamespace(
         user_id="alice",
         account_generation="generation",
@@ -21,6 +23,7 @@ def setup():
         updated_at=int(time.time()),
     )
     conversations = SimpleNamespace(
+        set_labels=lambda sid, values: conv.labels.update(values),
         get_conversation=lambda sid: conv if sid == conv.id else None,
         get_session_owner_authority=lambda sid, owner_only: SimpleNamespace(
             user_id="alice", generation="generation"

@@ -4768,7 +4768,12 @@ async def test_proxy_side_chat_has_independent_binding_and_concurrent_admission(
 
 @pytest.mark.parametrize("app", ["proxy"], indirect=True)
 @pytest.mark.parametrize(
-    "label", ["omnigent.inference_host_policy", "omnigent.separate_inference_runner"]
+    "label",
+    [
+        "omnigent.inference_host_policy",
+        "omnigent.separate_inference_runner",
+        "omnigent.inference_pricing_model.any-model",
+    ],
 )
 async def test_inference_placement_labels_cannot_be_forged_or_cleared(client, app, label):
     client.headers["X-Forwarded-Email"] = "alice@example.com"

@@ -195,7 +195,9 @@ identifier for provider stickiness and per-session usage attribution.
 
 Models unresolved by the shared pricing catalog can use exact public OpenRouter
 model prices, cached for five minutes. Input, output, cache reads and cache writes
-are counted separately. These are estimates, not provider invoices. Catalog
+are counted separately, including cache writes preserved through the OpenAI Agents
+SDK. For model aliases, accounting uses the upstream model recorded by the proxy
+for that session. These are estimates, not provider invoices. Catalog
 failures, invalid rates and context-tier prices that require per-request usage
 remain unpriced.
 

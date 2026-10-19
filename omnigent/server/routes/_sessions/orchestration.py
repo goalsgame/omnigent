@@ -67,6 +67,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inference_pricing import resolve_pricing_model
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
@@ -1641,7 +1642,9 @@ def _accumulate_session_usage(
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
             pricing = fetch_model_pricing_with_provider(
-                llm_model, provider_config=provider_config, harness=harness
+                resolve_pricing_model(llm_model, conv.labels if conv else {}),
+                provider_config=provider_config,
+                harness=harness,
             )
             priced = pricing is not None
             if pricing is not None:
@@ -1925,7 +1928,9 @@ def _persist_native_cumulative_usage(
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
             pricing = fetch_model_pricing_with_provider(
-                model_name, provider_config=provider_config, harness=harness
+                resolve_pricing_model(model_name, conv.labels if conv else {}),
+                provider_config=provider_config,
+                harness=harness,
             )
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.

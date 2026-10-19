@@ -10285,8 +10285,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         INFERENCE_HOST_POLICY_LABEL,
         SEPARATE_INFERENCE_RUNNER_LABEL,
     )
+    from omnigent.inference_pricing import PRICING_MODEL_LABEL_PREFIX
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
+
+    for key in labels:
+        if key.startswith(PRICING_MODEL_LABEL_PREFIX):
+            raise OmnigentError(
+                "Inference pricing labels are server-internal", code=ErrorCode.INVALID_INPUT
+            )
 
     for key in (INFERENCE_HOST_POLICY_LABEL, SEPARATE_INFERENCE_RUNNER_LABEL):
         if key in labels:
