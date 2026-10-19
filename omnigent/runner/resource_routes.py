@@ -133,7 +133,6 @@ def register_resource_routes(
     _search_registry_for_root: Callable[[Path], FilesystemRegistry],
     _session_comment_relays: dict[str, _CommentRelayBinding],
     auth_token_factory: Callable[[], str | None] | None,
-    filesystem_registry: FilesystemRegistry | None,
     resource_registry: SessionResourceRegistry,
     server_client: httpx.AsyncClient,
     terminal_registry: TerminalRegistry | None,
@@ -1428,6 +1427,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
+        session_registry = await _resolve_session_fs_registry(session_id)
         body = await request.json()
         content_str = body.get("content", "")
         encoding = body.get("encoding", "utf-8")
@@ -1435,8 +1435,8 @@ def register_resource_routes(
         content_bytes = content_str.encode(encoding)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
+            if existing.encoding and session_registry is not None:
+                session_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
                     session_id=session_id,
@@ -1448,8 +1448,8 @@ def register_resource_routes(
             content_bytes,
             create_parents=create_parents,
         )
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        if session_registry is not None:
+            session_registry.record_change(relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -1482,10 +1482,11 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
+        session_registry = await _resolve_session_fs_registry(session_id)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
+            if existing.encoding and session_registry is not None:
+                session_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
                     session_id=session_id,
@@ -1499,8 +1500,8 @@ def register_resource_routes(
             replace_all=body.get("replace_all", False),
         )
         result = await fs.edit_text(relative_path, edit_req)
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        if session_registry is not None:
+            session_registry.record_change(relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -1533,9 +1534,10 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
+        session_registry = await _resolve_session_fs_registry(session_id)
         result = await fs.delete(relative_path, recursive=recursive)
-        if filesystem_registry is not None and result.type == "file":
-            filesystem_registry.record_change(relative_path, "deleted", session_id)
+        if session_registry is not None and result.type == "file":
+            session_registry.record_change(relative_path, "deleted", session_id)
         return JSONResponse(
             status_code=200,
             content={

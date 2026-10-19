@@ -634,3 +634,17 @@ def test_windows_timeout_retains_output(tmp_path: Path, monkeypatch: pytest.Monk
     assert result["timed_out"] is True
     assert result["stdout"].strip() == "before-timeout"
     assert result["stderr"].strip() == "diagnostic"
+
+
+def test_windows_gate_ignores_workspace_python_modules(tmp_path: Path) -> None:
+    import sys
+
+    from omnigent.inner.os_env import _run_windows_shell
+
+    for name in ("json", "subprocess", "sitecustomize"):
+        (tmp_path / f"{name}.py").write_text("raise RuntimeError('workspace module imported')")
+    result = _run_windows_shell(
+        [sys.executable, "-I", "-c", "print('gate-ok')"], cwd=tmp_path, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "gate-ok"

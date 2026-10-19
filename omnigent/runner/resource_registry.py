@@ -1065,6 +1065,14 @@ class SessionResourceRegistry:
             return Path(_contained_session_dir(workspace, session_id))
         return workspace.resolve()
 
+    def prepare_session_workspace(self, session_id: str) -> Path | None:
+        """Create the private isolated directory before runtime processes use it."""
+        workspace = self.workspace_for_session(session_id)
+        if workspace is not None and self._per_session_workspace:
+            workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+            workspace.chmod(0o700)
+        return workspace
+
     def _effective_primary_spec(self, session_id: str, spec: OSEnvSpec) -> OSEnvSpec:
         """Use the same workspace identity for tools and inherited terminals."""
         workspace = self.workspace_for_session(session_id)
@@ -1107,16 +1115,13 @@ class SessionResourceRegistry:
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
         from omnigent.inner.os_env import create_os_environment
 
-        selected_workspace = self.workspace_for_session(session_id)
+        selected_workspace = self.prepare_session_workspace(session_id)
         # Prefer the CLI launch workspace so that the OS environment
         # cwd matches the filesystem-registry watch path.  Fall back
         # to the per-session temp dir for remote/cloud runners that
         # have no workspace affinity.
         if selected_workspace is not None:
             default_cwd = str(selected_workspace)
-            if self._per_session_workspace:
-                os.makedirs(default_cwd, mode=0o700, exist_ok=True)
-                os.chmod(default_cwd, 0o700)
         else:
             default_cwd = _session_workspace(session_id)
             # Restrict workspace visibility on shared hosts.

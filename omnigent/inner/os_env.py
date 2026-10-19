@@ -1707,7 +1707,7 @@ def _run_windows_shell(
     # The gate needs only the standard library, so start the base interpreter directly.
     gate_python = getattr(sys, "_base_executable", None) or sys.executable
     with subprocess.Popen(
-        [gate_python, "-c", gate, json.dumps(argv)],
+        [gate_python, "-I", "-c", gate, json.dumps(argv)],
         cwd=str(cwd),
         env=_child_shell_env(),
         text=True,

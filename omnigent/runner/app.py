@@ -2058,7 +2058,7 @@ def create_runner_app(
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
         await _session_workspace_value(session_id)
-        return resource_registry.workspace_for_session(session_id)
+        return resource_registry.prepare_session_workspace(session_id)
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
         await _get_server_version(server_client)
@@ -7165,7 +7165,6 @@ def create_runner_app(
         _search_registry_for_root=_search_registry_for_root,
         _session_comment_relays=_session_comment_relays,
         auth_token_factory=auth_token_factory,
-        filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
         server_client=server_client,
         terminal_registry=terminal_registry,

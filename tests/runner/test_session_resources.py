@@ -142,6 +142,9 @@ class _CapturingResourceRegistry:
     def workspace_for_session(self, session_id: str) -> Path | None:
         return self._session_workspace_resolver(session_id) or self._runner_workspace
 
+    def prepare_session_workspace(self, session_id: str) -> Path | None:
+        return self.workspace_for_session(session_id)
+
     def set_terminal_activity_publisher(
         self,
         publisher: Callable[[str, str], None],
