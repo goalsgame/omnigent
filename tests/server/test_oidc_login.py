@@ -1250,3 +1250,85 @@ def test_concurrent_signins_keep_both_generations(login):
     for state in states:
         assert broker.active(OWNER, state["generation"])
         assert broker.state(OWNER, state["generation"])["deadline"] == state["deadline"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_logout", [False, True])
+async def test_displaced_identity_logout_cannot_resurrect_credentials(
+    offline_auth_app, login, browser_logout
+):
+    app, broker, tokens = offline_auth_app
+    _broker, token, _tokens, _calls = login
+    first = broker.capture(OWNER, SUBJECT, tokens())
+    cookie = broker.browser_cookie(OWNER, first)
+    broker.capture(
+        OWNER, "other-subject", {**tokens(), "access_token": token(subject="other-subject")}
+    )
+    assert not broker.active(OWNER, first["generation"])
+    if browser_logout:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=broker.config.base_url
+        ) as client:
+            client.cookies.set(broker.cookie_name, cookie)
+            assert (await client.get("/auth/logout")).status_code == 302
+    else:
+        assert broker.revoke(OWNER, first["generation"])
+    latest = broker.capture(OWNER, SUBJECT, tokens())
+    assert broker.active(OWNER, latest["generation"])
+    assert not broker.active(OWNER, first["generation"])
+    with pytest.raises(DelegationUnavailable):
+        broker.browser_identity(cookie)
+
+
+@pytest.mark.parametrize("failure", ["invalid_grant", "temporary"])
+def test_delegation_falls_back_only_on_permanent_refresh_failure(login, failure):
+    from omnigent.server.oidc_login import DelegationTemporarilyUnavailable
+
+    broker, _token, tokens, _calls = login
+    older = broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_token": "older-refresh"})
+    latest = broker.capture(OWNER, SUBJECT, {**tokens(), "refresh_token": "latest-refresh"})
+    for state in (older, latest):
+        broker.store.update_secret(
+            OWNER, PROVIDER, account_id=state["generation"], secret={**state, "expires_at": 0}
+        )
+    calls = []
+
+    def provider(request):
+        refresh = parse_qs(request.content.decode())["refresh_token"][0]
+        calls.append(refresh)
+        if refresh == "latest-refresh":
+            return httpx.Response(
+                400 if failure == "invalid_grant" else 503, json={"error": failure}
+            )
+        return httpx.Response(200, json={**tokens(), "refresh_token": refresh})
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(provider))
+    if failure == "temporary":
+        with pytest.raises(DelegationTemporarilyUnavailable):
+            broker.state(OWNER)
+        assert broker.active(OWNER, latest["generation"])
+        assert calls == ["latest-refresh"]
+    else:
+        with pytest.raises(DelegationUnavailable):
+            broker.state(OWNER, latest["generation"])
+        assert not broker.active(OWNER, latest["generation"])
+        assert broker.state(OWNER)["generation"] == older["generation"]
+        assert calls == ["latest-refresh", "older-refresh"]
+
+
+def test_generationless_delegation_recovers_from_invalid_newest_refresh(login):
+    broker, _token, tokens, _calls = login
+    older = broker.capture(OWNER, SUBJECT, tokens())
+    newest = broker.capture(OWNER, SUBJECT, tokens())
+    broker.store.update_secret(
+        OWNER, PROVIDER, account_id=newest["generation"], secret={**newest, "expires_at": 0}
+    )
+    broker.client.close()
+    broker.client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, json={"error": "invalid_grant"})
+        )
+    )
+    assert broker.state(OWNER)["generation"] == older["generation"]
+    assert not broker.active(OWNER, newest["generation"])

@@ -958,6 +958,7 @@ def create_auth_router(
                 owner, generation = await asyncio.to_thread(
                     login_broker.browser_identity,
                     request.cookies.get(login_broker.cookie_name, ""),
+                    require_active=False,
                 )
                 await asyncio.to_thread(login_broker.revoke, owner, generation)
             except DelegationUnavailable:
