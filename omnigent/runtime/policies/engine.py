@@ -27,7 +27,11 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    ConversationStore,
+    DailyCostState,
+    apply_session_usage_delta,
+)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -774,9 +778,16 @@ class PolicyEngine:
                 self._subtree_usage["unpriced_tokens"] = (
                     self._subtree_usage.get("unpriced_tokens", 0) + unpriced
                 )
+
         # Persist only this conversation's delta. The hot counters above include
         # parent/sibling spend and may use a higher enforcement cost than display.
-        self._store.increment_session_usage(self._conversation_id, delta)
+        def merge(current: dict[str, Any]) -> None:
+            updates = dict(delta)
+            if "policy_cost_usd" in current:
+                updates["policy_cost_usd"] = delta_cost
+            apply_session_usage_delta(current, updates)
+
+        self._store.mutate_session_usage(self._conversation_id, merge)
 
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
         """

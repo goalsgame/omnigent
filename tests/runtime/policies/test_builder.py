@@ -1955,3 +1955,15 @@ def test_record_usage_preserves_tree_enforcement_totals(
     assert conversation_store.get_conversation(parent.id).session_usage[
         "total_cost_usd"
     ] == pytest.approx(8)
+
+    rebuilt = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child", llm=LLMConfig(model="test-model")),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    assert rebuilt.usage["total_cost_usd"] == pytest.approx(before + 1)
+    child_usage = conversation_store.get_conversation(child.id).session_usage
+    if policy_cost is not None:
+        assert child_usage["policy_cost_usd"] == pytest.approx(policy_cost + 1)
+    else:
+        assert "policy_cost_usd" not in child_usage
