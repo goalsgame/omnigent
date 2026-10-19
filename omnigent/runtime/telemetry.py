@@ -1044,11 +1044,18 @@ class _SafeLogFilter(logging.Filter):
     """Redact a private record copy before the OTLP bridge sees it."""
 
     def filter(self, record: logging.LogRecord) -> logging.LogRecord | bool:
-        from omnigent.process_logging import redact_log_text
-
         # Export failures stay in local logs rather than feeding the failing exporter.
         if record.name.startswith("opentelemetry."):
             return False
+        try:
+            return self._redact(record)
+        except Exception:
+            # A malformed diagnostic must not break application logging or export raw data.
+            return False
+
+    @staticmethod
+    def _redact(record: logging.LogRecord) -> logging.LogRecord:
+        from omnigent.process_logging import redact_log_text
 
         def safe(value: Any, key: str = "", depth: int = 0) -> Any:
             if depth > 8:

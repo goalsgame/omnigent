@@ -40,6 +40,13 @@ def test_init_restores_bridge_after_logging_configuration(monkeypatch):
         provider.shutdown()
 
 
+def test_malformed_log_record_does_not_interrupt_application():
+    record = logging.LogRecord(
+        "test", logging.ERROR, __file__, 43, "invalid format %d", (object(),), None
+    )
+    assert telemetry._SafeLogFilter().filter(record) is False
+
+
 def test_exporter_errors_do_not_feed_back_into_exporter():
     record = logging.LogRecord(
         "opentelemetry.exporter.otlp", logging.ERROR, __file__, 43, "export failed", (), None
