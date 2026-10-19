@@ -12812,3 +12812,65 @@ async def test_external_pi_usage_prices_cache_writes_separately(client, db_uri, 
     )
     assert response.status_code == 202
     assert _read_session_usage(db_uri, session["id"])["total_cost_usd"] == pytest.approx(0.00062)
+
+
+@pytest.mark.parametrize("native", [False, True])
+async def test_priced_then_unpriced_usage_preserves_incomplete_marker(
+    client, db_uri, monkeypatch, native
+):
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: (
+            ModelPricing(input_per_token=0.001, output_per_token=0.001)
+            if model == "priced"
+            else None
+        ),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    if native:
+        for model, tokens in [("priced", 10), ("unknown", 20), ("priced", 30)]:
+            response = await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={
+                    "type": "external_session_usage",
+                    "data": {
+                        "cumulative_input_tokens": tokens,
+                        "cumulative_output_tokens": 1,
+                        "model": model,
+                    },
+                },
+            )
+            assert response.status_code == 202
+    else:
+        for model in ["priced", "unknown", "priced"]:
+            sessions_routes._accumulate_session_usage(
+                {"usage": {"input_tokens": 10, "output_tokens": 1, "model": model}},
+                session["id"],
+                store,
+            )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["total_cost_usd"] > 0
+    assert usage["unpriced_tokens"] > 0
+    # The same persisted record must close the proxy gate despite earlier priced cost.
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.server.inference_proxy import InferenceProxy, InferenceProxyConfig
+
+    proxy = InferenceProxy(
+        InferenceProxyConfig(
+            "https://server.example", "k" * 32, ("test",), session_cost_limits={"owner": 10}
+        ),
+        store,
+        None,
+        SimpleNamespace(),
+    )
+    monkeypatch.setattr(proxy, "_owner_authority", lambda conv: SimpleNamespace(user_id="owner"))
+    with pytest.raises(HTTPException) as error:
+        proxy._check_cost_limit(store.get_conversation(session["id"]))
+    assert error.value.status_code == 503

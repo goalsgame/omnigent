@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 from typing import Any
 
@@ -39,7 +40,7 @@ def _catalog() -> dict[str, dict[str, Any]]:
 
 def model_rates(model: str) -> dict[str, float] | None:
     """Return finite per-token rates for an exact id, or leave it unpriced."""
-    if "/" not in model:
+    if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1" or "/" not in model:
         return None
     raw = _catalog().get(model)
     if not raw or raw.get("overrides"):

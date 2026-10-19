@@ -40,6 +40,13 @@ def main() -> None:
         artifact_store=artifacts,
     )
     named_route = os.environ.get("OMNIGENT_E2E_NAMED_ROUTE") == "1"
+    budget_test = os.environ.get("OMNIGENT_E2E_BUDGET") == "1"
+    if budget_test:
+        from omnigent.llms import context_window
+
+        context_window.fetch_model_pricing = lambda _: context_window.ModelPricing(
+            input_per_token=0.001, output_per_token=0.001
+        )
     app = create_app(
         agent_store=agent_store,
         file_store=files,
@@ -55,6 +62,7 @@ def main() -> None:
                 "public_url": f"https://127.0.0.1:{port}",
                 "signing_key_env": "OMNIGENT_E2E_SIGNING_KEY",
                 "models": ["friendly-alias" if named_route else "test-model"],
+                **({"session_cost_limits": {"local": 0.001}} if budget_test else {}),
                 **(
                     {
                         "upstreams": {
@@ -128,6 +136,12 @@ def main() -> None:
             timeout=20,
             suppress_recovery_turn=True,
         )
+        if budget_test:
+            from omnigent.server.routes import sessions
+
+            await sessions._ensure_runner_relay_ready(
+                sid, conv.runner_id, routed.client, conversations, conversation=conv
+            )
         connection = app.state.tunnel_registry.get(conv.runner_id)
         return {
             "status": response.status_code,

@@ -190,7 +190,8 @@ OpenRouter Claude requests without explicit cache settings receive automatic
 five-minute prompt caching from the backend. This also works for clients that
 register the proxy under a custom provider name. Existing `cache_control` and
 Responses `prompt_cache_breakpoint` settings are preserved; other upstreams and
-models are unchanged.
+models are unchanged. OpenRouter requests carry a server-bound workspace/session
+identifier for provider stickiness and per-session usage attribution.
 
 Models unresolved by the shared pricing catalog can use exact public OpenRouter
 model prices, cached for five minutes. Input, output, cache reads and cache writes
@@ -209,8 +210,11 @@ session_cost_limits:
 For listed owners, the proxy checks persisted session spend before each model
 request, returning HTTP 402 when the session reaches its limit. Token usage with
 no usable cost returns HTTP 503 rather than silently allowing unpriced inference.
+Previously priced totals do not authorize later unpriced usage; the incomplete
+pricing marker persists until the usage is reconciled.
 Owners absent from the mapping have no proxy budget. Limits apply to each session
 separately, including newly created review sessions; they do not form a daily
-owner or organization budget. Usage must be reported by the runner. A model call
-already in flight can overshoot the limit before its usage is persisted. Retain
+owner or organization budget. Usage must be reported by the runner. Reporting delays can allow multiple model calls or an entire tool loop to run
+before usage is persisted, particularly with harnesses that report only at turn
+completion. The proxy is a recorded-spend gate, not a strict billing ceiling. Retain
 provider-side budgets as the independent billing backstop.

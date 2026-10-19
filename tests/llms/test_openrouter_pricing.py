@@ -6,7 +6,8 @@ from omnigent.onboarding.providers import ModelInfo
 
 
 @pytest.fixture(autouse=True)
-def clear_cache():
+def clear_cache(monkeypatch):
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     openrouter_pricing._cache.clear()
     yield
     openrouter_pricing._cache.clear()
@@ -106,3 +107,13 @@ def test_catalog_outage_is_cached_and_not_reported_as_zero(monkeypatch):
     assert openrouter_pricing.model_rates("anthropic/test") is None
     assert openrouter_pricing.model_rates("anthropic/other") is None
     assert len(calls) == 1
+
+
+def test_disabled_catalog_never_makes_an_http_request(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+
+    def unexpected(**kwargs):
+        raise AssertionError("offline lookup attempted HTTP")
+
+    monkeypatch.setattr(openrouter_pricing.httpx, "Client", unexpected)
+    assert openrouter_pricing.model_rates("anthropic/test") is None

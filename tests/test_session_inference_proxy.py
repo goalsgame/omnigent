@@ -1591,3 +1591,18 @@ def test_session_cost_limits_reject_invalid_config(monkeypatch, limits):
                 "session_cost_limits": limits,
             }
         )
+
+
+async def test_openrouter_uses_server_bound_session_for_sticky_routing(setup):
+    service, app, conv, _host, calls = setup
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/chat/completions",
+            headers={"Authorization": "Bearer " + token},
+            json={"model": "model-a", "session_id": "caller-supplied", "stream": True},
+        )
+    assert response.status_code == 200
+    assert json.loads(calls[0].content)["session_id"] == "omnigent:0:session"

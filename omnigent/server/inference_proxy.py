@@ -396,6 +396,10 @@ class InferenceProxy:
             return
         usage = conv.session_usage or {}
         cost = usage.get("total_cost_usd")
+        if usage.get("unpriced_tokens"):
+            raise HTTPException(
+                503, "Session has unpriced usage; inference paused to enforce budget"
+            )
         if cost is None and not any(
             usage.get(key) for key in ("input_tokens", "output_tokens", "total_tokens")
         ):
@@ -669,6 +673,8 @@ class InferenceProxy:
                     )
                 except ValueError as exc:
                     raise HTTPException(400, str(exc)) from None
+                if selected.kind == "openrouter":
+                    upstream_payload["session_id"] = f"omnigent:{workspace}:{session_id}"
                 provider_headers = {}
                 if selected.kind == "vertex-anthropic" and "anthropic-beta" in request.headers:
                     beta = request.headers["anthropic-beta"]

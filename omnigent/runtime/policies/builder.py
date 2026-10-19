@@ -1188,6 +1188,7 @@ _SUBTREE_USAGE_PAGE_SIZE = 100
 # known numeric keys the PolicyEngine reads so an unexpected key in one
 # conversation's persisted usage can't leak into the aggregate.
 _SUMMABLE_USAGE_KEYS = (
+    "unpriced_tokens",
     "input_tokens",
     "output_tokens",
     "total_tokens",

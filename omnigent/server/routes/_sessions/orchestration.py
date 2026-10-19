@@ -1674,6 +1674,8 @@ def _accumulate_session_usage(
     }
     if priced:
         delta["total_cost_usd"] = cost_delta
+    else:
+        delta["unpriced_tokens"] = max(1, total_tokens, input_tokens + output_tokens)
     if llm_model:
         # Per-model attribution. Tokens are attributed whenever the model is
         # known — including unpriced turns — so the per-model token view is
@@ -1892,6 +1894,7 @@ def _persist_native_cumulative_usage(
         if needs_model
         else None
     )
+    fully_priced = cost is not None
     if cost is not None:
         # Monotonic: a reported total below the persisted one is ignored.
         current["total_cost_usd"] = max(old_cost, float(cost))
@@ -1921,6 +1924,12 @@ def _persist_native_cumulative_usage(
                 # also client-SET, so a lowered token report can't drop the
                 # priced cost below the persisted figure.
                 current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
+                fully_priced = True
+
+    if has_tokens and not fully_priced and current.get("total_tokens", 0):
+        current["unpriced_tokens"] = max(
+            int(current.get("unpriced_tokens", 0)), int(current["total_tokens"])
+        )
 
     # ADD this report's growth (new - old) to the active model, not the whole
     # cumulative total, so per-model buckets sum to the flat total across model
@@ -8564,7 +8573,8 @@ async def _relay_runner_stream_once(
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
                         # subtree roll-up below sees the new totals.
-                        _accumulate_session_usage(
+                        await asyncio.to_thread(
+                            _accumulate_session_usage,
                             event.get("response", {}),
                             session_id,
                             conversation_store,

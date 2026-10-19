@@ -302,3 +302,29 @@ def test_other_upstreams_and_models_do_not_receive_cache_controls(kind, model):
     upstream = InferenceUpstream(kind, "https://inference.example/v1")
     _, body = upstream.request("chat/completions", {}, model)
     assert "cache_control" not in body
+
+
+def test_schema_property_named_cache_control_is_not_a_cache_breakpoint():
+    upstream = InferenceUpstream.parse({"kind": "openrouter"})
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "example",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cache_control": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+    }
+    _, body = upstream.request("chat/completions", payload, "anthropic/claude-test")
+    assert body["cache_control"] == {"type": "ephemeral"}
+
+
+def test_openrouter_requests_stream_usage_even_when_client_omits_it():
+    upstream = InferenceUpstream.parse({"kind": "openrouter"})
+    _, body = upstream.request("chat/completions", {"stream": True}, "openai/test")
+    assert body["stream_options"] == {"include_usage": True}
