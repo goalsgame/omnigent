@@ -218,6 +218,11 @@ Previously priced totals do not authorize later unpriced usage; the incomplete
 pricing marker persists until the usage is reconciled. An authoritative
 `cumulative_cost_usd` update must include input and output counters covering the
 recorded usage to clear it; stale or cost-only updates cannot prove coverage.
+On authenticated servers, cumulative billing reports require the session's bound
+runner authority through the event tunnel or runner-binding header. Ordinary
+session editors can update context-display fields without advancing billing
+baselines or reconciling unpriced usage.
+
 Existing approval-based cost policies keep enforcing their known-spend limits
 independently of this proxy guard.
 Owners absent from the mapping have no proxy budget. Limits apply to each session

@@ -2145,6 +2145,23 @@ def register_events_routes(
             _publish_mcp_startup(session_id, mcp_servers)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
+            accounting_fields = {
+                "cumulative_cost_usd",
+                "policy_cost_usd",
+                "cumulative_input_tokens",
+                "cumulative_output_tokens",
+                "cumulative_cache_read_input_tokens",
+                "cumulative_cache_creation_input_tokens",
+            }
+            if (
+                auth_provider is not None
+                and accounting_fields.intersection(body.data)
+                and not _has_runner_created_by_authority(request, conv)
+            ):
+                raise OmnigentError(
+                    "Cumulative usage accounting requires this session's bound runner",
+                    code=ErrorCode.FORBIDDEN,
+                )
             # Persist the harness-reported cumulative usage so the
             # tool-call cost gate can read the running
             # ``total_cost_usd`` on the next tool call. (Cost budgets

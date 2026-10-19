@@ -12963,3 +12963,59 @@ async def test_native_token_peaks_survive_stale_reports_and_pricing_outage(
     assert usage["cumulative_output_high_water"] == 10
     assert usage["total_cost_usd"] == pytest.approx(0.11)
     assert (await report(110))["unpriced_tokens"] == 11
+
+
+async def test_editor_cannot_forge_billing_baselines_before_real_runner_usage(
+    auth_client, db_uri, monkeypatch
+):
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    auth_client.headers["X-Forwarded-Email"] = "alice@example.com"
+    agent = await create_test_agent(auth_client)
+    session = await _create_session(auth_client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    binding_token = "test-accounting-runner-secret"
+    store.replace_runner_id(session["id"], token_bound_runner_id(binding_token))
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.001,
+            output_per_token=0.001,
+        ),
+    )
+    url = f"/v1/sessions/{session['id']}/events"
+    forged = {
+        "type": "external_session_usage",
+        "data": {
+            "model": "priced-model",
+            "cumulative_input_tokens": 1000000,
+            "cumulative_output_tokens": 1000000,
+            "cumulative_cost_usd": 0,
+        },
+    }
+    for headers in ({}, {RUNNER_TUNNEL_TOKEN_HEADER: "wrong-runner-secret"}):
+        response = await auth_client.post(url, json=forged, headers=headers)
+        assert response.status_code == 403, response.text
+        assert not store.get_conversation(session["id"]).session_usage
+    # Ordinary context-ring updates do not affect accounting and remain editable.
+    context = await auth_client.post(
+        url, json={"type": "external_session_usage", "data": {"context_tokens": 42}}
+    )
+    assert context.status_code == 202, context.text
+    real = await auth_client.post(
+        url,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+        json={
+            "type": "external_session_usage",
+            "data": {
+                "model": "priced-model",
+                "cumulative_input_tokens": 1000,
+                "cumulative_output_tokens": 100,
+            },
+        },
+    )
+    assert real.status_code == 202, real.text
+    usage = store.get_conversation(session["id"]).session_usage
+    assert usage["total_cost_usd"] == pytest.approx(1.1)
+    assert usage["cumulative_input_high_water"] == 1000
+    assert usage["cumulative_output_high_water"] == 100

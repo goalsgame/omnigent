@@ -1696,7 +1696,32 @@ def _accumulate_session_usage(
             model_delta["total_cost_usd"] = cost_delta
         delta["by_model"] = {llm_model: model_delta}
 
-    new_current = conversation_store.increment_session_usage(session_id, delta)
+    def merge(current: dict[str, Any]) -> None:
+        from omnigent.stores.conversation_store import apply_session_usage_delta
+
+        if "total_cost_usd" not in current:
+            legacy_tokens = max(
+                int(current.get("total_tokens", 0)),
+                sum(
+                    int(current.get(key, 0))
+                    for key in (
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    )
+                ),
+            )
+            if legacy_tokens:
+                current["unpriced_tokens"] = max(
+                    int(current.get("unpriced_tokens", 0)), legacy_tokens
+                )
+        updates = dict(delta)
+        if priced and "policy_cost_usd" in current:
+            updates["policy_cost_usd"] = cost_delta
+        apply_session_usage_delta(current, updates)
+
+    new_current = conversation_store.mutate_session_usage(session_id, merge)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(new_current)

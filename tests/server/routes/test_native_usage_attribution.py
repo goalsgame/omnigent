@@ -683,3 +683,54 @@ def test_known_delta_cannot_price_unpriced_legacy_history(db_uri, monkeypatch):
     usage = _usage(store, conv.id)
     assert usage["total_cost_usd"] == pytest.approx(0.1)
     assert usage["unpriced_tokens"] == 100
+
+
+def test_priced_relay_preserves_legacy_unpriced_history_atomically(db_uri):
+    from omnigent.server.routes._sessions.orchestration import _accumulate_session_usage
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="legacy-relay", agent_id=_AGENT_ID)
+    store.set_session_usage(
+        conv.id, {"input_tokens": 100, "output_tokens": 0, "total_tokens": 100}
+    )
+    _accumulate_session_usage(
+        {
+            "usage": {
+                "model": "priced-model",
+                "input_tokens": 10,
+                "output_tokens": 0,
+                "total_tokens": 10,
+                "cost_usd": 1.0,
+            }
+        },
+        conv.id,
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["input_tokens"] == 110
+    assert usage["total_cost_usd"] == 1
+    assert usage["unpriced_tokens"] == 100
+
+
+def test_relay_preserves_existing_enforcement_cost_delta(db_uri):
+    from omnigent.server.routes._sessions.orchestration import _accumulate_session_usage
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="split-relay", agent_id=_AGENT_ID)
+    store.set_session_usage(conv.id, {"total_cost_usd": 2.0, "policy_cost_usd": 5.0})
+    _accumulate_session_usage(
+        {
+            "usage": {
+                "model": "priced-model",
+                "input_tokens": 10,
+                "output_tokens": 0,
+                "total_tokens": 10,
+                "cost_usd": 1.0,
+            }
+        },
+        conv.id,
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["total_cost_usd"] == 3
+    assert usage["policy_cost_usd"] == 6
