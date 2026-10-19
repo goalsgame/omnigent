@@ -1609,3 +1609,35 @@ async def test_openrouter_uses_server_bound_session_for_sticky_routing(setup):
         )
     assert response.status_code == 200
     assert json.loads(calls[0].content)["session_id"] == "omnigent:0:session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_identity_route_refreshes_previous_pricing_attribution(routed, legacy):
+    from omnigent.inference_pricing import pricing_model_label, resolve_pricing_model
+
+    service, app, conv, _, calls = routed
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+
+        async def invoke():
+            return await client.post(
+                "/v1/inference/sessions/session/chat/completions",
+                headers={"Authorization": "Bearer " + token},
+                json={"model": "model-a", "stream": True},
+            )
+
+        assert (await invoke()).status_code == 200
+        assert conv.labels[pricing_model_label("model-a")] == "openai/model-a"
+        raw = _multi_upstream_raw()
+        raw["model_routes"]["model-a"]["model"] = "model-a"
+        service.config = InferenceProxyConfig.parse(raw)
+        if legacy:
+            from dataclasses import replace
+
+            service.config = replace(service.config, upstreams={}, model_routes={})
+        assert (await invoke()).status_code == 200
+        assert resolve_pricing_model("model-a", conv.labels) == "model-a"
+        assert json.loads(calls[-1].content)["model"] == "model-a"

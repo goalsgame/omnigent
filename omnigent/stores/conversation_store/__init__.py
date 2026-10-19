@@ -4,7 +4,7 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -1235,6 +1235,18 @@ class ConversationStore(ABC):
             sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         ...
+
+    def mutate_session_usage(
+        self,
+        conversation_id: str,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """Apply a pure usage mutation under the same lock as additive writers.
+
+        The callback receives the latest persisted snapshot and may be retried.
+        It must not perform I/O or publish side effects. Return the committed usage.
+        """
+        raise NotImplementedError
 
     def set_session_todos(
         self,

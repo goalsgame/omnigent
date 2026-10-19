@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
@@ -1553,6 +1553,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_session_usage", write)
+
+    def mutate_session_usage(
+        self,
+        conversation_id: str,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        def write(session: Session) -> dict[str, Any]:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            current = json.loads(meta.session_usage) if meta and meta.session_usage else {}
+            mutate(current)
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(session_usage=json.dumps(current))
+            )
+            return current
+
+        return run_write_transaction(self._session_immediate, "mutate_session_usage", write)
 
     def set_session_todos(
         self,

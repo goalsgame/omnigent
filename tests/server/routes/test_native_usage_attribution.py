@@ -503,3 +503,87 @@ async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) 
         )
 
     assert [e.host_installation_id for e in events] == ["inst-host-9", None]
+
+
+def test_concurrent_stale_priced_report_preserves_unpriced_peak(db_uri, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.llms import context_window
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="concurrent-reports", agent_id=_AGENT_ID)
+    original_get = store.get_conversation
+    stale_read = threading.Event()
+    new_report_committed = threading.Event()
+
+    def get_with_stale_metadata(sid):
+        row = original_get(sid)
+        if threading.current_thread().name.startswith("stale-report"):
+            stale_read.set()
+            assert new_report_committed.wait(10)
+        return row
+
+    monkeypatch.setattr(store, "get_conversation", get_with_stale_metadata)
+    monkeypatch.setattr(context_window, "fetch_model_pricing_with_provider", lambda *a, **k: None)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stale-report") as pool:
+        replay = pool.submit(
+            _persist_native_cumulative_usage,
+            conv.id,
+            {
+                "model": "priced-model",
+                "cumulative_cost_usd": 1,
+                "cumulative_input_tokens": 10,
+                "cumulative_output_tokens": 0,
+            },
+            store,
+        )
+        try:
+            assert stale_read.wait(10)
+            _persist_native_cumulative_usage(
+                conv.id,
+                {
+                    "model": "unknown-model",
+                    "cumulative_input_tokens": 100,
+                    "cumulative_output_tokens": 0,
+                },
+                store,
+            )
+        finally:
+            new_report_committed.set()
+        replay.result(timeout=10)
+    usage = _usage(store, conv.id)
+    assert usage["unpriced_tokens"] == 100
+    assert usage["cumulative_input_high_water"] == 100
+    assert usage["total_cost_usd"] == 1
+
+
+def test_stale_policy_engine_usage_keeps_native_guard_metadata(db_uri, monkeypatch):
+    from omnigent.llms import context_window
+    from omnigent.runtime.policies.engine import PolicyEngine
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="policy-native", agent_id=_AGENT_ID)
+    engine = PolicyEngine(
+        policies=[],
+        label_defs={},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels={},
+        conversation_store=store,
+    )
+    monkeypatch.setattr(context_window, "fetch_model_pricing_with_provider", lambda *a, **k: None)
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "unknown-model",
+            "cumulative_input_tokens": 100,
+            "cumulative_output_tokens": 0,
+        },
+        store,
+    )
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    usage = _usage(store, conv.id)
+    assert usage["unpriced_tokens"] == 110
+    assert usage["cumulative_input_high_water"] == 100
+    assert usage["input_tokens"] == 110

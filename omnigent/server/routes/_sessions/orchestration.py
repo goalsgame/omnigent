@@ -1805,86 +1805,7 @@ def _persist_native_cumulative_usage(
     if cost is None and policy_cost is None and cin is None and cout is None:
         return None
 
-    # Deliberately a FRESH read — never a caller-supplied row. This row is the
-    # baseline for the monotonic clamps and the daily-rollup delta below, and
-    # ``set_session_usage`` rewrites the whole usage JSON; a row read earlier
-    # in the request would widen the forged-low-report race window and could
-    # overwrite a concurrent report's growth with stale state.
     conv = conversation_store.get_conversation(session_id)
-    current: dict[str, Any] = dict(conv.session_usage) if conv and conv.session_usage else {}
-    # Native usage is cumulative (SET semantics), so the per-turn delta
-    # for the daily rollup is new_total - old_total. Capture the old
-    # cumulative + enforcement costs before the fields below overwrite them.
-    # Both are clamped MONOTONIC below (a write may only raise them): the
-    # ``external_session_usage`` event is posted with the session owner's own
-    # bearer token (the forwarder uses no privileged identity), so a client
-    # could otherwise replay it with a falsified low cost to reset the gate's
-    # cost to ~0 (disabling the budget DENY/ASK) and drive the daily rollup
-    # delta negative (clawing back already-spent budget). Monotonicity makes a
-    # downward report a no-op, so the worst a forged post can do is leave the
-    # figure unchanged. (See also the runner-token guard on cost_control.*
-    # label writes — usage was the missing half.)
-    old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
-    old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
-    # Old cumulative token totals, captured before the overwrites below so
-    # per-model attribution can add only this report's growth (new - old).
-    old_tokens = {key: int(current.get(key, 0) or 0) for key in _MODEL_TOKEN_KEYS}
-    input_high_water = max(
-        int(current.get("cumulative_input_high_water", 0)),
-        old_tokens["input_tokens"]
-        + old_tokens["cache_read_input_tokens"]
-        + old_tokens["cache_creation_input_tokens"],
-    )
-    output_high_water = max(
-        int(current.get("cumulative_output_high_water", 0)), old_tokens["output_tokens"]
-    )
-    token_growth = max(0, int(cin or 0) - input_high_water) + max(
-        0, int(cout or 0) - output_high_water
-    )
-    current["cumulative_input_high_water"] = max(input_high_water, int(cin or 0))
-    current["cumulative_output_high_water"] = max(output_high_water, int(cout or 0))
-    if cin is not None:
-        # The reported input total is INCLUSIVE of cached tokens (codex's
-        # ``inputTokens`` counts cache reads). Split the cached portion into
-        # its own bucket so compute_llm_cost prices it at the cache-read rate;
-        # ``input_tokens`` keeps only the non-cached remainder (its contract).
-        # Clamp cached to the total so a malformed report never makes
-        # ``input_tokens`` negative.
-        if ccache is None:
-            # Cumulative cache counts never shrink: a report that omits the
-            # field keeps the persisted split instead of re-billing earlier
-            # cache reads at the full input rate.
-            ccache = int(current.get("cache_read_input_tokens", 0) or 0)
-        cached = min(int(ccache), int(cin))
-        if int(ccache) > int(cin):
-            # Reported or carried cache reads exceed the input total; surface it
-            # so operators can spot a malformed or shrunken cumulative report
-            # instead of silently clamping.
-            _logger.warning(
-                "Cumulative cache reads (%d) exceed the reported input total (%d) "
-                "for session %r; clamping cache reads to the input total.",
-                int(ccache),
-                int(cin),
-                session_id,
-            )
-        if cwrite is None:
-            cwrite = int(current.get("cache_creation_input_tokens", 0) or 0)
-        written = min(int(cwrite), int(cin) - cached)
-        current["cache_read_input_tokens"] = cached
-        current["cache_creation_input_tokens"] = written
-        current["input_tokens"] = int(cin) - cached - written
-    if cout is not None:
-        current["output_tokens"] = cout
-    if cin is not None or cout is not None:
-        # ``total_tokens`` reflects the full input (non-cached + cached) plus
-        # output, so the split above doesn't shrink the displayed total.
-        current["total_tokens"] = (
-            int(current.get("input_tokens", 0))
-            + int(current.get("cache_read_input_tokens", 0))
-            + int(current.get("cache_creation_input_tokens", 0))
-            + int(current.get("output_tokens", 0))
-        )
-
     # Resolve the model for per-model attribution on any broadcast that carries
     # tokens OR a priced cost — both the token-pricing branch and the per-model
     # attribution below need it. A cost-only broadcast must resolve it too:
@@ -1911,88 +1832,166 @@ def _persist_native_cumulative_usage(
         if needs_model
         else None
     )
-    fully_priced = cost is not None and float(cost) >= old_cost
-    if cost is not None:
-        # Monotonic: a reported total below the persisted one is ignored.
-        current["total_cost_usd"] = max(old_cost, float(cost))
-    elif has_tokens:
+    pricing = None
+    if cost is None and has_tokens and isinstance(model_name, str) and model_name:
+        from omnigent.llms.context_window import (
+            compute_llm_cost,
+            fetch_model_pricing_with_provider,
+        )
+        from omnigent.onboarding.provider_config import load_config
+
+        # Load provider config to check for custom pricing
+        provider_config = load_config()
+        # Resolve harness from conversation (agent spec + overrides)
+        harness = _resolve_harness(conv) if conv else None
+        pricing = fetch_model_pricing_with_provider(
+            resolve_pricing_model(model_name, conv.labels if conv else {}),
+            provider_config=provider_config,
+            harness=harness,
+        )
+    cost_delta = 0.0
+    reported_ccache, reported_cwrite = ccache, cwrite
+
+    def merge(current: dict[str, Any]) -> None:
+        nonlocal cost_delta
+        ccache, cwrite = reported_ccache, reported_cwrite
+        # Native usage is cumulative (SET semantics), so the per-turn delta
+        # for the daily rollup is new_total - old_total. Capture the old
+        # cumulative + enforcement costs before the fields below overwrite them.
+        # Both are clamped MONOTONIC below (a write may only raise them): the
+        # ``external_session_usage`` event is posted with the session owner's own
+        # bearer token (the forwarder uses no privileged identity), so a client
+        # could otherwise replay it with a falsified low cost to reset the gate's
+        # cost to ~0 (disabling the budget DENY/ASK) and drive the daily rollup
+        # delta negative (clawing back already-spent budget). Monotonicity makes a
+        # downward report a no-op, so the worst a forged post can do is leave the
+        # figure unchanged. (See also the runner-token guard on cost_control.*
+        # label writes — usage was the missing half.)
+        old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
+        old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
+        # Old cumulative token totals, captured before the overwrites below so
+        # per-model attribution can add only this report's growth (new - old).
+        old_tokens = {key: int(current.get(key, 0) or 0) for key in _MODEL_TOKEN_KEYS}
+        input_high_water = max(
+            int(current.get("cumulative_input_high_water", 0)),
+            old_tokens["input_tokens"]
+            + old_tokens["cache_read_input_tokens"]
+            + old_tokens["cache_creation_input_tokens"],
+        )
+        output_high_water = max(
+            int(current.get("cumulative_output_high_water", 0)), old_tokens["output_tokens"]
+        )
+        token_growth = max(0, int(cin or 0) - input_high_water) + max(
+            0, int(cout or 0) - output_high_water
+        )
+        current["cumulative_input_high_water"] = max(input_high_water, int(cin or 0))
+        current["cumulative_output_high_water"] = max(output_high_water, int(cout or 0))
+        if cin is not None:
+            # The reported input total is INCLUSIVE of cached tokens (codex's
+            # ``inputTokens`` counts cache reads). Split the cached portion into
+            # its own bucket so compute_llm_cost prices it at the cache-read rate;
+            # ``input_tokens`` keeps only the non-cached remainder (its contract).
+            # Clamp cached to the total so a malformed report never makes
+            # ``input_tokens`` negative.
+            if ccache is None:
+                # Cumulative cache counts never shrink: a report that omits the
+                # field keeps the persisted split instead of re-billing earlier
+                # cache reads at the full input rate.
+                ccache = int(current.get("cache_read_input_tokens", 0) or 0)
+            cached = min(int(ccache), int(cin))
+            if int(ccache) > int(cin):
+                # Reported or carried cache reads exceed the input total; surface it
+                # so operators can spot a malformed or shrunken cumulative report
+                # instead of silently clamping.
+                _logger.warning(
+                    "Cumulative cache reads (%d) exceed the reported input total (%d) "
+                    "for session %r; clamping cache reads to the input total.",
+                    int(ccache),
+                    int(cin),
+                    session_id,
+                )
+            if cwrite is None:
+                cwrite = int(current.get("cache_creation_input_tokens", 0) or 0)
+            written = min(int(cwrite), int(cin) - cached)
+            current["cache_read_input_tokens"] = cached
+            current["cache_creation_input_tokens"] = written
+            current["input_tokens"] = int(cin) - cached - written
+        if cout is not None:
+            current["output_tokens"] = cout
+        if cin is not None or cout is not None:
+            # ``total_tokens`` reflects the full input (non-cached + cached) plus
+            # output, so the split above doesn't shrink the displayed total.
+            current["total_tokens"] = (
+                int(current.get("input_tokens", 0))
+                + int(current.get("cache_read_input_tokens", 0))
+                + int(current.get("cache_creation_input_tokens", 0))
+                + int(current.get("output_tokens", 0))
+            )
+
+        fully_priced = cost is not None and float(cost) >= old_cost
+        if cost is not None:
+            # Monotonic: a reported total below the persisted one is ignored.
+            current["total_cost_usd"] = max(old_cost, float(cost))
+        elif has_tokens:
+            if isinstance(model_name, str) and model_name:
+                if pricing is not None:
+                    # SET (cumulative) — price the running token totals.
+                    # ``current`` carries the cache-read split when the harness
+                    # reports it (codex-native does), so compute_llm_cost prices
+                    # cache reads at their own rate; it falls back to the input
+                    # rate for cache tokens when the catalog omits a cache price
+                    # (e.g. ``databricks-*`` entries today).
+                    # Monotonic, like the explicit-cost branch: token totals are
+                    # also client-SET, so a lowered token report can't drop the
+                    # priced cost below the persisted figure.
+                    current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
+                    fully_priced = True
+
+        if token_growth and not fully_priced:
+            current["unpriced_tokens"] = int(current.get("unpriced_tokens", 0)) + token_growth
+        if current.get("unpriced_tokens"):
+            # Reconciliation must cover both counters, including any earlier peak.
+            if (
+                fully_priced
+                and cost is not None
+                and cin is not None
+                and cout is not None
+                and int(cin) >= input_high_water
+                and int(cout) >= output_high_water
+            ):
+                current.pop("unpriced_tokens", None)
+
+        # ADD this report's growth (new - old) to the active model, not the whole
+        # cumulative total, so per-model buckets sum to the flat total across model
+        # switches. Clamp >= 0 so a lowered report never claws a bucket back (flat
+        # tokens are SET not clamped, so buckets can exceed them then — fail-safe).
         if isinstance(model_name, str) and model_name:
-            from omnigent.llms.context_window import (
-                compute_llm_cost,
-                fetch_model_pricing_with_provider,
-            )
-            from omnigent.onboarding.provider_config import load_config
+            bucket = _model_usage_bucket(current, model_name)
+            for key in _MODEL_TOKEN_KEYS:
+                if key in current:
+                    bucket[key] = int(bucket.get(key, 0)) + max(
+                        0, int(current[key]) - old_tokens[key]
+                    )
+            if "total_cost_usd" in current:
+                bucket["total_cost_usd"] = float(bucket.get("total_cost_usd", 0.0)) + max(
+                    0.0, float(current["total_cost_usd"]) - old_cost
+                )
 
-            # Load provider config to check for custom pricing
-            provider_config = load_config()
-            # Resolve harness from conversation (agent spec + overrides)
-            harness = _resolve_harness(conv) if conv else None
-            pricing = fetch_model_pricing_with_provider(
-                resolve_pricing_model(model_name, conv.labels if conv else {}),
-                provider_config=provider_config,
-                harness=harness,
-            )
-            if pricing is not None:
-                # SET (cumulative) — price the running token totals.
-                # ``current`` carries the cache-read split when the harness
-                # reports it (codex-native does), so compute_llm_cost prices
-                # cache reads at their own rate; it falls back to the input
-                # rate for cache tokens when the catalog omits a cache price
-                # (e.g. ``databricks-*`` entries today).
-                # Monotonic, like the explicit-cost branch: token totals are
-                # also client-SET, so a lowered token report can't drop the
-                # priced cost below the persisted figure.
-                current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
-                fully_priced = True
+        # Enforcement value (claude-native display/policy split). Stored
+        # separately from the displayed ``total_cost_usd`` so the gate can read
+        # the real-time figure (incl. in-flight sub-agent spend) while the badge
+        # shows the frozen statusLine total. Monotonic, like total_cost_usd: this
+        # is the value the cost-budget gate actually reads, so a forged low report
+        # must never lower it. When an in-flight estimate later resolves below a
+        # prior peak the clamp keeps the peak — conservative (the gate errs toward
+        # MORE enforcement, never less), which is the safe direction for a budget.
+        if policy_cost is not None:
+            current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
 
-    if token_growth and not fully_priced:
-        current["unpriced_tokens"] = int(current.get("unpriced_tokens", 0)) + token_growth
-    if current.get("unpriced_tokens"):
-        # Reconciliation must cover both counters, including any earlier peak.
-        if (
-            fully_priced
-            and cost is not None
-            and cin is not None
-            and cout is not None
-            and int(cin) >= input_high_water
-            and int(cout) >= output_high_water
-        ):
-            current.pop("unpriced_tokens", None)
+        cost_delta = max(0.0, float(current.get("total_cost_usd", 0.0) or 0.0) - old_cost)
 
-    # ADD this report's growth (new - old) to the active model, not the whole
-    # cumulative total, so per-model buckets sum to the flat total across model
-    # switches. Clamp >= 0 so a lowered report never claws a bucket back (flat
-    # tokens are SET not clamped, so buckets can exceed them then — fail-safe).
-    if isinstance(model_name, str) and model_name:
-        bucket = _model_usage_bucket(current, model_name)
-        for key in _MODEL_TOKEN_KEYS:
-            if key in current:
-                bucket[key] = int(bucket.get(key, 0)) + max(0, int(current[key]) - old_tokens[key])
-        if "total_cost_usd" in current:
-            bucket["total_cost_usd"] = float(bucket.get("total_cost_usd", 0.0)) + max(
-                0.0, float(current["total_cost_usd"]) - old_cost
-            )
-
-    # Enforcement value (claude-native display/policy split). Stored
-    # separately from the displayed ``total_cost_usd`` so the gate can read
-    # the real-time figure (incl. in-flight sub-agent spend) while the badge
-    # shows the frozen statusLine total. Monotonic, like total_cost_usd: this
-    # is the value the cost-budget gate actually reads, so a forged low report
-    # must never lower it. When an in-flight estimate later resolves below a
-    # prior peak the clamp keeps the peak — conservative (the gate errs toward
-    # MORE enforcement, never less), which is the safe direction for a budget.
-    if policy_cost is not None:
-        current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
-
-    conversation_store.set_session_usage(session_id, current)
-    # Per-user daily rollup. Native reports cumulative totals, so the turn's
-    # delta is the increase in cumulative cost. Uses the authoritative
-    # ``total_cost_usd`` (= statusLine S), NOT ``policy_cost_usd`` — the
-    # daily report must reflect real spend, not the real-time gate estimate.
-    new_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
-    # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
-    # daily rollup from ever being clawed back even if that invariant changes.
-    _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
+    current = conversation_store.mutate_session_usage(session_id, merge)
+    _record_daily_cost(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(current)
 
 

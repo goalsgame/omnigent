@@ -27,7 +27,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
-from omnigent.inference_pricing import resolve_pricing_model
+from omnigent.inference_pricing import reject_pricing_label_writes, resolve_pricing_model
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
@@ -1121,6 +1121,7 @@ def _seed_and_load_labels(
     :returns: Full post-seed snapshot of the conversation's
         labels.
     """
+    reject_pricing_label_writes(label_defs)
     if existing is None:
         existing = _load_existing_labels(conversation_id, conversation_store)
     to_seed = {

@@ -675,15 +675,17 @@ class InferenceProxy:
                     raise HTTPException(400, str(exc)) from None
                 if selected.kind == "openrouter":
                     upstream_payload["session_id"] = f"omnigent:{workspace}:{session_id}"
-                if target_model != payload["model"]:
-                    from omnigent.inference_pricing import pricing_model_label
+                from omnigent.inference_pricing import pricing_model_label
 
-                    key = pricing_model_label(payload["model"])
-                    if (getattr(conv, "labels", None) or {}).get(key) != target_model:
-                        with workspace_scope(workspace):
-                            await asyncio.to_thread(
-                                self.conversations.set_labels, session_id, {key: target_model}
-                            )
+                key = pricing_model_label(payload["model"])
+                previous_target = (getattr(conv, "labels", None) or {}).get(key)
+                if previous_target != target_model and (
+                    previous_target is not None or target_model != payload["model"]
+                ):
+                    with workspace_scope(workspace):
+                        await asyncio.to_thread(
+                            self.conversations.set_labels, session_id, {key: target_model}
+                        )
                 provider_headers = {}
                 if selected.kind == "vertex-anthropic" and "anthropic-beta" in request.headers:
                     beta = request.headers["anthropic-beta"]

@@ -523,6 +523,9 @@ class PolicyEngine:
         """
         if not set_labels:
             return
+        from omnigent.inference_pricing import reject_pricing_label_writes
+
+        reject_pricing_label_writes(set_labels)
         filtered = self._filter_schema_valid(set_labels)
         if not filtered:
             return
@@ -750,7 +753,22 @@ class PolicyEngine:
             self._subtree_usage["cache_read_input_tokens"] += cache_read_input_tokens
             self._subtree_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
             self._subtree_usage["total_cost_usd"] += delta_cost
-        self._store.set_session_usage(self._conversation_id, dict(self._usage))
+        delta: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+        }
+        delta["total_cost_usd"] = delta_cost
+        if self._token_pricing is None:
+            delta["unpriced_tokens"] = (
+                input_tokens
+                + output_tokens
+                + cache_read_input_tokens
+                + cache_creation_input_tokens
+            )
+        self._usage.update(self._store.increment_session_usage(self._conversation_id, delta))
 
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
         """

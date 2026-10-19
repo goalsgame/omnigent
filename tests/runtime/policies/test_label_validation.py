@@ -121,3 +121,34 @@ def test_apply_label_writes_values_only_free_transitions(
     # Out-of-enum still rejected.
     engine.apply_label_writes({"role": "root"})
     assert engine.labels["role"] == "guest"
+
+
+def test_pricing_labels_cannot_be_seeded_by_agent_spec(conversation_store):
+    import pytest
+
+    from omnigent.errors import OmnigentError
+    from omnigent.inference_pricing import pricing_model_label
+    from omnigent.runtime.policies.builder import _seed_and_load_labels
+
+    conv = conversation_store.create_conversation()
+    key = pricing_model_label("paid-model")
+    with pytest.raises(OmnigentError, match="server-internal"):
+        _seed_and_load_labels(
+            conversation_id=conv.id,
+            conversation_store=conversation_store,
+            label_defs={key: LabelDef(initial="cheap-model")},
+        )
+    assert key not in conversation_store.get_conversation(conv.id).labels
+
+
+def test_pricing_labels_cannot_be_written_by_policy(conversation_store):
+    import pytest
+
+    from omnigent.errors import OmnigentError
+    from omnigent.inference_pricing import pricing_model_label
+
+    engine = _build_engine_with_defs(conversation_store, {})
+    key = pricing_model_label("paid-model")
+    with pytest.raises(OmnigentError, match="server-internal"):
+        engine.apply_label_writes({key: "cheap-model"})
+    assert key not in engine.labels
