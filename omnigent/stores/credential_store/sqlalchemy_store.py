@@ -319,9 +319,11 @@ class CredentialStore:
                 / f"omnigent-credentials-{os.getpid()}-{id(self._engine)}"
             )
         lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        key = hashlib.sha256(
-            json.dumps([workspace_id, user_id, provider, account_id]).encode()
-        ).hexdigest()
+        identity_key = [workspace_id, user_id, provider]
+        # Default-slot refreshes retain their lock name across upgrades.
+        if account_id:
+            identity_key.append(account_id)
+        key = hashlib.sha256(json.dumps(identity_key).encode()).hexdigest()
         identity = (
             SqlConnection.workspace_id == workspace_id,
             SqlConnection.user_id == user_id,
