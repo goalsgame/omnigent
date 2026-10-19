@@ -38,6 +38,7 @@ from omnigent.spec.types import (
     AgentSpec,
     GuardrailsSpec,
     LabelDef,
+    LLMConfig,
     Phase,
     PhaseSelector,
 )
@@ -1905,3 +1906,52 @@ def test_ancestor_walk_discards_an_untrustworthy_chain(shape: str, links: dict[s
     ]
 
     assert ancestor_ids_from_tree(tree, "a") == [], shape
+
+
+@pytest.mark.parametrize("policy_cost", [None, 5.0])
+def test_record_usage_preserves_tree_enforcement_totals(
+    conversation_store, monkeypatch, policy_cost
+):
+    from omnigent.llms import context_window
+
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing",
+        lambda _: context_window.ModelPricing(
+            input_per_token=0.1,
+            output_per_token=0.1,
+        ),
+    )
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title=_sub_agent_title(),
+    )
+    counts = {
+        "input_tokens": 20,
+        "output_tokens": 0,
+        "total_tokens": 20,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    conversation_store.set_session_usage(parent.id, {**counts, "total_cost_usd": 8.0})
+    own_usage = {**counts, "total_cost_usd": 2.0}
+    if policy_cost is not None:
+        own_usage["policy_cost_usd"] = policy_cost
+    conversation_store.set_session_usage(child.id, own_usage)
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child", llm=LLMConfig(model="test-model")),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    before = 8 + (policy_cost if policy_cost is not None else 2)
+    assert engine.usage["total_cost_usd"] == pytest.approx(before)
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    assert engine.usage["total_cost_usd"] == pytest.approx(before + 1)
+    assert conversation_store.get_conversation(child.id).session_usage[
+        "total_cost_usd"
+    ] == pytest.approx(3)
+    assert conversation_store.get_conversation(parent.id).session_usage[
+        "total_cost_usd"
+    ] == pytest.approx(8)

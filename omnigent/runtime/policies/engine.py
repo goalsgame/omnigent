@@ -768,7 +768,15 @@ class PolicyEngine:
                 + cache_read_input_tokens
                 + cache_creation_input_tokens
             )
-        self._usage.update(self._store.increment_session_usage(self._conversation_id, delta))
+            unpriced = delta["unpriced_tokens"]
+            self._usage["unpriced_tokens"] = self._usage.get("unpriced_tokens", 0) + unpriced
+            if self._subtree_usage is not None:
+                self._subtree_usage["unpriced_tokens"] = (
+                    self._subtree_usage.get("unpriced_tokens", 0) + unpriced
+                )
+        # Persist only this conversation's delta. The hot counters above include
+        # parent/sibling spend and may use a higher enforcement cost than display.
+        self._store.increment_session_usage(self._conversation_id, delta)
 
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
         """
