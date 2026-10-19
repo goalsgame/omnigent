@@ -7,9 +7,9 @@ JWKS for its access tokens, offline refresh credentials, and encrypted storage. 
 identity provider's client offline-session maximum and idle timeout to match.
 The maximum configurable application lifetime is 720 hours.
 
-Omnigent stores one encrypted offline refresh token per user/workspace. MCP and
-Lore share that login grant and obtain separate, audience-validated access
-tokens. Refresh-token rotation is serialized through the credential store;
+Omnigent stores an encrypted offline refresh token for each interactive login,
+scoped to its user and workspace. MCP and Lore share an active login grant and
+obtain separate, audience-validated access tokens. Refresh-token rotation is serialized through the credential store;
 downstream exchanges request access tokens only. Machine identities retain their
 existing exchange and binding policies. No shared machine fallback is used.
 
