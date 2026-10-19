@@ -2515,3 +2515,52 @@ async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: 
             await fs.read("escape/note.txt")
     finally:
         os_env.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_filesystem_write_uses_selected_project(tmp_path: Path) -> None:
+    from omnigent.spec.types import AgentSpec
+
+    launch = tmp_path / "runner-launch"
+    selected = tmp_path / "selected-project"
+    launch.mkdir()
+    selected.mkdir()
+    spec = AgentSpec(
+        spec_version=1, os_env=OSEnvSpec(cwd=".", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    def metadata(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/cold-session":
+            return httpx.Response(
+                200,
+                json={"id": "cold-session", "agent_id": "test-agent", "workspace": str(selected)},
+            )
+        return httpx.Response(404, json={})
+
+    registry = SessionResourceRegistry(runner_workspace=launch)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(metadata), base_url="http://server"
+    ) as server:
+        app = create_runner_app(
+            server_client=server,
+            spec_resolver=resolve,
+            resource_registry=registry,
+            runner_workspace=launch,
+            per_session_workspace=False,
+        )
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as client:
+                response = await client.put(
+                    f"/v1/sessions/cold-session/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/new.txt",
+                    json={"content": "selected-project-ok", "encoding": "utf-8"},
+                )
+            assert response.status_code == 200, response.text
+            assert (selected / "new.txt").read_text() == "selected-project-ok"
+            assert not (launch / "new.txt").exists()
+        finally:
+            await registry.cleanup_session("cold-session")

@@ -1605,6 +1605,9 @@ def create_runner_app(
 
     def _cached_session_workspace(session_id: str) -> Path | None:
         workspace = _session_workspace_cache.get(session_id)
+        if workspace is None:
+            snapshot = _session_snapshot_cache.get(session_id)
+            workspace = snapshot.workspace if snapshot is not None else None
         return (
             Path(workspace.strip()).expanduser().resolve()
             if workspace and workspace.strip()

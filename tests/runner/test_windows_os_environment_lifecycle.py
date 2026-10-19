@@ -227,14 +227,16 @@ async def test_implicit_windows_environment_is_owned_by_session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("isolate", [False, True])
 async def test_selected_workspace_wins_for_execution_and_resource_views(
-    tmp_path: Path, environments: list[_ProcessEnvironment]
+    tmp_path: Path, environments: list[_ProcessEnvironment], isolate: bool
 ) -> None:
     launch_root = tmp_path / "runner"
     selected_root = tmp_path / "project"
     selected_root.mkdir()
-    registry = SessionResourceRegistry(runner_workspace=launch_root)
+    registry = SessionResourceRegistry(runner_workspace=launch_root, per_session_workspace=isolate)
     registry.set_session_workspace_resolver(lambda session: selected_root)
+    expected_root = selected_root / "session-a" if isolate else selected_root
     spec = _spec(launch_root)
     try:
         result = json.loads(
@@ -248,12 +250,16 @@ async def test_selected_workspace_wins_for_execution_and_resource_views(
             )
         )
         assert result["exit_code"] == 0
-        assert environments[0].cwd == str(selected_root)
+        assert environments[0].cwd == str(expected_root)
         assert (
             registry.resolve_environment("session-a", DEFAULT_ENVIRONMENT_ID, spec)
             is environments[0]
         )
-        assert registry.compute_default_env_root("session-a", spec) == str(selected_root)
+        assert registry.compute_default_env_root("session-a", spec) == str(expected_root)
+        if isolate:
+            second_root = registry.compute_default_env_root("session-b", spec)
+            assert second_root == str(selected_root / "session-b")
+            assert second_root != str(expected_root)
     finally:
         await registry.cleanup_session("session-a")
 
@@ -294,3 +300,62 @@ async def test_placeholder_workspace_matches_both_entry_points(
         assert len(environments) == 1
     finally:
         await registry.cleanup_session("session-a")
+
+
+@pytest.mark.asyncio
+async def test_windows_file_reads_do_not_wait_for_running_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import threading
+
+    from omnigent.inner.os_env import CallerProcessOSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    started = threading.Event()
+    release = threading.Event()
+    helpers = []
+
+    class Helper:
+        def __init__(self, **kwargs: object) -> None:
+            self.closed = False
+            self.lock = threading.Lock()
+            helpers.append(self)
+
+        def request(self, request: dict) -> dict:
+            with self.lock:
+                if request["op"] == "shell":
+                    started.set()
+                    assert release.wait(5), "The shell was never released"
+                    return {"exit_code": 0}
+                return {"content": "file-preview-ok"}
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("omnigent.inner.os_env._HelperProcessClient", Helper)
+    environment = CallerProcessOSEnvironment(
+        spec=OSEnvSpec(),
+        cwd=tmp_path,
+        shell_path="cmd.exe",
+        sandbox=SandboxPolicy(
+            backend_type="windows_jobobject",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    shell = asyncio.create_task(environment.shell("long-running-command"))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 2), timeout=3)
+        result = await asyncio.wait_for(environment.read("note.txt"), timeout=1)
+        assert result["content"] == "file-preview-ok"
+        assert not shell.done()
+    finally:
+        release.set()
+        await shell
+        environment.close()
+    assert len(helpers) == 2
+    assert all(helper.closed for helper in helpers)

@@ -886,7 +886,16 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 self.sandbox.copy_on_write_roots
             )
             self._owns_copy_on_write = True
-        self._helper = _HelperProcessClient(
+        self._helper = self._new_helper()
+        # Shell waits must not block workspace previews and other file operations.
+        self._shell_helper = (
+            self._new_helper()
+            if self.sandbox.backend_type == "windows_jobobject"
+            else self._helper
+        )
+
+    def _new_helper(self) -> _HelperProcessClient:
+        return _HelperProcessClient(
             cwd=self.cwd,
             shell_path=self.shell_path,
             sandbox=self.sandbox,
@@ -968,11 +977,13 @@ class CallerProcessOSEnvironment(OSEnvironment):
         }
         if max_output is not None:
             request["max_output"] = max_output
-        result = await run_sync_on_thread(self._helper.request, request)
+        result = await run_sync_on_thread(self._shell_helper.request, request)
         return cast(OpResult, result)
 
     def close(self) -> None:
         self._helper.close()
+        if self._shell_helper is not self._helper:
+            self._shell_helper.close()
         if self._owns_copy_on_write and self._copy_on_write_environment is not None:
             self._copy_on_write_environment.close()
         if self._fork_dir is not None:

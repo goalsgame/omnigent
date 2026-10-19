@@ -1053,7 +1053,10 @@ class SessionResourceRegistry:
     def _selected_workspace(self, session_id: str) -> Path | None:
         if self._session_workspace_resolver is None:
             return None
-        return self._session_workspace_resolver(session_id)
+        workspace = self._session_workspace_resolver(session_id)
+        if workspace is not None and self._per_session_workspace:
+            return Path(_contained_session_dir(str(workspace), session_id))
+        return workspace
 
     def _effective_primary_spec(self, session_id: str, spec: OSEnvSpec) -> OSEnvSpec:
         """Use the same workspace identity for tools and inherited terminals."""
