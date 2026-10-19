@@ -1967,3 +1967,42 @@ def test_record_usage_preserves_tree_enforcement_totals(
         assert child_usage["policy_cost_usd"] == pytest.approx(policy_cost + 1)
     else:
         assert "policy_cost_usd" not in child_usage
+
+
+def test_priced_policy_delta_keeps_legacy_child_history_unpriced(conversation_store, monkeypatch):
+    from omnigent.llms import context_window
+
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing",
+        lambda _: context_window.ModelPricing(
+            input_per_token=0.1,
+            output_per_token=0.1,
+        ),
+    )
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title=_sub_agent_title(),
+    )
+    counts = {
+        "input_tokens": 20,
+        "output_tokens": 0,
+        "total_tokens": 20,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    conversation_store.set_session_usage(parent.id, {**counts, "total_cost_usd": 8.0})
+    conversation_store.set_session_usage(child.id, counts)
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child", llm=LLMConfig(model="test-model")),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    current = conversation_store.get_conversation(child.id).session_usage
+    assert current["total_cost_usd"] == pytest.approx(1)
+    assert current["unpriced_tokens"] == 20
+    assert engine.usage["total_cost_usd"] == pytest.approx(9)
+    assert engine.usage["unpriced_tokens"] == 20

@@ -734,3 +734,85 @@ def test_relay_preserves_existing_enforcement_cost_delta(db_uri):
     usage = _usage(store, conv.id)
     assert usage["total_cost_usd"] == 3
     assert usage["policy_cost_usd"] == 6
+
+
+@pytest.mark.parametrize("existing_baseline", [False, True])
+@pytest.mark.parametrize("reported_cost", [1, 2])
+def test_split_cost_and_tokens_do_not_double_charge(
+    db_uri, monkeypatch, existing_baseline, reported_cost
+):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.llms import context_window
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="split-cost", agent_id=_AGENT_ID)
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.01,
+            output_per_token=0.01,
+        ),
+    )
+    if existing_baseline:
+        _persist_native_cumulative_usage(
+            conv.id,
+            {
+                "model": "priced-model",
+                "cumulative_input_tokens": 100,
+                "cumulative_output_tokens": 0,
+                "cumulative_cost_usd": 1,
+            },
+            store,
+        )
+    _persist_native_cumulative_usage(
+        conv.id, {"model": "priced-model", "cumulative_cost_usd": reported_cost}, store
+    )
+    for _ in range(2):
+        _persist_native_cumulative_usage(
+            conv.id,
+            {
+                "model": "priced-model",
+                "cumulative_input_tokens": 200,
+                "cumulative_output_tokens": 0,
+            },
+            store,
+        )
+        usage = _usage(store, conv.id)
+        assert usage["total_cost_usd"] == pytest.approx(reported_cost)
+        assert usage["unpriced_tokens"] == (100 if existing_baseline else 200)
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": reported_cost + 1}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 503
+    # Joint trusted coverage resolves the ambiguity without lowering a cost.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "priced-model",
+            "cumulative_input_tokens": 200,
+            "cumulative_output_tokens": 0,
+            "cumulative_cost_usd": reported_cost,
+        },
+        store,
+    )
+    assert "unpriced_tokens" not in _usage(store, conv.id)
+    assert "pending_cost_coverage" not in _usage(store, conv.id)
+    InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "priced-model",
+            "cumulative_input_tokens": 300,
+            "cumulative_output_tokens": 0,
+        },
+        store,
+    )
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(reported_cost + 1)

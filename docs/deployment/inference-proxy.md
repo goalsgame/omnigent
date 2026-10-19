@@ -218,6 +218,9 @@ Previously priced totals do not authorize later unpriced usage; the incomplete
 pricing marker persists until the usage is reconciled. An authoritative
 `cumulative_cost_usd` update must include input and output counters covering the
 recorded usage to clear it; stale or cost-only updates cannot prove coverage.
+When cost-only and token-only reports overlap, the backend preserves the reported
+cost and marks ambiguous token coverage incomplete until a joint cost/counter
+report reconciles it, rather than adding potentially duplicate estimates.
 On authenticated servers, cumulative billing reports require the session's bound
 runner authority through the event tunnel or runner-binding header. Ordinary
 session editors can update context-display fields without advancing billing

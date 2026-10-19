@@ -370,6 +370,33 @@ def _is_addable_usage_increment(value: Any) -> bool:
     return math.isfinite(value) and value >= 0
 
 
+def mark_unpriced_usage_history(current: dict[str, Any]) -> int:
+    """Mark legacy tokens lacking a cost before applying a newly priced delta.
+
+    Return the newly marked count so an engine can update aggregate hot counters
+    without replacing them with conversation-local persisted totals.
+    """
+    if "total_cost_usd" in current:
+        return 0
+    tokens = max(
+        int(current.get("total_tokens", 0) or 0),
+        sum(
+            int(current.get(key, 0) or 0)
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        ),
+    )
+    old = int(current.get("unpriced_tokens", 0) or 0)
+    if tokens > old:
+        current["unpriced_tokens"] = tokens
+        return tokens - old
+    return 0
+
+
 def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) -> None:
     """
     Apply a usage *delta* to *current* in place (add semantics, nested-aware).

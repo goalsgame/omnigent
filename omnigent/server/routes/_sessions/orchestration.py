@@ -1697,25 +1697,12 @@ def _accumulate_session_usage(
         delta["by_model"] = {llm_model: model_delta}
 
     def merge(current: dict[str, Any]) -> None:
-        from omnigent.stores.conversation_store import apply_session_usage_delta
+        from omnigent.stores.conversation_store import (
+            apply_session_usage_delta,
+            mark_unpriced_usage_history,
+        )
 
-        if "total_cost_usd" not in current:
-            legacy_tokens = max(
-                int(current.get("total_tokens", 0)),
-                sum(
-                    int(current.get(key, 0))
-                    for key in (
-                        "input_tokens",
-                        "output_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                    )
-                ),
-            )
-            if legacy_tokens:
-                current["unpriced_tokens"] = max(
-                    int(current.get("unpriced_tokens", 0)), legacy_tokens
-                )
+        mark_unpriced_usage_history(current)
         updates = dict(delta)
         if priced and "policy_cost_usd" in current:
             updates["policy_cost_usd"] = cost_delta
@@ -1976,11 +1963,15 @@ def _persist_native_cumulative_usage(
 
         fully_priced = cost is not None and float(cost) >= old_cost
         if cost is not None:
+            if (cin is None or cout is None) and float(cost) >= old_cost:
+                # A cost-only increase may already cover tokens not yet reported.
+                # Wait for joint cost/counter coverage rather than double charge.
+                current["pending_cost_coverage"] = True
             # Monotonic: a reported total below the persisted one is ignored.
             current["total_cost_usd"] = max(old_cost, float(cost))
         elif has_tokens:
             if isinstance(model_name, str) and model_name:
-                if pricing is not None:
+                if pricing is not None and not current.get("pending_cost_coverage"):
                     # Only new tokens use the current route's rate. Repricing
                     # the entire history would erase spend after a cheaper reroute.
                     new_cached = min(
@@ -2012,17 +2003,17 @@ def _persist_native_cumulative_usage(
 
         if token_growth and not fully_priced:
             current["unpriced_tokens"] = int(current.get("unpriced_tokens", 0)) + token_growth
-        if current.get("unpriced_tokens"):
-            # Reconciliation must cover both counters, including any earlier peak.
-            if (
-                fully_priced
-                and cost is not None
-                and cin is not None
-                and cout is not None
-                and int(cin) >= input_high_water
-                and int(cout) >= output_high_water
-            ):
-                current.pop("unpriced_tokens", None)
+        # Reconciliation must cover both counters, including any earlier peak.
+        if (
+            fully_priced
+            and cost is not None
+            and cin is not None
+            and cout is not None
+            and int(cin) >= input_high_water
+            and int(cout) >= output_high_water
+        ):
+            current.pop("unpriced_tokens", None)
+            current.pop("pending_cost_coverage", None)
 
         # ADD this report's growth (new - old) to the active model, not the whole
         # cumulative total, so per-model buckets sum to the flat total across model
