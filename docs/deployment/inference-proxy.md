@@ -197,7 +197,9 @@ Models unresolved by the shared pricing catalog can use exact public OpenRouter
 model prices, cached for five minutes. Input, output, cache reads and cache writes
 are counted separately, including cache writes preserved through the OpenAI Agents
 SDK. For model aliases, accounting uses the upstream model recorded by the proxy
-for that session. These are estimates, not provider invoices. Catalog
+for that session. Cumulative native reports price only newly observed tokens,
+so route changes preserve historical spend and replays do not add cost. These are
+estimates, not provider invoices. Catalog
 failures, invalid rates and context-tier prices that require per-request usage
 remain unpriced.
 

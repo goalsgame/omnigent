@@ -587,3 +587,99 @@ def test_stale_policy_engine_usage_keeps_native_guard_metadata(db_uri, monkeypat
     assert usage["unpriced_tokens"] == 110
     assert usage["cumulative_input_high_water"] == 100
     assert usage["input_tokens"] == 110
+
+
+@pytest.mark.parametrize("rates", [(0.01, 0.001), (0.001, 0.01)])
+@pytest.mark.parametrize("cache", [None, "read", "write"])
+def test_routed_alias_prices_only_new_usage_and_enforces_budget(db_uri, monkeypatch, rates, cache):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.inference_pricing import pricing_model_label
+    from omnigent.llms import context_window
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="routed-usage", agent_id=_AGENT_ID)
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda model, **kw: {
+            "first-target": ModelPricing(input_per_token=rates[0], output_per_token=rates[0]),
+            "second-target": ModelPricing(input_per_token=rates[1], output_per_token=rates[1]),
+        }.get(model),
+    )
+    factor = 0.1 if cache == "read" else 1.25 if cache == "write" else 1.0
+
+    def report(count):
+        data = {
+            "model": "friendly-alias",
+            "cumulative_input_tokens": count,
+            "cumulative_output_tokens": 0,
+        }
+        if cache:
+            key = (
+                "cumulative_cache_read_input_tokens"
+                if cache == "read"
+                else "cumulative_cache_creation_input_tokens"
+            )
+            data[key] = count
+        _persist_native_cumulative_usage(conv.id, data, store)
+
+    key = pricing_model_label("friendly-alias")
+    store.set_labels(conv.id, {key: "first-target"})
+    report(100)
+    store.set_labels(conv.id, {key: "second-target"})
+    report(200)
+    expected = (100 * rates[0] + 100 * rates[1]) * factor
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(expected)
+    # Both a replay and an older snapshot must leave recorded spend unchanged.
+    report(200)
+    report(100)
+    report(200)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(expected)
+    assert _usage(store, conv.id)["by_model"]["friendly-alias"]["total_cost_usd"] == pytest.approx(
+        expected
+    )
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": expected - 0.001}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 402
+    report(300)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(
+        expected + 100 * rates[1] * factor
+    )
+
+
+def test_known_delta_cannot_price_unpriced_legacy_history(db_uri, monkeypatch):
+    from omnigent.llms import context_window
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="legacy-usage", agent_id=_AGENT_ID)
+    store.set_session_usage(
+        conv.id, {"input_tokens": 100, "output_tokens": 0, "total_tokens": 100}
+    )
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.001,
+            output_per_token=0.001,
+        ),
+    )
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "known-model",
+            "cumulative_input_tokens": 200,
+            "cumulative_output_tokens": 0,
+        },
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["total_cost_usd"] == pytest.approx(0.1)
+    assert usage["unpriced_tokens"] == 100

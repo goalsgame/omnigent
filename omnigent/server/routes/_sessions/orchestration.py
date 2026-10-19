@@ -1881,9 +1881,23 @@ def _persist_native_cumulative_usage(
         output_high_water = max(
             int(current.get("cumulative_output_high_water", 0)), old_tokens["output_tokens"]
         )
-        token_growth = max(0, int(cin or 0) - input_high_water) + max(
-            0, int(cout or 0) - output_high_water
+        input_growth = max(0, int(cin or 0) - input_high_water)
+        output_growth = max(0, int(cout or 0) - output_high_water)
+        token_growth = input_growth + output_growth
+        cache_read_high_water = max(
+            int(current.get("cumulative_cache_read_high_water", 0)),
+            old_tokens["cache_read_input_tokens"],
         )
+        cache_write_high_water = max(
+            int(current.get("cumulative_cache_write_high_water", 0)),
+            old_tokens["cache_creation_input_tokens"],
+        )
+        if "total_cost_usd" not in current and input_high_water + output_high_water:
+            # Existing unpriced snapshots cannot become a priced history merely
+            # because the newly arriving delta has a known rate.
+            current["unpriced_tokens"] = max(
+                int(current.get("unpriced_tokens", 0)), input_high_water + output_high_water
+            )
         current["cumulative_input_high_water"] = max(input_high_water, int(cin or 0))
         current["cumulative_output_high_water"] = max(output_high_water, int(cout or 0))
         if cin is not None:
@@ -1928,6 +1942,13 @@ def _persist_native_cumulative_usage(
                 + int(current.get("output_tokens", 0))
             )
 
+        current["cumulative_cache_read_high_water"] = max(
+            cache_read_high_water, int(current.get("cache_read_input_tokens", 0))
+        )
+        current["cumulative_cache_write_high_water"] = max(
+            cache_write_high_water, int(current.get("cache_creation_input_tokens", 0))
+        )
+
         fully_priced = cost is not None and float(cost) >= old_cost
         if cost is not None:
             # Monotonic: a reported total below the persisted one is ignored.
@@ -1935,16 +1956,33 @@ def _persist_native_cumulative_usage(
         elif has_tokens:
             if isinstance(model_name, str) and model_name:
                 if pricing is not None:
-                    # SET (cumulative) — price the running token totals.
-                    # ``current`` carries the cache-read split when the harness
-                    # reports it (codex-native does), so compute_llm_cost prices
-                    # cache reads at their own rate; it falls back to the input
-                    # rate for cache tokens when the catalog omits a cache price
-                    # (e.g. ``databricks-*`` entries today).
-                    # Monotonic, like the explicit-cost branch: token totals are
-                    # also client-SET, so a lowered token report can't drop the
-                    # priced cost below the persisted figure.
-                    current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
+                    # Only new tokens use the current route's rate. Repricing
+                    # the entire history would erase spend after a cheaper reroute.
+                    new_cached = min(
+                        input_growth,
+                        max(
+                            0,
+                            int(current.get("cache_read_input_tokens", 0)) - cache_read_high_water,
+                        ),
+                    )
+                    new_written = min(
+                        input_growth - new_cached,
+                        max(
+                            0,
+                            int(current.get("cache_creation_input_tokens", 0))
+                            - cache_write_high_water,
+                        ),
+                    )
+                    current["total_cost_usd"] = old_cost + compute_llm_cost(
+                        {
+                            "input_tokens": input_growth - new_cached - new_written,
+                            "output_tokens": output_growth,
+                            "total_tokens": token_growth,
+                            "cache_read_input_tokens": new_cached,
+                            "cache_creation_input_tokens": new_written,
+                        },
+                        pricing,
+                    )
                     fully_priced = True
 
         if token_growth and not fully_priced:
