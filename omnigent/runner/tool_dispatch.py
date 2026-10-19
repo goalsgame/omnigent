@@ -7078,18 +7078,9 @@ def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
 
 def _runner_default_os_env_cwd(conversation_id: str | None) -> str:
     """Return the cwd for a default runner-owned primary OSEnv."""
-    safe_conv = "default"
-    if conversation_id:
-        safe_conv = "".join(
-            ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in conversation_id
-        )
-    root = Path(
-        os.environ.get(
-            "OMNIGENT_RUNNER_OS_ENV_ROOT",
-            str(Path(tempfile.gettempdir()) / "omnigent-runner-os-envs"),
-        )
-    )
-    cwd = root / safe_conv / "workspace"
+    from omnigent.runner.resource_registry import _session_workspace
+
+    cwd = Path(_session_workspace(conversation_id or "default"))
     cwd.mkdir(parents=True, exist_ok=True)
     return str(cwd)
 

@@ -21,6 +21,7 @@ class _ProcessEnvironment:
 
         backend = "windows_jobobject" if uses_windows_jobobject(spec) else spec.sandbox.type
         self.sandbox = SimpleNamespace(backend_type=backend, copy_on_write_roots=())
+        self.cwd = spec.cwd
         self.closed = False
         self.commands: list[str] = []
 
@@ -223,3 +224,73 @@ async def test_implicit_windows_environment_is_owned_by_session(
     finally:
         await registry.cleanup_session("session-a")
     assert environments[-1].closed
+
+
+@pytest.mark.asyncio
+async def test_selected_workspace_wins_for_execution_and_resource_views(
+    tmp_path: Path, environments: list[_ProcessEnvironment]
+) -> None:
+    launch_root = tmp_path / "runner"
+    selected_root = tmp_path / "project"
+    selected_root.mkdir()
+    registry = SessionResourceRegistry(runner_workspace=launch_root)
+    registry.set_session_workspace_resolver(lambda session: selected_root)
+    spec = _spec(launch_root)
+    try:
+        result = json.loads(
+            await _execute_os_env_tool(
+                "sys_os_shell",
+                {"command": "launch"},
+                agent_spec=spec,
+                conversation_id="session-a",
+                resource_registry=registry,
+                runner_workspace=selected_root,
+            )
+        )
+        assert result["exit_code"] == 0
+        assert environments[0].cwd == str(selected_root)
+        assert (
+            registry.resolve_environment("session-a", DEFAULT_ENVIRONMENT_ID, spec)
+            is environments[0]
+        )
+        assert registry.compute_default_env_root("session-a", spec) == str(selected_root)
+    finally:
+        await registry.cleanup_session("session-a")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools_first", [True, False])
+@pytest.mark.parametrize("cwd", [None, "."])
+async def test_placeholder_workspace_matches_both_entry_points(
+    tmp_path: Path,
+    environments: list[_ProcessEnvironment],
+    monkeypatch: pytest.MonkeyPatch,
+    tools_first: bool,
+    cwd: str | None,
+) -> None:
+    monkeypatch.delenv("OMNIGENT_RUNNER_OS_ENV_ROOT", raising=False)
+    monkeypatch.setattr("omnigent.runner.resource_registry._DEFAULT_WORKSPACE_ROOT", str(tmp_path))
+    spec = _spec(tmp_path)
+    spec.os_env.cwd = cwd
+    registry = SessionResourceRegistry()
+    try:
+        if not tools_first:
+            registry.resolve_environment("session-a", DEFAULT_ENVIRONMENT_ID, spec)
+        result = json.loads(
+            await _execute_os_env_tool(
+                "sys_os_shell",
+                {"command": "launch"},
+                agent_spec=spec,
+                conversation_id="session-a",
+                resource_registry=registry,
+            )
+        )
+        assert result["exit_code"] == 0
+        assert (
+            registry.resolve_environment("session-a", DEFAULT_ENVIRONMENT_ID, spec)
+            is environments[0]
+        )
+        assert environments[0].cwd == str(tmp_path / "session-a" / "workspace")
+        assert len(environments) == 1
+    finally:
+        await registry.cleanup_session("session-a")

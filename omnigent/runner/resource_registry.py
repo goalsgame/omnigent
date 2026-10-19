@@ -472,6 +472,7 @@ class SessionResourceRegistry:
             terminal_registry.environment_resolver = self._resolve_terminal_environment
         self._runner_workspace = runner_workspace
         self._per_session_workspace = per_session_workspace
+        self._session_workspace_resolver: Callable[[str], Path | None] | None = None
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
@@ -1045,9 +1046,21 @@ class SessionResourceRegistry:
             self._primary_env_specs[session_id] = deepcopy(requested_spec)
             return os_env
 
+    def set_session_workspace_resolver(self, resolver: Callable[[str], Path | None]) -> None:
+        """Use the session's selected workspace before the runner launch directory."""
+        self._session_workspace_resolver = resolver
+
+    def _selected_workspace(self, session_id: str) -> Path | None:
+        if self._session_workspace_resolver is None:
+            return None
+        return self._session_workspace_resolver(session_id)
+
     def _effective_primary_spec(self, session_id: str, spec: OSEnvSpec) -> OSEnvSpec:
         """Use the same workspace identity for tools and inherited terminals."""
-        if self._runner_workspace is not None:
+        selected_workspace = self._selected_workspace(session_id)
+        if selected_workspace is not None:
+            cwd = str(selected_workspace)
+        elif self._runner_workspace is not None:
             cwd = (
                 _contained_session_dir(self._runner_workspace, session_id)
                 if self._per_session_workspace
@@ -1090,11 +1103,14 @@ class SessionResourceRegistry:
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
         from omnigent.inner.os_env import create_os_environment
 
+        selected_workspace = self._selected_workspace(session_id)
         # Prefer the CLI launch workspace so that the OS environment
         # cwd matches the filesystem-registry watch path.  Fall back
         # to the per-session temp dir for remote/cloud runners that
         # have no workspace affinity.
-        if self._runner_workspace is not None:
+        if selected_workspace is not None:
+            default_cwd = str(selected_workspace)
+        elif self._runner_workspace is not None:
             if self._per_session_workspace:
                 # Isolate sessions under the shared workspace.
                 default_cwd = _contained_session_dir(self._runner_workspace, session_id)
@@ -1153,17 +1169,18 @@ class SessionResourceRegistry:
         Precedence (per
         designs/SESSION_WORKSPACE_SELECTION.md "How this maps onto runtime"):
 
-        1. ``self._runner_workspace`` (sourced from
+        1. The session-selected workspace supplied by the runner's snapshot cache.
+        2. ``self._runner_workspace`` (sourced from
            ``OMNIGENT_RUNNER_WORKSPACE``) — when set, ALWAYS
            wins. Both CLI- and host-launched sessions populate it
            with the authoritative starting cwd; any spec cwd is
            treated as a session-create-time boundary, not a
            runtime override.
-        2. The agent's absolute ``os_env.cwd``, when present and
+        3. The agent's absolute ``os_env.cwd``, when present and
            not a relative placeholder. Used for pure local runs
            that bypass the env-var path (e.g. unit tests that
            construct an ``AgentSpec`` directly).
-        3. The per-session default workspace tmpdir.
+        4. The per-session default workspace tmpdir.
 
         :param session_id: Session/conversation identifier.
         :param agent_spec: Agent spec for the session.  When provided and its
@@ -1180,6 +1197,10 @@ class SessionResourceRegistry:
             spec_os_env = getattr(agent_spec, "os_env", None)
             if spec_os_env is None:
                 return None
+
+        selected_workspace = self._selected_workspace(session_id)
+        if selected_workspace is not None:
+            return str(selected_workspace.resolve())
 
         # Runner workspace wins when set. Per-session subdirectory
         # isolation is preserved so concurrent sessions

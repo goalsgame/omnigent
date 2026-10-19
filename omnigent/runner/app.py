@@ -1602,6 +1602,16 @@ def create_runner_app(
             runner_workspace=runner_workspace,
             per_session_workspace=per_session_workspace,
         )
+
+    def _cached_session_workspace(session_id: str) -> Path | None:
+        workspace = _session_workspace_cache.get(session_id)
+        return (
+            Path(workspace.strip()).expanduser().resolve()
+            if workspace and workspace.strip()
+            else None
+        )
+
+    resource_registry.set_session_workspace_resolver(_cached_session_workspace)
     app.state.session_resource_registry = resource_registry
 
     def _publish_terminal_activity(session_id: str, terminal_id: str) -> None:

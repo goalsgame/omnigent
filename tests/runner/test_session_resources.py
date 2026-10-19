@@ -136,6 +136,9 @@ class _CapturingResourceRegistry:
         self.resource_roles: list[str | None] = []
         self.launch_lifecycles: list[str] = []
 
+    def set_session_workspace_resolver(self, resolver: Callable[[str], Path | None]) -> None:
+        self._session_workspace_resolver = resolver
+
     def set_terminal_activity_publisher(
         self,
         publisher: Callable[[str, str], None],
