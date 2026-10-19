@@ -324,10 +324,15 @@ async def test_windows_file_reads_do_not_wait_for_running_shell(
 
         def request(self, request: dict) -> dict:
             with self.lock:
-                if request["op"] == "shell":
+                if request["op"] == "shell" and request["command"] == "long-running-command":
                     started.set()
                     assert release.wait(5), "The shell was never released"
                     return {"exit_code": 0}
+                if request["op"] == "shell":
+                    return {
+                        "stdout": '[{"n": "note.txt", "s": 2, "m": 0, "t": "f"}]',
+                        "exit_code": 0,
+                    }
                 return {"content": "file-preview-ok"}
 
         def close(self) -> None:
@@ -352,6 +357,12 @@ async def test_windows_file_reads_do_not_wait_for_running_shell(
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 2), timeout=3)
         result = await asyncio.wait_for(environment.read("note.txt"), timeout=1)
         assert result["content"] == "file-preview-ok"
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        listing = await asyncio.wait_for(
+            CallerProcessFilesystem(environment).list_dir(), timeout=1
+        )
+        assert listing.data[0].name == "note.txt"
         assert not shell.done()
     finally:
         release.set()
@@ -359,3 +370,94 @@ async def test_windows_file_reads_do_not_wait_for_running_shell(
         environment.close()
     assert len(helpers) == 2
     assert all(helper.closed for helper in helpers)
+
+
+@pytest.mark.asyncio
+async def test_selected_isolated_workspace_is_created_before_first_shell(tmp_path: Path) -> None:
+    import sys
+
+    registry = SessionResourceRegistry(
+        runner_workspace=tmp_path / "runner", per_session_workspace=True
+    )
+    project = tmp_path / "project"
+    registry.set_session_workspace_resolver(lambda session: project)
+    spec = _spec(project, "none")
+    try:
+        environment = registry.resolve_environment("cold-session", DEFAULT_ENVIRONMENT_ID, spec)
+        result = await environment.shell(f'"{sys.executable}" -c "print(123)"')
+        assert result.get("exit_code") == 0, result
+        assert result["stdout"].strip() == "123"
+        assert Path(environment.cwd) == project / "cold-session"
+    finally:
+        await registry.cleanup_session("cold-session")
+
+
+@pytest.mark.asyncio
+async def test_windows_channels_share_scratch_for_relative_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import os_env
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    class Helper:
+        def __init__(self, *, shared_scratch: Path, **kwargs: object) -> None:
+            self.root = shared_scratch
+            self.closed = False
+
+        def request(self, request: dict) -> dict:
+            assert self.root.is_dir()
+            if request["op"] == "shell":
+                (self.root / "note.txt").write_text("scratch-ok")
+                return {"exit_code": 0}
+            return {"content": (self.root / request["path"]).read_text()}
+
+        def close(self) -> None:
+            if not self.closed:
+                assert self.root.is_dir(), "Scratch removed before both helpers closed"
+                self.closed = True
+
+    monkeypatch.setattr(os_env, "_HelperProcessClient", Helper)
+    environment = os_env.CallerProcessOSEnvironment(
+        spec=OSEnvSpec(),
+        cwd=tmp_path,
+        shell_path="cmd.exe",
+        _start_in_scratch=True,
+        sandbox=SandboxPolicy(
+            backend_type="windows_jobobject",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    scratch = environment._shared_scratch
+    assert scratch is not None
+    try:
+        result = await environment.shell("printf scratch-ok > note.txt")
+        assert result.get("exit_code") == 0, result
+        assert (await environment.read("note.txt"))["content"] == "scratch-ok"
+    finally:
+        environment.close()
+    assert not scratch.exists()
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_native_windows_scratch_shell_to_file_round_trip(tmp_path: Path) -> None:
+    from omnigent.inner.os_env import create_os_environment
+
+    environment = create_os_environment(
+        OSEnvSpec(
+            cwd=str(tmp_path),
+            start_in_scratch=True,
+            sandbox=OSEnvSandboxSpec(type="windows_jobobject"),
+        )
+    )
+    assert environment is not None
+    try:
+        result = await environment.shell("echo scratch-ok>note.txt")
+        assert result.get("exit_code") == 0, result
+        assert (await environment.read("note.txt"))["content"].strip() == "scratch-ok"
+    finally:
+        environment.close()

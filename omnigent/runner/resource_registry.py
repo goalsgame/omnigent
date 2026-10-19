@@ -1113,6 +1113,9 @@ class SessionResourceRegistry:
         # have no workspace affinity.
         if selected_workspace is not None:
             default_cwd = str(selected_workspace)
+            if self._per_session_workspace:
+                os.makedirs(default_cwd, mode=0o700, exist_ok=True)
+                os.chmod(default_cwd, 0o700)
         elif self._runner_workspace is not None:
             if self._per_session_workspace:
                 # Isolate sessions under the shared workspace.
