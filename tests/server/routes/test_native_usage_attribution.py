@@ -816,3 +816,31 @@ def test_split_cost_and_tokens_do_not_double_charge(
         store,
     )
     assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(reported_cost + 1)
+
+
+def test_catalog_recovery_replay_does_not_create_a_priced_zero(db_uri, monkeypatch):
+    from omnigent.llms import context_window
+    from omnigent.policies.builtins.cost import _usage_is_unpriced
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="catalog-replay", agent_id=_AGENT_ID)
+    monkeypatch.setattr(context_window, "fetch_model_pricing_with_provider", lambda *a, **k: None)
+    report = {
+        "model": "priced-model",
+        "cumulative_input_tokens": 100,
+        "cumulative_output_tokens": 0,
+    }
+    _persist_native_cumulative_usage(conv.id, report, store)
+    assert _usage_is_unpriced(_usage(store, conv.id))
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.01,
+            output_per_token=0.01,
+        ),
+    )
+    _persist_native_cumulative_usage(conv.id, report, store)
+    assert _usage_is_unpriced(_usage(store, conv.id))
+    assert "total_cost_usd" not in _usage(store, conv.id)
+    assert _usage(store, conv.id)["unpriced_tokens"] == 100

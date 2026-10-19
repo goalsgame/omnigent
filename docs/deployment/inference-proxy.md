@@ -201,7 +201,8 @@ for that session. Cumulative native reports price only newly observed tokens,
 so route changes preserve historical spend and replays do not add cost. These are
 estimates, not provider invoices. Catalog
 failures, invalid rates and context-tier prices that require per-request usage
-remain unpriced.
+remain unpriced. A replay after pricing recovers does not turn previously
+unpriced history into a priced zero.
 
 Set `inference_proxy.session_cost_limits` to a mapping of session-owner subject
 IDs to positive USD amounts, for example:

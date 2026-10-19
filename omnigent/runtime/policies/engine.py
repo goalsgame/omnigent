@@ -85,8 +85,8 @@ class PolicyEngine:
         Defaults to all-zeros when no prior usage exists.
     :param token_pricing: Full per-token pricing from the MLflow
         catalog, including cache-read and cache-write rates.
-        ``None`` when pricing is unavailable — ``total_cost_usd``
-        stays at ``0.0`` in that case.
+        ``None`` when pricing is unavailable — unpriced consumption does not
+        create a ``total_cost_usd`` entry.
     :param initial_model: The model the session is currently
         using — the conversation's ``model_override`` when set,
         else the agent spec's ``llm.model``, e.g.
@@ -147,6 +147,10 @@ class PolicyEngine:
                 "cache_creation_input_tokens": 0,
                 "total_cost_usd": 0.0,
             }
+        )
+        self._has_priced_usage = bool(initial_usage and "total_cost_usd" in initial_usage)
+        self._subtree_has_priced_usage = bool(
+            initial_subtree_usage and "total_cost_usd" in initial_subtree_usage
         )
         # Ensure cache-token keys exist even when seeded from old
         # persisted usage that predates cache-token tracking.
@@ -709,10 +713,9 @@ class PolicyEngine:
         Add token counts to the cumulative usage counters.
 
         Called by the workflow after each LLM call. The counts are
-        additive — each call increments the running totals. After
-        updating the in-memory counters, persists the new totals
-        to the conversation's ``session_usage`` column so they
-        survive across turns.
+        additive — each call increments the running aggregate counters and
+        atomically persists this conversation's delta to ``session_usage``.
+        Unpriced usage keeps the cost absent rather than introducing a zero.
 
         Cost is computed via :func:`compute_llm_cost` when
         :attr:`_token_pricing` is set, pricing cache-read and
@@ -740,7 +743,11 @@ class PolicyEngine:
         self._usage["total_tokens"] += total_tokens
         self._usage["cache_read_input_tokens"] += cache_read_input_tokens
         self._usage["cache_creation_input_tokens"] += cache_creation_input_tokens
-        if self._token_pricing is not None:
+        priced_delta = self._token_pricing is not None and bool(
+            input_tokens or output_tokens or cache_read_input_tokens or cache_creation_input_tokens
+        )
+        if priced_delta:
+            assert self._token_pricing is not None
             delta_usage = {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -748,16 +755,25 @@ class PolicyEngine:
                 "cache_creation_input_tokens": cache_creation_input_tokens,
             }
             delta_cost = compute_llm_cost(delta_usage, self._token_pricing)
-            self._usage["total_cost_usd"] += delta_cost
+            self._usage["total_cost_usd"] = self._usage.get("total_cost_usd", 0.0) + delta_cost
+            self._has_priced_usage = True
         else:
             delta_cost = 0.0
+            if not self._has_priced_usage:
+                self._usage.pop("total_cost_usd", None)
         if self._subtree_usage is not None:
             self._subtree_usage["input_tokens"] += input_tokens
             self._subtree_usage["output_tokens"] += output_tokens
             self._subtree_usage["total_tokens"] += total_tokens
             self._subtree_usage["cache_read_input_tokens"] += cache_read_input_tokens
             self._subtree_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
-            self._subtree_usage["total_cost_usd"] += delta_cost
+            if priced_delta:
+                self._subtree_usage["total_cost_usd"] = (
+                    self._subtree_usage.get("total_cost_usd", 0.0) + delta_cost
+                )
+                self._subtree_has_priced_usage = True
+            elif not self._subtree_has_priced_usage:
+                self._subtree_usage.pop("total_cost_usd", None)
         delta: dict[str, Any] = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -765,8 +781,9 @@ class PolicyEngine:
             "cache_read_input_tokens": cache_read_input_tokens,
             "cache_creation_input_tokens": cache_creation_input_tokens,
         }
-        delta["total_cost_usd"] = delta_cost
-        if self._token_pricing is None:
+        if priced_delta:
+            delta["total_cost_usd"] = delta_cost
+        else:
             delta["unpriced_tokens"] = (
                 input_tokens
                 + output_tokens

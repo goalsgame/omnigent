@@ -2006,3 +2006,61 @@ def test_priced_policy_delta_keeps_legacy_child_history_unpriced(conversation_st
     assert current["unpriced_tokens"] == 20
     assert engine.usage["total_cost_usd"] == pytest.approx(9)
     assert engine.usage["unpriced_tokens"] == 20
+
+
+def test_unpriced_usage_stays_unpriced_after_record_and_rebuild(conversation_store, monkeypatch):
+    from omnigent.policies.builtins.cost import _usage_is_unpriced
+
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder.fetch_model_pricing_with_provider", lambda *a, **k: None
+    )
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_usage(
+        conv.id,
+        {
+            "input_tokens": 100,
+            "output_tokens": 0,
+            "total_tokens": 100,
+        },
+    )
+    spec = AgentSpec(spec_version=1, name="unknown", llm=LLMConfig(model="unknown-model"))
+    engine = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    assert _usage_is_unpriced(engine.usage)
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    assert _usage_is_unpriced(engine.usage)
+    persisted = conversation_store.get_conversation(conv.id).session_usage
+    assert "total_cost_usd" not in persisted
+    assert persisted["unpriced_tokens"] == 110
+    rebuilt = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    assert _usage_is_unpriced(rebuilt.usage)
+
+
+def test_explicitly_free_usage_retains_priced_zero_after_rebuild(conversation_store, monkeypatch):
+    from omnigent.llms.context_window import ModelPricing
+    from omnigent.policies.builtins.cost import _usage_is_unpriced
+
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder.fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0,
+            output_per_token=0,
+        ),
+    )
+    conv = conversation_store.create_conversation()
+    spec = AgentSpec(spec_version=1, name="free", llm=LLMConfig(model="free-model"))
+    engine = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    current = conversation_store.get_conversation(conv.id).session_usage
+    assert current["total_cost_usd"] == 0
+    assert not _usage_is_unpriced(current)
+    rebuilt = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    assert rebuilt.usage["total_cost_usd"] == 0
+    assert not _usage_is_unpriced(rebuilt.usage)

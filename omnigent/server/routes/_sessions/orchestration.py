@@ -1971,7 +1971,11 @@ def _persist_native_cumulative_usage(
             current["total_cost_usd"] = max(old_cost, float(cost))
         elif has_tokens:
             if isinstance(model_name, str) and model_name:
-                if pricing is not None and not current.get("pending_cost_coverage"):
+                if (
+                    pricing is not None
+                    and token_growth
+                    and not current.get("pending_cost_coverage")
+                ):
                     # Only new tokens use the current route's rate. Repricing
                     # the entire history would erase spend after a cheaper reroute.
                     new_cached = min(
