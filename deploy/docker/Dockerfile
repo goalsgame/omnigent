@@ -391,6 +391,11 @@ COPY --from=builder /build /build
 RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
 
+# Immutable PATH entry works in login shells and background/native tool processes.
+RUN mkdir -p /usr/local/libexec/omnigent \
+ && mv /usr/local/bin/gh /usr/local/libexec/omnigent/gh
+COPY --chmod=0755 deploy/docker/gh /usr/local/bin/gh
+
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
 # PATH above would silently drop off and `omnigent` / `pip` would

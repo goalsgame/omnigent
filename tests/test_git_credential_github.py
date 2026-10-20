@@ -15,10 +15,11 @@ from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
 
 @pytest.fixture(autouse=True)
-def _force_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+def _force_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     # The broker host integrations are sandbox-only; default every test to the
     # in-sandbox path. The not-in-sandbox no-op test clears IS_SANDBOX explicitly.
     monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def test_get_prints_credentials_for_github(monkeypatch: pytest.MonkeyPatch) -> None:

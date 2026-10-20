@@ -182,6 +182,9 @@ RUN set -eu; \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 
+RUN mkdir -p /usr/local/libexec/omnigent \
+ && mv /usr/local/bin/gh /usr/local/libexec/omnigent/gh
+COPY --chmod=0755 deploy/docker/gh /usr/local/bin/gh
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
 
 # Optional extra harness CLIs, off by default — see install-harness-cli.sh and
