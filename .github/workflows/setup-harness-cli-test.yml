@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/actions/setup-harness-cli/**"
       - ".github/ci-deps/package.json"
+      - "deploy/docker/pi-version"
       - ".github/workflows/setup-harness-cli-test.yml"
   workflow_dispatch:
 

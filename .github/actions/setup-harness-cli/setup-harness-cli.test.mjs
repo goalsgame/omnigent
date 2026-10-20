@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -105,4 +105,30 @@ test("retry helper propagates exhaustion after three attempts", async () => {
     /failed after 3 attempts \(exit 23\)/,
   );
   assert.deepEqual(attempts, [1, 2, 3]);
+});
+
+test("pinned remote Pi installers use the tested release override", async () => {
+  const manifest = await loadManifest();
+  const githubDirectory = path.resolve(actionDirectory, "..", "..");
+  let callers = 0;
+  for (const name of await readdir(githubDirectory, { recursive: true })) {
+    if (!/\.ya?ml$/.test(name)) continue;
+    const source = await readFile(path.join(githubDirectory, name), "utf8");
+    let remote = false, harness, version;
+    const check = () => {
+      if (remote && harness === "pi") {
+        callers++;
+        assert.equal(version, manifest.pi.version, name);
+      }
+    };
+    for (const line of source.split("\n")) {
+      if (/^\s*-\s/.test(line)) { check(); remote = false; harness = version = undefined; }
+      if (/uses:.*setup-harness-cli@/.test(line)) remote = true;
+      const field = line.match(/^\s*(harness|version):\s*["']?([^"'\s]+)["']?\s*$/);
+      if (field?.[1] === "harness") harness = field[2];
+      if (field?.[1] === "version") version = field[2];
+    }
+    check();
+  }
+  assert.ok(callers > 0);
 });

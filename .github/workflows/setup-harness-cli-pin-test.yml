@@ -51,4 +51,8 @@ jobs:
 
           pin="$unique_pins"
           git fetch --no-tags --depth=1 origin "$pin"
-          git diff --exit-code "$pin" HEAD -- .github/actions/setup-harness-cli
+          # Version overrides select package releases; the executable installer remains pinned.
+          git diff --exit-code "$pin" HEAD -- \
+            .github/actions/setup-harness-cli/action.yml \
+            .github/actions/setup-harness-cli/install.mjs \
+            .github/actions/setup-harness-cli/resolve.mjs
