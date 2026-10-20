@@ -75,6 +75,8 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # Config locations, not bearer tokens: agent tools use the host's CLI login.
         "GH_CONFIG_DIR",
         "GLAB_CONFIG_DIR",
+        # Nonsecret managed-image marker: gh must renew brokered credentials.
+        "IS_SANDBOX",
         OMNIGENT_SESSION_ENV_VAR,
         # Windows system / profile constants (SYSTEMROOT is mandatory for
         # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX

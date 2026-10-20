@@ -1,3 +1,3 @@
 #!/bin/sh
 # Managed images resolve fresh owner credentials before invoking the real CLI.
-exec /opt/venv/bin/python -m omnigent.github_cli "$@"
+exec /opt/venv/bin/python -I -m omnigent.github_cli "$@"

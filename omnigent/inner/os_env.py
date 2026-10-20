@@ -131,6 +131,8 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     "LOGNAME",
     "SHELL",
     "PWD",
+    # Nonsecret managed-image marker used by the per-invocation gh broker.
+    "IS_SANDBOX",
     # Terminal capabilities and timezone.
     "TERM",
     "TZ",

@@ -171,7 +171,7 @@ def test_never_linked_owner_keeps_legacy_authentication(managed_home: Path, monk
 def test_packaged_shim_uses_immutable_executable_and_preserves_arguments() -> None:
     root = Path(__file__).resolve().parents[1]
     shim = (root / "deploy/docker/gh").read_text()
-    assert 'exec /opt/venv/bin/python -m omnigent.github_cli "$@"' in shim
+    assert 'exec /opt/venv/bin/python -I -m omnigent.github_cli "$@"' in shim
     for name in ("Dockerfile", "Dockerfile.ubi"):
         dockerfile = (root / "deploy/docker" / name).read_text()
         assert "mv /usr/local/bin/gh /usr/local/libexec/omnigent/gh" in dockerfile
@@ -185,9 +185,11 @@ def test_local_host_cannot_write_broker_configuration(managed_home: Path, monkey
     assert not github_cli.broker_path().exists()
 
 
+@pytest.mark.parametrize("environment", ["inherited", "agent", "helper"])
 def test_real_subprocess_renews_each_invocation_and_never_replays_mutation(
     managed_home: Path,
     monkeypatch: pytest.MonkeyPatch,
+    environment: str,
 ) -> None:
     state = {"token": "initial-test-token", "available": True, "fetches": 0}
 
@@ -221,8 +223,14 @@ def test_real_subprocess_renews_each_invocation_and_never_replays_mutation(
         "sys.exit(7)\n"
     )
     real_gh.chmod(0o700)
+    # An older checkout/PYTHONPATH must not shadow the installed launcher.
+    shadow = managed_home / "workspace"
+    (shadow / "omnigent").mkdir(parents=True)
+    (shadow / "omnigent" / "__init__.py").write_text("raise RuntimeError('workspace shadow')")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
     command = [
         sys.executable,
+        "-I",
         "-c",
         "import sys; from omnigent import github_cli; "
         "github_cli._GH_EXECUTABLE=sys.argv[1]; "
@@ -237,17 +245,42 @@ def test_real_subprocess_renews_each_invocation_and_never_replays_mutation(
             "host-id",
             "test-host-authority",
         )
+        env = dict(os.environ)
+        if environment == "agent":
+            from omnigent.inner.agent_env import clean_agent_env
+
+            env = clean_agent_env(source=env)
+        elif environment == "helper":
+            from omnigent.inner.os_env import build_helper_env
+            from omnigent.inner.sandbox import SandboxPolicy
+
+            policy = SandboxPolicy(
+                backend_type="none",
+                active=True,
+                read_roots=None,
+                write_roots=[],
+                write_files=[],
+                allow_network=True,
+            )
+            env = build_helper_env(env, policy)
+        assert env["IS_SANDBOX"] == "1"
+        if environment != "inherited":
+            assert HOST_TOKEN_ENV_VAR not in env
         for token in ("initial-test-token", "rotated-test-token"):
             state["token"] = token
             expected.write_text(token)
-            result = subprocess.run(command, text=True, capture_output=True, timeout=20)
+            result = subprocess.run(
+                command, text=True, capture_output=True, timeout=20, env=env, cwd=shadow
+            )
             assert result.returncode == 7  # Preserve status; never replay a failed mutation.
             assert result.stdout.strip() == "authenticated"
             assert token not in result.stderr
         assert calls.read_text().splitlines() == ["invoked", "invoked"]
         assert state["fetches"] == 2
         state["available"] = False
-        result = subprocess.run(command, text=True, capture_output=True, timeout=20)
+        result = subprocess.run(
+            command, text=True, capture_output=True, timeout=20, env=env, cwd=shadow
+        )
         assert result.returncode == 1
         assert calls.read_text().splitlines() == ["invoked", "invoked"]
         assert not result.stdout
