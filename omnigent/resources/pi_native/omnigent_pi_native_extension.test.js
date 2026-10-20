@@ -625,8 +625,36 @@ async function testLegacyPiRetainsConnectorTools() {
   assert("legacy Pi keeps direct tool registration", h.registeredTools.docs__lookup && h.registeredTools.docs__lookup.exposure === undefined);
 }
 
+async function testPeerNotificationsAreTypedDeduplicatedAndSteered() {
+  for (const active of [false, true]) {
+    const h = makeHarness({ captureEvents: true });
+    const delivered = [];
+    h.pi.sendMessage = (message, options) => delivered.push({ message, options });
+    const ctx = makeCtx({ idle: !active });
+    await h.handlers.session_start({}, ctx);
+    if (active) await h.handlers.agent_start({}, ctx);
+    const id = active ? "a".repeat(64) : "b".repeat(64);
+    const file = path.join(h.inboxDir, `peer_${id}.json`);
+    const payload = JSON.stringify({ id, type: "peer_notification", message_ids: ["c".repeat(32)] });
+    fs.writeFileSync(file, payload);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert("peer message delivered exactly once", delivered.length === 1);
+    assert("typed as peer content", delivered[0].message.customType === "omnigent-peer-notification");
+    assert("idle starts a turn; active steers", delivered[0].options.deliverAs === (active ? "steer" : "followUp"));
+    assert("triggers processing", delivered[0].options.triggerTurn === true);
+    assert("not acknowledged before actual context delivery", !fs.existsSync(path.join(h.inboxDir, "peer-receipts", id)));
+    await h.handlers.message_start({ message: { role: "custom", ...delivered[0].message } }, ctx);
+    assert("receipt persisted after context delivery", fs.existsSync(path.join(h.inboxDir, "peer-receipts", id)));
+    fs.writeFileSync(file, payload);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert("retry does not trigger another turn", delivered.length === 1);
+    assert("never interrupts tools", ctx.abortCount === 0);
+  }
+}
+
 (async () => {
   try {
+    await testPeerNotificationsAreTypedDeduplicatedAndSteered();
     await testConnectorCatalogUsesNativeDiscovery();
     await testLegacyPiRetainsConnectorTools();
     await testEmptyLengthCompletionFailsVisiblyAndRetryResets();

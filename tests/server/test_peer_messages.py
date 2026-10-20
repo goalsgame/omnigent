@@ -558,3 +558,245 @@ async def test_delayed_send_and_backward_clock_cannot_land_behind_cursor(peer_en
         after_cleanup = store.send(replace(delayed, id=uuid.uuid4().hex))
         assert after_cleanup.created_at > committed.created_at
         assert [row.id for row in store.list_messages(target)] == [after_cleanup.id]
+
+
+@pytest.mark.asyncio
+async def test_notification_claims_retry_and_ack_are_separate(peer_env, db_uri):
+    from dataclasses import replace
+
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlPeerDelivery
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, messages, _, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        message = (
+            await client.post(_path(source), json=_message(target), headers=_headers())
+        ).json()
+    store = PeerDeliveryStore(db_uri)
+    mailbox = messages.mailbox_id(target)
+    default = DeliveryPolicy()
+    batch = store.claim(target, mailbox, default)
+    assert batch.message_ids == (message["id"],)
+    assert PeerDeliveryStore(db_uri).claim(target, mailbox, default) is None
+    assert store.finish(replace(batch, lease="f" * 32), accepted=True) is False
+    assert store.finish(batch, accepted=False)
+    with get_or_create_engine(db_uri).begin() as conn:
+        conn.execute(update(SqlPeerDelivery).values(retry_at=0))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(_path(source), json=_message(target), headers=_headers())
+    retry = store.claim(target, mailbox, default)
+    assert retry.id == batch.id
+    assert retry.lease != batch.lease
+    assert store.finish(batch, accepted=True) is False
+    assert store.finish(retry, accepted=True)
+    assert messages.list_messages(target, unread_only=True)[0].acknowledged_at is None
+    assert store.claim(target, mailbox, default) is None
+
+
+@pytest.mark.asyncio
+async def test_notification_policy_and_budget_survive_store_restart(peer_env, db_uri):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlPeerDelivery
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, messages, _, _, source, target, _ = peer_env
+    store = PeerDeliveryStore(db_uri)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(_path(source), json=_message(target), headers=_headers())
+        mailbox = messages.mailbox_id(target)
+        store.set_policy(target, mailbox, "alice@example.test", DeliveryPolicy(enabled=False))
+        assert store.claim(target, mailbox, DeliveryPolicy()) is None
+        store.set_policy(
+            target, mailbox, "alice@example.test", DeliveryPolicy(wake_on_message=True)
+        )
+        assert PeerDeliveryStore(db_uri).policy(target, mailbox, DeliveryPolicy()).wake_on_message
+        for _ in range(6):
+            batch = store.claim(target, mailbox, DeliveryPolicy())
+            assert batch is not None
+            assert store.finish(batch, accepted=True)
+            await client.post(_path(source), json=_message(target), headers=_headers())
+            with get_or_create_engine(db_uri).begin() as conn:
+                conn.execute(update(SqlPeerDelivery).values(retry_at=0))
+        assert PeerDeliveryStore(db_uri).claim(target, mailbox, DeliveryPolicy()) is None
+
+
+@pytest.mark.asyncio
+async def test_notification_owner_settings_enforce_origin_strict_types_and_visibility(
+    peer_env, db_uri
+):
+    from types import SimpleNamespace
+
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    _, _, conversations, permissions, source, target, _ = peer_env
+    store = PeerDeliveryStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_peer_messages_router(
+            store,
+            conversations,
+            permissions,
+            _Auth(),
+            notifier=SimpleNamespace(
+                store=store, defaults=lambda conv: DeliveryPolicy(), supported=lambda conv: True
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request, exc):
+        return JSONResponse({"error": str(exc)}, status_code=exc.http_status)
+
+    path = f"/v1/sessions/{target}/peer-notifications"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (await client.get(path, headers=_headers("reader@example.test"))).json()[
+            "can_manage"
+        ] is False
+        assert (
+            await client.put(
+                path,
+                json={"enabled": True, "wake_on_message": True},
+                headers=_headers("reader@example.test"),
+            )
+        ).status_code == 403
+        assert (
+            await client.put(
+                path,
+                json={"enabled": True, "wake_on_message": True},
+                headers=_headers(origin="https://untrusted.example.test"),
+            )
+        ).status_code == 403
+        assert (
+            await client.put(
+                path, json={"enabled": True, "wake_on_message": "true"}, headers=_headers()
+            )
+        ).status_code == 422
+        result = await client.put(
+            path, json={"enabled": True, "wake_on_message": True}, headers=_headers()
+        )
+        assert result.status_code == 200, result.text
+        assert (await client.get(path, headers=_headers())).json()["wake_on_message"] is True
+        assert store.policy(source, "f" * 32, DeliveryPolicy()).wake_on_message is False
+
+
+@pytest.mark.asyncio
+async def test_notification_scan_scopes_workspace_and_ignores_acknowledged_mail(peer_env, db_uri):
+    from omnigent.stores.peer_delivery_store import PeerDeliveryStore
+
+    app, messages, _, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        mid = (await client.post(_path(source), json=_message(target), headers=_headers())).json()[
+            "id"
+        ]
+    store = PeerDeliveryStore(db_uri)
+    assert store.candidates() == [(0, target, messages.mailbox_id(target))]
+    with workspace_scope(12):
+        assert messages.list_messages(target) == []
+    messages.acknowledge(target, mid, "bob@example.test")
+    assert store.candidates() == []
+
+
+@pytest.mark.asyncio
+async def test_notifier_retries_until_runner_receipt_without_acknowledging(
+    peer_env, db_uri, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlPeerDelivery
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.server import peer_notifications
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, messages, conversations, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        mid = (await client.post(_path(source), json=_message(target), headers=_headers())).json()[
+            "id"
+        ]
+    store = PeerDeliveryStore(db_uri)
+    posts = []
+
+    async def transport(request):
+        posts.append(json.loads(request.content))
+        return httpx.Response(202 if len(posts) == 1 else 200, json={"delivered": len(posts) > 1})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(transport), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            orchestration, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+        )
+        notifier = peer_notifications.PeerNotifier(
+            store, SimpleNamespace(runner_router=None), conversations, None, None
+        )
+        monkeypatch.setattr(notifier, "defaults", lambda conv: DeliveryPolicy())
+        monkeypatch.setattr(notifier, "supported", lambda conv: True)
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+        mailbox = messages.mailbox_id(target)
+        await notifier.deliver(target, mailbox)
+        with get_or_create_engine(db_uri).begin() as conn:
+            conn.execute(update(SqlPeerDelivery).values(retry_at=0))
+        await notifier.deliver(target, mailbox)
+    assert len(posts) == 2
+    assert posts[0] == posts[1]
+    assert posts[0]["type"] == "peer_notification" and posts[0]["message_ids"] == [mid]
+    assert "body" not in posts[0] and "subject" not in posts[0]
+    assert messages.list_messages(target, unread_only=True)[0].acknowledged_at is None
+    assert store.candidates() == []
+
+
+@pytest.mark.asyncio
+async def test_notifier_does_not_wake_by_default(peer_env, db_uri, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.peer_notifications import PeerNotifier
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, messages, conversations, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(_path(source), json=_message(target), headers=_headers())
+    store = PeerDeliveryStore(db_uri)
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    wake = AsyncMock(return_value=(None, conversations.get_conversation(target)))
+    monkeypatch.setattr(orchestration, "ensure_runner_connected", wake)
+    notifier = PeerNotifier(store, SimpleNamespace(runner_router=None), conversations, None, None)
+    monkeypatch.setattr(notifier, "defaults", lambda conv: DeliveryPolicy())
+    monkeypatch.setattr(notifier, "supported", lambda conv: True)
+    await notifier.deliver(target, messages.mailbox_id(target))
+    wake.assert_not_called()
+    store.set_policy(
+        target,
+        messages.mailbox_id(target),
+        "alice@example.test",
+        DeliveryPolicy(wake_on_message=True),
+    )
+    await notifier.deliver(target, messages.mailbox_id(target))
+    wake.assert_awaited_once()

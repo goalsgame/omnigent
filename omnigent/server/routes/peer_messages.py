@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import asdict
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
@@ -45,11 +45,19 @@ class SendPeerMessage(BaseModel):
         return value
 
 
+class NotificationSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool
+    wake_on_message: bool
+
+
 def create_peer_messages_router(
     store: PeerMessageStore,
     conversations: ConversationStore,
     permissions: PermissionStore | None,
     auth: AuthProvider | None,
+    *,
+    notifier: Any = None,
 ) -> APIRouter:
     """Expose inboxes to readers, sends and acknowledgements to session editors."""
 
@@ -70,7 +78,7 @@ def create_peer_messages_router(
 
     class BoundedMessageRoute(APIRoute):
         async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
-            if scope["type"] == "http" and scope["method"] == "POST":
+            if scope["type"] == "http" and scope["method"] in {"POST", "PUT"}:
                 request = Request(scope)
                 require_user(request, auth)
                 require_trusted_origin(request)
@@ -93,6 +101,52 @@ def create_peer_messages_router(
         response.headers["Cache-Control"] = "private, no-store"
 
     router = APIRouter(route_class=BoundedMessageRoute, dependencies=[Depends(private_response)])
+
+    @router.get("/sessions/{session_id}/peer-notifications")
+    async def notification_settings(session_id: str, request: Request) -> dict:
+        if notifier is None:
+            raise HTTPException(404, "Peer notifications unavailable")
+        _, mailbox = await authorize(request, session_id, 1)
+        conv = await asyncio.to_thread(conversations.get_conversation, session_id)
+        default = await asyncio.to_thread(notifier.defaults, conv)
+        policy = (
+            await asyncio.to_thread(notifier.store.policy, session_id, mailbox, default)
+            if mailbox
+            else default
+        )
+        user = require_user(request, auth) or "local"
+        owner = await asyncio.to_thread(
+            conversations.get_session_owner, session_id, owner_only=True
+        )
+        return {
+            **asdict(policy),
+            "can_manage": user == owner,
+            "max_batches_per_hour": 6,
+            "supported": await asyncio.to_thread(notifier.supported, conv),
+        }
+
+    @router.put("/sessions/{session_id}/peer-notifications")
+    async def update_notification_settings(
+        session_id: str, body: NotificationSettings, request: Request
+    ) -> dict:
+        if notifier is None:
+            raise HTTPException(404, "Peer notifications unavailable")
+        user, mailbox = await authorize(request, session_id, 4)
+        owner = await asyncio.to_thread(
+            conversations.get_session_owner, session_id, owner_only=True
+        )
+        if user != owner:
+            raise HTTPException(403, "Only the session owner can change automatic processing")
+        from omnigent.stores.peer_delivery_store import DeliveryPolicy
+
+        await asyncio.to_thread(
+            notifier.store.set_policy,
+            session_id,
+            mailbox,
+            user,
+            DeliveryPolicy(**body.model_dump()),
+        )
+        return {**body.model_dump(), "can_manage": True, "max_batches_per_hour": 6}
 
     @router.post("/sessions/{session_id}/peer-messages", status_code=201)
     async def send_message(session_id: str, message: SendPeerMessage, request: Request) -> dict:

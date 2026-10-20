@@ -1812,9 +1812,18 @@ def create_app(
             if publication_store is not None
             else None
         )
+        peer_notifier = getattr(app_inst.state, "peer_notifier", None)
+        peer_notifications = (
+            asyncio.create_task(peer_notifier.run()) if peer_notifier is not None else None
+        )
         try:
             yield
         finally:
+            if peer_notifications is not None:
+                peer_notifications.cancel()
+                with suppress(asyncio.CancelledError):
+                    await peer_notifications
+
             if publication_cleanup is not None:
                 publication_cleanup.cancel()
                 with suppress(asyncio.CancelledError):
@@ -3355,15 +3364,22 @@ def create_app(
         return {"user_id": user_id, "is_admin": flagged or listed}
 
     if isinstance(publication_uri, str):
+        from omnigent.server.peer_notifications import PeerNotifier
         from omnigent.server.routes.peer_messages import create_peer_messages_router
-        from omnigent.stores.peer_message_store import PeerMessageStore
+        from omnigent.stores.peer_delivery_store import PeerDeliveryStore
 
+        peer_store = PeerDeliveryStore(publication_uri)
+        peer_notifier = PeerNotifier(
+            peer_store, app.state, conversation_store, agent_store, agent_cache
+        )
+        app.state.peer_notifier = peer_notifier
         app.include_router(
             create_peer_messages_router(
-                PeerMessageStore(publication_uri),
+                peer_store,
                 conversation_store,
                 permission_store,
                 auth_provider,
+                notifier=peer_notifier,
             ),
             prefix="/v1",
         )
@@ -4063,6 +4079,7 @@ def create_app(
     machine_verifier = (
         auth_provider.machine_verifier if isinstance(auth_provider, UnifiedAuthProvider) else None
     )
+    app.state.peer_machine_verifier = machine_verifier
     github_machine_bindings = parse_machine_bindings(
         (server_config or {}).get("github_machine_auth"),
         principals=(machine_verifier.config.principals if machine_verifier else frozenset()),

@@ -495,3 +495,46 @@ def _atomic_text(path: Path, text: str) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+
+
+def enqueue_peer_notification(
+    bridge_dir: Path, notification_id: str, message_ids: list[str]
+) -> bool:
+    """Queue one typed notification, returning whether Pi has accepted it already."""
+    if (
+        not isinstance(notification_id, str)
+        or len(notification_id) != 64
+        or any(c not in "0123456789abcdef" for c in notification_id)
+    ):
+        raise ValueError("Invalid notification id")
+    if (
+        not isinstance(message_ids, list)
+        or not 1 <= len(message_ids) <= 20
+        or any(
+            not isinstance(mid, str)
+            or len(mid) != 32
+            or any(c not in "0123456789abcdef" for c in mid)
+            for mid in message_ids
+        )
+    ):
+        raise ValueError("Invalid peer message ids")
+    if not (bridge_dir / _INPUT_READY_FILE).is_file():
+        raise OSError("Pi input is not ready")
+    receipts = bridge_dir / "peer-receipts"
+    if (receipts / notification_id).is_file():
+        return True
+    inbox = bridge_dir / _INBOX_DIR
+    inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = inbox / f"peer_{notification_id}.json"
+    if target.exists():
+        queued = json.loads(target.read_text(encoding="utf-8"))
+        submitted = queued.get("submitted_at")
+        if isinstance(submitted, (int, float)) and time.time() * 1000 - submitted >= 120_000:
+            queued.pop("submitted_at", None)
+            _atomic_json(target, queued)
+    else:
+        _atomic_json(
+            target,
+            {"id": notification_id, "type": "peer_notification", "message_ids": message_ids},
+        )
+    return False

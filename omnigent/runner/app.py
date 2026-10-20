@@ -6255,6 +6255,29 @@ def create_runner_app(
             body.get("model_override") if isinstance(body, dict) else None,
             extra={"session_id": conversation_id},
         )
+        if body_type == "peer_notification":
+            if _session_harness_name(conversation_id) != "pi-native":
+                return JSONResponse(status_code=409, content={"error": "unsupported_harness"})
+            from omnigent.harnesses.pi_native.bridge import (
+                bridge_dir_for_session_id,
+                enqueue_peer_notification,
+            )
+
+            try:
+                delivered = await asyncio.to_thread(
+                    enqueue_peer_notification,
+                    bridge_dir_for_session_id(conversation_id),
+                    body.get("notification_id"),
+                    body.get("message_ids"),
+                )
+                return JSONResponse(
+                    status_code=200 if delivered else 202, content={"delivered": delivered}
+                )
+            except (ValueError, TypeError):
+                return JSONResponse(status_code=400, content={"error": "invalid_notification"})
+            except OSError:
+                return JSONResponse(status_code=503, content={"error": "peer_input_unavailable"})
+
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's

@@ -70,3 +70,38 @@ def test_upgrade_from_artifacts_preserves_data(tmp_path):
     command.downgrade(config, "oa1b2c3d4e5f")
     assert "peer_messages" not in sa.inspect(engine).get_table_names()
     engine.dispose()
+
+
+def test_notification_upgrade_and_downgrade_preserve_existing_messages(tmp_path):
+    uri = f"sqlite:///{tmp_path / 'notifications-upgrade.db'}"
+    config = _build_alembic_config(uri)
+    command.upgrade(config, "oc1b2c3d4e5f")
+    engine = sa.create_engine(uri)
+    identifier = uuid.uuid4().bytes
+    with engine.begin() as conn:
+        messages = sa.Table("peer_messages", sa.MetaData(), autoload_with=conn)
+        conn.execute(
+            messages.insert().values(
+                workspace_id=0,
+                id=identifier,
+                sender_session_id=uuid.uuid4().bytes,
+                recipient_session_id=uuid.uuid4().bytes,
+                sender_user_id="user@example.test",
+                sender_mailbox_id=uuid.uuid4().bytes,
+                recipient_mailbox_id=uuid.uuid4().bytes,
+                subject="Preserve",
+                body="pending content",
+                created_at=1,
+                expires_at=9999999999999999,
+            )
+        )
+    command.upgrade(config, "head")
+    with engine.connect() as conn:
+        assert "peer_deliveries" in sa.inspect(conn).get_table_names()
+        assert conn.scalar(sa.text("SELECT body FROM peer_messages")) == "pending content"
+        assert conn.scalar(sa.text("SELECT acknowledged_at FROM peer_messages")) is None
+    command.downgrade(config, "oc1b2c3d4e5f")
+    with engine.connect() as conn:
+        assert "peer_deliveries" not in sa.inspect(conn).get_table_names()
+        assert conn.scalar(sa.text("SELECT body FROM peer_messages")) == "pending content"
+    engine.dispose()
