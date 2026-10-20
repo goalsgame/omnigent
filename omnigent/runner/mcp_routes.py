@@ -90,7 +90,7 @@ def register_mcp_routes(
     _session_inboxes: dict[str, asyncio.Queue[_JsonObject]],
     _session_runtime_cwd: Callable[[str], Coroutine[Any, Any, Path | None]],
     _session_spec_cache: dict[str, _SpecEntry | None],
-    filesystem_registry: FilesystemRegistry | None,
+    _resolve_session_fs_registry: Callable[[str], Coroutine[Any, Any, FilesystemRegistry | None]],
     mcp_execution_registry: McpExecutionRegistry,
     mcp_manager: RunnerMcpManager | None,
     process_manager: HarnessProcessManager | None,
@@ -330,6 +330,7 @@ def register_mcp_routes(
                 _agent_id_local = _session_agent_ids.get(session_id)
                 try:
                     dispatch_workspace = await _session_runtime_cwd(session_id)
+                    session_fs_registry = await _resolve_session_fs_registry(session_id)
                     output = await execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),
@@ -348,7 +349,7 @@ def register_mcp_routes(
                         session_async_tasks=_session_async_tasks.get(session_id),
                         harness_client=None,
                         publish_event=_publish_event,
-                        filesystem_registry=filesystem_registry,
+                        filesystem_registry=session_fs_registry,
                         effective_harness=_session_harness_name(session_id),
                     )
                 except Exception as exc:

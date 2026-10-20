@@ -1395,6 +1395,7 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
         spec_resolver=_resolver,
         server_client=_WorkspaceServerClient(),  # type: ignore[arg-type]
         runner_workspace=workspace,
+        per_session_workspace=False,
     )
     async with _runner_client(app) as client:
         resp = await client.post(
@@ -1886,6 +1887,7 @@ async def test_sessions_native_dispatches_builtin_tool_with_runner_workspace(
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
         runner_workspace=workspace,
+        per_session_workspace=False,
     )
     async with _runner_client(app) as client:
         resp = await client.post(
@@ -1945,6 +1947,7 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
         runner_workspace=workspace,
+        per_session_workspace=False,
     )
     async with _runner_client(app) as client:
         seed_resp = await client.post(

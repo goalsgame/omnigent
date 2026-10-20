@@ -1421,13 +1421,13 @@ def register_resource_routes(
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
         agent_spec = await _require_os_env(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        session_registry = await _resolve_session_fs_registry(session_id)
         body = await request.json()
         content_str = body.get("content", "")
         encoding = body.get("encoding", "utf-8")
@@ -1476,13 +1476,13 @@ def register_resource_routes(
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
         agent_spec = await _require_os_env(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        session_registry = await _resolve_session_fs_registry(session_id)
         try:
             existing = await fs.read(relative_path, limit=None)
             if existing.encoding and session_registry is not None:
@@ -1528,13 +1528,13 @@ def register_resource_routes(
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
         agent_spec = await _require_os_env(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        session_registry = await _resolve_session_fs_registry(session_id)
         result = await fs.delete(relative_path, recursive=recursive)
         if session_registry is not None and result.type == "file":
             session_registry.record_change(relative_path, "deleted", session_id)

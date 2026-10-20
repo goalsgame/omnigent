@@ -7515,7 +7515,7 @@ def create_runner_app(
         _session_inboxes=_session_inboxes,
         _session_runtime_cwd=_session_runtime_cwd,
         _session_spec_cache=_session_spec_cache,
-        filesystem_registry=filesystem_registry,
+        _resolve_session_fs_registry=_resolve_session_fs_registry,
         mcp_execution_registry=mcp_execution_registry,
         mcp_manager=mcp_manager,
         process_manager=process_manager,
