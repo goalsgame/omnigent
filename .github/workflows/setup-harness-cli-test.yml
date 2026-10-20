@@ -5,6 +5,9 @@ on:
     paths:
       - ".github/actions/setup-harness-cli/**"
       - ".github/ci-deps/package.json"
+      - "deploy/docker/pi-version"
+      - "omnigent/resources/pi_native/**"
+      - "tests/harnesses/pi_native/**"
       - ".github/workflows/setup-harness-cli-test.yml"
   workflow_dispatch:
 
@@ -28,6 +31,9 @@ jobs:
         harness: [claude, codex, pi, agy]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
       - name: Install without cache
         uses: ./.github/actions/setup-harness-cli
         with:
@@ -66,3 +72,11 @@ jobs:
             pi) pi --version ;;
             agy) agy --version ;;
           esac
+
+      - name: Verify native Pi SDK discovery and authorization
+        if: matrix.harness == 'pi'
+        run: |
+          node tests/harnesses/pi_native/verify_codemode.mjs \
+            "$RUNNER_TEMP/omnigent-harness-clis/pi/${{ steps.restore.outputs.version }}/node_modules/@earendil-works/pi-coding-agent" \
+            "$PWD/omnigent/resources/pi_native/omnigent_pi_native_extension.js" \
+            "$(cat deploy/docker/pi-version)"

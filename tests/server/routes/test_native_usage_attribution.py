@@ -503,3 +503,442 @@ async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) 
         )
 
     assert [e.host_installation_id for e in events] == ["inst-host-9", None]
+
+
+def test_concurrent_stale_priced_report_preserves_unpriced_peak(db_uri, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.llms import context_window
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="concurrent-reports", agent_id=_AGENT_ID)
+    original_get = store.get_conversation
+    stale_read = threading.Event()
+    new_report_committed = threading.Event()
+
+    def get_with_stale_metadata(sid):
+        row = original_get(sid)
+        if threading.current_thread().name.startswith("stale-report"):
+            stale_read.set()
+            assert new_report_committed.wait(10)
+        return row
+
+    monkeypatch.setattr(store, "get_conversation", get_with_stale_metadata)
+    monkeypatch.setattr(context_window, "fetch_model_pricing_with_provider", lambda *a, **k: None)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stale-report") as pool:
+        replay = pool.submit(
+            _persist_native_cumulative_usage,
+            conv.id,
+            {
+                "model": "priced-model",
+                "cumulative_cost_usd": 1,
+                "cumulative_input_tokens": 10,
+                "cumulative_output_tokens": 0,
+            },
+            store,
+        )
+        try:
+            assert stale_read.wait(10)
+            _persist_native_cumulative_usage(
+                conv.id,
+                {
+                    "model": "unknown-model",
+                    "cumulative_input_tokens": 100,
+                    "cumulative_output_tokens": 0,
+                },
+                store,
+            )
+        finally:
+            new_report_committed.set()
+        replay.result(timeout=10)
+    usage = _usage(store, conv.id)
+    assert usage["unpriced_tokens"] == 100
+    assert usage["cumulative_input_high_water"] == 100
+    assert usage["total_cost_usd"] == 1
+
+
+def test_stale_policy_engine_usage_keeps_native_guard_metadata(db_uri, monkeypatch):
+    from omnigent.llms import context_window
+    from omnigent.runtime.policies.engine import PolicyEngine
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="policy-native", agent_id=_AGENT_ID)
+    engine = PolicyEngine(
+        policies=[],
+        label_defs={},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels={},
+        conversation_store=store,
+    )
+    monkeypatch.setattr(context_window, "fetch_model_pricing_with_provider", lambda *a, **k: None)
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "unknown-model",
+            "cumulative_input_tokens": 100,
+            "cumulative_output_tokens": 0,
+        },
+        store,
+    )
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    usage = _usage(store, conv.id)
+    assert usage["unpriced_tokens"] == 110
+    assert usage["cumulative_input_high_water"] == 100
+    assert usage["input_tokens"] == 110
+
+
+@pytest.mark.parametrize("rates", [(0.01, 0.001), (0.001, 0.01)])
+@pytest.mark.parametrize("cache", [None, "read", "write"])
+def test_routed_alias_prices_only_new_usage_and_enforces_budget(db_uri, monkeypatch, rates, cache):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.inference_pricing import pricing_model_label
+    from omnigent.llms import context_window
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="routed-usage", agent_id=_AGENT_ID)
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda model, **kw: {
+            "first-target": ModelPricing(input_per_token=rates[0], output_per_token=rates[0]),
+            "second-target": ModelPricing(input_per_token=rates[1], output_per_token=rates[1]),
+        }.get(model),
+    )
+    factor = 0.1 if cache == "read" else 1.25 if cache == "write" else 1.0
+
+    def report(count):
+        data = {
+            "model": "friendly-alias",
+            "cumulative_input_tokens": count,
+            "cumulative_output_tokens": 0,
+        }
+        if cache:
+            key = (
+                "cumulative_cache_read_input_tokens"
+                if cache == "read"
+                else "cumulative_cache_creation_input_tokens"
+            )
+            data[key] = count
+        _persist_native_cumulative_usage(conv.id, data, store)
+
+    key = pricing_model_label("friendly-alias")
+    store.set_labels(conv.id, {key: "first-target"})
+    report(100)
+    store.set_labels(conv.id, {key: "second-target"})
+    report(200)
+    expected = (100 * rates[0] + 100 * rates[1]) * factor
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(expected)
+    # Both a replay and an older snapshot must leave recorded spend unchanged.
+    report(200)
+    report(100)
+    report(200)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(expected)
+    assert _usage(store, conv.id)["by_model"]["friendly-alias"]["total_cost_usd"] == pytest.approx(
+        expected
+    )
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": expected - 0.001}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 402
+    report(300)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(
+        expected + 100 * rates[1] * factor
+    )
+
+
+@pytest.mark.parametrize("legacy_zero", [False, True])
+def test_known_delta_cannot_price_unpriced_legacy_history(db_uri, monkeypatch, legacy_zero):
+    from omnigent.llms import context_window
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="legacy-usage", agent_id=_AGENT_ID)
+    store.set_session_usage(
+        conv.id, {"input_tokens": 100, "output_tokens": 0, "total_tokens": 100}
+    )
+    if legacy_zero:
+        seed = _usage(store, conv.id)
+        seed["total_cost_usd"] = 0
+        store.set_session_usage(conv.id, seed)
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.001,
+            output_per_token=0.001,
+        ),
+    )
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "known-model",
+            "cumulative_input_tokens": 200,
+            "cumulative_output_tokens": 0,
+        },
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["total_cost_usd"] == pytest.approx(0.1)
+    assert usage["unpriced_tokens"] == 100
+
+
+def test_priced_relay_preserves_legacy_unpriced_history_atomically(db_uri):
+    from omnigent.server.routes._sessions.orchestration import _accumulate_session_usage
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="legacy-relay", agent_id=_AGENT_ID)
+    store.set_session_usage(
+        conv.id, {"input_tokens": 100, "output_tokens": 0, "total_tokens": 100}
+    )
+    _accumulate_session_usage(
+        {
+            "usage": {
+                "model": "priced-model",
+                "input_tokens": 10,
+                "output_tokens": 0,
+                "total_tokens": 10,
+                "cost_usd": 1.0,
+            }
+        },
+        conv.id,
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["input_tokens"] == 110
+    assert usage["total_cost_usd"] == 1
+    assert usage["unpriced_tokens"] == 100
+
+
+def test_relay_preserves_existing_enforcement_cost_delta(db_uri):
+    from omnigent.server.routes._sessions.orchestration import _accumulate_session_usage
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="split-relay", agent_id=_AGENT_ID)
+    store.set_session_usage(conv.id, {"total_cost_usd": 2.0, "policy_cost_usd": 5.0})
+    _accumulate_session_usage(
+        {
+            "usage": {
+                "model": "priced-model",
+                "input_tokens": 10,
+                "output_tokens": 0,
+                "total_tokens": 10,
+                "cost_usd": 1.0,
+            }
+        },
+        conv.id,
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["total_cost_usd"] == 3
+    assert usage["policy_cost_usd"] == 6
+
+
+@pytest.mark.parametrize("existing_baseline", [False, True])
+@pytest.mark.parametrize("reported_cost", [1, 2])
+def test_split_cost_and_tokens_do_not_double_charge(
+    db_uri, monkeypatch, existing_baseline, reported_cost
+):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.llms import context_window
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="split-cost", agent_id=_AGENT_ID)
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.01,
+            output_per_token=0.01,
+        ),
+    )
+    if existing_baseline:
+        _persist_native_cumulative_usage(
+            conv.id,
+            {
+                "model": "priced-model",
+                "cumulative_input_tokens": 100,
+                "cumulative_output_tokens": 0,
+                "cumulative_cost_usd": 1,
+            },
+            store,
+        )
+    _persist_native_cumulative_usage(
+        conv.id, {"model": "priced-model", "cumulative_cost_usd": reported_cost}, store
+    )
+    for _ in range(2):
+        _persist_native_cumulative_usage(
+            conv.id,
+            {
+                "model": "priced-model",
+                "cumulative_input_tokens": 200,
+                "cumulative_output_tokens": 0,
+            },
+            store,
+        )
+        usage = _usage(store, conv.id)
+        assert usage["total_cost_usd"] == pytest.approx(reported_cost)
+        assert usage["unpriced_tokens"] == (100 if existing_baseline else 200)
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": reported_cost + 1}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 503
+    # Joint trusted coverage resolves the ambiguity without lowering a cost.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "priced-model",
+            "cumulative_input_tokens": 200,
+            "cumulative_output_tokens": 0,
+            "cumulative_cost_usd": reported_cost,
+        },
+        store,
+    )
+    assert "unpriced_tokens" not in _usage(store, conv.id)
+    assert "pending_cost_coverage" not in _usage(store, conv.id)
+    InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "priced-model",
+            "cumulative_input_tokens": 300,
+            "cumulative_output_tokens": 0,
+        },
+        store,
+    )
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(reported_cost + 1)
+
+
+def test_catalog_recovery_replay_does_not_create_a_priced_zero(db_uri, monkeypatch):
+    from omnigent.llms import context_window
+    from omnigent.policies.builtins.cost import _usage_is_unpriced
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="catalog-replay", agent_id=_AGENT_ID)
+    monkeypatch.setattr(context_window, "fetch_model_pricing_with_provider", lambda *a, **k: None)
+    report = {
+        "model": "priced-model",
+        "cumulative_input_tokens": 100,
+        "cumulative_output_tokens": 0,
+    }
+    _persist_native_cumulative_usage(conv.id, report, store)
+    assert _usage_is_unpriced(_usage(store, conv.id))
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.01,
+            output_per_token=0.01,
+        ),
+    )
+    _persist_native_cumulative_usage(conv.id, report, store)
+    assert _usage_is_unpriced(_usage(store, conv.id))
+    assert "total_cost_usd" not in _usage(store, conv.id)
+    assert _usage(store, conv.id)["unpriced_tokens"] == 100
+
+
+def test_late_cache_writes_require_joint_reconciliation(db_uri, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.llms import context_window
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="late-cache-writes", agent_id=_AGENT_ID)
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=1e-6,
+            output_per_token=1e-6,
+            cache_write_per_token=1.25e-6,
+        ),
+    )
+    data = {
+        "model": "priced-model",
+        "cumulative_input_tokens": 1000000,
+        "cumulative_output_tokens": 0,
+    }
+    _persist_native_cumulative_usage(conv.id, data, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1)
+    data["cumulative_cache_creation_input_tokens"] = 1000000
+    for _ in range(2):
+        _persist_native_cumulative_usage(conv.id, data, store)
+        usage = _usage(store, conv.id)
+        assert usage["total_cost_usd"] == pytest.approx(1)
+        assert usage["unpriced_tokens"] == 1000000
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": 2.4}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 503
+    _persist_native_cumulative_usage(conv.id, {**data, "cumulative_cost_usd": 1.25}, store)
+    assert "unpriced_tokens" not in _usage(store, conv.id)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.25)
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            **data,
+            "cumulative_input_tokens": 2000000,
+            "cumulative_cache_creation_input_tokens": 2000000,
+        },
+        store,
+    )
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(2.5)
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 402
+
+
+def test_trusted_free_reconciliation_resolves_legacy_zero(db_uri):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.server.inference_proxy import InferenceProxy
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="legacy-free", agent_id=_AGENT_ID)
+    store.set_session_usage(
+        conv.id, {"input_tokens": 100, "total_tokens": 100, "total_cost_usd": 0}
+    )
+    service = SimpleNamespace(
+        config=SimpleNamespace(session_cost_limits={"owner": 1}),
+        _owner_authority=lambda _: SimpleNamespace(user_id="owner"),
+    )
+    with pytest.raises(HTTPException) as error:
+        InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))
+    assert error.value.status_code == 503
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "free-model",
+            "cumulative_input_tokens": 100,
+            "cumulative_output_tokens": 0,
+            "cumulative_cost_usd": 0,
+        },
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["pricing_recorded"] is True
+    assert usage["total_cost_usd"] == 0
+    assert "unpriced_tokens" not in usage
+    InferenceProxy._check_cost_limit(service, store.get_conversation(conv.id))

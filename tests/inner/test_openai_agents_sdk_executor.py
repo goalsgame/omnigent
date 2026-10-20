@@ -129,7 +129,12 @@ class _FakeUsage:
 
 
 def _sdk_usage(
-    *, input_tokens: int, output_tokens: int, total_tokens: int, cached_tokens: int = 0
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> Usage:
     """
     Build the real openai-agents ``Usage`` for one LLM call, so cache tests
@@ -138,7 +143,9 @@ def _sdk_usage(
     return Usage(
         requests=1,
         input_tokens=input_tokens,
-        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
+        input_tokens_details=InputTokensDetails.model_validate(
+            {"cached_tokens": cached_tokens, "cache_write_tokens": cache_write_tokens}
+        ),
         output_tokens=output_tokens,
         total_tokens=total_tokens,
     )
@@ -2803,6 +2810,56 @@ def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
         assert usage["cache_read_input_tokens"] == 8000, (
             "cache_read_input_tokens must carry the cached token count."
         )
+        assert usage["output_tokens"] == 500
+        # total_tokens is the billing sum and stays unchanged.
+        assert usage["total_tokens"] == 10500
+
+    _run(_t())
+
+
+def test_turn_usage_separates_cache_reads_and_writes() -> None:
+    """Cache reads and writes have separate rates and are excluded from fresh input."""
+
+    async def _t() -> None:
+        _FakeRunner.last_calls = []
+        result = _FakeResult(events=[], final_output="hello")
+        result.raw_responses = [
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=10000,
+                    output_tokens=500,
+                    total_tokens=10500,
+                    cached_tokens=6000,
+                    cache_write_tokens=2000,
+                )
+            )
+        ]
+        _FakeRunner.next_result = result
+        executor = OpenAIAgentsSDKExecutor(client=object())
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        turn_complete = next(e for e in events if isinstance(e, TurnComplete))
+        usage = turn_complete.usage
+        assert usage is not None
+        # Fresh input: 10000 - 6000 reads - 2000 writes = 2000.
+        assert usage["input_tokens"] == 2000, (
+            "input_tokens must be the non-cached portion (total input minus cached)."
+        )
+        assert usage["cache_read_input_tokens"] == 6000, (
+            "cache_read_input_tokens must carry the cached token count."
+        )
+        assert usage["cache_creation_input_tokens"] == 2000
         assert usage["output_tokens"] == 500
         # total_tokens is the billing sum and stays unchanged.
         assert usage["total_tokens"] == 10500

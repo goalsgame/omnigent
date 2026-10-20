@@ -385,6 +385,7 @@ class FunctionCallData(BaseModel):
     :param arguments: JSON-encoded arguments string.
     :param call_id: Unique call identifier from the LLM,
         e.g. ``"call_abc123"``.
+    :param parent_call_id: Parent call for nested audit-only tool execution.
     :param namespace: Tool namespace the model emitted the call under,
         e.g. ``"container"``. ``None`` for the default namespace. Harnesses
         that replay history must round-trip it with the call.
@@ -395,6 +396,7 @@ class FunctionCallData(BaseModel):
     arguments: str
     call_id: str
     namespace: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    parent_call_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FunctionCallOutputData(BaseModel):
@@ -404,11 +406,13 @@ class FunctionCallOutputData(BaseModel):
     :param call_id: The call_id this output corresponds to,
         e.g. ``"call_abc123"``.
     :param output: The tool's string result.
+    :param parent_call_id: Parent call for nested audit-only tool execution.
     :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     call_id: str
     output: str
+    parent_call_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 

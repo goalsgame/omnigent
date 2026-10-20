@@ -1495,6 +1495,7 @@ module.exports = function (pi) {
   // policies, double-prompt. Pi's OWN built-in tools (read/shell/etc) are not
   // in this set and stay gated by the hook below.
   const bridgedTools = new Set();
+  const discoveryTools = new Map();
   if (config && Array.isArray(config.tools)) {
     for (const tool of config.tools) {
       if (!tool || typeof tool !== "object") continue;
@@ -1511,7 +1512,7 @@ module.exports = function (pi) {
       // Omnigent schema is usable as-is. execute() round-trips the call to the
       // Omnigent server's MCP proxy and returns the result to Pi.
       if (typeof pi.registerTool === "function") {
-        pi.registerTool({
+        const definition = {
           name,
           label: name,
           description,
@@ -1520,9 +1521,29 @@ module.exports = function (pi) {
           async execute(_toolCallId, params) {
             return callOmnigentTool(config, name, params || {});
           },
-        });
+        };
+        pi.registerTool(definition);
+        if (tool.exposure === "codemode") discoveryTools.set(name, definition);
       }
     }
+  }
+
+  function enableToolDiscovery() {
+    if (!discoveryTools.size || typeof pi.getAllTools !== "function" ||
+        typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
+    if (!pi.getAllTools().some((tool) => tool.name === "codemode")) return;
+    for (const [name, definition] of discoveryTools) {
+      const namespace = name.includes("__") ? name.split("__")[0] : "connected_tools";
+      pi.registerTool({
+        ...definition,
+        exposure: "codemode",
+        namespace: { name: namespace, description: `Connected tools from ${namespace}.` },
+      });
+    }
+    pi.setActiveTools([...new Set([
+      ...pi.getActiveTools().filter((name) => !discoveryTools.has(name)),
+      "codemode",
+    ])]);
   }
 
   let taskList = [];
@@ -1692,6 +1713,7 @@ module.exports = function (pi) {
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
   let cumulativeCacheReadTokens = 0;
+  let cumulativeCacheWriteTokens = 0;
   let usageModel = null;
   let lastPostedUsageKey = "";
 
@@ -1727,16 +1749,11 @@ module.exports = function (pi) {
     const key = usageMessageKey(message, usage);
     if (countedUsageMessages.has(key)) return false;
     countedUsageMessages.add(key);
-    // The server's ``cumulative_input_tokens`` is INCLUSIVE of cache reads (it
-    // splits the cache portion back out and prices it at the cache-read rate),
-    // so add cacheRead into the input total. ``cacheWrite`` (cache creation)
-    // has no dedicated cumulative field on the server, so fold it into the
-    // input total too — it is then priced at the input rate rather than the
-    // ~1.25x cache-write rate, a small, documented approximation that never
-    // drops the tokens.
+    // Input totals include both cache buckets; the server prices each separately.
     cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
+    cumulativeCacheWriteTokens += usage.cacheWrite;
     if (usage.model) usageModel = usage.model;
     return true;
   }
@@ -1747,13 +1764,14 @@ module.exports = function (pi) {
   // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
   async function postSessionUsage() {
     if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
-    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${cumulativeCacheWriteTokens}-${usageModel || ""}`;
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
     const data = {
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+      cumulative_cache_creation_input_tokens: cumulativeCacheWriteTokens,
     };
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
@@ -1826,7 +1844,7 @@ module.exports = function (pi) {
     const name = String(toolCall.name || toolCall.toolName || "");
     if (!callId || !name) return;
     const key = `${responseId}:${callId}`;
-    toolCallsById.set(callId, { key, responseId, name });
+    toolCallsById.set(callId, { key, responseId, name, parentCallId: toolCall.parentToolCallId });
     if (postedToolCalls.has(key)) return;
     postedToolCalls.add(key);
     await postEvent(config, {
@@ -1841,6 +1859,7 @@ module.exports = function (pi) {
             toolCall.arguments ?? toolCall.input ?? {},
           ),
           call_id: callId,
+          ...(toolCall.parentToolCallId ? { parent_call_id: toolCall.parentToolCallId } : {}),
         },
       },
     });
@@ -1862,6 +1881,8 @@ module.exports = function (pi) {
         item_data: {
           call_id: callId,
           output: textFromToolResult(event),
+          ...((event.parentToolCallId || known?.parentCallId)
+            ? { parent_call_id: event.parentToolCallId || known.parentCallId } : {}),
         },
       },
     });
@@ -1998,6 +2019,7 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    enableToolDiscovery();
     await ensureSupportedThinking(pi, config, ctx, ctx && ctx.model);
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
@@ -2220,6 +2242,7 @@ module.exports = function (pi) {
         id: event && event.toolCallId,
         name: event && event.toolName,
         arguments: event && event.input,
+        parentToolCallId: event && event.parentToolCallId,
       },
       responseId,
     );

@@ -27,6 +27,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+from omnigent.inference_pricing import reject_pricing_label_writes, resolve_pricing_model
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
@@ -834,7 +835,9 @@ def build_policy_engine(
             conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
         token_pricing = fetch_model_pricing_with_provider(
-            initial_model, provider_config=provider_config, harness=harness
+            resolve_pricing_model(initial_model, conv.labels if conv else {}),
+            provider_config=provider_config,
+            harness=harness,
         )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
@@ -1118,6 +1121,7 @@ def _seed_and_load_labels(
     :returns: Full post-seed snapshot of the conversation's
         labels.
     """
+    reject_pricing_label_writes(label_defs)
     if existing is None:
         existing = _load_existing_labels(conversation_id, conversation_store)
     to_seed = {
@@ -1188,6 +1192,7 @@ _SUBTREE_USAGE_PAGE_SIZE = 100
 # known numeric keys the PolicyEngine reads so an unexpected key in one
 # conversation's persisted usage can't leak into the aggregate.
 _SUMMABLE_USAGE_KEYS = (
+    "unpriced_tokens",
     "input_tokens",
     "output_tokens",
     "total_tokens",
@@ -1432,6 +1437,13 @@ def _sum_subtree_usage(
         if tree_conv.id not in subtree_ids:
             continue
         session_usage = tree_conv.session_usage
+        from omnigent.stores.conversation_store import has_ambiguous_zero_pricing
+
+        if has_ambiguous_zero_pricing(session_usage):
+            session_usage = dict(session_usage)
+            session_usage.pop("total_cost_usd", None)
+            if session_usage.get("policy_cost_usd") == 0:
+                session_usage.pop("policy_cost_usd", None)
         for key in _SUMMABLE_USAGE_KEYS:
             value = session_usage.get(key)
             if value is not None:

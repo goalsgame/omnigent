@@ -4547,6 +4547,7 @@ async def test_get_session_includes_title_labels_effort(
     resp = await client.get(f"/v1/sessions/{session['id']}")
     assert resp.status_code == 200
     body = resp.json()
+    assert resp.headers["X-Omnigent-Nested-Tool-Audit"] == "1"
     assert body["title"] == "snap-test"
     assert body["labels"]["mode"] == "debug"
     assert body["reasoning_effort"] == "medium"
@@ -12773,3 +12774,249 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+async def test_external_pi_usage_prices_cache_writes_separately(client, db_uri, monkeypatch):
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(
+            input_per_token=1e-6,
+            output_per_token=2e-6,
+            cache_read_per_token=1e-7,
+            cache_write_per_token=1.25e-6,
+        ),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    data = {
+        "cumulative_input_tokens": 1000,
+        "cumulative_output_tokens": 100,
+        "cumulative_cache_read_input_tokens": 700,
+        "cumulative_cache_creation_input_tokens": 200,
+        "model": "anthropic/test",
+    }
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202, response.text
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["input_tokens"] == 100
+    assert usage["cache_creation_input_tokens"] == 200
+    assert usage["cache_read_input_tokens"] == 700
+    assert usage["total_tokens"] == 1100
+    assert usage["total_cost_usd"] == pytest.approx(0.00062)
+    # Repeated cumulative posts must not bill the same cache write twice.
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202
+    assert _read_session_usage(db_uri, session["id"])["total_cost_usd"] == pytest.approx(0.00062)
+
+
+@pytest.mark.parametrize("native", [False, True])
+async def test_priced_then_unpriced_usage_preserves_incomplete_marker(
+    client, db_uri, monkeypatch, native
+):
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: (
+            ModelPricing(input_per_token=0.001, output_per_token=0.001)
+            if model == "priced"
+            else None
+        ),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    if native:
+        for model, tokens in [("priced", 10), ("unknown", 20), ("priced", 30)]:
+            response = await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={
+                    "type": "external_session_usage",
+                    "data": {
+                        "cumulative_input_tokens": tokens,
+                        "cumulative_output_tokens": 1,
+                        "model": model,
+                    },
+                },
+            )
+            assert response.status_code == 202
+    else:
+        for model in ["priced", "unknown", "priced"]:
+            sessions_routes._accumulate_session_usage(
+                {"usage": {"input_tokens": 10, "output_tokens": 1, "model": model}},
+                session["id"],
+                store,
+            )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["total_cost_usd"] > 0
+    assert usage["unpriced_tokens"] > 0
+    # The same persisted record must close the proxy gate despite earlier priced cost.
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from omnigent.server.inference_proxy import InferenceProxy, InferenceProxyConfig
+
+    proxy = InferenceProxy(
+        InferenceProxyConfig(
+            "https://server.example", "k" * 32, ("test",), session_cost_limits={"owner": 10}
+        ),
+        store,
+        None,
+        SimpleNamespace(),
+    )
+    monkeypatch.setattr(proxy, "_owner_authority", lambda conv: SimpleNamespace(user_id="owner"))
+    with pytest.raises(HTTPException) as error:
+        proxy._check_cost_limit(store.get_conversation(session["id"]))
+    assert error.value.status_code == 503
+
+
+async def test_replayed_native_snapshot_does_not_make_priced_usage_incomplete(
+    client, db_uri, monkeypatch
+):
+    rate = [ModelPricing(input_per_token=0.001, output_per_token=0.001)]
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: rate[0])
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    data = {"cumulative_input_tokens": 10, "cumulative_output_tokens": 1, "model": "test"}
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202
+    rate[0] = None
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    assert response.status_code == 202
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["total_cost_usd"] == pytest.approx(0.011)
+    assert not usage.get("unpriced_tokens")
+
+
+async def test_only_complete_authoritative_native_snapshot_clears_unpriced_usage(
+    client, db_uri, monkeypatch
+):
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: None)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def report(data):
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_usage", "data": {"model": "test", **data}},
+        )
+        assert response.status_code == 202
+        return _read_session_usage(db_uri, session["id"])
+
+    usage = await report({"cumulative_input_tokens": 20, "cumulative_output_tokens": 2})
+    assert usage["unpriced_tokens"] > 0
+    for data in [
+        {"cumulative_cost_usd": 0.1},
+        {"cumulative_cost_usd": 0.2, "cumulative_input_tokens": 10, "cumulative_output_tokens": 1},
+        {"cumulative_cost_usd": 0.3, "cumulative_input_tokens": 10, "cumulative_output_tokens": 1},
+        {"cumulative_cost_usd": 0.2, "cumulative_input_tokens": 20, "cumulative_output_tokens": 2},
+    ]:
+        assert (await report(data))["unpriced_tokens"] > 0
+    usage = await report(
+        {"cumulative_cost_usd": 0.4, "cumulative_input_tokens": 20, "cumulative_output_tokens": 2}
+    )
+    assert not usage.get("unpriced_tokens")
+    assert usage["total_cost_usd"] == pytest.approx(0.4)
+
+
+async def test_native_token_peaks_survive_stale_reports_and_pricing_outage(
+    client, db_uri, monkeypatch
+):
+    rate = [ModelPricing(input_per_token=0.001, output_per_token=0.001)]
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: rate[0])
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def report(tokens):
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_usage",
+                "data": {
+                    "model": "test",
+                    "cumulative_input_tokens": tokens,
+                    "cumulative_output_tokens": tokens // 10,
+                },
+            },
+        )
+        assert response.status_code == 202
+        return _read_session_usage(db_uri, session["id"])
+
+    await report(100)
+    await report(10)
+    rate[0] = None
+    usage = await report(100)
+    assert not usage.get("unpriced_tokens")
+    assert usage["cumulative_input_high_water"] == 100
+    assert usage["cumulative_output_high_water"] == 10
+    assert usage["total_cost_usd"] == pytest.approx(0.11)
+    assert (await report(110))["unpriced_tokens"] == 11
+
+
+async def test_editor_cannot_forge_billing_baselines_before_real_runner_usage(
+    auth_client, db_uri, monkeypatch
+):
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    auth_client.headers["X-Forwarded-Email"] = "alice@example.com"
+    agent = await create_test_agent(auth_client)
+    session = await _create_session(auth_client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    binding_token = "test-accounting-runner-secret"
+    store.replace_runner_id(session["id"], token_bound_runner_id(binding_token))
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0.001,
+            output_per_token=0.001,
+        ),
+    )
+    url = f"/v1/sessions/{session['id']}/events"
+    forged = {
+        "type": "external_session_usage",
+        "data": {
+            "model": "priced-model",
+            "cumulative_input_tokens": 1000000,
+            "cumulative_output_tokens": 1000000,
+            "cumulative_cost_usd": 0,
+        },
+    }
+    for headers in ({}, {RUNNER_TUNNEL_TOKEN_HEADER: "wrong-runner-secret"}):
+        response = await auth_client.post(url, json=forged, headers=headers)
+        assert response.status_code == 403, response.text
+        assert not store.get_conversation(session["id"]).session_usage
+    # Ordinary context-ring updates do not affect accounting and remain editable.
+    context = await auth_client.post(
+        url, json={"type": "external_session_usage", "data": {"context_tokens": 42}}
+    )
+    assert context.status_code == 202, context.text
+    real = await auth_client.post(
+        url,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+        json={
+            "type": "external_session_usage",
+            "data": {
+                "model": "priced-model",
+                "cumulative_input_tokens": 1000,
+                "cumulative_output_tokens": 100,
+            },
+        },
+    )
+    assert real.status_code == 202, real.text
+    usage = store.get_conversation(session["id"]).session_usage
+    assert usage["total_cost_usd"] == pytest.approx(1.1)
+    assert usage["cumulative_input_high_water"] == 1000
+    assert usage["cumulative_output_high_water"] == 100

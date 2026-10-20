@@ -1397,6 +1397,7 @@ def register_core_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Omnigent-Nested-Tool-Audit"] = "1"
         user_id = _get_user_id(request, auth_provider)
         # Single permission pass: authorize + resolve the display level +
         # fetch the conversation once, then reuse the conversation in the
@@ -3637,6 +3638,11 @@ def register_core_routes(
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        from omnigent.inference_pricing import PRICING_MODEL_LABEL_PREFIX
+
+        dropped_label_keys_set.update(
+            key for key in source.labels if key.startswith(PRICING_MODEL_LABEL_PREFIX)
+        )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always

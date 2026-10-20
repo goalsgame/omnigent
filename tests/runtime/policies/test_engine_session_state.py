@@ -465,7 +465,7 @@ async def test_record_usage_accumulates(
 ) -> None:
     """
     After ``record_usage()`` calls, the engine's usage property reflects the
-    cumulative values. Without pricing, total_cost_usd stays at 0.
+    cumulative values. Without pricing, total_cost_usd remains absent.
 
     What breaks if this fails: usage counters would reset or not increment,
     making cumulative tracking useless for budget policies.
@@ -477,7 +477,7 @@ async def test_record_usage_accumulates(
     assert engine.usage["total_tokens"] == 150
     assert engine.usage["cache_read_input_tokens"] == 0
     assert engine.usage["cache_creation_input_tokens"] == 0
-    assert engine.usage["total_cost_usd"] == 0.0
+    assert "total_cost_usd" not in engine.usage
     engine.record_usage(input_tokens=200, output_tokens=100, total_tokens=300)
     assert engine.usage["input_tokens"] == 300
     assert engine.usage["output_tokens"] == 150
@@ -643,4 +643,5 @@ async def test_record_usage_persists_to_store(
     assert reloaded.session_usage["total_tokens"] == 150
     assert reloaded.session_usage["cache_read_input_tokens"] == 400
     assert reloaded.session_usage["cache_creation_input_tokens"] == 200
-    assert reloaded.session_usage["total_cost_usd"] == 0.0
+    assert "total_cost_usd" not in reloaded.session_usage
+    assert reloaded.session_usage["unpriced_tokens"] == 750

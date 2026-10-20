@@ -117,7 +117,37 @@ class InferenceUpstream:
             return f"{self.base_url}/endpoints/openapi/{endpoint}", restore_thought_signatures(
                 body
             )
+        if self.kind == "openrouter" and endpoint == "chat/completions" and body.get("stream"):
+            options = body.get("stream_options")
+            if options is not None and not isinstance(options, dict):
+                raise ValueError("stream_options must be an object")
+            body["stream_options"] = {**(options or {}), "include_usage": True}
+        if self.kind == "openrouter" and model.startswith("anthropic/"):
+            # Preserve explicit cache settings, including per-block breakpoints.
+            if not _has_cache_control(body):
+                body["cache_control"] = {"type": "ephemeral"}
         return f"{self.base_url}/{endpoint}", body
+
+
+def _has_cache_control(body: dict[str, Any]) -> bool:
+    if "cache_control" in body:
+        return True
+    blocks: list[Any] = list(body.get("tools", [])) if isinstance(body.get("tools"), list) else []
+    for field in ("messages", "input"):
+        messages = body.get(field)
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if isinstance(message, dict):
+                blocks.append(message)
+                content = message.get("content")
+                if isinstance(content, list):
+                    blocks.extend(content)
+    return any(
+        isinstance(block, dict)
+        and ("cache_control" in block or "prompt_cache_breakpoint" in block)
+        for block in blocks
+    )
 
 
 @dataclass(frozen=True)

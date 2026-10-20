@@ -253,12 +253,13 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 
 # The harness CLI set mirrors omnigent/onboarding/harness_install.py
 # (the binary/package map `omnigent setup` installs from) — keep the
-# two in sync. Unpinned on purpose: the official image is rebuilt by
-# CI, so it tracks the same "latest" a laptop install would get.
+# two in sync. Pi uses the same tested release as CI; the other CLIs
+# track the latest version available when their installation layer is built.
+COPY deploy/docker/pi-version /opt/omnigent/pi-version
 RUN npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
-      @earendil-works/pi-coding-agent \
+      "@earendil-works/pi-coding-agent@$(cat /opt/omnigent/pi-version)" \
  && npm cache clean --force
 
 # Kiro CLI is not published as an npm package, and its installer has NO version

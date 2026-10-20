@@ -65,8 +65,8 @@
 # Off-by-default bounds this, but a deployment needing kiro-cli-grade integrity
 # should pin + verify in its own image rather than rely on a name here.
 #
-# Default-set CLIs are deliberately not rows: claude/codex/pi install unpinned
-# from npm in the Dockerfiles (override via the npm: escape hatch, e.g.
+# Default-set CLIs are installed by the Dockerfiles. Pi is pinned in pi-version;
+# claude/codex track npm (override via the npm: escape hatch, e.g.
 # npm:@openai/codex@0.147.0), and kiro-cli is version-pinned there via the
 # KIRO_CLI_VERSION build ARG. agy IS a row (see install_agy) because UBI does
 # not install it by default.
@@ -262,7 +262,7 @@ for spec in "$@"; do
             die "hermes needs Node >= 26 at runtime and the host image ships Node 22 — its installer's managed Node lands in the build user's home. Raise the image's Node baseline first; no EXTRA_HARNESS_CLIS row until then" ;;
         claude)   die "claude ships in the host image by default (unpinned npm install) — pin a different version via the npm: escape hatch: npm:@anthropic-ai/claude-code@<version>" ;;
         codex)    die "codex ships in the host image by default (unpinned npm install) — pin a different version via the npm: escape hatch: npm:@openai/codex@<version>" ;;
-        pi)       die "pi ships in the host image by default (unpinned npm install) — pin a different version via the npm: escape hatch: npm:@earendil-works/pi-coding-agent@<version>" ;;
+        pi)       die "pi ships in the host image by default (pinned in deploy/docker/pi-version) — pin a different version via the npm: escape hatch: npm:@earendil-works/pi-coding-agent@<version>" ;;
         kiro | kiro-cli)
             die "$name ships in the host image by default, version-pinned via the KIRO_CLI_VERSION build ARG — override with --build-arg instead" ;;
         *)

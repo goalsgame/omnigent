@@ -281,6 +281,11 @@ def pi_session_records_from_session_items(
         group = None
 
     for index, item in enumerate(items):
+        # Nested executions are audit events; Pi replays their enclosing tool result.
+        if item.get("type") in {"function_call", "function_call_output"} and item.get(
+            "parent_call_id"
+        ):
+            continue
         response_id = item.get("response_id")
         if isinstance(response_id, str) and response_id in skip_response_ids:
             continue

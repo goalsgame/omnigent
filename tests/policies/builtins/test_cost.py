@@ -768,3 +768,13 @@ def test_registry_validates_factory_params() -> None:
     assert err_unknown is not None and "bogus" in err_unknown
     # Wrong type for the hard limit.
     assert validate_factory_params(_HANDLER, {"max_cost_usd": "lots"}) is not None
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_proxy_incomplete_pricing_marker_never_bypasses_known_spend_cap(approved):
+    from omnigent.policies.schema import SESSION_COST_UNPRICED_APPROVED_KEY
+
+    event = _event("request", 6.0)
+    event["context"]["usage"]["unpriced_tokens"] = 100
+    event["session_state"] = {SESSION_COST_UNPRICED_APPROVED_KEY: approved}
+    assert cost_budget(max_cost_usd=5.0)(event)["result"] == "DENY"

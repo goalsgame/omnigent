@@ -1550,3 +1550,39 @@ async def test_authenticated_evaluate_route_sql_budget(
     assert len(statements) == _EVALUATE_ROUTE_SQL_BUDGET, [
         s.split("\n")[0][:80] for s in statements
     ]
+
+
+async def test_policy_engine_build_does_not_block_request_loop(client, monkeypatch):
+    import threading
+
+    from omnigent.server.routes.sessions import routes_hooks
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            default_policies=[
+                FunctionPolicySpec(
+                    name="admin__deny_bash",
+                    on=None,
+                    function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+                )
+            ]
+        ),
+    )
+    original = routes_hooks.build_policy_engine
+    request_thread = threading.get_ident()
+    worker_threads = []
+
+    def record_build(*args, **kwargs):
+        worker_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(routes_hooks, "build_policy_engine", record_build)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert response.status_code == 200, response.text
+    assert worker_threads and all(thread != request_thread for thread in worker_threads)

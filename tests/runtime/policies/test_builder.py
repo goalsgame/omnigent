@@ -38,6 +38,7 @@ from omnigent.spec.types import (
     AgentSpec,
     GuardrailsSpec,
     LabelDef,
+    LLMConfig,
     Phase,
     PhaseSelector,
 )
@@ -1905,3 +1906,166 @@ def test_ancestor_walk_discards_an_untrustworthy_chain(shape: str, links: dict[s
     ]
 
     assert ancestor_ids_from_tree(tree, "a") == [], shape
+
+
+@pytest.mark.parametrize("policy_cost", [None, 5.0])
+def test_record_usage_preserves_tree_enforcement_totals(
+    conversation_store, monkeypatch, policy_cost
+):
+    from omnigent.llms import context_window
+
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing",
+        lambda _: context_window.ModelPricing(
+            input_per_token=0.1,
+            output_per_token=0.1,
+        ),
+    )
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title=_sub_agent_title(),
+    )
+    counts = {
+        "input_tokens": 20,
+        "output_tokens": 0,
+        "total_tokens": 20,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    conversation_store.set_session_usage(parent.id, {**counts, "total_cost_usd": 8.0})
+    own_usage = {**counts, "total_cost_usd": 2.0}
+    if policy_cost is not None:
+        own_usage["policy_cost_usd"] = policy_cost
+    conversation_store.set_session_usage(child.id, own_usage)
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child", llm=LLMConfig(model="test-model")),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    before = 8 + (policy_cost if policy_cost is not None else 2)
+    assert engine.usage["total_cost_usd"] == pytest.approx(before)
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    assert engine.usage["total_cost_usd"] == pytest.approx(before + 1)
+    assert conversation_store.get_conversation(child.id).session_usage[
+        "total_cost_usd"
+    ] == pytest.approx(3)
+    assert conversation_store.get_conversation(parent.id).session_usage[
+        "total_cost_usd"
+    ] == pytest.approx(8)
+
+    rebuilt = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child", llm=LLMConfig(model="test-model")),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    assert rebuilt.usage["total_cost_usd"] == pytest.approx(before + 1)
+    child_usage = conversation_store.get_conversation(child.id).session_usage
+    if policy_cost is not None:
+        assert child_usage["policy_cost_usd"] == pytest.approx(policy_cost + 1)
+    else:
+        assert "policy_cost_usd" not in child_usage
+
+
+@pytest.mark.parametrize("legacy_zero", [False, True])
+def test_priced_policy_delta_keeps_legacy_child_history_unpriced(
+    conversation_store, monkeypatch, legacy_zero
+):
+    from omnigent.llms import context_window
+
+    monkeypatch.setattr(
+        context_window,
+        "fetch_model_pricing",
+        lambda _: context_window.ModelPricing(
+            input_per_token=0.1,
+            output_per_token=0.1,
+        ),
+    )
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title=_sub_agent_title(),
+    )
+    counts = {
+        "input_tokens": 20,
+        "output_tokens": 0,
+        "total_tokens": 20,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    conversation_store.set_session_usage(parent.id, {**counts, "total_cost_usd": 8.0})
+    own_usage = {**counts, **({"total_cost_usd": 0} if legacy_zero else {})}
+    conversation_store.set_session_usage(child.id, own_usage)
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child", llm=LLMConfig(model="test-model")),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    current = conversation_store.get_conversation(child.id).session_usage
+    assert current["total_cost_usd"] == pytest.approx(1)
+    assert current["unpriced_tokens"] == 20
+    assert engine.usage["total_cost_usd"] == pytest.approx(9)
+    assert engine.usage["unpriced_tokens"] == 20
+
+
+def test_unpriced_usage_stays_unpriced_after_record_and_rebuild(conversation_store, monkeypatch):
+    from omnigent.policies.builtins.cost import _usage_is_unpriced
+
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder.fetch_model_pricing_with_provider", lambda *a, **k: None
+    )
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_usage(
+        conv.id,
+        {
+            "input_tokens": 100,
+            "output_tokens": 0,
+            "total_tokens": 100,
+        },
+    )
+    spec = AgentSpec(spec_version=1, name="unknown", llm=LLMConfig(model="unknown-model"))
+    engine = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    assert _usage_is_unpriced(engine.usage)
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    assert _usage_is_unpriced(engine.usage)
+    persisted = conversation_store.get_conversation(conv.id).session_usage
+    assert "total_cost_usd" not in persisted
+    assert persisted["unpriced_tokens"] == 110
+    rebuilt = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    assert _usage_is_unpriced(rebuilt.usage)
+
+
+def test_explicitly_free_usage_retains_priced_zero_after_rebuild(conversation_store, monkeypatch):
+    from omnigent.llms.context_window import ModelPricing
+    from omnigent.policies.builtins.cost import _usage_is_unpriced
+
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder.fetch_model_pricing_with_provider",
+        lambda *a, **k: ModelPricing(
+            input_per_token=0,
+            output_per_token=0,
+        ),
+    )
+    conv = conversation_store.create_conversation()
+    spec = AgentSpec(spec_version=1, name="free", llm=LLMConfig(model="free-model"))
+    engine = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine.record_usage(input_tokens=10, output_tokens=0, total_tokens=10)
+    current = conversation_store.get_conversation(conv.id).session_usage
+    assert current["total_cost_usd"] == 0
+    assert current["pricing_recorded"] is True
+    assert not _usage_is_unpriced(current)
+    rebuilt = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    assert rebuilt.usage["total_cost_usd"] == 0
+    assert not _usage_is_unpriced(rebuilt.usage)
