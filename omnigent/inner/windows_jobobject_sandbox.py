@@ -14,10 +14,9 @@ So this backend trades a different set of guarantees than its POSIX siblings:
 
 - **Provided**: process-tree containment (the helper and every descendant are
   killed together when Omnigent closes the job handle, including on an
-  unexpected Omnigent crash, since the OS closes handles of dead processes) and
-  optional CPU/memory ceilings.
-- **NOT provided**: filesystem isolation (read/write roots), network isolation,
-  or syscall filtering. ``read_paths`` / ``write_paths`` / ``allow_network`` in
+  unexpected Omnigent crash, since the OS closes handles of dead processes).
+- **NOT provided**: CPU/memory ceilings, filesystem isolation (read/write roots),
+  network isolation, or syscall filtering. ``read_paths`` / ``write_paths`` / ``allow_network`` in
   the spec are therefore *advisory* here and not enforced — see the one-time
   warning emitted by :meth:`resolve`.
 
@@ -61,8 +60,8 @@ def _warn_no_fs_isolation_once() -> None:
     warning a single time rather than once per spawned helper.
     """
     _LOGGER.warning(
-        "windows_jobobject provides process-tree containment + resource "
-        "limits only; it does NOT isolate the filesystem or network. "
+        "windows_jobobject provides process-tree containment only; it does NOT "
+        "enforce CPU/memory limits or isolate the filesystem or network. "
         "read_paths/write_paths/allow_network in os_env.sandbox are not "
         "enforced on Windows. Run on Linux/macOS for full sandboxing."
     )

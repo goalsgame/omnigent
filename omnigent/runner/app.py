@@ -2058,6 +2058,11 @@ def create_runner_app(
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
         await _session_workspace_value(session_id)
+        if session_id not in _session_workspace_cache:
+            raise HTTPException(
+                status_code=503,
+                detail="Session workspace metadata is unavailable; retry the request.",
+            )
         return resource_registry.prepare_session_workspace(session_id)
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
@@ -2155,11 +2160,6 @@ def create_runner_app(
             return _session_fs_registries[session_id]
 
         session_ws_path = await _session_runtime_cwd(session_id)
-        if session_id not in _session_workspace_cache:
-            raise HTTPException(
-                status_code=503,
-                detail="Session workspace metadata is unavailable; retry the request.",
-            )
         if session_ws_path is None:
             return filesystem_registry
 

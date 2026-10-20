@@ -107,7 +107,7 @@ async def test_cold_mutation_targets_selected_workspace_and_records_diff(
 
 
 @pytest.mark.asyncio
-async def test_mcp_dispatch_recovers_workspace_when_registry_metadata_retry_succeeds(
+async def test_mcp_rejects_unconfirmed_workspace_and_recovers_on_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launch = tmp_path / "launch"
@@ -153,6 +153,15 @@ async def test_mcp_dispatch_recovers_workspace_when_registry_metadata_retry_succ
                     },
                 )
                 assert response.status_code == 200
+                assert "error" in response.json(), response.text
+                assert captured == []
+                response = await client.post(
+                    "/v1/sessions/retry-session/mcp/execute",
+                    json={
+                        "method": "tools/call",
+                        "params": {"name": "sys_os_write", "arguments": {}},
+                    },
+                )
                 assert "error" not in response.json(), response.text
                 assert captured == [selected]
                 assert reads == 2
@@ -304,13 +313,15 @@ async def test_direct_stream_metadata_outage_fails_before_harness_and_allows_ret
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-async def test_cold_copy_on_write_turn_uses_selected_workspace_before_materialization(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: bool
+@pytest.mark.parametrize(
+    "entrypoint", ["background-turn", "direct-stream", "title", "legacy-init"]
+)
+async def test_cold_copy_on_write_entrypoint_confirms_workspace_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str
 ) -> None:
     import asyncio
     from types import SimpleNamespace
-    from unittest.mock import Mock
+    from unittest.mock import AsyncMock, Mock
 
     from omnigent.inner.datamodel import WritePathSpec
     from omnigent.spec.types import ExecutorSpec
@@ -378,8 +389,19 @@ async def test_cold_copy_on_write_turn_uses_selected_workspace_before_materializ
         ]
     )
 
+    available = entrypoint in {"background-turn", "direct-stream"}
+    monkeypatch.setattr(
+        "omnigent.runner.app.run_background_title", AsyncMock(return_value="Test title")
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.app.generator_spec_for_harness",
+        lambda h: SimpleNamespace(resolver_harness=None),
+    )
+
     def metadata(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/cow-cold":
+            if not available:
+                return httpx.Response(503, json={})
             return httpx.Response(200, json={"agent_id": "cow-agent", "workspace": str(selected)})
         return httpx.Response(200, json={})
 
@@ -398,21 +420,53 @@ async def test_cold_copy_on_write_turn_uses_selected_workspace_before_materializ
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://runner"
             ) as client:
-                response = await client.post(
-                    "/v1/sessions/cow-cold/events",
-                    params={"stream": str(stream).lower()},
-                    json={
-                        "type": "message",
-                        "role": "user",
-                        "agent_id": "cow-agent",
-                        "harness": "openai-agents",
-                        "content": [{"type": "input_text", "text": "test"}],
-                    },
-                )
-                assert response.status_code == (200 if stream else 202), response.text
-                async with asyncio.timeout(5):
-                    while not dispatched:
-                        await asyncio.sleep(0.01)
+
+                async def request() -> httpx.Response:
+                    if entrypoint == "title":
+                        return await client.post(
+                            "/v1/sessions/cow-cold/background-title",
+                            json={"agent_id": "cow-agent", "prompt": "test title"},
+                        )
+                    if entrypoint == "legacy-init":
+                        return await client.post(
+                            "/v1/sessions",
+                            json={"session_id": "cow-cold", "agent_id": "cow-agent"},
+                        )
+                    return await client.post(
+                        "/v1/sessions/cow-cold/events",
+                        params={"stream": str(entrypoint == "direct-stream").lower()},
+                        json={
+                            "type": "message",
+                            "role": "user",
+                            "agent_id": "cow-agent",
+                            "harness": "openai-agents",
+                            "content": [{"type": "input_text", "text": "test"}],
+                        },
+                    )
+
+                if not available:
+                    failed = await request()
+                    assert failed.status_code == 503, failed.text
+                    assert roots == []
+                    assert "cow-cold" not in registry._primary_envs
+                    available = True
+                response = await request()
+                expected_status = {
+                    "title": 200,
+                    "legacy-init": 201,
+                    "background-turn": 202,
+                    "direct-stream": 200,
+                }[entrypoint]
+                assert response.status_code == expected_status, response.text
+                if entrypoint in {"background-turn", "direct-stream"}:
+                    async with asyncio.timeout(5):
+                        while not dispatched:
+                            await asyncio.sleep(0.01)
+                else:
+                    environment = registry.resolve_environment(
+                        "cow-cold", DEFAULT_ENVIRONMENT_ID, spec
+                    )
+                    dispatched.append(environment.cwd)
                 assert roots == [selected]
                 assert dispatched == [selected]
         finally:
