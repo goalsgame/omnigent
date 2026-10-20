@@ -1844,7 +1844,7 @@ module.exports = function (pi) {
     const name = String(toolCall.name || toolCall.toolName || "");
     if (!callId || !name) return;
     const key = `${responseId}:${callId}`;
-    toolCallsById.set(callId, { key, responseId, name });
+    toolCallsById.set(callId, { key, responseId, name, parentCallId: toolCall.parentToolCallId });
     if (postedToolCalls.has(key)) return;
     postedToolCalls.add(key);
     await postEvent(config, {
@@ -1859,6 +1859,7 @@ module.exports = function (pi) {
             toolCall.arguments ?? toolCall.input ?? {},
           ),
           call_id: callId,
+          ...(toolCall.parentToolCallId ? { parent_call_id: toolCall.parentToolCallId } : {}),
         },
       },
     });
@@ -1880,6 +1881,8 @@ module.exports = function (pi) {
         item_data: {
           call_id: callId,
           output: textFromToolResult(event),
+          ...((event.parentToolCallId || known?.parentCallId)
+            ? { parent_call_id: event.parentToolCallId || known.parentCallId } : {}),
         },
       },
     });
@@ -2239,6 +2242,7 @@ module.exports = function (pi) {
         id: event && event.toolCallId,
         name: event && event.toolName,
         arguments: event && event.input,
+        parentToolCallId: event && event.parentToolCallId,
       },
       responseId,
     );

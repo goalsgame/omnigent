@@ -251,6 +251,18 @@ try {
     0,
     "Bridged calls must not prompt twice",
   );
+  const sequential = await execute(
+    'text(await tools.docs__lookup_169({ query: "first" })); text(await tools.docs__lookup_168({ query: "second" }));',
+  );
+  assert.match(text(sequential), /relay-ok/);
+  const nestedItems = events.filter(
+    (event) => event.type === "external_conversation_item" &&
+      event.data.item_data.call_id?.includes("/"),
+  );
+  assert.ok(nestedItems.length >= 6, "Sequential nested calls and results must be mirrored");
+  for (const event of nestedItems) {
+    assert.ok(event.data.item_data.parent_call_id, "Nested audit items must retain their parent");
+  }
   relayToken = "smoke-relay-rotated";
   fs.writeFileSync(configPath, JSON.stringify({ ...bridgeConfig, relayToken }));
   mode = "deny";

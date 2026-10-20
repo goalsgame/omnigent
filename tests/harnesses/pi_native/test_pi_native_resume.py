@@ -556,3 +556,44 @@ async def test_fetch_paginates(tmp_path: Path) -> None:
         items = await fetch_all_session_items_for_pi_resume(client, "conv_abc")
     assert calls["n"] == 2
     assert [i["id"] for i in items] == ["u1", "a1"]
+
+
+def test_nested_sequential_tools_are_audit_only_on_fork_and_resume() -> None:
+    from omnigent.entities import parse_item_data
+
+    items = [
+        _user_item("find two documents"),
+        _function_call_item(name="codemode", call_id="outer", arguments="{}"),
+    ]
+    for index in range(2):
+        call_id = f"outer/{index}"
+        for item in (
+            _function_call_item(name="docs__lookup", call_id=call_id, arguments="{}"),
+            _function_output_item(call_id=call_id, output="document"),
+        ):
+            item["parent_call_id"] = "outer"
+            # Verify metadata survives the server's typed persistence boundary.
+            data = {"agent": "Pi", **item}
+            persisted = parse_item_data(item["type"], data).model_dump(mode="json")
+            items.append({**item, **persisted})
+    items.extend(
+        [
+            _function_output_item(call_id="outer", output="two documents"),
+            _assistant_item("found them", response_id="r2"),
+        ]
+    )
+    for external_id in (_EXTERNAL_ID, mint_pi_session_id()):
+        records = pi_session_records_from_session_items(
+            items, session_id="conversation", external_session_id=external_id, cwd=Path("/repo")
+        )
+        messages = [record["message"] for record in records[1:]]
+        assert [message["role"] for message in messages] == [
+            "user",
+            "assistant",
+            "toolResult",
+            "assistant",
+        ]
+        assert messages[1]["content"] == [
+            {"type": "toolCall", "id": "outer", "name": "codemode", "arguments": {}}
+        ]
+        assert messages[2]["toolCallId"] == "outer"
