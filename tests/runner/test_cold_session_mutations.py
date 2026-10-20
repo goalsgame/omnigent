@@ -211,3 +211,65 @@ async def test_dispatch_recovers_workspace_when_registry_metadata_retry_succeeds
                 assert dispatch_reads == 2
         finally:
             await registry.cleanup_session("retry-session")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+async def test_unconfirmed_workspace_rejects_mutation_before_environment_is_cached(
+    tmp_path: Path, method: str
+) -> None:
+    launch = tmp_path / "launch"
+    selected = tmp_path / "selected"
+    launch.mkdir()
+    selected.mkdir()
+    (launch / "note.txt").write_text("runner-original")
+    (selected / "note.txt").write_text("project-original")
+    available = False
+
+    def metadata(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/recovery-session" and available:
+            return httpx.Response(200, json={"workspace": str(selected), "agent_id": "test"})
+        return httpx.Response(503, json={})
+
+    registry = SessionResourceRegistry(runner_workspace=launch, per_session_workspace=False)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(metadata), base_url="http://server"
+    ) as server:
+        app = create_runner_app(
+            server_client=server,
+            resource_registry=registry,
+            runner_workspace=launch,
+            per_session_workspace=False,
+        )
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as client:
+                url = (
+                    "/v1/sessions/recovery-session/resources/environments/"
+                    f"{DEFAULT_ENVIRONMENT_ID}/filesystem/note.txt"
+                )
+                body = (
+                    {"content": "updated"}
+                    if method == "PUT"
+                    else {"old_text": "project-original", "new_text": "updated"}
+                )
+                response = await client.request(
+                    method, url, json=body if method != "DELETE" else None
+                )
+                assert response.status_code == 503, response.text
+                assert (launch / "note.txt").read_text() == "runner-original"
+                assert (selected / "note.txt").read_text() == "project-original"
+                assert "recovery-session" not in registry._primary_envs
+                available = True
+                response = await client.request(
+                    method, url, json=body if method != "DELETE" else None
+                )
+                assert response.status_code == 200, response.text
+                assert (launch / "note.txt").read_text() == "runner-original"
+                if method == "DELETE":
+                    assert not (selected / "note.txt").exists()
+                else:
+                    assert (selected / "note.txt").read_text() == "updated"
+        finally:
+            await registry.cleanup_session("recovery-session")

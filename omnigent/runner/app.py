@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
@@ -2155,8 +2155,12 @@ def create_runner_app(
             return _session_fs_registries[session_id]
 
         session_ws_path = await _session_runtime_cwd(session_id)
-        if session_ws_path is None or session_id not in _session_workspace_cache:
-            # A failed snapshot must not cache the fallback as the session's root.
+        if session_id not in _session_workspace_cache:
+            raise HTTPException(
+                status_code=503,
+                detail="Session workspace metadata is unavailable; retry the request.",
+            )
+        if session_ws_path is None:
             return filesystem_registry
 
         runner_ws_resolved = runner_workspace.resolve() if runner_workspace is not None else None

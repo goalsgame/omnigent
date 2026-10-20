@@ -982,6 +982,7 @@ def register_resource_routes(
 
     async def _require_os_env(session_id: str) -> AgentSpec | None:
         spec = await _resolve_session_agent_spec(session_id)
+        await _resolve_session_fs_registry(session_id)
         if spec is not None and getattr(spec, "os_env", None) is None:
             raise HTTPException(
                 status_code=404,

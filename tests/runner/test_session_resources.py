@@ -2410,10 +2410,8 @@ async def test_failed_snapshot_does_not_latch_session_workspace(
     finally:
         await server_client.aclose()
 
-    # While the server is down the read still succeeds off the global
-    # workspace fallback, which is clean and so reports nothing.
-    assert during_outage.status_code == 200, during_outage.text
-    assert during_outage.json()["data"] == []
+    # Do not serve the runner's files as the session's confirmed workspace.
+    assert during_outage.status_code == 503, during_outage.text
     assert after_recovery.status_code == 200, after_recovery.text
     paths = [entry["path"] for entry in after_recovery.json()["data"]]
     # The marker only exists in the worktree. Its absence means the failed
@@ -2688,7 +2686,7 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     finally:
         await server_client.aclose()
 
-    assert first.status_code == 200, first.text
+    assert first.status_code == 503, first.text
     assert second.status_code == 200, second.text
     assert snapshot_count >= 2, (
         f"expected at least a failed + a successful snapshot fetch, got {snapshot_count}"
