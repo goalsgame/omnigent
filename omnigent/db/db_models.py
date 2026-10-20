@@ -353,6 +353,25 @@ class SqlPeerMessage(OmnigentBase):
     )
 
 
+class SqlPeerDelivery(OmnigentBase):
+    """Durable notification policy, cursor and bounded delivery lease per mailbox."""
+
+    __tablename__ = "peer_deliveries"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    mailbox_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), index=True)
+    settings: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    pending_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_cursor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    lease: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    retry_at: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    window_start: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
 class SqlPublishedArtifact(OmnigentBase):
     """Immutable published bytes with ownership independent of a session."""
 

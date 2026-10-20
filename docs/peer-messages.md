@@ -19,11 +19,44 @@ message's `id` as `reply_to`; replies must stay between the same two sessions.
 
 ## Delivery and lifecycle
 
-The SQL database owns messages and acknowledgements. They survive runner sleep,
-workspace replacement and server restarts. Delivery is **pull-based**: sending does
-not wake a sleeping sandbox, interrupt a running turn, or automatically start work.
-Agents coordinating should check their inbox when starting or resuming work.
-There are no process-local delivery queues or background model invocations.
+The SQL database owns messages, acknowledgements and notification delivery leases.
+They survive runner sleep and server restarts. Native Pi sessions receive typed
+peer notifications through the runner's event channel. A running turn receives
+notifications through Pi's steering queue between operations; an idle session starts
+a turn. Notifications carry message IDs, not human instructions. The agent reads,
+processes and explicitly acknowledges messages using the ordinary tools.
+
+Automatic processing while awake is enabled by default. Sleeping sandboxes stay
+asleep unless their owner enables **Wake sleeping sandbox when a message arrives**
+in the session header's **Agent message notifications** dialog. Owners can disable
+automatic processing entirely. Offline workstation hosts cannot be powered on by
+this feature. Other harnesses retain manual inbox tools; automatic notifications
+currently require native Pi. The backend checks the runner notification protocol
+before dispatch; inboxes on older runners remain pending until the runner is upgraded.
+
+Agent YAML provides declarative defaults through `params.peer_messages`:
+
+```yaml
+params:
+  peer_messages:
+    enabled: true
+    wake_on_message: false
+```
+
+An explicit per-session setting overrides the current agent defaults. Notifications
+run under the recipient owner's identity and current permissions, never the sender's.
+A message does not approve credential use or bypass an approval gate.
+
+Delivery batches contain at most twenty messages. Accepted batches are separated
+by at least a minute and limited to six per mailbox per hour. Saving settings preserves
+accepted-delivery cooldowns; limits survive server
+restarts. Excess messages remain pending. Database leases serialize delivery across
+servers. A stable batch ID and runner receipts suppress retries; the server advances
+the notification cursor only after Pi accepts the batch. A crash between Pi accepting
+a notification and writing its receipt can redeliver it, so agent work must remain
+idempotent. Notification delivery is separate from processing acknowledgement: it
+does not guarantee the model turn or requested work succeeds. Avoid receipt-only
+replies and automatic reply loops.
 
 Text is bounded to 8 KiB of UTF-8 per message; use published artifacts for larger
 outputs. Messages expire after 90 days. Expired records are hidden immediately
@@ -54,6 +87,11 @@ writes also require a trusted origin. IDs are canonical 32-character UUID hex.
   Returns `{ "messages": [...], "cursor": "..." | null, "has_more": false }`.
 - `POST /v1/sessions/{recipient}/peer-messages/{message}/acknowledge`: requires edit
   on the recipient; returns `{ "id": "...", "acknowledged": true }`.
+
+- `GET /v1/sessions/{session}/peer-notifications`: requires read; returns `enabled`,
+  `wake_on_message`, `can_manage` and `max_batches_per_hour`.
+- `PUT /v1/sessions/{session}/peer-notifications`: requires the current owner;
+  JSON `{ "enabled": true, "wake_on_message": false }`. Both fields are strict booleans.
 
 Timestamps are Unix microseconds. Requests are bounded to 64 KiB before JSON parsing.
 Responses are private and must not be cached. Missing/inaccessible sessions and

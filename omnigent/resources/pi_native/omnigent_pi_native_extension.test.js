@@ -625,8 +625,92 @@ async function testLegacyPiRetainsConnectorTools() {
   assert("legacy Pi keeps direct tool registration", h.registeredTools.docs__lookup && h.registeredTools.docs__lookup.exposure === undefined);
 }
 
+async function testPeerNotificationsAreTypedDeduplicatedAndSteered() {
+  for (const active of [false, true]) {
+    const h = makeHarness({ captureEvents: true });
+    const delivered = [];
+    h.pi.sendMessage = (message, options) => delivered.push({ message, options });
+    const ctx = makeCtx({ idle: !active });
+    await h.handlers.session_start({}, ctx);
+    if (active) {
+      await h.handlers.agent_start({}, ctx);
+      await h.handlers.message_start({ message: { role: "user", content: "Human turn" } }, ctx);
+    }
+    const id = active ? "a".repeat(64) : "b".repeat(64);
+    const file = path.join(h.inboxDir, `peer_${id}.json`);
+    const payload = JSON.stringify({ id, type: "peer_notification", message_ids: ["c".repeat(32)] });
+    fs.writeFileSync(file, payload);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert("peer message delivered exactly once", delivered.length === 1);
+    assert("typed as peer content", delivered[0].message.customType === "omnigent-peer-notification");
+    assert("idle starts a turn; active steers", delivered[0].options.deliverAs === (active ? "steer" : "followUp"));
+    assert("triggers processing", delivered[0].options.triggerTurn === true);
+    if (active) {
+      const retry = { id, type: "peer_notification", message_ids: ["c".repeat(32)], attempt_id: "d".repeat(32) };
+      fs.writeFileSync(file, JSON.stringify(retry));
+      await new Promise(resolve => setTimeout(resolve, 400));
+      assert("a fresh backend attempt does not duplicate a queued live message", delivered.length === 1);
+    }
+    assert("not acknowledged before actual context delivery", !fs.existsSync(path.join(h.inboxDir, "peer-receipts", id)));
+    await h.handlers.message_start({ message: { role: "custom", ...delivered[0].message } }, ctx);
+    assert("receipt persisted after context delivery", fs.existsSync(path.join(h.inboxDir, "peer-receipts", id)));
+    fs.writeFileSync(file, payload);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert("retry does not trigger another turn", delivered.length === 1);
+    assert("never interrupts tools", ctx.abortCount === 0);
+  }
+}
+
+async function testPeerSubmissionFailureRetries() {
+  const h = makeHarness();
+  const ctx = makeCtx({ idle: true });
+  await h.handlers.session_start({}, ctx);
+  let attempts = 0;
+  h.pi.sendMessage = () => { if (++attempts === 1) throw new Error("temporary submission error"); };
+  const id = "e".repeat(64);
+  fs.writeFileSync(path.join(h.inboxDir, `peer_${id}.json`), JSON.stringify({ id, type: "peer_notification", message_ids: ["c".repeat(32)] }));
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert("failed submission retries on the next poll", attempts === 2);
+}
+
+
+async function testPeerActorBindingAndInstructions() {
+  for (const active of [false, true]) {
+    const h = makeHarness({ captureEvents: true });
+    const ctx = makeCtx({ idle: !active });
+    const configPath = path.join(h.inboxDir, "config.json");
+    const config = JSON.parse(fs.readFileSync(configPath));
+    config.systemPrompt = "Agent instructions";
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    let bindings = 0;
+    const fetch = global.fetch;
+    global.fetch = async (url, options) => {
+      if (String(url).endsWith("/peer-notifications/actor")) {
+        bindings++;
+        assert("actor callback only supplies batch ID", JSON.stringify(JSON.parse(options.body)) === JSON.stringify({ notification_id: "f".repeat(64) }));
+      }
+      return fetch(url, options);
+    };
+    await h.handlers.agent_start({}, ctx);
+    if (active) await h.handlers.message_start({ message: { role: "user" } }, ctx);
+    await h.handlers.message_start({ message: { role: "custom", customType: "omnigent-peer-notification", details: { notificationId: "f".repeat(64) } } }, ctx);
+    assert("only automatic idle turns bind owner", bindings === (active ? 0 : 1));
+    const transformed = await h.handlers.context_with_system({ messages: [{ role: "user", content: "Peer context" }] });
+    assert("custom-started turns retain agent instructions", transformed.messages[0].content === "Agent instructions" && typeof transformed.messages[0].timestamp === "number");
+    global.fetch = async (url, options) => String(url).endsWith("/peer-notifications/actor") ? { status: 403 } : fetch(url, options);
+    await h.handlers.agent_start({}, ctx);
+    await h.handlers.message_start({ message: { role: "custom", customType: "omnigent-peer-notification", details: { notificationId: "e".repeat(64) } } }, ctx);
+    assert("failed identity aborts automatic turn", ctx.abortCount === 1);
+    assert("failed identity prevents tool execution", (await h.handlers.tool_call({ toolName: "bash", input: {} }, ctx)).block === true);
+    global.fetch = fetch;
+  }
+}
+
 (async () => {
   try {
+    await testPeerActorBindingAndInstructions();
+    await testPeerSubmissionFailureRetries();
+    await testPeerNotificationsAreTypedDeduplicatedAndSteered();
     await testConnectorCatalogUsesNativeDiscovery();
     await testLegacyPiRetainsConnectorTools();
     await testEmptyLengthCompletionFailsVisiblyAndRetryResets();

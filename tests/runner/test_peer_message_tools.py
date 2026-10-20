@@ -147,3 +147,109 @@ async def test_invalid_success_body_is_uncertain_but_validation_rejection_is_def
             assert result["outcome_unknown"] is unknown
             assert result["server_detail"] == body
             assert len(result["message_id"]) == 32
+
+
+@pytest.mark.asyncio
+async def test_runner_peer_notification_requires_pi_context_receipt(tmp_path, monkeypatch):
+    from omnigent.harnesses.pi_native import bridge
+    from omnigent.runner import create_runner_app
+    from omnigent.spec.types import ExecutorSpec
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+    from tests.runner.helpers import NullServerClient
+
+    sid = uuid.uuid4().hex
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridge")
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def resolve(agent_id, session_id=None):
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+        spec_resolver=resolve,
+        server_client=NullServerClient(),
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex}
+        )
+        assert response.status_code == 201, response.text
+        path = f"/v1/sessions/{sid}/events"
+        payload = {
+            "type": "peer_notification",
+            "notification_id": "a" * 64,
+            "message_ids": ["b" * 32],
+        }
+        assert (await client.post(path, json=payload)).status_code == 503
+        directory = bridge.bridge_dir_for_session_id(sid)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "input_ready").touch()
+        assert (await client.post(path, json=payload)).status_code == 202
+        assert (await client.post(path, json=payload)).status_code == 202
+        assert len(list((directory / "inbox").glob("*.json"))) == 1
+        (directory / "peer-receipts").mkdir()
+        (directory / "peer-receipts" / payload["notification_id"]).write_text("accepted\n")
+        response = await client.post(path, json=payload)
+        assert response.status_code == 200 and response.json()["delivered"]
+        payload["notification_id"] = "../bad"
+        assert (await client.post(path, json=payload)).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_peer_notification_recovers_native_terminal_before_enqueue(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.pi_native import bridge
+    from omnigent.runner import app as runner_module
+    from omnigent.spec.types import ExecutorSpec
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+    from tests.runner.helpers import NullServerClient
+
+    sid = uuid.uuid4().hex
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridge")
+
+    async def recover(session_id, harness):
+        assert session_id == sid and harness == "pi-native"
+        directory = bridge.prepare_bridge_dir(sid)
+        (directory / "input_ready").touch()
+
+    recovered = AsyncMock(side_effect=recover)
+    register = runner_module.register_resource_routes
+
+    def register_with_recovery(*args, **kwargs):
+        return replace(register(*args, **kwargs), ensure_native_terminal_for_turn=recovered)
+
+    monkeypatch.setattr(runner_module, "register_resource_routes", register_with_recovery)
+    spec = AgentSpec(
+        spec_version=1, executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"})
+    )
+
+    async def resolve(agent_id, session_id=None):
+        return spec
+
+    app = runner_module.create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+        spec_resolver=resolve,
+        server_client=NullServerClient(),
+    )
+    async with _runner_client(app) as client:
+        result = await client.post(
+            "/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex}
+        )
+        assert result.status_code == 201
+        assert not (bridge.bridge_dir_for_session_id(sid) / "input_ready").exists()
+        result = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "peer_notification",
+                "notification_id": "a" * 64,
+                "message_ids": ["b" * 32],
+            },
+        )
+        assert result.status_code == 202
+        recovered.assert_awaited_once_with(sid, "pi-native")

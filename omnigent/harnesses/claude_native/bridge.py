@@ -6575,6 +6575,7 @@ def _tool_relay_handler_factory(
                 "/events",
                 "/mcp",
                 "/policies/evaluate",
+                "/peer-notifications/actor",
                 "/hook/claude/evaluate-policy",
                 "/hook/observe-tool",
             ):
@@ -6592,6 +6593,9 @@ def _tool_relay_handler_factory(
                 return
             if self.path == "/events":
                 self._handle_native_event(payload)
+                return
+            if self.path == "/peer-notifications/actor":
+                self._handle_peer_actor(payload)
                 return
             if self.path == "/hook/observe-tool":
                 from omnigent.runner.pr_observer import observe_hook
@@ -6756,6 +6760,31 @@ def _tool_relay_handler_factory(
                 )
             self._respond_hook_output(hook_output)
 
+        def _handle_peer_actor(self, payload: _JsonObject) -> None:
+            """Use renewable owner authentication and bind the callback to this session."""
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            import urllib.parse as _up
+
+            future = asyncio.run_coroutine_threadsafe(
+                policy_client.post(
+                    f"/v1/sessions/{_up.quote(session_id, safe='')}/peer-notifications/actor",
+                    json=payload,
+                    timeout=10.0,
+                ),
+                loop,
+            )
+            try:
+                response = future.result(timeout=10.5)
+            except Exception:  # noqa: BLE001 — relay transport failures fail closed
+                future.cancel()
+                self.send_error(HTTPStatus.BAD_GATEWAY)
+                return
+            self.send_response(response.status_code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _handle_native_event(self, payload: _JsonObject) -> None:
             """Forward native telemetry through the runner's refresh-capable client."""
             if policy_client is None or session_id is None:
@@ -6896,6 +6925,8 @@ def _tool_relay_handler_factory(
             except ValueError:
                 return None
             if self.path in ("/events", "/mcp") and not 0 <= length <= 16_777_216:
+                return None
+            if self.path == "/peer-notifications/actor" and not 0 <= length <= 1024:
                 return None
             if self.path == "/hook/observe-tool" and not 0 <= length <= 1_048_576:
                 return None

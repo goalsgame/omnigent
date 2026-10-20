@@ -1,3 +1,4 @@
+import { PeerNotificationSettings } from "@/components/PeerNotificationSettings";
 import { RootGoogleCloudSessionAccess } from "@/components/RootGoogleCloudSessionAccess";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import {
@@ -2465,15 +2466,21 @@ export function AppShell() {
                     onAgentInfo={() => setAgentInfoOpen(true)}
                     hasHeaderMenu={hasHeaderMenu}
                     sessionAccessControl={
-                      serverConversationId &&
-                      serverInfo !== "loading" &&
-                      hasGoogleCloudSessionAccess(serverInfo) ? (
-                        <RootGoogleCloudSessionAccess
-                          key={serverConversationId}
-                          sessionId={serverConversationId}
-                          humanEnabled={serverInfo.enabled_connections.includes("google_cloud")}
-                          machineEnabled={serverInfo.machine_google_cloud_enabled === true}
-                        />
+                      serverConversationId ? (
+                        <>
+                          <PeerNotificationSettings
+                            key={`peer-${serverConversationId}`}
+                            sessionId={serverConversationId}
+                          />
+                          {serverInfo !== "loading" && hasGoogleCloudSessionAccess(serverInfo) ? (
+                            <RootGoogleCloudSessionAccess
+                              key={serverConversationId}
+                              sessionId={serverConversationId}
+                              humanEnabled={serverInfo.enabled_connections.includes("google_cloud")}
+                              machineEnabled={serverInfo.machine_google_cloud_enabled === true}
+                            />
+                          ) : null}
+                        </>
                       ) : undefined
                     }
                     showFilesPanel={showFilesPanel}

@@ -456,3 +456,26 @@ def test_refresh_system_prompt_preserves_auth_tools_and_clears_old_text(
     path.write_text(json.dumps(original))
     pi_native_bridge.refresh_config_system_prompt(tmp_path, prompt)
     assert json.loads(path.read_text()) == {**original, "systemPrompt": prompt}
+
+
+def test_peer_notification_stable_queue_and_receipt(tmp_path):
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "input_ready").touch()
+    notification = "a" * 64
+    mids = ["b" * 32]
+    assert pi_native_bridge.enqueue_peer_notification(bridge, notification, mids) is False
+    assert pi_native_bridge.enqueue_peer_notification(bridge, notification, mids) is False
+    assert len(list((bridge / "inbox").glob("*.json"))) == 1
+    (bridge / "peer-receipts").mkdir()
+    (bridge / "peer-receipts" / notification).write_text("accepted\n")
+    assert pi_native_bridge.enqueue_peer_notification(bridge, notification, mids) is True
+
+
+@pytest.mark.parametrize(
+    "notification,mids",
+    [("../bad", ["b" * 32]), ("a" * 64, []), ("a" * 64, ["../bad"]), (None, None)],
+)
+def test_peer_notification_rejects_untrusted_paths(tmp_path, notification, mids):
+    with pytest.raises(ValueError):
+        pi_native_bridge.enqueue_peer_notification(tmp_path, notification, mids)
