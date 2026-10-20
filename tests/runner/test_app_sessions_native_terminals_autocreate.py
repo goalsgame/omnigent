@@ -168,6 +168,7 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ),
     ],
 )
+@pytest.mark.parametrize("nested_tool_audit", [False, True])
 @pytest.mark.parametrize(
     "mcp_status", ["absent", "available", "unavailable", "exception", "needs_login"]
 )
@@ -177,6 +178,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     env_denylist: str | None,
     expected_env_unset: list[str],
     mcp_status: str,
+    nested_tool_audit: bool,
 ) -> None:
     """
     Pi-native auto-create must launch a *required* terminal.
@@ -227,6 +229,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             server_url="http://127.0.0.1:8000",
             terminal_launch_args=None,
             external_session_id=None,
+            nested_tool_audit=nested_tool_audit,
         )
 
     monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
@@ -357,7 +360,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     if mcp_status == "available":
         external = next(tool for tool in config["tools"] if tool["name"] == "search__find")
         assert external["parameters"]["properties"]["query"] == {"type": "string"}
-        assert external["exposure"] == "codemode"
+        assert external.get("exposure") == ("codemode" if nested_tool_audit else None)
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
 

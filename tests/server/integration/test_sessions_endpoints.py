@@ -4547,6 +4547,7 @@ async def test_get_session_includes_title_labels_effort(
     resp = await client.get(f"/v1/sessions/{session['id']}")
     assert resp.status_code == 200
     body = resp.json()
+    assert resp.headers["X-Omnigent-Nested-Tool-Audit"] == "1"
     assert body["title"] == "snap-test"
     assert body["labels"]["mode"] == "debug"
     assert body["reasoning_effort"] == "medium"

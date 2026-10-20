@@ -273,3 +273,23 @@ async def test_resolve_fresh_session_returns_none(tmp_path: Path) -> None:
         )
     assert out is None
     assert not list(tmp_path.glob("*.jsonl"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("advertised", [False, True])
+async def test_launch_config_requires_server_nested_audit_capability(
+    monkeypatch: pytest.MonkeyPatch, advertised: bool
+) -> None:
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/repo")
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={"workspace": "/repo"},
+            headers={"X-Omnigent-Nested-Tool-Audit": "1"} if advertised else {},
+        )
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://server.test") as client:
+        config = await _pi_native_launch_config(session_id="conv_1", server_client=client)
+    assert config.nested_tool_audit is advertised

@@ -16,6 +16,8 @@ rather than treating nested executions as separate model calls.
 The Docker host images and CI use the Pi version in `deploy/docker/pi-version`
 and the matching harness manifest and npm lockfile. Older local Pi versions, or
 clients without the built-in codemode extension, retain directly exposed tools.
+Discovery also requires the server to advertise nested-audit metadata support;
+a newer runner connected to an older server keeps direct tool registration.
 Upgrade those clients to the tested Pi release to use discovery.
 
 After updating the runner, start or resume a Pi session with an MCP server. Ask

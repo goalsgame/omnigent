@@ -667,6 +667,7 @@ class _PiNativeLaunchConfig:
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
+    :param nested_tool_audit: Server preserves nested tool audit metadata.
     """
 
     workspace: Path
@@ -678,6 +679,7 @@ class _PiNativeLaunchConfig:
     fork_carry_history: bool = False
     model_override: str | None = None
     reasoning_effort: str | None = None
+    nested_tool_audit: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1138,6 +1140,9 @@ async def _fetch_native_launch_snapshot(
             impact=ErrorImpact.BLOCKING,
             phase=ErrorPhase.HARNESS_SETUP,
         )
+    snapshot["_nested_tool_audit"] = (
+        getattr(resp, "headers", {}).get("X-Omnigent-Nested-Tool-Audit") == "1"
+    )
     return snapshot
 
 
@@ -1265,6 +1270,7 @@ async def _pi_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
+        nested_tool_audit=snapshot.get("_nested_tool_audit") is True,
         reasoning_effort=reasoning_effort
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
@@ -2582,7 +2588,11 @@ async def _auto_create_pi_terminal(
                 )
                 registered_names = {tool["name"] for tool in pi_tools}
                 pi_tools.extend(
-                    {**schema, "exposure": "codemode"}
+                    (
+                        {**schema, "exposure": "codemode"}
+                        if launch_config.nested_tool_audit
+                        else schema
+                    )
                     for schema in mcp_result.schemas
                     if schema["name"] not in registered_names
                 )
