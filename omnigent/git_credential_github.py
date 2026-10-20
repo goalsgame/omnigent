@@ -14,8 +14,9 @@ Why this shape:
   :func:`configure_host_gh` does materialize the token into gh's ``hosts.yml``
   at launch — a within-sandbox persistence the threat model below already
   admits, matching how ``~/.databrickscfg`` is written — and
-  :func:`start_host_gh_refresh` re-writes it on an interval so gh stays fresh
-  across the ~8h token expiry the git broker otherwise handles per-op.)
+  :func:`start_host_gh_refresh` re-writes it on an interval for compatibility.
+  Managed images also use :mod:`omnigent.github_cli` to fetch a fresh token
+  before every gh invocation; correctness does not depend on this timer.)
 - It is **executor-agnostic**: every executor already starts the host with a
   server URL + launch token, so nothing GitHub-specific is injected per
   executor. The host bakes the endpoint coordinates (server URL, host id, launch
@@ -284,13 +285,14 @@ def configure_host_gh(server_url: str, host_id: str) -> bool:
     the gh CLI has no per-op credential hook, so — like the Databricks config
     writer in :mod:`omnigent.onboarding.setup` materializes ``~/.databrickscfg``
     — the owner's brokered GitHub token is materialized into ``hosts.yml`` at
-    host startup. The token is a short-lived, server-refreshed user token; it is
-    re-fetched on each host launch, so a long-lived session should relaunch to
-    refresh it.
+    host startup for compatibility. Managed images also fetch a current broker
+    token on every gh invocation; the periodic hosts.yml writer alone cannot
+    cover expiry or rotation by another host.
 
-    Best-effort: a no-op when the host token is absent, the broker is
-    unreachable, or the owner hasn't linked GitHub (any ambient gh auth is left
-    untouched). Never raises.
+    Sandbox-only. Install broker context on inconclusive probes so managed
+    commands fail closed; never-linked deployments keep ambient authentication.
+    A context-write failure aborts setup instead of silently reusing old authority.
+    Returns whether hosts.yml was updated.
 
     :returns: ``True`` when gh was authenticated; ``False`` otherwise.
     """
@@ -300,6 +302,12 @@ def configure_host_gh(server_url: str, host_id: str) -> bool:
     if not token:
         return False
     data = _fetch(server_url, host_id, token)
+    from omnigent.github_cli import broker_path, configure_broker
+
+    if data is None or data.get("connected") or broker_path().exists():
+        # Rebind retained workspaces even after disconnect; never reuse a prior host's authority.
+        if not configure_broker(server_url, host_id, token):
+            raise RuntimeError("Cannot configure managed GitHub CLI credential broker")
     if not data or not data.get("connected") or not data.get("token"):
         return False
     gh_token = str(data["token"])
@@ -337,10 +345,9 @@ def start_host_gh_refresh(server_url: str, host_id: str) -> threading.Thread | N
     the token :func:`configure_host_gh` writes at startup goes stale when the
     GitHub App user token expires (~8h) and the server rotates it — a
     long-running session would then hit ``gh api`` 401s. This best-effort daemon
-    thread re-materializes ``hosts.yml`` on an interval well under the token
-    lifetime, so gh stays authenticated for the life of the host. (An
-    agent-sandbox resume already refreshes it by re-running host startup; this
-    covers a session that stays live without ever suspending.)
+    retains hosts.yml compatibility for custom images, but tokens can become
+    invalid between ticks. The managed image's per-invocation shim provides
+    fresh credentials independently of this background loop.
 
     :returns: The started daemon thread, or ``None`` when disabled (a
         non-positive interval, or outside a managed sandbox) — mainly for tests.

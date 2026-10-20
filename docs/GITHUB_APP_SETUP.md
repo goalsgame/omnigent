@@ -23,9 +23,10 @@ short-lived token minted from that user's authorization — never a shared PAT.
   (KMS) in the credential store. The `state` is signed with a subkey derived
   from the App's client secret, and the callback rebinds `state.sub` to the
   authenticated caller so it can't be replayed or cross-bound.
-- **Use (in the sandbox).** On sandbox launch the server vends that user's
-  fresh token to the runner, which materializes git/gh credentials. A refresh
-  token keeps long sessions authenticated.
+- **Use (in the sandbox).** Git fetches the owner's current token from the
+  host-authenticated broker per operation. The managed host image's `gh` shim
+  does the same before each invocation, so expiry or rotation in another
+  workspace does not leave long sessions using stale credentials.
 - **App, not OAuth App or PAT.** A GitHub App is an org-ownable, least-privilege
   identity whose **per-repo content access requires the App to be installed** on
   the account/org that owns the repo — so access is auditable and revocable per
@@ -207,6 +208,42 @@ nor `OMNIGENT_DOMAIN`), the feature logs a warning and **stays disabled**.
 
 If Step 3 returns `404` on a private repo while Steps 1–2 succeeded, the App is
 connected but **not installed** on that repo's owner — revisit [Step 7](#step-7--install-the-app).
+
+## Long-running GitHub CLI sessions
+
+The managed host image installs a `gh` shim at `/usr/local/bin/gh`, with the real
+CLI at `/usr/local/libexec/omnigent/gh`. The shim fetches the current owner-bound
+credential before executing the CLI once. The token enters `GH_TOKEN` only in
+the child environment, not arguments, stdout or an additional token file. Ambient
+`GH_TOKEN`/`GITHUB_TOKEN` values cannot override a configured managed identity.
+The existing periodic `hosts.yml` writer remains for compatibility; it is not
+an authentication correctness guarantee. Expiry/rotation can occur between ticks.
+
+The host stores only its broker coordinates and lesser host-scoped authority in
+`~/.omnigent/github/gh-broker.json` (atomic writes, mode `0600`). Runner/native
+processes need neither an inherited host-token environment nor a special PATH;
+login shells and the GitHub side panel reach the image's same `gh` command.
+A failed or disconnected configured broker fails closed instead of using stale
+saved credentials or a shared identity. Failure to persist broker context aborts
+host setup rather than reusing a prior host's authority. Offline `--version` and
+`--help` diagnostics do not need the broker. CLI failures are not automatically
+replayed: repeating a PR creation or another mutation could duplicate effects.
+
+Outside managed sandboxes, or where no broker has ever been configured, the
+shim preserves ordinary CLI authentication. Enterprise-token environment values
+are left unchanged; the injected `GH_TOKEN` follows GitHub CLI's host scoping.
+Custom host images must install the same shim and real-executable path to gain
+per-invocation renewal. Deploy the updated runner image and restart/migrate
+retained workspaces using the deployment's approved workspace-preservation
+procedure; existing processes/images do not gain the shim automatically.
+
+To verify after an authorized rollout, run `gh api user --jq .login` and a
+read-only `gh pr list --repo OWNER/REPO` in a disposable managed session. Repeat
+after a broker token refresh (or after the old token's lifetime), including when
+another workspace has caused the refresh. Both should work without manual
+`gh auth login` or a session restart. Check that a broker outage causes a clear
+credential error and runs no GitHub command. Live account disconnect/reconnect
+or synthetic fault tests require separate operator approval.
 
 ## Machine-owned sessions
 
