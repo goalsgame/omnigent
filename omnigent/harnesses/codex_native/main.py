@@ -2227,6 +2227,14 @@ def _codex_rollout_records_from_session_items(
     :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
     :returns: Codex rollout record dictionaries.
     """
+    items = [
+        item
+        for item in items
+        if not (
+            item.get("type") in {"function_call", "function_call_output"}
+            and item.get("parent_call_id")
+        )
+    ]
     timestamp = _codex_rollout_timestamp()
     turn_context_policy_fields = _codex_turn_context_policy_fields_from_launch_args(
         terminal_launch_args

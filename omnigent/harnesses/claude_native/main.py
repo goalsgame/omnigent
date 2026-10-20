@@ -5587,6 +5587,14 @@ def _claude_transcript_records_from_session_items(
     :param bridge_dir: Launch bridge path identifying the attachment cache.
     :returns: Claude JSONL record dictionaries.
     """
+    items = [
+        item
+        for item in items
+        if not (
+            item.get("type") in {"function_call", "function_call_output"}
+            and item.get("parent_call_id")
+        )
+    ]
     records: list[_JsonObject] = []
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}

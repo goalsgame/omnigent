@@ -1,5 +1,7 @@
 """Nested audit executions must not become model calls on a cross-harness fork."""
 
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
@@ -12,8 +14,10 @@ from omnigent.runtime.prompt import history_to_input_items
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["runner", "runtime"])
-async def test_nested_calls_replay_only_enclosing_call_across_harnesses(boundary: str) -> None:
+@pytest.mark.parametrize("boundary", ["runner", "runtime", "codex-native", "claude-native"])
+async def test_nested_calls_replay_only_enclosing_call_across_harnesses(
+    boundary: str, tmp_path: Path
+) -> None:
     raw = [
         {
             "type": "function_call",
@@ -38,7 +42,7 @@ async def test_nested_calls_replay_only_enclosing_call_across_harnesses(boundary
                 {
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": "document",
+                    "output": "hidden nested document",
                     "parent_call_id": "outer",
                 },
             ]
@@ -55,6 +59,42 @@ async def test_nested_calls_replay_only_enclosing_call_across_harnesses(boundary
                 server_client=client,
             )
             converted = history.convert_raw_items_to_input(raw)
+    elif boundary in {"codex-native", "claude-native"}:
+        if boundary == "codex-native":
+            from omnigent.harnesses.codex_native.main import (
+                _codex_rollout_records_from_session_items,
+            )
+
+            records = _codex_rollout_records_from_session_items(
+                raw,
+                session_id="session",
+                external_session_id="external",
+                cwd=tmp_path,
+                model_provider="test",
+                cli_version="0.136.0",
+            )
+            converted = [
+                record["payload"] for record in records if record["type"] == "response_item"
+            ]
+        else:
+            from omnigent.harnesses.claude_native.main import (
+                _claude_transcript_records_from_session_items,
+            )
+
+            records = _claude_transcript_records_from_session_items(
+                raw,
+                session_id="session",
+                external_session_id="external",
+                cwd=tmp_path,
+                bridge_dir=tmp_path,
+            )
+            blocks = [block for record in records for block in record["message"]["content"]]
+            assert [block["type"] for block in blocks] == ["tool_use", "tool_result"]
+            assert blocks[0]["id"] == blocks[1]["tool_use_id"] == "outer"
+            assert "hidden nested document" not in json.dumps(records)
+            assert len(raw) == 6
+            return
+        assert "hidden nested document" not in json.dumps(records)
     else:
         stored = [
             ConversationItem(
