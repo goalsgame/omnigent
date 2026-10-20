@@ -30,26 +30,34 @@ class PeerNotifier:
         self.agents = agent_store
         self.cache = agent_cache
 
-    def defaults(self, conv: Any) -> DeliveryPolicy:
-        """Agent YAML params supply defaults; session settings override them."""
+    def _spec(self, conv: Any) -> Any:
+        from omnigent.runtime.workflow import _find_spec_by_name
+
         agent = self.agents.get(conv.agent_id) if conv.agent_id else None
         if agent is None:
-            return DeliveryPolicy()
-        loaded = self.cache.load(
+            return None
+        spec = self.cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
-        )
-        return DeliveryPolicy.parse(loaded.spec.params.get("peer_messages"))
+        ).spec
+        if conv.sub_agent_name:
+            selected = _find_spec_by_name(spec, conv.sub_agent_name)
+            if selected is None:
+                raise ValueError("Notification sub-agent is unavailable")
+            return selected
+        return spec
+
+    def defaults(self, conv: Any) -> DeliveryPolicy:
+        """Agent YAML params supply defaults; session settings override them."""
+        spec = self._spec(conv)
+        return DeliveryPolicy.parse(spec.params.get("peer_messages")) if spec else DeliveryPolicy()
 
     def supported(self, conv: Any) -> bool:
         """Only adapters with a typed, acknowledged delivery path may start work."""
         from omnigent.inference_config import normalize_inference_harness
 
-        agent = self.agents.get(conv.agent_id) if conv.agent_id else None
-        if agent is None:
+        spec = self._spec(conv)
+        if spec is None:
             return False
-        spec = self.cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.operator_authored
-        ).spec
         override = conv.harness_override
         harness = (
             override
@@ -57,6 +65,23 @@ class PeerNotifier:
             else spec.executor.config.get("harness") or spec.executor.type
         )
         return normalize_inference_harness(harness) == "pi-native"
+
+    async def _client(self, sid: str, conv: Any) -> Any:
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.server.routes._sessions.helpers import _get_runner_client
+
+        if self.state.runner_router is not None:
+            try:
+                return self.state.runner_router.client_for_session_resources(
+                    sid, conversation=conv
+                ).client
+            except OmnigentError as exc:
+                if exc.code == ErrorCode.WRONG_REPLICA:
+                    raise
+                return None
+            except (LookupError, ConnectionError):
+                return None
+        return await _get_runner_client(sid, None, conversation=conv)
 
     async def run(self) -> None:
         """A database lease serializes each mailbox across backend processes."""
@@ -86,7 +111,7 @@ class PeerNotifier:
 
     async def deliver(self, sid: str, mailbox: str) -> None:
         """Run as the current recipient owner, never as the sending agent."""
-        from omnigent.server.routes._sessions.helpers import _get_runner_client
+        from omnigent.errors import ErrorCode, OmnigentError
         from omnigent.server.routes._sessions.orchestration import (
             _ensure_runner_relay_ready,
             _ensure_runner_session_initialized,
@@ -102,7 +127,12 @@ class PeerNotifier:
             return
         default = await asyncio.to_thread(self.defaults, conv)
         policy = await asyncio.to_thread(self.store.policy, sid, mailbox, default)
-        client = await _get_runner_client(sid, self.state.runner_router, conversation=conv)
+        try:
+            client = await self._client(sid, conv)
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                return
+            raise
         if client is None and not policy.wake_on_message:
             await asyncio.to_thread(self.store.defer, sid, mailbox)
             return
@@ -126,7 +156,7 @@ class PeerNotifier:
                 policy = await asyncio.to_thread(self.store.policy, sid, mailbox, default)
                 if not policy.enabled:
                     return
-                client = await _get_runner_client(sid, self.state.runner_router, conversation=conv)
+                client = await self._client(sid, conv)
                 if client is None and policy.wake_on_message:
                     client, conv = await ensure_runner_connected(
                         session_id=sid,
@@ -151,6 +181,7 @@ class PeerNotifier:
                 payload = {
                     "type": "peer_notification",
                     "notification_id": delivery.id,
+                    "attempt_id": delivery.lease,
                     "message_ids": list(delivery.message_ids),
                 }
                 for _ in range(20):

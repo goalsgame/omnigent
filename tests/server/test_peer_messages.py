@@ -800,3 +800,70 @@ async def test_notifier_does_not_wake_by_default(peer_env, db_uri, monkeypatch):
     )
     await notifier.deliver(target, messages.mailbox_id(target))
     wake.assert_awaited_once()
+
+
+def test_notification_selects_child_policy_and_executor():
+    from types import SimpleNamespace
+
+    from omnigent.server.peer_notifications import PeerNotifier
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    child = AgentSpec(
+        spec_version=1,
+        name="child",
+        params={"peer_messages": {"enabled": False}},
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        sub_agents=[child],
+        executor=ExecutorSpec(type="omnigent", config={"harness": "openai-agents"}),
+    )
+    agent = SimpleNamespace(id="agent", bundle_location="bundle", operator_authored=False)
+    notifier = PeerNotifier(
+        None,
+        None,
+        None,
+        SimpleNamespace(get=lambda _: agent),
+        SimpleNamespace(load=lambda *a, **k: SimpleNamespace(spec=root)),
+    )
+    conv = SimpleNamespace(agent_id="agent", sub_agent_name="child", harness_override=None)
+    assert notifier.supported(conv)
+    assert not notifier.defaults(conv).enabled
+    conv.sub_agent_name = None
+    assert not notifier.supported(conv)
+
+
+@pytest.mark.asyncio
+async def test_wrong_replica_does_not_write_backoff_or_consume_budget(
+    peer_env, db_uri, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omnigent.errors import ErrorCode
+    from omnigent.server.peer_notifications import PeerNotifier
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, messages, conversations, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(_path(source), json=_message(target), headers=_headers())
+    store = PeerDeliveryStore(db_uri)
+    router = SimpleNamespace(
+        client_for_session_resources=Mock(
+            side_effect=OmnigentError("Other replica", code=ErrorCode.WRONG_REPLICA)
+        )
+    )
+    notifier = PeerNotifier(
+        store, SimpleNamespace(runner_router=router), conversations, None, None
+    )
+    monkeypatch.setattr(notifier, "supported", lambda conv: True)
+    monkeypatch.setattr(notifier, "defaults", lambda conv: DeliveryPolicy(wake_on_message=True))
+    mailbox = messages.mailbox_id(target)
+    await notifier.deliver(target, mailbox)
+    assert store.candidates() == [(0, target, mailbox)]
+    batch = store.claim(target, mailbox, DeliveryPolicy())
+    assert batch is not None

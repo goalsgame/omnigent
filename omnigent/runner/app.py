@@ -6263,12 +6263,14 @@ def create_runner_app(
                 enqueue_peer_notification,
             )
 
+            await _ensure_native_terminal_for_turn(conversation_id, "pi-native")
             try:
                 delivered = await asyncio.to_thread(
                     enqueue_peer_notification,
                     bridge_dir_for_session_id(conversation_id),
                     body.get("notification_id"),
                     body.get("message_ids"),
+                    attempt_id=body.get("attempt_id"),
                 )
                 return JSONResponse(
                     status_code=200 if delivered else 202, content={"delivered": delivered}

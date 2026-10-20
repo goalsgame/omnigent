@@ -642,6 +642,12 @@ async function testPeerNotificationsAreTypedDeduplicatedAndSteered() {
     assert("typed as peer content", delivered[0].message.customType === "omnigent-peer-notification");
     assert("idle starts a turn; active steers", delivered[0].options.deliverAs === (active ? "steer" : "followUp"));
     assert("triggers processing", delivered[0].options.triggerTurn === true);
+    if (active) {
+      const retry = { id, type: "peer_notification", message_ids: ["c".repeat(32)], attempt_id: "d".repeat(32) };
+      fs.writeFileSync(file, JSON.stringify(retry));
+      await new Promise(resolve => setTimeout(resolve, 400));
+      assert("a fresh backend attempt does not duplicate a queued live message", delivered.length === 1);
+    }
     assert("not acknowledged before actual context delivery", !fs.existsSync(path.join(h.inboxDir, "peer-receipts", id)));
     await h.handlers.message_start({ message: { role: "custom", ...delivered[0].message } }, ctx);
     assert("receipt persisted after context delivery", fs.existsSync(path.join(h.inboxDir, "peer-receipts", id)));

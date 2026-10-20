@@ -1,4 +1,4 @@
-"""Permission-checked, pull-based communication between independent sessions."""
+"""Permission-checked peer inboxes and owner-controlled notification settings."""
 
 from __future__ import annotations
 
