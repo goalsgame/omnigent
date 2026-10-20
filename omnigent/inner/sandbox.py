@@ -493,6 +493,11 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
     return path.resolve(strict=False)
 
 
+def uses_windows_jobobject(spec: OSEnvSpec) -> bool:
+    """Include the platform default when deciding process-containment ownership."""
+    return (spec.sandbox or _default_sandbox_for_platform()).type == "windows_jobobject"
+
+
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     sandbox_spec = spec.sandbox or _default_sandbox_for_platform()
     if sandbox_spec.type != "linux_bwrap" and any(

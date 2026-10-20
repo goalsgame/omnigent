@@ -2515,3 +2515,114 @@ async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: 
             await fs.read("escape/note.txt")
     finally:
         os_env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolate", [False, True])
+async def test_selected_workspace_is_shared_by_resources_runtime_and_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolate: bool
+) -> None:
+    import json
+
+    from omnigent.runner.background_titles import BackgroundTitleContext
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.spec.types import AgentSpec
+
+    launch = tmp_path / "runner-launch"
+    selected = tmp_path / "selected-project"
+    launch.mkdir()
+    selected.mkdir()
+    spec = AgentSpec(
+        spec_version=1, os_env=OSEnvSpec(cwd=".", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    def metadata(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/cold-session":
+            return httpx.Response(
+                200,
+                json={"id": "cold-session", "agent_id": "test-agent", "workspace": str(selected)},
+            )
+        return httpx.Response(404, json={})
+
+    expected_root = selected / "cold-session" if isolate else selected
+    runtime_roots = []
+
+    async def harness_config(**kwargs: object) -> tuple[str, dict[str, str]]:
+        runtime_roots.append(kwargs["cwd"])
+        assert not registry._primary_envs, "Cold shell must precede resource materialization"
+        result = json.loads(
+            await _execute_os_env_tool(
+                "sys_os_shell",
+                {"command": "echo first-shell-ok"},
+                agent_spec=spec,
+                conversation_id="cold-session",
+                resource_registry=registry,
+                runner_workspace=kwargs["cwd"],
+            )
+        )
+        assert result.get("exit_code") == 0, result
+        assert result["stdout"].strip() == "first-shell-ok"
+        return "codex", {}
+
+    async def title(context: BackgroundTitleContext) -> str:
+        assert context.cwd == expected_root
+        return "Workspace check"
+
+    monkeypatch.setattr("omnigent.runner.app._resolve_harness_config", harness_config)
+    monkeypatch.setattr("omnigent.runner.app.run_background_title", title)
+    registry = SessionResourceRegistry(runner_workspace=launch, per_session_workspace=isolate)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(metadata), base_url="http://server"
+    ) as server:
+        app = create_runner_app(
+            server_client=server,
+            spec_resolver=resolve,
+            resource_registry=registry,
+            runner_workspace=launch,
+            per_session_workspace=isolate,
+            process_manager=SimpleNamespace(),
+        )
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as client:
+                base = f"/v1/sessions/cold-session/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+                title_response = await client.post(
+                    "/v1/sessions/cold-session/background-title",
+                    json={"prompt": "Check workspace", "agent_id": "test-agent"},
+                )
+                assert title_response.status_code == 200, title_response.text
+                assert runtime_roots == [expected_root]
+                (expected_root / "new.txt").write_text("baseline")
+                response = await client.put(
+                    f"{base}/filesystem/new.txt",
+                    json={"content": "selected-project-ok", "encoding": "utf-8"},
+                )
+                assert response.status_code == 200, response.text
+                assert (expected_root / "new.txt").read_text() == "selected-project-ok"
+                assert not (launch / "new.txt").exists()
+                changes = await client.get(
+                    f"/v1/sessions/cold-session/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+                )
+                assert changes.status_code == 200, changes.text
+                assert [entry["path"] for entry in changes.json()["data"]] == ["new.txt"]
+                diff = await client.get(f"{base}/diff/new.txt")
+                assert diff.status_code == 200, diff.text
+                assert diff.json()["before"] == "baseline"
+                assert diff.json()["after"] == "selected-project-ok"
+                edited = await client.patch(
+                    f"{base}/filesystem/new.txt",
+                    json={"old_text": "selected-project-ok", "new_text": "edited"},
+                )
+                assert edited.status_code == 200, edited.text
+                assert (await client.get(f"{base}/diff/new.txt")).json()["after"] == "edited"
+                deleted = await client.delete(f"{base}/filesystem/new.txt")
+                assert deleted.status_code == 200, deleted.text
+                diff = await client.get(f"{base}/diff/new.txt")
+                assert diff.status_code == 200, diff.text
+                assert diff.json()["before"] == "baseline" and diff.json()["after"] is None
+        finally:
+            await registry.cleanup_session("cold-session")

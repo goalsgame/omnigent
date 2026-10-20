@@ -7078,18 +7078,9 @@ def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
 
 def _runner_default_os_env_cwd(conversation_id: str | None) -> str:
     """Return the cwd for a default runner-owned primary OSEnv."""
-    safe_conv = "default"
-    if conversation_id:
-        safe_conv = "".join(
-            ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in conversation_id
-        )
-    root = Path(
-        os.environ.get(
-            "OMNIGENT_RUNNER_OS_ENV_ROOT",
-            str(Path(tempfile.gettempdir()) / "omnigent-runner-os-envs"),
-        )
-    )
-    cwd = root / safe_conv / "workspace"
+    from omnigent.runner.resource_registry import _session_workspace
+
+    cwd = Path(_session_workspace(conversation_id or "default"))
     cwd.mkdir(parents=True, exist_ok=True)
     return str(cwd)
 
@@ -7217,16 +7208,25 @@ async def _execute_os_env_tool(
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
         )
-        needs_shared_environment = effective_spec.sandbox is not None and any(
-            p.copy_on_write for p in effective_spec.sandbox.write_path_specs
+        from omnigent.inner.sandbox import uses_windows_jobobject
+
+        needs_shared_environment = (
+            uses_windows_jobobject(effective_spec)
+            or (
+                effective_spec.sandbox is not None
+                and any(p.copy_on_write for p in effective_spec.sandbox.write_path_specs)
+            )
+            or (
+                resource_registry is not None
+                and conversation_id is not None
+                and resource_registry.uses_windows_jobobject(conversation_id)
+            )
         )
         if needs_shared_environment:
             if resource_registry is None or conversation_id is None:
-                raise ValueError("copy_on_write tools require a session resource registry")
-            from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-
-            os_env = resource_registry.resolve_environment(
-                conversation_id, DEFAULT_ENVIRONMENT_ID, agent_spec
+                raise ValueError("Session-owned OS tools require a session resource registry")
+            os_env = resource_registry.resolve_execution_environment(
+                conversation_id, effective_spec
             )
             owns_environment = False
         else:

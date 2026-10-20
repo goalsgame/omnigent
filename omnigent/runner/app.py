@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
@@ -1602,6 +1602,19 @@ def create_runner_app(
             runner_workspace=runner_workspace,
             per_session_workspace=per_session_workspace,
         )
+
+    def _cached_session_workspace(session_id: str) -> Path | None:
+        workspace = _session_workspace_cache.get(session_id)
+        if workspace is None:
+            snapshot = _session_snapshot_cache.get(session_id)
+            workspace = snapshot.workspace if snapshot is not None else None
+        return (
+            Path(workspace.strip()).expanduser().resolve()
+            if workspace and workspace.strip()
+            else None
+        )
+
+    resource_registry.set_session_workspace_resolver(_cached_session_workspace)
     app.state.session_resource_registry = resource_registry
 
     def _publish_terminal_activity(session_id: str, terminal_id: str) -> None:
@@ -2044,10 +2057,13 @@ def create_runner_app(
         return None
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
-        workspace = await _session_workspace_value(session_id)
-        if workspace and workspace.strip():
-            return Path(workspace.strip()).expanduser().resolve()
-        return runner_workspace.resolve() if runner_workspace is not None else None
+        await _session_workspace_value(session_id)
+        if session_id not in _session_workspace_cache:
+            raise HTTPException(
+                status_code=503,
+                detail="Session workspace metadata is unavailable; retry the request.",
+            )
+        return resource_registry.prepare_session_workspace(session_id)
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
         await _get_server_version(server_client)
@@ -2143,11 +2159,10 @@ def create_runner_app(
         if session_id in _session_fs_registries:
             return _session_fs_registries[session_id]
 
-        session_workspace = await _session_workspace_value(session_id)
-        if session_workspace is None:
+        session_ws_path = await _session_runtime_cwd(session_id)
+        if session_ws_path is None:
             return filesystem_registry
 
-        session_ws_path = Path(session_workspace).resolve()
         runner_ws_resolved = runner_workspace.resolve() if runner_workspace is not None else None
         if runner_ws_resolved is not None and session_ws_path == runner_ws_resolved:
             return filesystem_registry
@@ -4887,6 +4902,8 @@ def create_runner_app(
             conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))
         )
 
+        await _resolve_session_fs_registry(conv)
+
         cached_spec_entry = _session_spec_cache.get(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
@@ -5341,6 +5358,22 @@ def create_runner_app(
             _ds_agent_id,
             None if dispatch else cast(str | None, body.get("agent_revision")),
         )
+        try:
+            await _resolve_session_fs_registry(conv_id)
+        except HTTPException as exc:
+            workspace_error = {
+                "code": "workspace_metadata_unavailable",
+                "message": str(exc.detail),
+                "type": type(exc).__name__,
+            }
+
+            async def workspace_failure_stream() -> AsyncIterator[bytes]:
+                _publish_event(conv_id, _response_failed_payload(workspace_error))
+                _on_proxy_stream_end(conv_id, error=workspace_error)
+                yield _response_failed_event(workspace_error)
+
+            return StreamingResponse(workspace_failure_stream(), media_type="text/event-stream")
+
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -5926,7 +5959,13 @@ def create_runner_app(
                                         _spec_for_dispatch = _unwrap_resolved_spec(
                                             _spec_for_dispatch_entry
                                         )
-                                        _dispatch_workspace = await _session_runtime_cwd(conv_id)
+                                        await _session_runtime_cwd(conv_id)
+                                        _dispatch_fs_registry = await _resolve_session_fs_registry(
+                                            conv_id
+                                        )
+                                        _dispatch_workspace = (
+                                            resource_registry.prepare_session_workspace(conv_id)
+                                        )
                                         event[_RUNNER_DISPATCHED_FIELD] = True
                                         raw_sse_bytes = _encode_sse_event(event)
                                         _agent_id_for_dispatch = cast(
@@ -5964,7 +6003,7 @@ def create_runner_app(
                                                         conv_id
                                                     ),
                                                     publish_event=_publish_event,
-                                                    filesystem_registry=filesystem_registry,
+                                                    filesystem_registry=_dispatch_fs_registry,
                                                     effective_harness=_session_harness_name(
                                                         conv_id
                                                     ),
@@ -7151,7 +7190,6 @@ def create_runner_app(
         _search_registry_for_root=_search_registry_for_root,
         _session_comment_relays=_session_comment_relays,
         auth_token_factory=auth_token_factory,
-        filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
         server_client=server_client,
         terminal_registry=terminal_registry,
@@ -7502,7 +7540,7 @@ def create_runner_app(
         _session_inboxes=_session_inboxes,
         _session_runtime_cwd=_session_runtime_cwd,
         _session_spec_cache=_session_spec_cache,
-        filesystem_registry=filesystem_registry,
+        _resolve_session_fs_registry=_resolve_session_fs_registry,
         mcp_execution_registry=mcp_execution_registry,
         mcp_manager=mcp_manager,
         process_manager=process_manager,

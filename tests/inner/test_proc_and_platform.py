@@ -695,3 +695,36 @@ def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> 
         "MALLOC_ARENA_MAX": "1",
         "MALLOC_TRIM_THRESHOLD_": "65536",
     }
+
+
+def test_windows_completed_command_job_can_release_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    from omnigent.inner import windows_jobobject_sandbox as windows
+
+    flags = []
+    closed = []
+
+    def set_information(handle, information_class, pointer, size):
+        info = ctypes.cast(
+            pointer, ctypes.POINTER(windows._JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+        ).contents
+        flags.append(info.BasicLimitInformation.LimitFlags)
+        return True
+
+    monkeypatch.setattr(
+        windows,
+        "_kernel32",
+        lambda: SimpleNamespace(
+            SetInformationJobObject=set_information,
+            CloseHandle=lambda h: closed.append(h.value) or True,
+        ),
+    )
+    job = windows._JobHandle(123)
+    job.release_processes()
+    job.close()
+    assert flags == [0]
+    assert closed == [123]

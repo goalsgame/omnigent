@@ -515,3 +515,136 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+def test_windows_shell_timeout_reaps_only_its_command_tree(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+    import time
+
+    import psutil
+
+    from omnigent.inner.os_env import _run_windows_shell
+
+    successful_pid = tmp_path / "successful.pid"
+    timed_out_pid = tmp_path / "timed-out.pid"
+    children = []
+
+    def launcher(path: Path, wait: bool) -> list[str]:
+        child = "import time; time.sleep(60)"
+        script = (
+            "import subprocess,sys,time; from pathlib import Path; "
+            f"p=subprocess.Popen([sys.executable,'-c',{child!r}], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+            f"Path({str(path)!r}).write_text(str(p.pid)); "
+            + ("time.sleep(60)" if wait else "print('launched')")
+        )
+        return [sys.executable, "-c", script]
+
+    try:
+        result = _run_windows_shell(launcher(successful_pid, False), cwd=tmp_path, timeout=5)
+        assert result.returncode == 0
+        earlier = psutil.Process(int(successful_pid.read_text()))
+        children.append(earlier)
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_windows_shell(launcher(timed_out_pid, True), cwd=tmp_path, timeout=2)
+        pid = int(timed_out_pid.read_text())
+        if psutil.pid_exists(pid):
+            children.append(psutil.Process(pid))
+        deadline = time.monotonic() + 3
+        while psutil.pid_exists(pid) and time.monotonic() < deadline:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                break
+            time.sleep(0.05)
+        assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        assert earlier.is_running() and earlier.status() != psutil.STATUS_ZOMBIE
+    finally:
+        for child in children:
+            try:
+                child.kill()
+                child.wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass
+
+
+@pytest.mark.parametrize("containment_available", [True, False])
+def test_windows_shell_waits_for_containment_before_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, containment_available: bool
+) -> None:
+    import sys
+
+    from omnigent.inner import os_env
+
+    marker = tmp_path / "command-ran"
+    events = []
+
+    class Job:
+        def release_processes(self) -> None:
+            events.append("release")
+
+        def close(self) -> None:
+            events.append("close")
+
+    def attach(pid: int) -> Job | None:
+        assert pid > 0
+        assert not marker.exists(), "Command ran before containment was attached"
+        events.append("attach")
+        return Job() if containment_available else None
+
+    monkeypatch.setattr(os_env, "IS_WINDOWS", True)
+    monkeypatch.setattr("omnigent.inner.windows_jobobject_sandbox.create_process_job", attach)
+    argv = [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]
+    if containment_available:
+        result = os_env._run_windows_shell(argv, cwd=tmp_path, timeout=5)
+        assert result.returncode == 0
+        assert marker.exists()
+        assert events == ["attach", "release", "close"]
+    else:
+        with pytest.raises(OSError, match="containment"):
+            os_env._run_windows_shell(argv, cwd=tmp_path, timeout=5)
+        assert not marker.exists()
+        assert events == ["attach"]
+
+
+def test_windows_timeout_retains_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from omnigent.inner import os_env
+
+    class Job:
+        def release_processes(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(os_env, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent.inner.windows_jobobject_sandbox.create_process_job", lambda pid: Job()
+    )
+    result = os_env._shell_impl(
+        command=(
+            "import sys,time; print('before-timeout',flush=True); "
+            "print('diagnostic',file=sys.stderr,flush=True); time.sleep(60)"
+        ),
+        shell_path=sys.executable,
+        cwd=tmp_path,
+        timeout=1,
+    )
+    assert result["timed_out"] is True
+    assert result["stdout"].strip() == "before-timeout"
+    assert result["stderr"].strip() == "diagnostic"
+
+
+def test_windows_gate_ignores_workspace_python_modules(tmp_path: Path) -> None:
+    import sys
+
+    from omnigent.inner.os_env import _run_windows_shell
+
+    for name in ("json", "subprocess", "sitecustomize"):
+        (tmp_path / f"{name}.py").write_text("raise RuntimeError('workspace module imported')")
+    result = _run_windows_shell(
+        [sys.executable, "-I", "-c", "print('gate-ok')"], cwd=tmp_path, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "gate-ok"

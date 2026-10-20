@@ -592,7 +592,7 @@ class CallerProcessFilesystem:
 
     Routes read/write/edit through the OSEnvironment's methods so
     sandbox policies (bwrap, seatbelt) are enforced by the helper
-    subprocess.  Directory listing and stat use ``os_env.shell()``
+    subprocess.  Directory listing and stat use ``os_env.filesystem_shell()``
     for the same reason.  The ``_root`` path is used only for
     path validation (traversal checks), not for direct I/O.
 
@@ -770,7 +770,7 @@ class CallerProcessFilesystem:
     ) -> PagedList[FilesystemEntry]:
         """List directory contents via the sandboxed helper.
 
-        Uses ``os_env.shell()`` to run a Python script inside the sandbox so
+        Uses ``os_env.filesystem_shell()`` to run a Python script inside the sandbox so
         access control is enforced.  The script uses ``os.lstat()`` (does not
         follow symlinks) for size/mtime and ``os.path.isdir()`` (follows
         symlinks but returns ``False`` for broken ones) for type classification.
@@ -818,7 +818,7 @@ class CallerProcessFilesystem:
             ]
         )
         result = await _run_os_env_async(
-            self._os_env.shell,
+            self._os_env.filesystem_shell,
             f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result:
@@ -1042,7 +1042,7 @@ print(json.dumps({'r': results, 't': truncated}))
 """
         _script = _header + "\n" + _body
         result = await _run_os_env_async(
-            self._os_env.shell,
+            self._os_env.filesystem_shell,
             f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result:
@@ -1271,7 +1271,7 @@ print(json.dumps({'r': results, 't': truncated}))
             ]
         )
         result = await _run_os_env_async(
-            self._os_env.shell,
+            self._os_env.filesystem_shell,
             f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
@@ -1457,7 +1457,7 @@ print(json.dumps({'r': results, 't': truncated}))
             ]
         )
         result = await _run_os_env_async(
-            self._os_env.shell,
+            self._os_env.filesystem_shell,
             f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
@@ -1489,7 +1489,7 @@ print(json.dumps({'r': results, 't': truncated}))
             ]
         )
         check = await _run_os_env_async(
-            self._os_env.shell,
+            self._os_env.filesystem_shell,
             f"python3 -c {_shell_quote(_script)}",
         )
         count = int(check.get("stdout", "0").strip() or "0")
@@ -1522,7 +1522,7 @@ print(json.dumps({'r': results, 't': truncated}))
             )
 
         cmd = f"rm -rf {_shell_quote(validated)}" if is_dir else f"rm -f {_shell_quote(validated)}"
-        result = await _run_os_env_async(self._os_env.shell, cmd)
+        result = await _run_os_env_async(self._os_env.filesystem_shell, cmd)
         if "error" in result and result.get("exit_code", 0) != 0:
             raise FilesystemPathNotFound(
                 result.get("error", f"Delete failed for {path!r}"),

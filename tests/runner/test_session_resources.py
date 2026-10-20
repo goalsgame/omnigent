@@ -136,6 +136,15 @@ class _CapturingResourceRegistry:
         self.resource_roles: list[str | None] = []
         self.launch_lifecycles: list[str] = []
 
+    def set_session_workspace_resolver(self, resolver: Callable[[str], Path | None]) -> None:
+        self._session_workspace_resolver = resolver
+
+    def workspace_for_session(self, session_id: str) -> Path | None:
+        return self._session_workspace_resolver(session_id) or self._runner_workspace
+
+    def prepare_session_workspace(self, session_id: str) -> Path | None:
+        return self.workspace_for_session(session_id)
+
     def set_terminal_activity_publisher(
         self,
         publisher: Callable[[str, str], None],
@@ -2401,10 +2410,8 @@ async def test_failed_snapshot_does_not_latch_session_workspace(
     finally:
         await server_client.aclose()
 
-    # While the server is down the read still succeeds off the global
-    # workspace fallback, which is clean and so reports nothing.
-    assert during_outage.status_code == 200, during_outage.text
-    assert during_outage.json()["data"] == []
+    # Do not serve the runner's files as the session's confirmed workspace.
+    assert during_outage.status_code == 503, during_outage.text
     assert after_recovery.status_code == 200, after_recovery.text
     paths = [entry["path"] for entry in after_recovery.json()["data"]]
     # The marker only exists in the worktree. Its absence means the failed
@@ -2578,9 +2585,11 @@ async def test_claude_terminal_ensure_concurrent_calls_create_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("isolate", [False, True])
 async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    isolate: bool,
 ) -> None:
     """
     Never-retried-because-already-present scenario:
@@ -2658,6 +2667,7 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     app = create_runner_app(
         runner_workspace=runner_ws,
         server_client=server_client,
+        per_session_workspace=isolate,
     )
     # The shared default registry is created eagerly at app-build time,
     # watched at the runner root — this is registry_calls[0], not part of
@@ -2676,7 +2686,7 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     finally:
         await server_client.aclose()
 
-    assert first.status_code == 200, first.text
+    assert first.status_code == 503, first.text
     assert second.status_code == 200, second.text
     assert snapshot_count >= 2, (
         f"expected at least a failed + a successful snapshot fetch, got {snapshot_count}"
@@ -2685,7 +2695,8 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     # workspace, must be created once the snapshot succeeds — a value of
     # [runner_ws] only (no session_ws entry) means the failed first fetch
     # permanently pinned workspace=None and the second call never re-asked.
-    assert session_ws.resolve() in registry_calls, (
+    expected_workspace = session_ws / conv if isolate else session_ws
+    assert expected_workspace.resolve() in registry_calls, (
         f"expected a per-session filesystem registry watching {session_ws!r} "
         f"after the snapshot recovered — got registry_calls={registry_calls!r}. "
         f"Only the startup entry means the failed first snapshot pinned this "

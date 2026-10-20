@@ -41,7 +41,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.async_utils import run_sync_cleanup
-from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.inner.sandbox import contained_realpath, containment_prefix, uses_windows_jobobject
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
@@ -472,6 +472,7 @@ class SessionResourceRegistry:
             terminal_registry.environment_resolver = self._resolve_terminal_environment
         self._runner_workspace = runner_workspace
         self._per_session_workspace = per_session_workspace
+        self._session_workspace_resolver: Callable[[str], Path | None] | None = None
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
@@ -954,6 +955,19 @@ class SessionResourceRegistry:
 
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
 
+    def resolve_execution_environment(self, session_id: str, spec: OSEnvSpec) -> OSEnvironment:
+        """Resolve the execution spec even when no authored agent spec is available."""
+        return self._resolve_primary(session_id, None, os_env_spec=spec)
+
+    def uses_windows_jobobject(self, session_id: str) -> bool:
+        """Retain policy validation after a later caller requests a different backend."""
+        with self._lock:
+            environment = self._primary_envs.get(session_id)
+            return (
+                getattr(getattr(environment, "sandbox", None), "backend_type", None)
+                == "windows_jobobject"
+            )
+
     def uses_copy_on_write(self, session_id: str) -> bool:
         """Preserve disposable semantics if a later spec lookup is unavailable."""
         with self._lock:
@@ -994,16 +1008,29 @@ class SessionResourceRegistry:
                 cached_cow = bool(
                     getattr(getattr(cached, "sandbox", None), "copy_on_write_roots", None)
                 )
-                if requested_spec is not None and (requested_cow or cached_cow):
-                    if previous_spec is None and not cached_cow:
+                requested_windows_job = requested_spec is not None and uses_windows_jobobject(
+                    requested_spec
+                )
+                cached_windows_job = (
+                    getattr(getattr(cached, "sandbox", None), "backend_type", None)
+                    == "windows_jobobject"
+                )
+                if requested_spec is not None and (
+                    requested_cow or cached_cow or requested_windows_job or cached_windows_job
+                ):
+                    if previous_spec is None and not (cached_cow or cached_windows_job):
                         # The filesystem panel may create a host read view before
                         # the agent's sandbox configuration becomes available.
                         cached.close()
                         self._primary_envs.pop(session_id)
                     elif previous_spec != requested_spec:
+                        kind = (
+                            "copy-on-write"
+                            if requested_cow or cached_cow
+                            else "Windows Job Object"
+                        )
                         raise ValueError(
-                            "Cannot change an active copy-on-write environment; "
-                            "start a new session"
+                            f"Cannot change an active {kind} environment; start a new session"
                         )
                     else:
                         return cached
@@ -1019,14 +1046,38 @@ class SessionResourceRegistry:
             self._primary_env_specs[session_id] = deepcopy(requested_spec)
             return os_env
 
+    def set_session_workspace_resolver(self, resolver: Callable[[str], Path | None]) -> None:
+        """Use the session's selected workspace before the runner launch directory."""
+        self._session_workspace_resolver = resolver
+
+    def workspace_for_session(self, session_id: str) -> Path | None:
+        """Resolve workspace selection and isolation for all runtime consumers."""
+        workspace = (
+            self._session_workspace_resolver(session_id)
+            if self._session_workspace_resolver is not None
+            else None
+        )
+        if workspace is None:
+            workspace = self._runner_workspace
+        if workspace is None:
+            return None
+        if self._per_session_workspace:
+            return Path(_contained_session_dir(workspace, session_id))
+        return workspace.resolve()
+
+    def prepare_session_workspace(self, session_id: str) -> Path | None:
+        """Create the private isolated directory before runtime processes use it."""
+        workspace = self.workspace_for_session(session_id)
+        if workspace is not None and self._per_session_workspace:
+            workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+            workspace.chmod(0o700)
+        return workspace
+
     def _effective_primary_spec(self, session_id: str, spec: OSEnvSpec) -> OSEnvSpec:
         """Use the same workspace identity for tools and inherited terminals."""
-        if self._runner_workspace is not None:
-            cwd = (
-                _contained_session_dir(self._runner_workspace, session_id)
-                if self._per_session_workspace
-                else str(self._runner_workspace)
-            )
+        workspace = self.workspace_for_session(session_id)
+        if workspace is not None:
+            cwd = str(workspace)
         elif spec.cwd is None or spec.cwd in ("", ".", "./"):
             cwd = _session_workspace(session_id)
         else:
@@ -1064,18 +1115,13 @@ class SessionResourceRegistry:
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
         from omnigent.inner.os_env import create_os_environment
 
+        selected_workspace = self.prepare_session_workspace(session_id)
         # Prefer the CLI launch workspace so that the OS environment
         # cwd matches the filesystem-registry watch path.  Fall back
         # to the per-session temp dir for remote/cloud runners that
         # have no workspace affinity.
-        if self._runner_workspace is not None:
-            if self._per_session_workspace:
-                # Isolate sessions under the shared workspace.
-                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
-                os.makedirs(default_cwd, mode=0o700, exist_ok=True)
-                os.chmod(default_cwd, 0o700)  # ensure mode even if pre-existing
-            else:
-                default_cwd = str(self._runner_workspace)
+        if selected_workspace is not None:
+            default_cwd = str(selected_workspace)
         else:
             default_cwd = _session_workspace(session_id)
             # Restrict workspace visibility on shared hosts.
@@ -1127,17 +1173,18 @@ class SessionResourceRegistry:
         Precedence (per
         designs/SESSION_WORKSPACE_SELECTION.md "How this maps onto runtime"):
 
-        1. ``self._runner_workspace`` (sourced from
+        1. The session-selected workspace supplied by the runner's snapshot cache.
+        2. ``self._runner_workspace`` (sourced from
            ``OMNIGENT_RUNNER_WORKSPACE``) — when set, ALWAYS
            wins. Both CLI- and host-launched sessions populate it
            with the authoritative starting cwd; any spec cwd is
            treated as a session-create-time boundary, not a
            runtime override.
-        2. The agent's absolute ``os_env.cwd``, when present and
+        3. The agent's absolute ``os_env.cwd``, when present and
            not a relative placeholder. Used for pure local runs
            that bypass the env-var path (e.g. unit tests that
            construct an ``AgentSpec`` directly).
-        3. The per-session default workspace tmpdir.
+        4. The per-session default workspace tmpdir.
 
         :param session_id: Session/conversation identifier.
         :param agent_spec: Agent spec for the session.  When provided and its
@@ -1155,15 +1202,9 @@ class SessionResourceRegistry:
             if spec_os_env is None:
                 return None
 
-        # Runner workspace wins when set. Per-session subdirectory
-        # isolation is preserved so concurrent sessions
-        # don't share a cwd.
-        if self._runner_workspace is not None:
-            if self._per_session_workspace:
-                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
-            else:
-                default_cwd = str(self._runner_workspace)
-            return str(Path(default_cwd).resolve())
+        selected_workspace = self.workspace_for_session(session_id)
+        if selected_workspace is not None:
+            return str(selected_workspace.resolve())
 
         # No runner workspace → fall back to the spec's cwd if it's
         # a real absolute path, otherwise the per-session tmpdir.
