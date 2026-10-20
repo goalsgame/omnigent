@@ -31,7 +31,8 @@ asleep unless their owner enables **Wake sleeping sandbox when a message arrives
 in the session header's **Agent message notifications** dialog. Owners can disable
 automatic processing entirely. Offline workstation hosts cannot be powered on by
 this feature. Other harnesses retain manual inbox tools; automatic notifications
-currently require native Pi.
+currently require native Pi. The backend checks the runner notification protocol
+before dispatch; inboxes on older runners remain pending until the runner is upgraded.
 
 Agent YAML provides declarative defaults through `params.peer_messages`:
 

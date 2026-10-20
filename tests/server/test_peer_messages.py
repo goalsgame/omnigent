@@ -739,6 +739,8 @@ async def test_notifier_retries_until_runner_receipt_without_acknowledging(
     posts = []
 
     async def transport(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"protocol_version": 1})
         posts.append(json.loads(request.content))
         return httpx.Response(202 if len(posts) == 1 else 200, json={"delivered": len(posts) > 1})
 
@@ -867,3 +869,46 @@ async def test_wrong_replica_does_not_write_backoff_or_consume_budget(
     assert store.candidates() == [(0, target, mailbox)]
     batch = store.claim(target, mailbox, DeliveryPolicy())
     assert batch is not None
+
+
+@pytest.mark.asyncio
+async def test_older_runner_is_not_sent_an_unrecognized_notification(
+    peer_env, db_uri, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlPeerDelivery
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.server.peer_notifications import PeerNotifier
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, messages, conversations, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(_path(source), json=_message(target), headers=_headers())
+    requests = []
+
+    async def transport(request):
+        requests.append(request)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(transport), base_url="http://runner"
+    ) as runner:
+        state = SimpleNamespace(
+            runner_router=SimpleNamespace(
+                client_for_session_resources=lambda *a, **kw: SimpleNamespace(client=runner)
+            )
+        )
+        store = PeerDeliveryStore(db_uri)
+        notifier = PeerNotifier(store, state, conversations, None, None)
+        monkeypatch.setattr(notifier, "supported", lambda conv: True)
+        monkeypatch.setattr(notifier, "defaults", lambda conv: DeliveryPolicy())
+        await notifier.deliver(target, messages.mailbox_id(target))
+    assert [request.method for request in requests] == ["GET"]
+    with get_or_create_engine(db_uri).connect() as conn:
+        assert conn.scalar(select(SqlPeerDelivery.attempts)) == 0
+    assert messages.list_messages(target, unread_only=True)

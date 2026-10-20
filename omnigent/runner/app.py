@@ -2241,6 +2241,10 @@ def create_runner_app(
             content={"error": error},
         )
 
+    @app.get("/v1/peer-notifications/capabilities")
+    async def peer_notification_capabilities() -> dict[str, int]:
+        return {"protocol_version": 1}
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}

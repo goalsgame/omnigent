@@ -83,6 +83,15 @@ class PeerNotifier:
                 return None
         return await _get_runner_client(sid, None, conversation=conv)
 
+    async def _supports_client(self, client: Any) -> bool:
+        response = await client.get("/v1/peer-notifications/capabilities", timeout=10)
+        if response.status_code != 200:
+            return False
+        try:
+            return response.json().get("protocol_version") == 1
+        except (ValueError, AttributeError):
+            return False
+
     async def run(self) -> None:
         """A database lease serializes each mailbox across backend processes."""
         slots = asyncio.Semaphore(4)
@@ -136,6 +145,9 @@ class PeerNotifier:
         if client is None and not policy.wake_on_message:
             await asyncio.to_thread(self.store.defer, sid, mailbox)
             return
+        if client is not None and not await self._supports_client(client):
+            await asyncio.to_thread(self.store.defer, sid, mailbox, seconds=300)
+            return
         delivery = await asyncio.to_thread(self.store.claim, sid, mailbox, default)
         if delivery is None:
             return
@@ -165,7 +177,7 @@ class PeerNotifier:
                         conversation_store=self.conversations,
                         runner_router=self.state.runner_router,
                     )
-                if client is None:
+                if client is None or not await self._supports_client(client):
                     return
                 await _ensure_runner_session_initialized(
                     sid,
