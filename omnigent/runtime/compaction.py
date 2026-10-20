@@ -160,6 +160,12 @@ def count_tokens(messages: list[dict[str, Any]], model: str) -> int:
     return len(enc.encode(text))
 
 
+def _is_nested_tool_audit(item: ConversationItem) -> bool:
+    return isinstance(item.data, (FunctionCallData, FunctionCallOutputData)) and bool(
+        item.data.parent_call_id
+    )
+
+
 def _find_recent_boundary(
     history: list[ConversationItem],
     recent_window: int,
@@ -184,6 +190,8 @@ def _find_recent_boundary(
     groups_seen = 0
     for i in range(len(history) - 1, -1, -1):
         item = history[i]
+        if _is_nested_tool_audit(item):
+            continue
         is_assistant_msg = (
             item.type == "message"
             and isinstance(item.data, MessageData)
@@ -202,6 +210,8 @@ def _tool_safe_history_boundary(history: list[ConversationItem], boundary: int) 
     call_positions: dict[str, int] = {}
     spans: list[tuple[int, int]] = []
     for index, item in enumerate(history):
+        if _is_nested_tool_audit(item):
+            continue
         if isinstance(item.data, FunctionCallData):
             call_positions[item.data.call_id] = index
         elif isinstance(item.data, FunctionCallOutputData):
@@ -776,9 +786,8 @@ def _history_idx_to_msg_idx(
     """
     Map a history index to the corresponding messages list index.
 
-    ``history_to_input_items`` skips reasoning items, so the
-    messages list may be shorter than the history list. This
-    function counts non-reasoning items up to *history_idx*.
+    Reasoning and nested audit entries are omitted from model input, so
+    they do not contribute to the messages index.
 
     :param history: The full conversation history.
     :param history_idx: The index in *history* to map.
@@ -788,7 +797,7 @@ def _history_idx_to_msg_idx(
     for i, item in enumerate(history):
         if i >= history_idx:
             break
-        if item.type != "reasoning":
+        if item.type != "reasoning" and not _is_nested_tool_audit(item):
             msg_idx += 1
     return msg_idx
 

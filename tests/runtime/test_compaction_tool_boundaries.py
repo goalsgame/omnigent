@@ -139,3 +139,94 @@ async def test_closed_older_tool_pairs_remain_eligible_for_summarization() -> No
     ] == ["new"]
     assert result.summary_metadata is not None
     assert result.summary_metadata.last_item_id == "old_result"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("recent_window", [1, 2, 3, 4])
+async def test_nested_audit_entries_do_not_shift_protected_tool_results(
+    force: bool, recent_window: int
+) -> None:
+    from omnigent.runtime.compaction import _find_recent_boundary, _history_idx_to_msg_idx
+
+    history = [
+        _item(
+            "function_call",
+            "outer-call",
+            agent="Pi",
+            name="codemode",
+            arguments="{}",
+            call_id="outer",
+        )
+    ]
+    for index in range(2):
+        history.extend(
+            [
+                _item(
+                    "function_call",
+                    f"nested-call-{index}",
+                    agent="Pi",
+                    name="docs__lookup",
+                    arguments="{}",
+                    call_id=f"outer/{index}",
+                    parent_call_id="outer",
+                ),
+                _item(
+                    "function_call_output",
+                    f"nested-output-{index}",
+                    call_id=f"outer/{index}",
+                    output="hidden",
+                    parent_call_id="outer",
+                ),
+            ]
+        )
+    history.append(
+        _item("function_call_output", "outer-output", call_id="outer", output="outer result")
+    )
+    for name in ("recent-a", "recent-b"):
+        history.extend(
+            [
+                _item(
+                    "function_call",
+                    f"{name}-call",
+                    agent="Pi",
+                    name="read",
+                    arguments="{}",
+                    call_id=name,
+                ),
+                _item(
+                    "function_call_output", f"{name}-output", call_id=name, output=f"keep {name}"
+                ),
+            ]
+        )
+    boundary = _find_recent_boundary(history, recent_window)
+    assert boundary == ({1: 8, 2: 6}.get(recent_window, 0))
+    assert _history_idx_to_msg_idx(history, boundary) == {1: 4, 2: 2}.get(recent_window, 0)
+    summarize = AsyncMock(
+        return_value=Response(
+            output=[MessageOutput(content=[OutputText(text="Earlier context.")])],
+            model="test-model",
+        )
+    )
+    result = await compact(
+        history_to_input_items(history),
+        history,
+        config=CompactionConfig(recent_window=recent_window),
+        context_window=8192,
+        system_token_budget=0,
+        model="test-model",
+        task_id="nested-compaction",
+        llm_client=SimpleNamespace(responses=SimpleNamespace(create=summarize)),
+        force=force,
+    )
+    calls = {item["call_id"] for item in result.messages if item.get("type") == "function_call"}
+    outputs = {
+        item["call_id"]: item["output"]
+        for item in result.messages
+        if item.get("type") == "function_call_output"
+    }
+    protected = {1: {"recent-b"}}.get(recent_window, {"recent-a", "recent-b"})
+    assert protected <= calls
+    assert all(outputs[name] == f"keep {name}" for name in protected)
+    assert set(outputs) == calls
+    assert not any("/" in call_id for call_id in calls)
