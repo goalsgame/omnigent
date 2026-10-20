@@ -1046,8 +1046,10 @@ class CallerProcessOSEnvironment(OSEnvironment):
             try:
                 return helper.request(request)
             finally:
-                cancel_path.unlink(missing_ok=True)
-                finished.set()
+                try:
+                    cancel_path.unlink(missing_ok=True)
+                finally:
+                    finished.set()
 
         try:
             return cast(OpResult, await run_sync_on_thread(run_request))
@@ -1057,7 +1059,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
             try:
                 await run_sync_cleanup(finished.wait, component="windows-command-cancel")
             finally:
-                cancel_path.unlink(missing_ok=True)
+                with contextlib.suppress(PermissionError):
+                    cancel_path.unlink(missing_ok=True)
             raise
 
     def close(self) -> None:

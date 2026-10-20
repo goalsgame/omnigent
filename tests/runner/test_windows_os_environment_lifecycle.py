@@ -638,3 +638,69 @@ def test_windows_gate_transports_long_unicode_command_over_stdin(
     )
     assert result.returncode == 0
     assert result.stdout.strip() == "6000"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller_unlink_fails", [False, True])
+async def test_windows_cancellation_finishes_when_marker_unlink_is_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caller_unlink_fails: bool
+) -> None:
+    import asyncio
+    import threading
+    import time
+
+    from omnigent.inner import os_env
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    environment = os_env.CallerProcessOSEnvironment(
+        spec=OSEnvSpec(),
+        cwd=tmp_path,
+        shell_path="cmd.exe",
+        sandbox=SandboxPolicy(
+            backend_type="windows_jobobject",
+            active=False,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    started = threading.Event()
+    main_thread = threading.current_thread()
+    unlink = Path.unlink
+    denied: list[bool] = []
+
+    def failing_unlink(path: Path, *args: object, **kwargs: object):
+        if path.parent == environment._command_control_dir:
+            worker = threading.current_thread() is not main_thread
+            if worker or caller_unlink_fails:
+                denied.append(worker)
+                raise PermissionError("marker is busy")
+        return unlink(path, *args, **kwargs)
+
+    def request(payload: dict) -> dict:
+        started.set()
+        marker = Path(payload["cancel_path"])
+        deadline = time.monotonic() + 3
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), "Cancellation did not notify the worker"
+        return {"exit_code": 0}
+
+    async def bounded_cleanup(wait, **kwargs):
+        # Bound the regression: a missing completion signal must fail, not hang pytest.
+        assert await asyncio.to_thread(wait, 1), "Worker completion was not signaled"
+
+    monkeypatch.setattr(environment._shell_helper, "request", request)
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    monkeypatch.setattr(os_env, "run_sync_cleanup", bounded_cleanup)
+    command = asyncio.create_task(environment.shell("blocked"))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        assert True in denied
+        assert (False in denied) == caller_unlink_fails
+    finally:
+        environment.close()
