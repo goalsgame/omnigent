@@ -1062,3 +1062,38 @@ async def test_notification_actor_endpoint_rejects_spoofing_replay_and_revoked_p
         store.set_policy(target, mailbox, "alice@example.test", DeliveryPolicy())
         store.finish(batch, accepted=True)
         assert (await client.post(path, json=body, headers=_headers())).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_saving_notification_settings_preserves_accepted_delivery_cooldown(
+    peer_env, db_uri, monkeypatch
+):
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, _, _, _, source, target, _ = peer_env
+    store = PeerDeliveryStore(db_uri)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (
+            await client.post(_path(source), json=_message(target), headers=_headers())
+        ).status_code == 201
+        mailbox = store.mailbox_id(target)
+        clock = time.time_ns() // 1000
+        monkeypatch.setattr("omnigent.stores.peer_delivery_store.now_epoch_us", lambda: clock)
+        first = store.claim(target, mailbox, DeliveryPolicy())
+        assert first is not None
+        assert store.finish(first, accepted=True)
+        assert (
+            await client.post(_path(source), json=_message(target), headers=_headers())
+        ).status_code == 201
+        clock += 1_000_000
+        store.set_policy(
+            target, mailbox, "alice@example.test", DeliveryPolicy(wake_on_message=True)
+        )
+        assert store.claim(target, mailbox, DeliveryPolicy()) is None
+        clock += 58_999_999
+        assert store.claim(target, mailbox, DeliveryPolicy()) is None
+        clock += 1
+        second = store.claim(target, mailbox, DeliveryPolicy())
+        assert second is not None and second.id != first.id

@@ -189,7 +189,7 @@ class PeerDeliveryStore(PeerMessageStore):
                     },
                 }
             )
-            if row.lease is None:
+            if row.lease is None and row.cursor == 0:
                 row.retry_at = 0
 
         run_write_transaction(self._write, "set_notification_policy", write)

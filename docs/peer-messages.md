@@ -48,7 +48,8 @@ run under the recipient owner's identity and current permissions, never the send
 A message does not approve credential use or bypass an approval gate.
 
 Delivery batches contain at most twenty messages. Accepted batches are separated
-by at least a minute and limited to six per mailbox per hour; limits survive server
+by at least a minute and limited to six per mailbox per hour. Saving settings preserves
+accepted-delivery cooldowns; limits survive server
 restarts. Excess messages remain pending. Database leases serialize delivery across
 servers. A stable batch ID and runner receipts suppress retries; the server advances
 the notification cursor only after Pi accepts the batch. A crash between Pi accepting
