@@ -65,8 +65,8 @@
 # Off-by-default bounds this, but a deployment needing kiro-cli-grade integrity
 # should pin + verify in its own image rather than rely on a name here.
 #
-# Default-set CLIs are deliberately not rows: claude/codex/pi install unpinned
-# from npm in the Dockerfiles (override via the npm: escape hatch, e.g.
+# Default-set CLIs are installed by the Dockerfiles. Pi is pinned in pi-version;
+# claude/codex track npm (override via the npm: escape hatch, e.g.
 # npm:@openai/codex@0.147.0), and kiro-cli is version-pinned there via the
 # KIRO_CLI_VERSION build ARG. agy IS a row (see install_agy) because UBI does
 # not install it by default.
