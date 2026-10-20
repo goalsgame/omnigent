@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     env = dict(os.environ)
     try:
-        if env.get("IS_SANDBOX", "").strip() == "1":
+        if env.get("IS_SANDBOX", "").strip() == "1" and args not in (["--version"], ["--help"]):
             try:
                 raw = broker_path().read_text(encoding="utf-8")
             except FileNotFoundError:

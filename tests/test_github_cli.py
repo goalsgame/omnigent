@@ -101,8 +101,27 @@ def test_personal_host_ignores_existing_managed_configuration(
     monkeypatch.setattr(credentials, "_fetch", fetch)
     execute = Mock()
     monkeypatch.setattr(github_cli.os, "execve", execute)
-    assert github_cli.main(["--version"]) == 0
+    assert github_cli.main(["pr", "list"]) == 0
     fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("args", [["--version"], ["--help"]])
+def test_offline_cli_diagnostics_do_not_require_a_broker(managed_home: Path, monkeypatch, args):
+    assert github_cli.configure_broker("http://broker.example", "host-id", "host-authority")
+    fetch = Mock(side_effect=AssertionError("offline diagnostics must not fetch credentials"))
+    monkeypatch.setattr(credentials, "_fetch", fetch)
+    execute = Mock()
+    monkeypatch.setattr(github_cli.os, "execve", execute)
+    assert github_cli.main(args) == 0
+    fetch.assert_not_called()
+    assert execute.call_count == 1
+
+
+def test_context_write_failure_aborts_host_setup(managed_home: Path, monkeypatch):
+    monkeypatch.setattr(credentials, "_fetch", lambda *_: {"connected": True, "token": "secret"})
+    monkeypatch.setattr(github_cli, "configure_broker", lambda *_: False)
+    with pytest.raises(RuntimeError, match="Cannot configure managed GitHub CLI"):
+        credentials.configure_host_gh("http://broker.example", "host-id")
 
 
 def test_corrupt_configuration_fails_closed(managed_home: Path, monkeypatch, capsys) -> None:

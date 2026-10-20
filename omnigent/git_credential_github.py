@@ -289,9 +289,10 @@ def configure_host_gh(server_url: str, host_id: str) -> bool:
     token on every gh invocation; the periodic hosts.yml writer alone cannot
     cover expiry or rotation by another host.
 
-    Best-effort, sandbox-only. Install broker context on inconclusive probes
-    so managed commands fail closed; never-linked deployments keep ambient
-    authentication. Returns whether hosts.yml was updated.
+    Sandbox-only. Install broker context on inconclusive probes so managed
+    commands fail closed; never-linked deployments keep ambient authentication.
+    A context-write failure aborts setup instead of silently reusing old authority.
+    Returns whether hosts.yml was updated.
 
     :returns: ``True`` when gh was authenticated; ``False`` otherwise.
     """
@@ -306,7 +307,7 @@ def configure_host_gh(server_url: str, host_id: str) -> bool:
     if data is None or data.get("connected") or broker_path().exists():
         # Rebind retained workspaces even after disconnect; never reuse a prior host's authority.
         if not configure_broker(server_url, host_id, token):
-            return False
+            raise RuntimeError("Cannot configure managed GitHub CLI credential broker")
     if not data or not data.get("connected") or not data.get("token"):
         return False
     gh_token = str(data["token"])

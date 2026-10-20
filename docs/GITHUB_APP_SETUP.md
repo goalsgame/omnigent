@@ -224,7 +224,9 @@ The host stores only its broker coordinates and lesser host-scoped authority in
 processes need neither an inherited host-token environment nor a special PATH;
 login shells and the GitHub side panel reach the image's same `gh` command.
 A failed or disconnected configured broker fails closed instead of using stale
-saved credentials or a shared identity. CLI failures are not automatically
+saved credentials or a shared identity. Failure to persist broker context aborts
+host setup rather than reusing a prior host's authority. Offline `--version` and
+`--help` diagnostics do not need the broker. CLI failures are not automatically
 replayed: repeating a PR creation or another mutation could duplicate effects.
 
 Outside managed sandboxes, or where no broker has ever been configured, the
