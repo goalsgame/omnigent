@@ -51,6 +51,13 @@ class NotificationSettings(BaseModel):
     wake_on_message: bool
 
 
+class PeerTurnStart(BaseModel):
+    """The owner actor is authenticated, never supplied by the notification payload."""
+
+    model_config = ConfigDict(extra="forbid")
+    notification_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 def create_peer_messages_router(
     store: PeerMessageStore,
     conversations: ConversationStore,
@@ -147,6 +154,25 @@ def create_peer_messages_router(
             DeliveryPolicy(**body.model_dump()),
         )
         return {**body.model_dump(), "can_manage": True, "max_batches_per_hour": 6}
+
+    @router.post("/sessions/{session_id}/peer-notifications/actor")
+    async def begin_notification_turn(
+        session_id: str, body: PeerTurnStart, request: Request
+    ) -> dict:
+        if notifier is None:
+            raise HTTPException(404, "Peer notifications unavailable")
+        user, mailbox = await authorize(request, session_id, 4)
+        conv = await asyncio.to_thread(conversations.get_conversation, session_id)
+        default = await asyncio.to_thread(notifier.defaults, conv)
+        await asyncio.to_thread(
+            notifier.store.begin_owner_turn,
+            session_id,
+            mailbox,
+            user,
+            body.notification_id,
+            default,
+        )
+        return {"actor": user}
 
     @router.post("/sessions/{session_id}/peer-messages", status_code=201)
     async def send_message(session_id: str, message: SendPeerMessage, request: Request) -> dict:

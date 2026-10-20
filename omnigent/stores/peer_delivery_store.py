@@ -7,7 +7,7 @@ import json
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, true
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_generation, require_active_account
@@ -60,7 +60,9 @@ class PeerDelivery:
 class PeerDeliveryStore(PeerMessageStore):
     """Serialize deliveries per mailbox; limit automatic processing to six batches/hour."""
 
-    def candidates(self, *, limit: int = 100) -> list[tuple[int, str, str]]:
+    def candidates(
+        self, *, limit: int = 100, after: tuple[int, str] | None = None
+    ) -> list[tuple[int, str, str]]:
         """Scan eligible mailboxes across workspaces without reading message bodies."""
         now = now_epoch_us()
         m, d, c = SqlPeerMessage, SqlPeerDelivery, SqlConversationMetadata
@@ -82,6 +84,12 @@ class PeerDeliveryStore(PeerMessageStore):
                 .where(
                     m.acknowledged_at.is_(None),
                     m.expires_at > now,
+                    or_(
+                        m.workspace_id > after[0],
+                        and_(m.workspace_id == after[0], m.recipient_session_id > after[1]),
+                    )
+                    if after
+                    else true(),
                     or_(d.mailbox_id.is_(None), and_(d.cursor < m.created_at, d.retry_at <= now)),
                 )
                 .distinct()
@@ -186,6 +194,42 @@ class PeerDeliveryStore(PeerMessageStore):
 
         run_write_transaction(self._write, "set_notification_policy", write)
 
+    def begin_owner_turn(
+        self,
+        session_id: str,
+        mailbox_id: str,
+        actor: str,
+        notification_id: str,
+        default: DeliveryPolicy,
+    ) -> None:
+        """Attribute a new native turn only to the current authenticated recipient owner."""
+        from omnigent.stores.conversation_store.sqlalchemy_store import _upsert_labels
+
+        def write(session: Session) -> None:
+            require_active_account(session, actor, generation=account_generation(actor))
+            row = self._state(session, session_id, mailbox_id)
+            owner = self._owner(session, session_id)
+            if (
+                owner is None
+                or owner[0] != actor
+                or not self._policy(session, row, default).enabled
+            ):
+                raise OmnigentError(
+                    "Automatic peer turn is not authorized", code=ErrorCode.FORBIDDEN
+                )
+            if (
+                row.pending_ids is None
+                or hashlib.sha256(row.pending_ids.encode()).hexdigest() != notification_id
+            ):
+                raise OmnigentError(
+                    "Peer notification is no longer pending", code=ErrorCode.CONFLICT
+                )
+            _upsert_labels(
+                session, session_id, {"omnigent.turn_actor": actor}, now_epoch_us() // 1_000_000
+            )
+
+        run_write_transaction(self._write, "begin_notification_turn", write)
+
     def defer(self, session_id: str, mailbox_id: str, *, seconds: int = 30) -> None:
         """Back off unavailable sessions without consuming automatic-turn budget."""
 
@@ -235,6 +279,7 @@ class PeerDeliveryStore(PeerMessageStore):
             if row.pending_ids is None:
                 row.pending_ids = json.dumps([message.id for message in messages])
                 row.pending_cursor = messages[-1].created_at
+            assert row.pending_ids is not None
             ids = tuple(json.loads(row.pending_ids))
             assert row.pending_cursor is not None
             cursor = row.pending_cursor

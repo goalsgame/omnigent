@@ -110,8 +110,15 @@ class PeerNotifier:
 
         while True:
             try:
-                page = await asyncio.to_thread(self.store.candidates)
-                await asyncio.gather(*(one(*row) for row in page))
+                after = None
+                while True:
+                    page = await asyncio.to_thread(self.store.candidates, after=after)
+                    if not page:
+                        break
+                    await asyncio.gather(*(one(*row) for row in page))
+                    after = (page[-1][0], page[-1][1])
+                    if len(page) < 100:
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception:

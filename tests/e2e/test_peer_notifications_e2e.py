@@ -33,17 +33,40 @@ from tests.runner.helpers import NullServerClient
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("active", [False, True])
 @pytest.mark.skipif(shutil.which("pi") is None, reason="native Pi CLI is required")
-async def test_peer_send_automatically_starts_idle_pi_turn(tmp_path, db_uri, monkeypatch):
+async def test_peer_send_automatically_reaches_pi(tmp_path, db_uri, monkeypatch, active):
     """No user prompt, fake notification receipt, or stubbed delivery HTTP responses."""
+    release_human = threading.Event()
     calls = []
+    actors = []
+    callback_client = None
+    loop = asyncio.get_running_loop()
 
     class Model(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
         def do_POST(self):
-            calls.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path.endswith("/peer-notifications/actor"):
+                future = asyncio.run_coroutine_threadsafe(
+                    callback_client.post(self.path, json=payload), loop
+                )
+                response = future.result(timeout=15)
+                self.send_response(response.status_code)
+                self.end_headers()
+                return
+            if not self.path.endswith("/chat/completions"):
+                self.send_response(204)
+                self.end_headers()
+                return
+            calls.append(payload)
+            actors.append(
+                (conversations.get_conversation(target).labels or {}).get("omnigent.turn_actor")
+            )
+            if active and len(calls) == 1:
+                release_human.wait(timeout=20)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -71,9 +94,16 @@ async def test_peer_send_automatically_starts_idle_pi_turn(tmp_path, db_uri, mon
     source, target = [conversations.create_conversation(agent_id=agent_id).id for _ in range(2)]
     for sid in (source, target):
         permissions.grant("local", sid, 4)
+    permissions.ensure_user("previous-editor@example.test")
+    permissions.grant("previous-editor@example.test", target, 2)
+    conversations.set_labels(target, {"omnigent.turn_actor": "previous-editor@example.test"})
     directory = bridge.prepare_bridge_dir(target)
     extension, config = bridge.write_extension_files(
-        directory, session_id=target, server_url="", conversation_url=""
+        directory,
+        session_id=target,
+        server_url=f"http://127.0.0.1:{model.server_port}",
+        conversation_url="",
+        system_prompt="Notification test agent instructions",
     )
     pi_agent = tmp_path / "pi-agent"
     pi_agent.mkdir()
@@ -161,7 +191,8 @@ async def test_peer_send_automatically_starts_idle_pi_turn(tmp_path, db_uri, mon
                     "--no-extensions",
                     "--no-skills",
                     "--no-prompt-templates",
-                    "--no-tools",
+                    "--tools",
+                    "read",
                     "--extension",
                     str(extension),
                     "--provider",
@@ -208,8 +239,21 @@ async def test_peer_send_automatically_starts_idle_pi_turn(tmp_path, db_uri, mon
                     ),
                     prefix="/v1",
                 )
+                callback_client = httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://server"
+                )
+                if active:
+                    process.stdin.write(
+                        (json.dumps({"type": "prompt", "message": "Human task"}) + "\n").encode()
+                    )
+                    process.stdin.flush()
+                    deadline = time.monotonic() + 15
+                    while not calls and time.monotonic() < deadline:
+                        await asyncio.sleep(0.02)
+                    assert len(calls) == 1
+                else:
+                    assert calls == []
                 task = asyncio.create_task(notifier.run())
-                assert calls == []
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=server), base_url="http://server"
                 ) as client:
@@ -223,11 +267,33 @@ async def test_peer_send_automatically_starts_idle_pi_turn(tmp_path, db_uri, mon
                         },
                     )
                     assert result.status_code == 201, result.text
+                if active:
+                    deadline = time.monotonic() + 10
+                    while (
+                        not list((directory / "inbox").glob("peer_*.json"))
+                        and time.monotonic() < deadline
+                    ):
+                        await asyncio.sleep(0.01)
+                    while (
+                        list((directory / "inbox").glob("peer_*.json"))
+                        and time.monotonic() < deadline
+                    ):
+                        await asyncio.sleep(0.02)
+                    release_human.set()
                 deadline = time.monotonic() + 30
-                while time.monotonic() < deadline and (not calls or store.candidates()):
+                while time.monotonic() < deadline and (
+                    len(calls) < (2 if active else 1) or not (directory / "peer-receipts").exists()
+                ):
                     await asyncio.sleep(0.05)
                 assert calls, (tmp_path / "pi.log").read_text()
-                assert "Peer messages are waiting" in json.dumps(calls[0]["messages"])
+                assert "Peer messages are waiting" in json.dumps(calls[-1]["messages"])
+                assert "Notification test agent instructions" in json.dumps(calls[-1]["messages"])
+                assert any(
+                    tool["function"]["name"] == "read" for tool in calls[-1].get("tools", [])
+                )
+                assert actors == (
+                    ["previous-editor@example.test"] * len(calls) if active else ["local"]
+                )
                 receipts = list((directory / "peer-receipts").iterdir())
                 assert len(receipts) == 1
                 assert store.candidates() == []
@@ -237,6 +303,7 @@ async def test_peer_send_automatically_starts_idle_pi_turn(tmp_path, db_uri, mon
                     await task
                 task = None
         finally:
+            release_human.set()
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -248,6 +315,8 @@ async def test_peer_send_automatically_starts_idle_pi_turn(tmp_path, db_uri, mon
                 except subprocess.TimeoutExpired:
                     process.kill()
                     await asyncio.to_thread(process.wait)
+            if callback_client is not None:
+                await callback_client.aclose()
             model.shutdown()
             model.server_close()
             thread.join(timeout=5)

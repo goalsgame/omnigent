@@ -912,3 +912,153 @@ async def test_older_runner_is_not_sent_an_unrecognized_notification(
     with get_or_create_engine(db_uri).connect() as conn:
         assert conn.scalar(select(SqlPeerDelivery.attempts)) == 0
     assert messages.list_messages(target, unread_only=True)
+
+
+@pytest.mark.asyncio
+async def test_notification_owner_actor_is_bound_only_for_pending_authorized_turn(
+    peer_env, db_uri
+):
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    app, messages, conversations, _, source, target, _ = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(_path(source), json=_message(target), headers=_headers())
+    store = PeerDeliveryStore(db_uri)
+    mailbox = messages.mailbox_id(target)
+    default = DeliveryPolicy()
+    batch = store.claim(target, mailbox, default)
+    conversations.set_labels(target, {"omnigent.turn_actor": "previous-editor@example.test"})
+    with pytest.raises(OmnigentError):
+        store.begin_owner_turn(target, mailbox, "bob@example.test", batch.id, default)
+    assert (
+        conversations.get_conversation(target).labels["omnigent.turn_actor"]
+        == "previous-editor@example.test"
+    )
+    store.begin_owner_turn(target, mailbox, "alice@example.test", batch.id, default)
+    assert (
+        conversations.get_conversation(target).labels["omnigent.turn_actor"]
+        == "alice@example.test"
+    )
+    assert store.finish(batch, accepted=True)
+    with pytest.raises(OmnigentError):
+        store.begin_owner_turn(target, mailbox, "alice@example.test", batch.id, default)
+
+
+@pytest.mark.asyncio
+async def test_notification_scan_pages_past_remote_mailboxes(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from omnigent.server.peer_notifications import PeerNotifier
+
+    rows = [(0, f"{i:032x}", f"{i:032x}") for i in range(101)]
+    visited = []
+    done = asyncio.Event()
+
+    def candidates(*, after=None):
+        return [row for row in rows if after is None or row[:2] > after][:100]
+
+    notifier = PeerNotifier(SimpleNamespace(candidates=candidates), None, None, None, None)
+
+    async def deliver(sid, mailbox):
+        visited.append(sid)
+        if sid == rows[-1][1]:
+            done.set()
+
+    monkeypatch.setattr(notifier, "deliver", deliver)
+    task = asyncio.create_task(notifier.run())
+    try:
+        await asyncio.wait_for(done.wait(), timeout=2)
+        assert visited == [row[1] for row in rows]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_notification_candidate_cursor_crosses_mailboxes(peer_env, db_uri):
+    from omnigent.stores.peer_delivery_store import PeerDeliveryStore
+
+    app, _, _, _, source, target, other = peer_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for sid in (target, other):
+            await client.post(_path(source), json=_message(sid), headers=_headers())
+    store = PeerDeliveryStore(db_uri)
+    first = store.candidates(limit=1)
+    second = store.candidates(limit=1, after=first[0][:2])
+    assert len(first) == len(second) == 1
+    assert {first[0][1], second[0][1]} == {target, other}
+    assert store.candidates(after=second[0][:2]) == []
+
+
+@pytest.mark.asyncio
+async def test_notification_actor_endpoint_rejects_spoofing_replay_and_revoked_policy(
+    peer_env, db_uri
+):
+    from types import SimpleNamespace
+
+    from omnigent.stores.peer_delivery_store import DeliveryPolicy, PeerDeliveryStore
+
+    original, _, conversations, permissions, source, target, _ = peer_env
+    store = PeerDeliveryStore(db_uri)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=original), base_url="http://test"
+    ) as client:
+        assert (
+            await client.post(_path(source), json=_message(target), headers=_headers())
+        ).status_code == 201
+    mailbox = store.mailbox_id(target)
+    batch = store.claim(target, mailbox, DeliveryPolicy())
+    assert batch is not None
+    app = FastAPI()
+    app.include_router(
+        create_peer_messages_router(
+            store,
+            conversations,
+            permissions,
+            _Auth(),
+            notifier=SimpleNamespace(store=store, defaults=lambda conv: DeliveryPolicy()),
+        ),
+        prefix="/v1",
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request, exc):
+        return JSONResponse({"error": str(exc)}, status_code=exc.http_status)
+
+    path = f"/v1/sessions/{target}/peer-notifications/actor"
+    body = {"notification_id": batch.id}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (
+            await client.post(path, json=body, headers=_headers("reader@example.test"))
+        ).status_code == 403
+        assert (
+            await client.post(path, json=body, headers=_headers("bob@example.test"))
+        ).status_code == 403
+        assert (
+            await client.post(path, json={**body, "actor": "other"}, headers=_headers())
+        ).status_code == 422
+        assert (
+            await client.post(
+                path, json=body, headers=_headers(origin="https://untrusted.example.test")
+            )
+        ).status_code == 403
+        assert (await client.post(path, json=body, headers=_headers())).json() == {
+            "actor": "alice@example.test"
+        }
+        assert (
+            conversations.get_conversation(target).labels["omnigent.turn_actor"]
+            == "alice@example.test"
+        )
+        store.set_policy(target, mailbox, "alice@example.test", DeliveryPolicy(enabled=False))
+        assert (await client.post(path, json=body, headers=_headers())).status_code == 403
+        store.set_policy(target, mailbox, "alice@example.test", DeliveryPolicy())
+        store.finish(batch, accepted=True)
+        assert (await client.post(path, json=body, headers=_headers())).status_code == 409

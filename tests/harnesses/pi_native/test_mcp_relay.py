@@ -148,3 +148,53 @@ async def test_mcp_relay_renews_rejected_bearer_and_fails_closed_on_outage(
             executor.assert_not_called()
         finally:
             relay.close()
+
+
+@pytest.mark.asyncio
+async def test_peer_actor_relay_is_authenticated_session_bound_and_uses_fresh_auth(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OMNIGENT_BRIDGE_BIND_HOST", raising=False)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = bridge.prepare_bridge_dir("bound-session")
+    seen = []
+
+    class FreshAuth(httpx.Auth):
+        def auth_flow(self, request):
+            request.headers["Authorization"] = f"Bearer renewed-{len(seen)}"
+            yield request
+
+    def upstream(request):
+        assert request.url.path == "/v1/sessions/bound-session/peer-notifications/actor"
+        assert request.headers["Authorization"] == f"Bearer renewed-{len(seen)}"
+        seen.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example",
+        transport=httpx.MockTransport(upstream),
+        auth=FreshAuth(),
+    ) as runner_client:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[],
+            tool_executor=AsyncMock(),
+            loop=asyncio.get_running_loop(),
+            policy_client=runner_client,
+            session_id="bound-session",
+        )
+        try:
+            info = json.loads((bridge_dir / "tool_relay.json").read_text())
+            async with httpx.AsyncClient(trust_env=False) as client:
+                url = info["url"] + "/peer-notifications/actor"
+                body = {"notification_id": "a" * 64}
+                assert (await client.post(url, json=body)).status_code == 401
+                headers = {"Authorization": "Bearer " + info["token"]}
+                assert (
+                    await client.post(url, headers=headers, content=b"x" * 1025)
+                ).status_code == 400
+                for _ in range(2):
+                    assert (await client.post(url, headers=headers, json=body)).status_code == 200
+                assert seen == [body, body]
+        finally:
+            relay.close()
