@@ -5636,6 +5636,20 @@ def create_runner_app(
                 yield _response_failed_event({"message": _err_msg, "type": _err_type})
                 return
 
+            # Confirm the workspace before the harness can request local work.
+            try:
+                await _resolve_session_fs_registry(conv_id)
+            except HTTPException as exc:
+                _workspace_error = {
+                    "code": "workspace_metadata_unavailable",
+                    "message": str(exc.detail),
+                    "type": type(exc).__name__,
+                }
+                _publish_event(conv_id, _response_failed_payload(_workspace_error))
+                _on_proxy_stream_end(conv_id, error=_workspace_error)
+                yield _response_failed_event(_workspace_error)
+                return
+
             # Compose instructions for direct-stream turns (dispatch is None;
             # background path pre-composes).
             _instr_body = body

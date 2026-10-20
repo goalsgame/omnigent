@@ -107,33 +107,23 @@ async def test_cold_mutation_targets_selected_workspace_and_records_diff(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["MCP", "stream"])
-async def test_dispatch_recovers_workspace_when_registry_metadata_retry_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+async def test_mcp_dispatch_recovers_workspace_when_registry_metadata_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import asyncio
-    import json
-
-    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
-
     launch = tmp_path / "launch"
     selected = tmp_path / "selected"
     launch.mkdir()
     selected.mkdir()
-    dispatching = route == "MCP"
-    dispatch_reads = 0
+    reads = 0
     captured: list[Path | None] = []
 
     def metadata(request: httpx.Request) -> httpx.Response:
-        nonlocal dispatch_reads
+        nonlocal reads
         if request.url.path == "/v1/sessions/retry-session":
-            if dispatching:
-                dispatch_reads += 1
-                if dispatch_reads >= 2:
-                    return httpx.Response(
-                        200, json={"workspace": str(selected), "agent_id": "test"}
-                    )
-            return httpx.Response(503, json={})
+            reads += 1
+            if reads == 1:
+                return httpx.Response(503, json={})
+            return httpx.Response(200, json={"workspace": str(selected), "agent_id": "test"})
         return httpx.Response(200, json={})
 
     async def dispatch(*, runner_workspace: Path | None = None, **kwargs: object) -> str:
@@ -141,38 +131,11 @@ async def test_dispatch_recovers_workspace_when_registry_metadata_retry_succeeds
         return "ok"
 
     monkeypatch.setattr("omnigent.runner.tool_dispatch.execute_tool", dispatch)
-    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch)
-
-    class Frames(list):
-        def __iter__(self):
-            nonlocal dispatching
-            dispatching = True
-            return super().__iter__()
-
-    frames = Frames(
-        [
-            _sse({"type": "response.created", "response": {"id": "response"}}),
-            _sse(
-                {
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "function_call",
-                        "status": "action_required",
-                        "name": "sys_os_write",
-                        "call_id": "call",
-                        "arguments": json.dumps({"path": "note.txt", "content": "ok"}),
-                    },
-                }
-            ),
-            _sse({"type": "response.completed", "response": {"id": "response"}}),
-        ]
-    )
     registry = SessionResourceRegistry(runner_workspace=launch, per_session_workspace=False)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(metadata), base_url="http://server"
     ) as server:
         app = create_runner_app(
-            process_manager=_FakeProcessManager(_ScriptedHarnessClient(frames)),
             server_client=server,
             resource_registry=registry,
             runner_workspace=launch,
@@ -182,33 +145,17 @@ async def test_dispatch_recovers_workspace_when_registry_metadata_retry_succeeds
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://runner"
             ) as client:
-                if route == "MCP":
-                    response = await client.post(
-                        "/v1/sessions/retry-session/mcp/execute",
-                        json={
-                            "method": "tools/call",
-                            "params": {"name": "sys_os_write", "arguments": {}},
-                        },
-                    )
-                    assert response.status_code == 200
-                    assert "error" not in response.json(), response.text
-                else:
-                    response = await client.post(
-                        "/v1/sessions/retry-session/events",
-                        json={
-                            "type": "message",
-                            "role": "user",
-                            "agent_id": "test",
-                            "content": [{"type": "input_text", "text": "write"}],
-                            "harness": "openai-agents",
-                        },
-                    )
-                    assert response.status_code == 202, response.text
-                    async with asyncio.timeout(5):
-                        while not captured:
-                            await asyncio.sleep(0.01)
+                response = await client.post(
+                    "/v1/sessions/retry-session/mcp/execute",
+                    json={
+                        "method": "tools/call",
+                        "params": {"name": "sys_os_write", "arguments": {}},
+                    },
+                )
+                assert response.status_code == 200
+                assert "error" not in response.json(), response.text
                 assert captured == [selected]
-                assert dispatch_reads == 2
+                assert reads == 2
         finally:
             await registry.cleanup_session("retry-session")
 
@@ -273,3 +220,84 @@ async def test_unconfirmed_workspace_rejects_mutation_before_environment_is_cach
                     assert (selected / "note.txt").read_text() == "updated"
         finally:
             await registry.cleanup_session("recovery-session")
+
+
+@pytest.mark.asyncio
+async def test_direct_stream_metadata_outage_fails_before_harness_and_allows_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
+
+    available = False
+    calls: list[Path | None] = []
+
+    def metadata(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/stream-retry":
+            if not available:
+                return httpx.Response(503, json={})
+            return httpx.Response(200, json={"agent_id": "test", "workspace": str(tmp_path)})
+        return httpx.Response(200, json={})
+
+    async def dispatch(*, runner_workspace: Path | None = None, **kwargs: object) -> str:
+        calls.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch)
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_retry"}}),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "action_required",
+                        "name": "sys_os_write",
+                        "call_id": "write",
+                        "arguments": "{}",
+                    },
+                }
+            ),
+            _sse({"type": "response.completed", "response": {"id": "resp_retry"}}),
+        ]
+    )
+    registry = SessionResourceRegistry(runner_workspace=tmp_path, per_session_workspace=False)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(metadata), base_url="http://server"
+    ) as server:
+        app = create_runner_app(
+            process_manager=_FakeProcessManager(harness),
+            server_client=server,
+            resource_registry=registry,
+            runner_workspace=tmp_path,
+            per_session_workspace=False,
+        )
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as client:
+                body = {
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "test",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "write"}],
+                }
+                first = await client.post(
+                    "/v1/sessions/stream-retry/events?stream=true", json=body
+                )
+                assert first.status_code == 200
+                assert "response.failed" in first.text
+                assert "workspace_metadata_unavailable" in first.text
+                assert harness.posted_bodies == [], "No pending harness call may be started"
+                assert calls == []
+                available = True
+                second = await client.post(
+                    "/v1/sessions/stream-retry/events?stream=true", json=body
+                )
+                assert second.status_code == 200, second.text
+                assert "response.completed" in second.text
+                assert len(harness.posted_bodies) == 1, "Recovered turn must not remain buffered"
+                assert calls == [tmp_path]
+        finally:
+            await registry.cleanup_session("stream-retry")
