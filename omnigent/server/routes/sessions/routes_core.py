@@ -1397,6 +1397,7 @@ def register_core_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Omnigent-Nested-Tool-Audit"] = "1"
         user_id = _get_user_id(request, auth_provider)
         # Single permission pass: authorize + resolve the display level +
         # fetch the conversation once, then reuse the conversation in the

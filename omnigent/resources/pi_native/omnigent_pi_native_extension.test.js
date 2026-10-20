@@ -32,7 +32,7 @@ const harnesses = [];
 // Build a fresh extension instance with its own temp inbox directory. Each call
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
-function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
+function makeHarness({ captureEvents = false, existingTools = [], tools = [], discoveryApi = false } = {}) {
   const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
   const configPath = path.join(inboxDir, "config.json");
   // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
@@ -41,6 +41,7 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   const config = captureEvents
     ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
     : { inboxDir, bridgeDir: inboxDir };
+  config.tools = tools;
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -59,6 +60,7 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
 
   const handlers = {};
   const registeredTools = {};
+  let activeTools = existingTools.filter(t => t.defaultActive !== false).map(t => t.name);
   const pi = {
     on: (name, fn) => {
       handlers[name] = fn;
@@ -66,10 +68,16 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
     registerCommand: () => {},
     registerTool: (tool) => {
       registeredTools[tool.name] = tool;
+      if (tool.exposure !== "codemode" && !activeTools.includes(tool.name)) activeTools.push(tool.name);
     },
-    getAllTools: () => existingTools,
+    getAllTools: () => discoveryApi ? [...existingTools, ...Object.values(registeredTools)] : existingTools,
     sendUserMessage: () => {},
   };
+
+  if (discoveryApi) {
+    pi.getActiveTools = () => activeTools.slice();
+    pi.setActiveTools = names => { activeTools = names.slice(); };
+  }
 
   // Fresh module-function invocation -> fresh closures.
   delete require.cache[EXT_PATH];
@@ -590,8 +598,37 @@ async function testLengthCompletionWithToolCallIsNotEmptyFailure() {
   assert("tool call ends idle", statusEdges(h.postedEvents).at(-1).status === "idle");
 }
 
+async function testConnectorCatalogUsesNativeDiscovery() {
+  const tools = Array.from({ length: 170 }, (_, i) => ({
+    name: `docs__lookup_${i}`, description: "Find documents",
+    parameters: { type: "object", properties: {} }, exposure: "codemode",
+  }));
+  tools.push({ name: "sys_peer_send", description: "Send a peer message" });
+  const h = makeHarness({ tools, discoveryApi: true, existingTools: [
+    { name: "read" }, { name: "bash" }, { name: "codemode", defaultActive: false },
+  ] });
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+  assert("native discovery is enabled", h.pi.getActiveTools().includes("codemode"));
+  assert("ordinary tools remain direct", h.pi.getActiveTools().includes("sys_peer_send"));
+  assert("file and shell tools remain direct", h.pi.getActiveTools().includes("read") && h.pi.getActiveTools().includes("bash"));
+  assert("connector schemas are not declared", !h.pi.getActiveTools().some(name => name.startsWith("docs__")));
+  assert("connector tools stay registered", tools.every(tool => h.registeredTools[tool.name]));
+  assert("connector tools stay callable from codemode", h.registeredTools.docs__lookup_169.exposure === "codemode");
+  assert("connector namespace is discoverable", h.registeredTools.docs__lookup_169.namespace.name === "docs");
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+  assert("resume does not re-expose the catalog", !h.pi.getActiveTools().some(name => name.startsWith("docs__")));
+}
+
+async function testLegacyPiRetainsConnectorTools() {
+  const h = makeHarness({ tools: [{ name: "docs__lookup", exposure: "codemode" }] });
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+  assert("legacy Pi keeps direct tool registration", h.registeredTools.docs__lookup && h.registeredTools.docs__lookup.exposure === undefined);
+}
+
 (async () => {
   try {
+    await testConnectorCatalogUsesNativeDiscovery();
+    await testLegacyPiRetainsConnectorTools();
     await testEmptyLengthCompletionFailsVisiblyAndRetryResets();
     await testLengthCompletionWithToolCallIsNotEmptyFailure();
     await testSessionStartupDoesNotCompleteATurn();

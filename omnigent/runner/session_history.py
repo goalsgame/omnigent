@@ -209,6 +209,10 @@ def build_session_history(
         _skipped_types: list[str] = []
         for item in remaining:
             item_type = item.get("type")
+            if item_type in {"function_call", "function_call_output"} and item.get(
+                "parent_call_id"
+            ):
+                continue
             if item_type not in (
                 "message",
                 "function_call",

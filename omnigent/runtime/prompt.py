@@ -382,6 +382,8 @@ def history_to_input_items(
 
         elif item.type == "function_call":
             assert isinstance(item.data, FunctionCallData)
+            if item.data.parent_call_id:
+                continue
             result.append(
                 {
                     "type": "function_call",
@@ -393,6 +395,8 @@ def history_to_input_items(
 
         elif item.type == "function_call_output":
             assert isinstance(item.data, FunctionCallOutputData)
+            if item.data.parent_call_id:
+                continue
             result.append(
                 {
                     "type": "function_call_output",
