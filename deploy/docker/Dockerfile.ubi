@@ -106,10 +106,11 @@ COPY --from=node-runtime /usr/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
+COPY deploy/docker/pi-version /opt/omnigent/pi-version
 RUN npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
-      @earendil-works/pi-coding-agent \
+      "@earendil-works/pi-coding-agent@$(cat /opt/omnigent/pi-version)" \
  && npm cache clean --force
 
 # Kiro CLI is not published as an npm package and its installer has no version

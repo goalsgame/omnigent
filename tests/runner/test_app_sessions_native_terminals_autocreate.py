@@ -357,6 +357,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     if mcp_status == "available":
         external = next(tool for tool in config["tools"] if tool["name"] == "search__find")
         assert external["parameters"]["properties"]["query"] == {"type": "string"}
+        assert external["exposure"] == "codemode"
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
 

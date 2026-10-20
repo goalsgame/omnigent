@@ -11,6 +11,8 @@ const actionDirectory = path.dirname(fileURLToPath(import.meta.url));
 
 test("npm harness defaults match the committed CI dependency pins", async () => {
   const manifest = await loadManifest();
+  const runtimePiVersion = await readFile(path.join(actionDirectory, "..", "..", "..", "deploy", "docker", "pi-version"), "utf8");
+  assert.equal(manifest.pi.version, runtimePiVersion.trim());
   const ciDependencies = JSON.parse(
     await readFile(path.join(actionDirectory, "..", "..", "ci-deps", "package.json"), "utf8"),
   ).dependencies;

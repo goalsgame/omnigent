@@ -2582,7 +2582,7 @@ async def _auto_create_pi_terminal(
                 )
                 registered_names = {tool["name"] for tool in pi_tools}
                 pi_tools.extend(
-                    schema
+                    {**schema, "exposure": "codemode"}
                     for schema in mcp_result.schemas
                     if schema["name"] not in registered_names
                 )
