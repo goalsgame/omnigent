@@ -615,3 +615,26 @@ async def test_windows_command_cancellation_allows_next_call_and_preserves_prior
                 earlier.wait(timeout=5)
             except psutil.NoSuchProcess:
                 pass
+
+
+def test_windows_gate_transports_long_unicode_command_over_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import sys
+
+    from omnigent.inner.os_env import _run_windows_shell
+
+    popen = subprocess.Popen
+
+    def windows_sized_popen(argv: list[str], **kwargs: object):
+        assert len(subprocess.list2cmdline(argv)) < 32767
+        return popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", windows_sized_popen)
+    text = "界" * 6000
+    result = _run_windows_shell(
+        [sys.executable, "-c", f"print(len({text!r}))"], cwd=tmp_path, timeout=10
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "6000"

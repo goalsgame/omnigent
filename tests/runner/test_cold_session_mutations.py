@@ -104,3 +104,110 @@ async def test_cold_mutation_targets_selected_workspace_and_records_diff(
                 assert diff.json()["after"] == (None if method == "DELETE" else "updated")
         finally:
             await registry.cleanup_session("cold-session")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["MCP", "stream"])
+async def test_dispatch_recovers_workspace_when_registry_metadata_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    import asyncio
+    import json
+
+    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
+
+    launch = tmp_path / "launch"
+    selected = tmp_path / "selected"
+    launch.mkdir()
+    selected.mkdir()
+    dispatching = route == "MCP"
+    dispatch_reads = 0
+    captured: list[Path | None] = []
+
+    def metadata(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatch_reads
+        if request.url.path == "/v1/sessions/retry-session":
+            if dispatching:
+                dispatch_reads += 1
+                if dispatch_reads >= 2:
+                    return httpx.Response(
+                        200, json={"workspace": str(selected), "agent_id": "test"}
+                    )
+            return httpx.Response(503, json={})
+        return httpx.Response(200, json={})
+
+    async def dispatch(*, runner_workspace: Path | None = None, **kwargs: object) -> str:
+        captured.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.execute_tool", dispatch)
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch)
+
+    class Frames(list):
+        def __iter__(self):
+            nonlocal dispatching
+            dispatching = True
+            return super().__iter__()
+
+    frames = Frames(
+        [
+            _sse({"type": "response.created", "response": {"id": "response"}}),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "action_required",
+                        "name": "sys_os_write",
+                        "call_id": "call",
+                        "arguments": json.dumps({"path": "note.txt", "content": "ok"}),
+                    },
+                }
+            ),
+            _sse({"type": "response.completed", "response": {"id": "response"}}),
+        ]
+    )
+    registry = SessionResourceRegistry(runner_workspace=launch, per_session_workspace=False)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(metadata), base_url="http://server"
+    ) as server:
+        app = create_runner_app(
+            process_manager=_FakeProcessManager(_ScriptedHarnessClient(frames)),
+            server_client=server,
+            resource_registry=registry,
+            runner_workspace=launch,
+            per_session_workspace=False,
+        )
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as client:
+                if route == "MCP":
+                    response = await client.post(
+                        "/v1/sessions/retry-session/mcp/execute",
+                        json={
+                            "method": "tools/call",
+                            "params": {"name": "sys_os_write", "arguments": {}},
+                        },
+                    )
+                    assert response.status_code == 200
+                    assert "error" not in response.json(), response.text
+                else:
+                    response = await client.post(
+                        "/v1/sessions/retry-session/events",
+                        json={
+                            "type": "message",
+                            "role": "user",
+                            "agent_id": "test",
+                            "content": [{"type": "input_text", "text": "write"}],
+                            "harness": "openai-agents",
+                        },
+                    )
+                    assert response.status_code == 202, response.text
+                    async with asyncio.timeout(5):
+                        while not captured:
+                            await asyncio.sleep(0.01)
+                assert captured == [selected]
+                assert dispatch_reads == 2
+        finally:
+            await registry.cleanup_session("retry-session")

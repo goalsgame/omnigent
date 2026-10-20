@@ -1700,14 +1700,14 @@ def _run_windows_shell(
     gate = (
         "import json,subprocess,sys; "
         "sys.stdin.buffer.read(1) == b'1' or sys.exit(1); "
-        "sys.exit(subprocess.call(json.loads(sys.argv[1]), stdin=subprocess.DEVNULL))"
+        "sys.exit(subprocess.call(json.loads(sys.stdin.buffer.read()), stdin=subprocess.DEVNULL))"
     )
     job = None
     # The Windows venv redirector can spawn the interpreter before job assignment.
     # The gate needs only the standard library, so start the base interpreter directly.
     gate_python = getattr(sys, "_base_executable", None) or sys.executable
     with subprocess.Popen(
-        [gate_python, "-I", "-c", gate, json.dumps(argv)],
+        [gate_python, "-I", "-c", gate],
         cwd=str(cwd),
         env=_child_shell_env(),
         text=True,
@@ -1729,7 +1729,7 @@ def _run_windows_shell(
                     raise InterruptedError("Windows command cancelled")
                 try:
                     stdout, stderr = process.communicate(
-                        input="1" if first else None,
+                        input=("1" + json.dumps(argv)) if first else None,
                         timeout=min(0.1, max(0.001, deadline - time.monotonic())),
                     )
                     break

@@ -329,8 +329,9 @@ def register_mcp_routes(
                         pass
                 _agent_id_local = _session_agent_ids.get(session_id)
                 try:
-                    dispatch_workspace = await _session_runtime_cwd(session_id)
+                    await _session_runtime_cwd(session_id)
                     session_fs_registry = await _resolve_session_fs_registry(session_id)
+                    dispatch_workspace = resource_registry.prepare_session_workspace(session_id)
                     output = await execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),

@@ -5937,9 +5937,12 @@ def create_runner_app(
                                         _spec_for_dispatch = _unwrap_resolved_spec(
                                             _spec_for_dispatch_entry
                                         )
-                                        _dispatch_workspace = await _session_runtime_cwd(conv_id)
+                                        await _session_runtime_cwd(conv_id)
                                         _dispatch_fs_registry = await _resolve_session_fs_registry(
                                             conv_id
+                                        )
+                                        _dispatch_workspace = (
+                                            resource_registry.prepare_session_workspace(conv_id)
                                         )
                                         event[_RUNNER_DISPATCHED_FIELD] = True
                                         raw_sse_bytes = _encode_sse_event(event)
