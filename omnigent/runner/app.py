@@ -4902,6 +4902,8 @@ def create_runner_app(
             conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))
         )
 
+        await _resolve_session_fs_registry(conv)
+
         cached_spec_entry = _session_spec_cache.get(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
@@ -5356,6 +5358,22 @@ def create_runner_app(
             _ds_agent_id,
             None if dispatch else cast(str | None, body.get("agent_revision")),
         )
+        try:
+            await _resolve_session_fs_registry(conv_id)
+        except HTTPException as exc:
+            workspace_error = {
+                "code": "workspace_metadata_unavailable",
+                "message": str(exc.detail),
+                "type": type(exc).__name__,
+            }
+
+            async def workspace_failure_stream() -> AsyncIterator[bytes]:
+                _publish_event(conv_id, _response_failed_payload(workspace_error))
+                _on_proxy_stream_end(conv_id, error=workspace_error)
+                yield _response_failed_event(workspace_error)
+
+            return StreamingResponse(workspace_failure_stream(), media_type="text/event-stream")
+
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -5634,20 +5652,6 @@ def create_runner_app(
                     error={"message": _err_msg, "type": _err_type},
                 )
                 yield _response_failed_event({"message": _err_msg, "type": _err_type})
-                return
-
-            # Confirm the workspace before the harness can request local work.
-            try:
-                await _resolve_session_fs_registry(conv_id)
-            except HTTPException as exc:
-                _workspace_error = {
-                    "code": "workspace_metadata_unavailable",
-                    "message": str(exc.detail),
-                    "type": type(exc).__name__,
-                }
-                _publish_event(conv_id, _response_failed_payload(_workspace_error))
-                _on_proxy_stream_end(conv_id, error=_workspace_error)
-                yield _response_failed_event(_workspace_error)
                 return
 
             # Compose instructions for direct-stream turns (dispatch is None;

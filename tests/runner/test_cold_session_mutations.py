@@ -301,3 +301,119 @@ async def test_direct_stream_metadata_outage_fails_before_harness_and_allows_ret
                 assert calls == [tmp_path]
         finally:
             await registry.cleanup_session("stream-retry")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_cold_copy_on_write_turn_uses_selected_workspace_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omnigent.inner.datamodel import WritePathSpec
+    from omnigent.spec.types import ExecutorSpec
+    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
+
+    launch = tmp_path / "launch"
+    selected = tmp_path / "selected"
+    launch.mkdir()
+    selected.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="cow-test",
+        os_env=OSEnvSpec(
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=[WritePathSpec(".", True)]),
+        ),
+        executor=ExecutorSpec(type="omnigent", config={"harness": "openai-agents"}),
+    )
+    registry = SessionResourceRegistry(runner_workspace=launch, per_session_workspace=False)
+    roots: list[Path | None] = []
+    dispatched: list[Path | None] = []
+
+    def create(session_id: str, agent_spec: object, **kwargs: object):
+        root = registry.workspace_for_session(session_id)
+        roots.append(root)
+        return Mock(
+            cwd=root,
+            sandbox=SimpleNamespace(
+                backend_type="linux_bwrap",
+                copy_on_write_roots=(root,),
+                copy_on_write_namespace=(1, 2, 3),
+            ),
+        )
+
+    monkeypatch.setattr(registry, "_create_primary_env", create)
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_openai_agents_sdk_spawn_env", lambda spec: {}
+    )
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    async def dispatch(**kwargs: object) -> str:
+        environment = registry.resolve_environment("cow-cold", DEFAULT_ENVIRONMENT_ID, spec)
+        dispatched.append(environment.cwd)
+        return "ok"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch)
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "cow-response"}}),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "action_required",
+                        "name": "sys_os_shell",
+                        "call_id": "cow-call",
+                        "arguments": '{"command":"echo ok"}',
+                    },
+                }
+            ),
+            _sse({"type": "response.completed", "response": {"id": "cow-response"}}),
+        ]
+    )
+
+    def metadata(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/cow-cold":
+            return httpx.Response(200, json={"agent_id": "cow-agent", "workspace": str(selected)})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(metadata), base_url="http://server"
+    ) as server:
+        app = create_runner_app(
+            process_manager=_FakeProcessManager(harness),
+            spec_resolver=resolve,
+            server_client=server,
+            resource_registry=registry,
+            runner_workspace=launch,
+            per_session_workspace=False,
+        )
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as client:
+                response = await client.post(
+                    "/v1/sessions/cow-cold/events",
+                    params={"stream": str(stream).lower()},
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "cow-agent",
+                        "harness": "openai-agents",
+                        "content": [{"type": "input_text", "text": "test"}],
+                    },
+                )
+                assert response.status_code == (200 if stream else 202), response.text
+                async with asyncio.timeout(5):
+                    while not dispatched:
+                        await asyncio.sleep(0.01)
+                assert roots == [selected]
+                assert dispatched == [selected]
+        finally:
+            await registry.cleanup_session("cow-cold")
