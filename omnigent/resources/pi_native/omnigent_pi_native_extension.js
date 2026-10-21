@@ -2073,6 +2073,81 @@ module.exports = function (pi) {
     },
   });
 
+  pi.on("session_before_compact", async (event, ctx) => {
+    try {
+      const agentDir = process.env.PI_CODING_AGENT_DIR;
+      if (!agentDir || !ctx.model) return;
+      const policyPath = path.join(agentDir, "omnigent-compaction.json");
+      let policies;
+      try {
+        policies = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+      } catch (error) {
+        if (error.code === "ENOENT") return;
+        throw new Error("Omnigent economic compaction policy is unreadable");
+      }
+      if (!policies || typeof policies !== "object" || Array.isArray(policies)) {
+        throw new Error("Invalid Omnigent economic compaction policies");
+      }
+      const key = `${ctx.model.provider}/${ctx.model.id}`;
+      if (!Object.prototype.hasOwnProperty.call(policies, key)) return;
+      const policy = policies[key];
+      if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+        throw new Error("Invalid Omnigent economic compaction policy entry");
+      }
+      if (
+        !Number.isSafeInteger(policy.summaryReserveTokens) ||
+        policy.summaryReserveTokens < 0 ||
+        !Number.isSafeInteger(policy.triggerReserveTokens) ||
+        policy.triggerReserveTokens < 0
+      ) {
+        throw new Error("Invalid Omnigent economic compaction policy");
+      }
+      // Project overrides may select another threshold; do not reinterpret their budget.
+      if (
+        event.preparation.settings.reserveTokens !== policy.triggerReserveTokens
+      )
+        return;
+      // Use Pi's supported custom-summary hook and canonical compactor, not a new
+      // token/window fiction or an async compact request during an active tool loop.
+      const cliDir = path.dirname(fs.realpathSync(process.argv[1]));
+      // Pi's CLI and public ESM index are packaged beside each other. CJS
+      // require.resolve cannot select its import-only package export.
+      const runtimePath = path.join(cliDir, "index.js");
+      const runtime = await import(
+        require("url").pathToFileURL(runtimePath).href
+      );
+      const preparation = {
+        ...event.preparation,
+        settings: {
+          ...event.preparation.settings,
+          reserveTokens: policy.summaryReserveTokens,
+        },
+      };
+      const compaction = await runtime.compact(
+        preparation,
+        ctx.model,
+        undefined,
+        undefined,
+        event.customInstructions,
+        event.signal,
+        pi.getThinkingLevel(),
+        (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options),
+        undefined,
+        undefined,
+        undefined,
+        ctx.sessionManager.getSessionId(),
+      );
+      return { compaction };
+    } catch (_error) {
+      // Pi may otherwise fall back to the inflated threshold reserve on hook failure.
+      ctx.ui?.notify?.(
+        "Economic compaction failed; summary was not generated. Check the native Pi policy/runtime and retry.",
+        "error",
+      );
+      return { cancel: true };
+    }
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
     enableToolDiscovery();

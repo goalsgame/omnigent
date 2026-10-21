@@ -80,6 +80,7 @@ def prepare_managed_pi_agent_dir(
     *,
     overlay: Mapping[str, object] | None = None,
     global_agent_dir: Path | None = None,
+    model_context_windows: Mapping[str, int] | None = None,
 ) -> None:
     """
     Seed a managed ``PI_CODING_AGENT_DIR`` with the user's global Pi settings.
@@ -96,11 +97,19 @@ def prepare_managed_pi_agent_dir(
     :param overlay: Settings merged on top of the copied global file.
     :param global_agent_dir: Override for tests; defaults to
         :data:`DEFAULT_PI_AGENT_DIR`.
+    :param model_context_windows: Canonical provider/model windows from generated
+        models; enables translation of the operator's economic compaction targets.
     """
     agent_root = global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR
     settings = _read_settings_file(agent_root / "settings.json")
     if overlay:
         settings = _deep_merge_settings(settings, overlay)
+
+    from omnigent.inner.pi_compaction import POLICY_FILE, economic_settings
+
+    policy: dict[str, object] = {}
+    if model_context_windows is not None:
+        settings, policy = economic_settings(settings, model_context_windows)
 
     managed_dir.mkdir(parents=True, exist_ok=True)
     settings_path = managed_dir / "settings.json"
@@ -113,4 +122,6 @@ def prepare_managed_pi_agent_dir(
         _logger.warning("Could not write managed Pi settings at %s: %s", settings_path, exc)
         return
 
+    # No secrets; replace stale launch policy when the operator removes a target.
+    (managed_dir / POLICY_FILE).write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
     _symlink_agent_resource_dirs(managed_dir, agent_root)
