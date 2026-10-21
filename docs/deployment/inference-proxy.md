@@ -41,8 +41,9 @@ HTTP 429 responses distinguish session/global concurrency, a full waiting queue,
 and timeout, and include `Retry-After: 1`. Capacity is released when each stream
 finishes, fails or is cancelled. Authorization and recorded-spend checks run again
 before contacting the provider after a wait. Helpers share the session's allowed
-models and spending accounting, not separate provider credentials. Concurrent
-calls can exceed a recorded-spend threshold before usage is reported; this is not
+models and recorded-spend checks, not separate provider credentials. Every helper
+must report usage for its cost to appear in Omnigent's session totals; an arbitrary
+standalone CLI does not automatically report through the runner. Concurrent calls can exceed a recorded-spend threshold before usage is reported; this is not
 a reservation-based hard billing cap.
 
 Opt a host in before starting it. In PowerShell:
