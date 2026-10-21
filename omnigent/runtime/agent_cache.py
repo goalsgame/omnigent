@@ -42,6 +42,15 @@ def _published_location(workdir: Path) -> str | None:
         return None
 
 
+def _rebase_skill_dirs(spec: AgentSpec, source: Path, destination: Path) -> None:
+    """Keep resource paths valid after atomically publishing a staged bundle."""
+    for skill in spec.skills:
+        if skill.skill_dir is not None and skill.skill_dir.is_relative_to(source):
+            skill.skill_dir = destination / skill.skill_dir.relative_to(source)
+    for child in spec.sub_agents:
+        _rebase_skill_dirs(child, source, destination)
+
+
 class AgentCache:
     """
     Two-tier cache for loaded agents.
@@ -283,6 +292,7 @@ class AgentCache:
                     published or not (backup_dir / "previous").exists()
                 ):
                     _cleanup_staging_dir(backup_dir)
+        _rebase_skill_dirs(spec, staging_dir, workdir)
         self._specs[agent_id] = (bundle_location, spec)
         return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -372,5 +382,6 @@ class AgentCache:
                     expand_env=expand_env,
                     prune_invalid_sub_agents=True,
                 )
+        _rebase_skill_dirs(spec, staging_dir, workdir)
         self._specs[agent_id] = (bundle_location, spec)
         return LoadedAgent(spec=spec, workdir=workdir)

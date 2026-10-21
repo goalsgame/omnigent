@@ -2295,6 +2295,8 @@ def _build_pi_native_args(
     session_dir: Path,
     external_session_id: str | None,
     approve: bool = False,
+    bundle_dir: Path | None = None,
+    skills_filter: str | list[str] = "all",
 ) -> list[str]:
     """
     Build Pi CLI args for a runner-owned native TUI session.
@@ -2305,10 +2307,15 @@ def _build_pi_native_args(
     :param external_session_id: Captured Pi session id, if any.
     :param approve: When ``True``, pass ``--approve`` to pre-accept Pi's
         project-folder trust dialog (supported from Pi 0.79+).
+    :param bundle_dir: Extracted agent bundle containing portable skills.
+    :param skills_filter: Existing agent skill filter.
     :returns: Complete Pi arg vector excluding the executable.
     """
     user_args = list(terminal_launch_args or [])
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
     args = ["--extension", str(extension_path)]
+    args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
     if approve:
         # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
         # blocking TUI prompt on first launch in a directory with .pi/
@@ -2651,6 +2658,8 @@ async def _auto_create_pi_terminal(
         session_dir=session_dir,
         external_session_id=resume_session_id,
         approve=supports_approve,
+        bundle_dir=_resolved_spec_workdir(agent_spec),
+        skills_filter=spec_for_mcp.skills_filter if spec_for_mcp is not None else "all",
     )
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
