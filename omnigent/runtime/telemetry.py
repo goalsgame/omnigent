@@ -1343,6 +1343,15 @@ def init(service_name: str | None = None) -> None:
         service_name or os.environ.get("OTEL_SERVICE_NAME") or "omnigent"
     )
 
+    # Managed workspace processes can have a release identity independent of the server.
+    runner_attributes = os.environ.get("OMNIGENT_OTEL_RUNNER_RESOURCE_ATTRIBUTES")
+    if runner_attributes is not None and os.environ["OTEL_SERVICE_NAME"] in {
+        "omni-host",
+        "omni-runner",
+        "omni-harness",
+    }:
+        os.environ["OTEL_RESOURCE_ATTRIBUTES"] = runner_attributes
+
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
     _init_otel_traces(endpoint)
     _init_otel_metrics()
