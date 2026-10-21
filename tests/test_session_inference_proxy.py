@@ -1708,12 +1708,13 @@ async def test_parallel_session_streams_queue_and_release_independently(setup):
                 headers={"Authorization": "Bearer " + token},
             )
 
-        pending = [asyncio.create_task(request()) for _ in range(5)]
+        pending = [asyncio.create_task(request()) for _ in range(4)]
         try:
-            await _wait_for_capacity(service, active=4, queued=1)
             async with asyncio.timeout(5):
                 while len(upstream_calls) != 4:
                     await asyncio.sleep(0.001)
+            pending.append(asyncio.create_task(request()))
+            await _wait_for_capacity(service, active=4, queued=1)
             pending[0].cancel()
             with pytest.raises(asyncio.CancelledError):
                 await pending[0]
