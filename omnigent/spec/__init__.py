@@ -284,11 +284,19 @@ def load(
     # *expand_env* and the flag does not apply.
     candidate = _find_omnigent_yaml_in_dir(root)
     if candidate is not None:
-        return load_omnigent_yaml(
+        spec = load_omnigent_yaml(
             candidate,
             enforce_handler_allowlist=enforce_handler_allowlist,
             prune_invalid_sub_agents=prune_invalid_sub_agents,
         )
+        from omnigent.spec.parser import _discover_skills, _with_legacy_skill_names
+
+        spec.skills = _with_legacy_skill_names(_discover_skills(root / "skills"))
+        result = validate(spec)
+        if not result.valid:
+            errors = "; ".join(f"{e.path}: {e.message}" for e in result.errors)
+            raise OmnigentError(f"invalid agent spec: {errors}", code=ErrorCode.INVALID_INPUT)
+        return spec
 
     spec = parse(root, expand_env=expand_env)
     if prune_invalid_sub_agents:

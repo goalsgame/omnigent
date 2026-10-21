@@ -87,6 +87,7 @@ from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.operator_skills import OperatorSkills
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -902,6 +903,7 @@ def _ensure_default_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
+    operator_skills: OperatorSkills | None = None,
 ) -> None:
     """
     Register all built-in agents that should always be available.
@@ -920,7 +922,7 @@ def _ensure_default_agents(
     _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
-    _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache, operator_skills)
 
 
 # Env var listing extra built-in agent specs to seed at startup, in addition
@@ -937,6 +939,7 @@ def _ensure_extra_builtin_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
+    operator_skills: OperatorSkills | None = None,
 ) -> None:
     """
     Seed extra built-in agents named by :data:`_EXTRA_BUILTIN_AGENTS_ENV`.
@@ -951,7 +954,8 @@ def _ensure_extra_builtin_agents(
     operator-supplied paths that may be wrong in a deployment (typo, stale
     mount). A bad entry is logged and skipped — one misconfigured extra
     agent must never block server startup (the packaged built-ins still
-    seed). Mirrors the best-effort spec-load in :func:`_to_agent_object`.
+    seed). Explicit skill mappings are validated before startup and fail
+    closed if their sources change or cannot be registered.
 
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
@@ -962,17 +966,26 @@ def _ensure_extra_builtin_agents(
     from omnigent.spec import materialize_bundle
 
     raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "").strip()
-    if not raw:
-        return
-    for entry in raw.split(os.pathsep):
-        entry = entry.strip()
-        if not entry:
-            continue
-        source = Path(entry)
+    sources = [Path(entry.strip()) for entry in raw.split(os.pathsep) if entry.strip()]
+    mapped_sources = operator_skills.sources if operator_skills is not None else {}
+    current_paths = {source.absolute() for source in sources}
+    sources.extend(path for path in mapped_sources if path not in current_paths)
+    for source in sources:
+        mapped_name = mapped_sources.get(source.absolute())
+        name = mapped_name or source.name
         try:
-            name = source.stem if source.is_file() else source.name
+            if mapped_name is None:
+                name = source.stem if source.is_file() else source.name
             with tempfile.TemporaryDirectory() as tmpdir:
+                if operator_skills is not None and operator_skills.agents.get(name):
+                    operator_skills.check_source(source)
                 bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+                if operator_skills is not None:
+                    operator_skills.apply(bundle_dir, name)
+                    if name in operator_skills.agents:
+                        from omnigent.spec import load as load_spec
+
+                        load_spec(bundle_dir, expand_env=False)
                 bundle_bytes = _tar_gz_dir(bundle_dir)
             _ensure_builtin_agent(
                 agent_store,
@@ -981,7 +994,9 @@ def _ensure_extra_builtin_agents(
                 name=name,
                 bundle_bytes=bundle_bytes,
             )
-        except Exception:  # a bad operator path must not block server startup
+        except Exception:  # Unmapped extras preserve best-effort registration.
+            if operator_skills is not None and name in operator_skills.agents:
+                raise
             _logger.exception(
                 "Failed to register extra built-in agent from %r (%s); skipping. Check %s.",
                 str(source),
@@ -1491,6 +1506,21 @@ def create_app(
     resolved_server_config = load_server_config() if server_config is None else server_config
     from omnigent.server.agent_catalog import agent_catalog_names, agent_catalog_presentation
 
+    extra_sources = [
+        Path(entry.strip())
+        for entry in os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "").split(os.pathsep)
+        if entry.strip()
+    ]
+    extra_source_names = [p.stem if p.is_file() else p.name for p in extra_sources]
+    if resolved_server_config.get("operator_skills") is not None and len(
+        set(extra_source_names)
+    ) != len(extra_source_names):
+        raise ValueError("operator_skills cannot use ambiguously named extra agent sources")
+    operator_skills = OperatorSkills.parse(
+        resolved_server_config.get("operator_skills"),
+        sources={p.stem if p.is_file() else p.name: p for p in extra_sources},
+    )
+
     agent_store.catalog_names = agent_catalog_names(resolved_server_config)
     default_agent_name, agent_display_names = agent_catalog_presentation(resolved_server_config)
     branding_snapshot = load_branding_snapshot(resolved_server_config)
@@ -1691,7 +1721,7 @@ def create_app(
         # SessionFilesystemRegistry moved to the runner. Both
         # warmup blocks deleted here.
 
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        _ensure_default_agents(agent_store, artifact_store, agent_cache, operator_skills)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.

@@ -2903,9 +2903,8 @@ def create_runner_app(
                 _launch_pre = _antigravity_pre_launch
 
             elif harness_name == "pi-native":
-                # pi resolves its spec unwrapped — a resolution error surfaces as
-                # a terminal-start error (the resolver does not swallow it).
-                _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
+                # Keep the bundle workdir for portable skill discovery.
+                _launch_resolve_spec = lambda: _resolve_session_spec_entry(session_id)  # noqa: E731
             elif harness_name in (
                 "cursor-native",
                 "opencode-native",

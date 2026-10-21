@@ -464,14 +464,17 @@ def register_resource_routes(
                 )
 
             elif terminal_name in ("pi", "opencode"):
-                # pi/opencode resolve the spec unwrapped — a resolution error
-                # surfaces as a terminal-start error (the resolver does not
-                # swallow it).
+                # Pi needs the resolved bundle workdir for portable skills.
                 async def _spec_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
                     return dataclasses.replace(
-                        ctx, agent_spec=await _resolve_session_agent_spec(session_id)
+                        ctx,
+                        agent_spec=(
+                            await _resolve_session_spec_entry(session_id)
+                            if terminal_name == "pi"
+                            else await _resolve_session_agent_spec(session_id)
+                        ),
                     )
 
                 _ensure_build = _spec_ensure_build
