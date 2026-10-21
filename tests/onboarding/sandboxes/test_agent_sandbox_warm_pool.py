@@ -111,6 +111,18 @@ def _launcher(**kwargs: Any) -> warm.AgentSandboxWarmPoolLauncher:
     return warm.AgentSandboxWarmPoolLauncher(**options)
 
 
+def test_runner_resource_identity_keeps_server_only_release_out_of_profile(monkeypatch):
+    name = "OMNIGENT_OTEL_RUNNER_RESOURCE_ATTRIBUTES"
+    monkeypatch.setenv(name, "service.version=runner-v1")
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "service.version=server-v1")
+    launcher = _launcher(env=[name])
+    original = launcher.template_spec(shared=True)
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "service.version=server-v2")
+    assert original == _launcher(env=[name]).template_spec(shared=True)
+    monkeypatch.setenv(name, "service.version=runner-v2")
+    assert original != _launcher(env=[name]).template_spec(shared=True)
+
+
 def _pod(spec: dict[str, Any], *, uid: str = _POD_UID) -> SimpleNamespace:
     raw = copy.deepcopy(spec["podTemplate"])
     raw["metadata"].update({"name": "pooled-sandbox-pod", "uid": uid})
