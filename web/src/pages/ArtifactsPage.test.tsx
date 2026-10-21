@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { Link } from "@/lib/routing";
+import { basenamedRouting, Link, RoutingProvider } from "@/lib/routing";
 import { ArtifactsPage } from "./ArtifactsPage";
 import { getOmnigentTransformShareLink, resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
@@ -68,6 +68,50 @@ it("links to a full-page authenticated view in a separate tab", async () => {
   expect(link).toHaveAttribute("href", `/artifacts/${artifact.id}?view=full`);
   expect(link).toHaveAttribute("target", "_blank");
   expect(link).toHaveAttribute("rel", "noopener noreferrer");
+});
+
+it("preserves transformed host URL context and hash while selecting full-page mode", async () => {
+  const transform = vi.fn(
+    (path: string) => `https://host.example${path}?workspace=42&view=details#report`,
+  );
+  vi.mocked(getOmnigentTransformShareLink).mockReturnValue(transform);
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  render(
+    <MemoryRouter initialEntries={[`/artifacts/${artifact.id}`]}>
+      <Routes>
+        <Route path="/artifacts/:artifactId?" element={<ArtifactsPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole("link", { name: "Open full page" })).toHaveAttribute(
+    "href",
+    `https://host.example/artifacts/${artifact.id}?workspace=42&view=full#report`,
+  );
+  expect(transform).toHaveBeenCalledWith(`/artifacts/${artifact.id}`);
+});
+
+it("transforms the rebased mount path for an embedded host", async () => {
+  const transform = vi.fn((path: string) => `https://host.example${path}?workspace=42#section`);
+  vi.mocked(getOmnigentTransformShareLink).mockReturnValue(transform);
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  render(
+    <MemoryRouter initialEntries={[`/mount/artifacts/${artifact.id}`]}>
+      <RoutingProvider value={basenamedRouting("/mount")}>
+        <Routes>
+          <Route path="/mount/artifacts/:artifactId" element={<ArtifactsPage />} />
+        </Routes>
+      </RoutingProvider>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole("link", { name: "Open full page" })).toHaveAttribute(
+    "href",
+    `https://host.example/mount/artifacts/${artifact.id}?workspace=42&view=full#section`,
+  );
+  expect(transform).toHaveBeenCalledWith(`/mount/artifacts/${artifact.id}`);
 });
 
 it("renders only the isolated viewport in full-page mode", async () => {

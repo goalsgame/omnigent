@@ -50,6 +50,11 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
   const [principalType, setPrincipalType] = useState<"user" | "group">("user");
   const [saving, setSaving] = useState(false);
   const rendererUrl = resolveArtifactRendererUrl(artifact?.renderer_url);
+  const transformedViewUrl = artifact
+    ? getOmnigentTransformShareLink()?.(rebasePath(`/artifacts/${artifact.id}`))
+    : undefined;
+  const fullPageUrl = transformedViewUrl ? new URL(transformedViewUrl, window.location.href) : null;
+  fullPageUrl?.searchParams.set("view", "full");
 
   useEffect(() => {
     let active = true;
@@ -213,13 +218,19 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
             <>
               {artifact.kind === "html" && rendererUrl && (
                 <Button variant="outline" asChild>
-                  <Link
-                    to={`/artifacts/${artifact.id}?view=full`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Open full page
-                  </Link>
+                  {fullPageUrl ? (
+                    <a href={fullPageUrl.href} target="_blank" rel="noopener noreferrer">
+                      Open full page
+                    </a>
+                  ) : (
+                    <Link
+                      to={`/artifacts/${artifact.id}?view=full`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Open full page
+                    </Link>
+                  )}
                 </Button>
               )}
               <Button variant="outline" onClick={() => void download()}>

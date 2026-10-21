@@ -96,6 +96,8 @@ def test_full_page_view_fills_viewport_and_preserves_isolation(page: Page, artif
     link = page.get_by_role("link", name="Open full page")
     expect(link).to_have_attribute("target", "_blank")
     expect(link).to_have_attribute("rel", "noopener noreferrer")
+    # A full-page open must not merely cover the existing navigation.
+    expect(page.get_by_test_id("artifacts-nav")).to_be_visible()
     # The same independently loadable URL is also usable after login or reload.
     href = link.get_attribute("href")
     assert href and href.endswith("?view=full")
@@ -104,6 +106,7 @@ def test_full_page_view_fills_viewport_and_preserves_isolation(page: Page, artif
     page = opened.value
     page.wait_for_url(artifact_url + "?view=full")
     assert page.evaluate("window.opener === null")
+    expect(page.get_by_test_id("artifacts-nav")).to_have_count(0)
     outer = page.locator('iframe[title="Published HTML artifact"]')
     expect(outer).to_be_visible()
     bounds = outer.bounding_box()
@@ -121,6 +124,8 @@ def test_full_page_view_fills_viewport_and_preserves_isolation(page: Page, artif
     expect(frame.get_by_role("button", name="Interaction works")).to_be_visible()
     assert page.evaluate("document.body.dataset.compromised") is None
     expect(page.get_by_role("button", name="Download", exact=True)).to_have_count(0)
+    page.keyboard.press("Tab")
+    assert page.evaluate("document.activeElement?.tagName") in ("IFRAME", "BODY")
 
 
 def test_catalog_navigation_and_group_sharing(

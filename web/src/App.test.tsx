@@ -1,4 +1,5 @@
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { Outlet, MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -12,6 +13,9 @@ vi.mock("@/shell/AppShell", () => ({
   AppShell: () => (
     <div>
       <span>app shell</span>
+      <nav aria-label="Open sidebar">
+        <a href="/">Sidebar navigation</a>
+      </nav>
       <Outlet />
     </div>
   ),
@@ -19,6 +23,13 @@ vi.mock("@/shell/AppShell", () => ({
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/pages/ArtifactsPage", () => ({
+  ArtifactsPage: () => (
+    <main>
+      <button type="button">Artifact interaction</button>
+    </main>
+  ),
+}));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
@@ -149,6 +160,37 @@ function renderRoute(
     </CapabilitiesProvider>,
   );
 }
+
+describe("Full-page artifact layout", () => {
+  afterEach(cleanup);
+  it.each(["", "/mount"])(
+    "unmounts open sidebar controls for %s artifact full-page views",
+    async (basename) => {
+      render(
+        <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+          <MemoryRouter initialEntries={[`${basename}/artifacts/${"a".repeat(32)}?view=full`]}>
+            <App basename={basename || undefined} />
+          </MemoryRouter>
+        </CapabilitiesProvider>,
+      );
+      const interaction = await screen.findByRole("button", { name: "Artifact interaction" });
+      expect(screen.queryByRole("navigation", { name: "Open sidebar" })).toBeNull();
+      expect(screen.queryByRole("link", { name: "Sidebar navigation" })).toBeNull();
+      await userEvent.tab();
+      expect(document.activeElement).toBe(interaction);
+      await userEvent.tab();
+      expect(document.activeElement).toBe(document.body);
+    },
+  );
+
+  it.each([`/artifacts/${"a".repeat(32)}`, "/artifacts?view=full", "/?view=full"])(
+    "retains shell navigation outside a full-page artifact: %s",
+    async (path) => {
+      renderRoute(path);
+      expect(await screen.findByRole("link", { name: "Sidebar navigation" })).toBeInTheDocument();
+    },
+  );
+});
 
 describe("Canvas route", () => {
   it("shows a spinner, not 'not found', while server info is still loading", () => {
