@@ -2066,7 +2066,13 @@ def pi_native_provider_launch(
     enabled_refs = _enabled_model_refs(rendered)
     if provider.curated_models and enabled_refs:
         overlay["enabledModels"] = enabled_refs
-    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
+    windows = {
+        f"{provider_id}/{model['id']}": model["contextWindow"]
+        for provider_id, configured in rendered["providers"].items()
+        for model in configured.get("models", [])
+        if isinstance(model.get("contextWindow"), int) and model["contextWindow"] > 0
+    }
+    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay, model_context_windows=windows)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     if provider.inference_bound:
         env["OMNIGENT_PI_INFERENCE_BOUND"] = "1"

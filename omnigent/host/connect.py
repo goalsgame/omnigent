@@ -724,6 +724,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Credential-env denylists must survive both daemon and runner hops.
         # This carries variable names only; their values still follow normal forwarding.
         "OMNIGENT_PI_ENV_UNSET",
+        # Nonsecret exact-model economic compaction targets for native Pi.
+        "OMNIGENT_PI_COMPACTION_TARGETS",
         "OMNIGENT_ACP_ENV_UNSET",
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
