@@ -1,5 +1,6 @@
 import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { matchPath, Navigate, Route, Routes } from "react-router-dom";
+import { Outlet, useLocation } from "@/lib/routing";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
@@ -144,6 +145,10 @@ function AppRoutes({ basename }: AppProps) {
   // the original relative route table.
   const prefix = basename ?? "";
   const info = useServerInfo();
+  const location = useLocation();
+  const fullPageArtifact =
+    matchPath(`${prefix}/artifacts/:artifactId`, location.pathname) !== null &&
+    new URLSearchParams(location.search).get("view") === "full";
 
   // First-run: accounts on but no admin claimed yet. Route EVERY path to
   // the Create-admin form so the first visitor lands on it no matter how
@@ -171,7 +176,7 @@ function AppRoutes({ basename }: AppProps) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
-        <Route element={<AppShell />}>
+        <Route element={fullPageArtifact ? <Outlet /> : <AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />

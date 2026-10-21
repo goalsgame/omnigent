@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { Link } from "@/lib/routing";
+import { basenamedRouting, Link, RoutingProvider } from "@/lib/routing";
 import { ArtifactsPage } from "./ArtifactsPage";
 import { getOmnigentTransformShareLink, resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
@@ -57,6 +57,107 @@ it("previews untrusted HTML only inside an opaque sandbox without a bridge", asy
     "*",
   );
   expect(screen.queryByText("HTML")).toBeNull();
+});
+
+it("links to a full-page authenticated view in a separate tab", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  show();
+  const link = await screen.findByRole("link", { name: "Open full page" });
+  expect(link).toHaveAttribute("href", `/artifacts/${artifact.id}?view=full`);
+  expect(link).toHaveAttribute("target", "_blank");
+  expect(link).toHaveAttribute("rel", "noopener noreferrer");
+});
+
+it("preserves transformed host URL context and hash while selecting full-page mode", async () => {
+  const transform = vi.fn(
+    (path: string) => `https://host.example${path}?workspace=42&view=details#report`,
+  );
+  vi.mocked(getOmnigentTransformShareLink).mockReturnValue(transform);
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  render(
+    <MemoryRouter initialEntries={[`/artifacts/${artifact.id}`]}>
+      <Routes>
+        <Route path="/artifacts/:artifactId?" element={<ArtifactsPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole("link", { name: "Open full page" })).toHaveAttribute(
+    "href",
+    `https://host.example/artifacts/${artifact.id}?workspace=42&view=full#report`,
+  );
+  expect(transform).toHaveBeenCalledWith(`/artifacts/${artifact.id}`);
+});
+
+it("transforms the rebased mount path for an embedded host", async () => {
+  const transform = vi.fn((path: string) => `https://host.example${path}?workspace=42#section`);
+  vi.mocked(getOmnigentTransformShareLink).mockReturnValue(transform);
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  render(
+    <MemoryRouter initialEntries={[`/mount/artifacts/${artifact.id}`]}>
+      <RoutingProvider value={basenamedRouting("/mount")}>
+        <Routes>
+          <Route path="/mount/artifacts/:artifactId" element={<ArtifactsPage />} />
+        </Routes>
+      </RoutingProvider>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole("link", { name: "Open full page" })).toHaveAttribute(
+    "href",
+    `https://host.example/mount/artifacts/${artifact.id}?workspace=42&view=full#section`,
+  );
+  expect(transform).toHaveBeenCalledWith(`/mount/artifacts/${artifact.id}`);
+});
+
+it("renders only the isolated viewport in full-page mode", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  show(`/artifacts/${artifact.id}?view=full`);
+  const frame = await screen.findByTitle("Published HTML artifact");
+  expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+  expect(frame).toHaveAttribute("src", "/v1/artifact-renderer");
+  expect(screen.getByRole("main", { name: "Full-page artifact" })).toHaveClass("fixed", "inset-0");
+  expect(screen.queryByText("Sharing")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
+  expect(authenticatedFetch).toHaveBeenCalledWith(`/v1/artifacts/${artifact.id}/preview`);
+});
+
+it("rechecks authorization on a full-page open", async () => {
+  vi.mocked(authenticatedFetch).mockResolvedValueOnce(json({}, 404));
+  show(`/artifacts/${artifact.id}?view=full`);
+  expect(await screen.findByRole("alert")).toHaveTextContent("not shared with you");
+  expect(screen.queryByTitle("Published HTML artifact")).toBeNull();
+  expect(screen.getByRole("link", { name: "Artifact details" })).toBeInTheDocument();
+});
+
+it("keeps the full-page link under the embedding basename", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  render(
+    <MemoryRouter basename="/embedded" initialEntries={[`/embedded/artifacts/${artifact.id}`]}>
+      <Routes>
+        <Route path="/artifacts/:artifactId?" element={<ArtifactsPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole("link", { name: "Open full page" })).toHaveAttribute(
+    "href",
+    `/embedded/artifacts/${artifact.id}?view=full`,
+  );
+});
+
+it("does not offer full-page rendering for download-only files", async () => {
+  vi.mocked(authenticatedFetch).mockResolvedValueOnce(json({ ...artifact, kind: "file" }));
+  show();
+  await screen.findByText("Report");
+  expect(screen.queryByRole("link", { name: "Open full page" })).toBeNull();
 });
 
 it("grants exact group read access and exposes no agent-side permission bridge", async () => {
