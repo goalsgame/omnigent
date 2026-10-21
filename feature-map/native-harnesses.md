@@ -48,6 +48,10 @@ implements them separately, so a fix for one harness does not reach the others.
   through direct links. The import review modal's See more opens Harnesses and
   dismisses the modal. Import sessions contains only session imports.
 
+- `parallel-server-inference`: a main agent and background helpers can make
+  concurrent model calls using the same session credentials, within configured
+  per-session/global limits and bounded waiting.
+
 ## How to get to it (user POV)
 
 **Web:** start a new session, choose the harness in the harness picker, open its
@@ -327,6 +331,15 @@ Cross-harness journeys:
   derived skill/MCP plugin listing still works; a 502 shows an inventory error.
   Codex and Cursor keep their existing derived listings.
 
+**Parallel server inference:** on an opted-in host, configure the proxy with four
+requests per session and bounded waiting, then run a main agent alongside a
+background helper using the inherited proxy configuration. Both should continue
+without a session-capacity error. The credential-free TLS host/runner test
+`tests/e2e/test_session_inference_proxy.py::test_opted_in_host_launches_runner_and_streams_without_provider_credentials`
+covers four concurrent authenticated streams and a queued fifth in its default
+workspace variant. This verifies the shared proxy path, not every vendor CLI's
+subprocess environment behavior.
+
 ## Gotchas
 
 - A change to shared native-harness behavior (cleanup, idle handling,
@@ -351,3 +364,7 @@ Cross-harness journeys:
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
+
+- Parallel server inference is opt-in: the default remains one request per
+  session with no waiting. Each background helper shares authorization and
+  session accounting; concurrency does not make spending thresholds hard caps.

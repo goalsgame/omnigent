@@ -64,6 +64,8 @@ def main() -> None:
                 "public_url": f"https://127.0.0.1:{port}",
                 "signing_key_env": "OMNIGENT_E2E_SIGNING_KEY",
                 "models": ["friendly-alias" if named_route else "test-model"],
+                "max_concurrent_requests_per_session": 4,
+                "capacity_wait_timeout_seconds": 5,
                 **({"session_cost_limits": {"local": 0.001}} if budget_test else {}),
                 **(
                     {
@@ -131,7 +133,7 @@ def main() -> None:
 
     @app.get("/v1/_e2e/proxy_requests")
     async def requests():
-        return {"calls": calls, "active": proxy.active_requests}
+        return {"calls": calls, "active": proxy.active_requests, "queued": proxy.queued_requests}
 
     app.router.routes.insert(0, app.router.routes.pop())
 
@@ -158,6 +160,16 @@ def main() -> None:
             "generation": connection.generation,
         }
 
+    @app.post("/v1/_e2e/sessions/{sid}/inference-grant")
+    async def inference_grant(sid: str):
+        conv = await asyncio.to_thread(conversations.get_conversation, sid)
+        owner = await asyncio.to_thread(
+            conversations.get_session_owner_authority, sid, owner_only=True
+        )
+        return proxy.launch_config(
+            conv, conv.runner_id, "openai-agents", conv.host_id, owner.user_id, owner.generation
+        )["server_inference"]
+
     @app.post("/v1/_e2e/sessions/{sid}/recycle")
     async def recycle(sid: str):
         conv = await asyncio.to_thread(conversations.get_conversation, sid)
@@ -173,7 +185,7 @@ def main() -> None:
                 await asyncio.sleep(0.05)
 
     # Place test routes ahead of the SPA fallback.
-    for _ in range(2):
+    for _ in range(3):
         app.router.routes.insert(0, app.router.routes.pop())
 
     workspace = int(os.environ.get("OMNIGENT_E2E_WORKSPACE", "0"))

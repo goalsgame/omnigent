@@ -64,6 +64,55 @@ def _certificate(root: Path) -> None:
     (root / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
+async def _verify_parallel_inference(base, cert, session_id):
+    async with httpx.AsyncClient(
+        base_url=base,
+        verify=ssl.create_default_context(cafile=str(cert)),
+        timeout=15,
+        trust_env=False,
+    ) as client:
+        config_response = await client.post(f"/v1/_e2e/sessions/{session_id}/inference-grant")
+        config_response.raise_for_status()
+        config = config_response.json()
+        assert "server-only-provider" not in config_response.text
+        token = await client.post(
+            config["url"] + "/token", headers={"Authorization": "Bearer " + config["grant"]}
+        )
+        token.raise_for_status()
+
+        async def infer():
+            async with client.stream(
+                "POST",
+                config["url"] + "/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "parallel"}],
+                    "stream": True,
+                },
+                headers={"Authorization": "Bearer " + token.json()["token"]},
+            ) as response:
+                assert response.status_code == 200, await response.aread()
+                text = (await response.aread()).decode()
+                assert "PARALLEL_PROXY_OK" in text
+                assert "server-only-provider" not in text
+
+        pending = [asyncio.create_task(infer()) for _ in range(5)]
+        try:
+            async with asyncio.timeout(5):
+                while True:
+                    snapshot = (await client.get("/v1/_e2e/proxy_requests")).json()
+                    if snapshot["active"] == 4 and snapshot["queued"] == 1:
+                        break
+                    await asyncio.sleep(0.01)
+            await asyncio.gather(*pending)
+            snapshot = (await client.get("/v1/_e2e/proxy_requests")).json()
+            assert snapshot["active"] == snapshot["queued"] == 0
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
 async def _verify_repl_rotation(base, cert, session_id, runner_id, bundle, mock_url):
     from types import SimpleNamespace
 
@@ -312,6 +361,15 @@ def test_opted_in_host_launches_runner_and_streams_without_provider_credentials(
                     recovered = client.post(f"/v1/_e2e/sessions/{session_id}/initialize").json()
                     assert recovered["status"] == 201, recovered
                     assert recovered["payload"]["inference_config_verified"] is True
+                if workspace == 0 and not named_route and not budget_test:
+                    configure_mock_llm(
+                        isolated_mock_llm_server_url,
+                        [{"text": "PARALLEL_PROXY_OK", "delay": 2} for _ in range(5)],
+                    )
+                    asyncio.run(
+                        _verify_parallel_inference(base, tmp_path / "cert.pem", session_id)
+                    )
+                    configure_mock_llm(isolated_mock_llm_server_url, [{"text": marker}])
                 response_id = send_user_message_to_session(
                     client, session_id=session_id, content="Reply briefly."
                 )

@@ -1663,3 +1663,219 @@ async def test_zero_cost_budget_requires_server_pricing_provenance(setup, verifi
         )
     assert response.status_code == (200 if verified else 503)
     assert len(calls) == (1 if verified else 0)
+
+
+async def _wait_for_capacity(service, *, active, queued):
+    import asyncio
+
+    async with asyncio.timeout(5):
+        while service.active_requests != active or service.queued_requests != queued:
+            await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_parallel_session_streams_queue_and_release_independently(setup):
+    import asyncio
+    from dataclasses import replace
+
+    service, app, conv, _, _ = setup
+    service.config = replace(
+        service.config, max_concurrent_requests_per_session=4, capacity_wait_timeout_seconds=5
+    )
+    release = asyncio.Event()
+    upstream_calls = []
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"data: first\n\n"
+            await release.wait()
+            yield b"data: [DONE]\n\n"
+
+    def upstream(request):
+        upstream_calls.append(request)
+        return httpx.Response(200, stream=Stream())
+
+    service.transport = httpx.MockTransport(upstream)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+
+        async def request():
+            return await client.post(
+                "/v1/inference/sessions/session/chat/completions",
+                json={"model": "model-a", "stream": True},
+                headers={"Authorization": "Bearer " + token},
+            )
+
+        pending = [asyncio.create_task(request()) for _ in range(5)]
+        try:
+            await _wait_for_capacity(service, active=4, queued=1)
+            async with asyncio.timeout(5):
+                while len(upstream_calls) != 4:
+                    await asyncio.sleep(0.001)
+            pending[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending[0]
+            await _wait_for_capacity(service, active=4, queued=0)
+            assert service._session_requests == {(0, conv.id): 4}
+            release.set()
+            results = await asyncio.gather(*pending[1:])
+            assert all(response.status_code == 200 for response in results)
+            assert len(upstream_calls) == 5
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+    assert service.active_requests == service.queued_requests == 0
+    assert not service.active_sessions and not service._session_requests
+
+
+@pytest.mark.asyncio
+async def test_waiting_queue_is_bounded_and_cancellation_reclaims_waiter(setup):
+    import asyncio
+    from dataclasses import replace
+
+    service, app, conv, _, _ = setup
+    service.config = replace(
+        service.config, max_queued_requests=1, capacity_wait_timeout_seconds=5
+    )
+    # A slow upload holds a slot before contacting any provider.
+    started = asyncio.Event()
+
+    async def body():
+        yield b'{"model":'
+        started.set()
+        await asyncio.Event().wait()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        headers = {"Authorization": "Bearer " + token}
+
+        async def request(**kwargs):
+            return await client.post(
+                "/v1/inference/sessions/session/responses", headers=headers, **kwargs
+            )
+
+        active = asyncio.create_task(request(content=body()))
+        await asyncio.wait_for(started.wait(), 5)
+        waiter = asyncio.create_task(request(json={"model": "model-a"}))
+        try:
+            await _wait_for_capacity(service, active=1, queued=1)
+            blocked = await request(json={"model": "model-a"})
+            assert blocked.status_code == 429
+            assert blocked.json()["detail"] == "Inference waiting queue is full"
+            assert blocked.headers["retry-after"] == "1"
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            await _wait_for_capacity(service, active=1, queued=0)
+        finally:
+            active.cancel()
+            waiter.cancel()
+            await asyncio.gather(active, waiter, return_exceptions=True)
+    assert service.active_requests == service.queued_requests == 0
+    assert not service._session_requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_limit", [False, True])
+async def test_capacity_timeout_distinguishes_session_and_global_limits(setup, global_limit):
+    from dataclasses import replace
+
+    service, app, conv, _, calls = setup
+    service.config = replace(
+        service.config,
+        max_concurrent_requests=1 if global_limit else 32,
+        capacity_wait_timeout_seconds=0.01,
+    )
+    await service._reserve_capacity((0, conv.id))
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="https://server.example"
+        ) as client:
+            token = await access(client, service, conv)
+            response = await client.post(
+                "/v1/inference/sessions/session/responses",
+                json={"model": "model-a"},
+                headers={"Authorization": "Bearer " + token},
+            )
+        assert response.status_code == 429
+        assert ("Global" if global_limit else "Session") in response.json()["detail"]
+        assert response.headers["retry-after"] == "1"
+        assert service.queued_requests == 0 and service.active_requests == 1
+        assert not calls
+    finally:
+        service._release_capacity((0, conv.id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["revoked", "budget"])
+async def test_queued_inference_rechecks_authorization_and_cost_before_provider(setup, mutation):
+    import asyncio
+    from dataclasses import replace
+
+    service, app, conv, host, calls = setup
+    service.config = replace(service.config, capacity_wait_timeout_seconds=5)
+    await service._reserve_capacity((0, conv.id))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        pending = asyncio.create_task(
+            client.post(
+                "/v1/inference/sessions/session/responses",
+                json={"model": "model-a"},
+                headers={"Authorization": "Bearer " + token},
+            )
+        )
+        try:
+            await _wait_for_capacity(service, active=1, queued=1)
+            if mutation == "revoked":
+                host.status = "offline"
+            else:
+                from fastapi import HTTPException
+
+                def reject_cost(_conv):
+                    raise HTTPException(402, "Session inference budget exhausted")
+
+                service._check_cost_limit = reject_cost
+            service._release_capacity((0, conv.id))
+            response = await asyncio.wait_for(pending, 5)
+            assert response.status_code == (401 if mutation == "revoked" else 402)
+            assert not calls
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            if service.active_requests:
+                service._release_capacity((0, conv.id))
+    assert not service.active_sessions and not service._session_requests
+    assert service.active_requests == service.queued_requests == 0
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"max_concurrent_requests_per_session": 0},
+        {"max_concurrent_requests_per_session": True},
+        {"max_queued_requests": 0},
+        {"max_queued_requests": 1.5},
+        *(
+            {"capacity_wait_timeout_seconds": value}
+            for value in [-1, True, "30", float("inf"), float("nan"), 121]
+        ),
+    ],
+)
+def test_invalid_capacity_configuration(monkeypatch, patch):
+    monkeypatch.setenv("TEST_INFERENCE_KEY", "k" * 32)
+    with pytest.raises(ValueError):
+        InferenceProxyConfig.parse(
+            {
+                "public_url": "https://server.example",
+                "signing_key_env": "TEST_INFERENCE_KEY",
+                "models": ["model-a"],
+                **patch,
+            }
+        )
