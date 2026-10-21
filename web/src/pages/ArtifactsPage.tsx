@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Link, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import { Link, useNavigate, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
 import { withBasePath } from "@/lib/basePath";
 import { copyText } from "@/lib/clipboard";
 import { getOmnigentTransformShareLink, resolveArtifactRendererUrl } from "@/lib/host";
@@ -32,6 +32,8 @@ export function ArtifactsPage() {
 function ArtifactContents({ artifactId }: { artifactId?: string }) {
   const navigate = useNavigate();
   const rebasePath = useRebasePath();
+  const [searchParams] = useSearchParams();
+  const fullPage = !!artifactId && searchParams.get("view") === "full";
   const alive = useRef(true);
   useLayoutEffect(() => {
     alive.current = true;
@@ -150,6 +152,54 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
     }
   }
 
+  const htmlFrame =
+    preview !== null && rendererUrl ? (
+      <iframe
+        title="Published HTML artifact"
+        sandbox="allow-scripts"
+        referrerPolicy="no-referrer"
+        src={rendererUrl}
+        onLoad={(event) => {
+          event.currentTarget.contentWindow?.postMessage(
+            { type: "omnigent.artifact.render", html: preview },
+            "*",
+          );
+        }}
+        className={
+          fullPage
+            ? "h-full w-full border-0 bg-white"
+            : "min-h-96 w-full flex-1 rounded border bg-white"
+        }
+      />
+    ) : null;
+
+  if (fullPage) {
+    return (
+      <main
+        className="fixed inset-0 z-50 flex flex-col bg-background"
+        aria-label="Full-page artifact"
+      >
+        {htmlFrame ?? (
+          <div className="p-4">
+            {loading ? (
+              <p role="status">Loading artifact…</p>
+            ) : (
+              <p role="alert">
+                {error ||
+                  (artifact?.kind === "html"
+                    ? "This host must configure an artifact renderer URL to preview HTML."
+                    : "Full-page viewing is available for HTML artifacts.")}
+              </p>
+            )}
+            <Link className="underline" to={`/artifacts/${artifactId}`}>
+              Artifact details
+            </Link>
+          </div>
+        )}
+      </main>
+    );
+  }
+
   return (
     <PageScroll
       maxWidthClassName="max-w-none"
@@ -161,6 +211,17 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
           <h1 className="text-xl font-semibold">{artifact?.title ?? "Published artifacts"}</h1>
           {artifact && (
             <>
+              {artifact.kind === "html" && rendererUrl && (
+                <Button variant="outline" asChild>
+                  <Link
+                    to={`/artifacts/${artifact.id}?view=full`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open full page
+                  </Link>
+                </Button>
+              )}
               <Button variant="outline" onClick={() => void download()}>
                 Download
               </Button>
@@ -271,24 +332,7 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
             available.
           </p>
         )}
-        {preview !== null && rendererUrl && (
-          <iframe
-            title="Published HTML artifact"
-            sandbox="allow-scripts"
-            referrerPolicy="no-referrer"
-            src={rendererUrl}
-            onLoad={(event) => {
-              event.currentTarget.contentWindow?.postMessage(
-                {
-                  type: "omnigent.artifact.render",
-                  html: preview,
-                },
-                "*",
-              );
-            }}
-            className="min-h-96 w-full flex-1 rounded border bg-white"
-          />
-        )}
+        {htmlFrame}
       </main>
     </PageScroll>
   );

@@ -59,6 +59,63 @@ it("previews untrusted HTML only inside an opaque sandbox without a bridge", asy
   expect(screen.queryByText("HTML")).toBeNull();
 });
 
+it("links to a full-page authenticated view in a separate tab", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  show();
+  const link = await screen.findByRole("link", { name: "Open full page" });
+  expect(link).toHaveAttribute("href", `/artifacts/${artifact.id}?view=full`);
+  expect(link).toHaveAttribute("target", "_blank");
+  expect(link).toHaveAttribute("rel", "noopener noreferrer");
+});
+
+it("renders only the isolated viewport in full-page mode", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  show(`/artifacts/${artifact.id}?view=full`);
+  const frame = await screen.findByTitle("Published HTML artifact");
+  expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+  expect(frame).toHaveAttribute("src", "/v1/artifact-renderer");
+  expect(screen.getByRole("main", { name: "Full-page artifact" })).toHaveClass("fixed", "inset-0");
+  expect(screen.queryByText("Sharing")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
+  expect(authenticatedFetch).toHaveBeenCalledWith(`/v1/artifacts/${artifact.id}/preview`);
+});
+
+it("rechecks authorization on a full-page open", async () => {
+  vi.mocked(authenticatedFetch).mockResolvedValueOnce(json({}, 404));
+  show(`/artifacts/${artifact.id}?view=full`);
+  expect(await screen.findByRole("alert")).toHaveTextContent("not shared with you");
+  expect(screen.queryByTitle("Published HTML artifact")).toBeNull();
+  expect(screen.getByRole("link", { name: "Artifact details" })).toBeInTheDocument();
+});
+
+it("keeps the full-page link under the embedding basename", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(json(artifact))
+    .mockResolvedValueOnce(new Response("<h1>Report</h1>"));
+  render(
+    <MemoryRouter basename="/embedded" initialEntries={[`/embedded/artifacts/${artifact.id}`]}>
+      <Routes>
+        <Route path="/artifacts/:artifactId?" element={<ArtifactsPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByRole("link", { name: "Open full page" })).toHaveAttribute(
+    "href",
+    `/embedded/artifacts/${artifact.id}?view=full`,
+  );
+});
+
+it("does not offer full-page rendering for download-only files", async () => {
+  vi.mocked(authenticatedFetch).mockResolvedValueOnce(json({ ...artifact, kind: "file" }));
+  show();
+  await screen.findByText("Report");
+  expect(screen.queryByRole("link", { name: "Open full page" })).toBeNull();
+});
+
 it("grants exact group read access and exposes no agent-side permission bridge", async () => {
   vi.mocked(authenticatedFetch)
     .mockResolvedValueOnce(json(artifact))

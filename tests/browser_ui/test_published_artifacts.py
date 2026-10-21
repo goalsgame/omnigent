@@ -91,6 +91,38 @@ def test_html_scripts_cannot_read_parent_storage_or_call_api(page: Page, artifac
     )
 
 
+def test_full_page_view_fills_viewport_and_preserves_isolation(page: Page, artifact_url: str):
+    page.goto(artifact_url)
+    link = page.get_by_role("link", name="Open full page")
+    expect(link).to_have_attribute("target", "_blank")
+    expect(link).to_have_attribute("rel", "noopener noreferrer")
+    # The same independently loadable URL is also usable after login or reload.
+    href = link.get_attribute("href")
+    assert href and href.endswith("?view=full")
+    with page.expect_popup() as opened:
+        link.click()
+    page = opened.value
+    page.wait_for_url(artifact_url + "?view=full")
+    assert page.evaluate("window.opener === null")
+    outer = page.locator('iframe[title="Published HTML artifact"]')
+    expect(outer).to_be_visible()
+    bounds = outer.bounding_box()
+    viewport = page.viewport_size
+    assert bounds and viewport
+    assert abs(bounds["width"] - viewport["width"]) <= 2
+    assert abs(bounds["height"] - viewport["height"]) <= 2
+    frame = page.frame_locator('iframe[title="Published HTML artifact"]').frame_locator(
+        'iframe[title="Artifact content"]'
+    )
+    expect(frame.locator("#isolation")).to_have_text(
+        '{"parentBlocked":true,"storageBlocked":true,"fetchBlocked":true}'
+    )
+    frame.get_by_role("button", name="Try interaction").click()
+    expect(frame.get_by_role("button", name="Interaction works")).to_be_visible()
+    assert page.evaluate("document.body.dataset.compromised") is None
+    expect(page.get_by_role("button", name="Download", exact=True)).to_have_count(0)
+
+
 def test_catalog_navigation_and_group_sharing(
     page: Page, artifact_url: str, browser_contract: BrowserContract
 ):
