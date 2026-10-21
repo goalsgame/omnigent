@@ -59,6 +59,9 @@ class InferenceProxyConfig:
     harnesses: tuple[str, ...] = ("openai-agents",)
     max_request_bytes: int = 8 * 1024 * 1024
     max_concurrent_requests: int = 32
+    max_concurrent_requests_per_session: int = 1
+    max_queued_requests: int = 64
+    capacity_wait_timeout_seconds: float = 0
 
     upstreams: dict[str, InferenceUpstream] = field(default_factory=dict)
     model_routes: dict[str, InferenceRoute] = field(default_factory=dict)
@@ -95,6 +98,9 @@ class InferenceProxyConfig:
             "harnesses",
             "max_request_bytes",
             "max_concurrent_requests",
+            "max_concurrent_requests_per_session",
+            "max_queued_requests",
+            "capacity_wait_timeout_seconds",
             "upstreams",
             "model_routes",
             "model_limits",
@@ -151,11 +157,23 @@ class InferenceProxyConfig:
         for name, default in (
             ("max_request_bytes", 8 * 1024 * 1024),
             ("max_concurrent_requests", 32),
+            ("max_concurrent_requests_per_session", 1),
+            ("max_queued_requests", 64),
         ):
             value = raw.get(name, default)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"inference_proxy.{name} must be a positive integer")
             limits[name] = value
+        wait = raw.get("capacity_wait_timeout_seconds", 0)
+        if (
+            isinstance(wait, bool)
+            or not isinstance(wait, (int, float))
+            or not math.isfinite(wait)
+            or not 0 <= wait <= 120
+        ):
+            raise ValueError(
+                "inference_proxy.capacity_wait_timeout_seconds must be between 0 and 120"
+            )
         if type(raw.get("managed_sandboxes", False)) is not bool:
             raise ValueError("inference_proxy.managed_sandboxes must be a boolean")
         cost_limits = raw.get("session_cost_limits", {})
@@ -199,6 +217,7 @@ class InferenceProxyConfig:
             model_limits={model: dict(limits) for model, limits in limits_raw.items()},
             model_reasoning=dict(raw.get("model_reasoning", {})),
             session_cost_limits=dict(cost_limits),
+            capacity_wait_timeout_seconds=float(wait),
             **limits,
         )
         config.validate_harnesses()
@@ -237,7 +256,64 @@ class InferenceProxy:
         self.machine_allowed = machine_allowed
         self.active_requests = 0
         self.active_sessions: set[tuple[int, str]] = set()
+        self._session_requests: dict[tuple[int, str], int] = {}
+        self.queued_requests = 0
+        self._capacity_changed = asyncio.Event()
         self._client: httpx.AsyncClient | None = None
+
+    def _capacity_reason(self, session_key: tuple[int, str]) -> str | None:
+        if self.active_requests >= self.config.max_concurrent_requests:
+            return "Global inference concurrency limit reached"
+        if (
+            self._session_requests.get(session_key, 0)
+            >= self.config.max_concurrent_requests_per_session
+        ):
+            return "Session inference concurrency limit reached"
+        return None
+
+    def _capacity_error(self, session_key: tuple[int, str], reason: str) -> HTTPException:
+        _logger.info(
+            "Inference capacity rejected workspace=%s session=%s reason=%r active=%d queued=%d",
+            *session_key,
+            reason,
+            self.active_requests,
+            self.queued_requests,
+        )
+        return HTTPException(429, reason, headers={"Retry-After": "1"})
+
+    async def _reserve_capacity(self, session_key: tuple[int, str]) -> None:
+        reason = self._capacity_reason(session_key)
+        if reason is not None:
+            if not self.config.capacity_wait_timeout_seconds:
+                raise self._capacity_error(session_key, reason)
+            if self.queued_requests >= self.config.max_queued_requests:
+                raise self._capacity_error(session_key, "Inference waiting queue is full")
+            self.queued_requests += 1
+            try:
+                async with asyncio.timeout(self.config.capacity_wait_timeout_seconds):
+                    while (reason := self._capacity_reason(session_key)) is not None:
+                        # Check and clear without yielding so a release cannot be lost.
+                        self._capacity_changed.clear()
+                        await self._capacity_changed.wait()
+            except TimeoutError:
+                raise self._capacity_error(
+                    session_key, "Timed out waiting: " + (reason or "inference capacity")
+                ) from None
+            finally:
+                self.queued_requests -= 1
+        self.active_requests += 1
+        self._session_requests[session_key] = self._session_requests.get(session_key, 0) + 1
+        self.active_sessions.add(session_key)
+
+    def _release_capacity(self, session_key: tuple[int, str]) -> None:
+        self.active_requests -= 1
+        remaining = self._session_requests[session_key] - 1
+        if remaining:
+            self._session_requests[session_key] = remaining
+        else:
+            del self._session_requests[session_key]
+            self.active_sessions.discard(session_key)
+        self._capacity_changed.set()
 
     def _upstream_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -618,13 +694,7 @@ class InferenceProxy:
             if request.headers.get("content-encoding", "identity") != "identity":
                 raise HTTPException(415, "Compressed requests are unsupported")
             session_key = (workspace, session_id)
-            if (
-                session_key in self.active_sessions
-                or self.active_requests >= self.config.max_concurrent_requests
-            ):
-                raise HTTPException(429, "Inference capacity exhausted")
-            self.active_requests += 1
-            self.active_sessions.add(session_key)
+            await self._reserve_capacity(session_key)
             upstream: httpx.Response | None = None
             released = False
 
@@ -633,8 +703,7 @@ class InferenceProxy:
                 if released:
                     return
                 released = True
-                self.active_requests -= 1
-                self.active_sessions.discard(session_key)
+                self._release_capacity(session_key)
                 with anyio.CancelScope(shield=True):
                     if upstream is not None:
                         await upstream.aclose()

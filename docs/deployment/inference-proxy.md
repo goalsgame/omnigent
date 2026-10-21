@@ -17,6 +17,9 @@ inference_proxy:
     - openai-agents
   max_request_bytes: 8388608
   max_concurrent_requests: 32
+  max_concurrent_requests_per_session: 4
+  max_queued_requests: 64
+  capacity_wait_timeout_seconds: 30
 ```
 
 Use a random secret of at least 32 bytes for the signing key, shared by server
@@ -24,6 +27,24 @@ replicas. Rotating it revokes outstanding proxy credentials and requires runner
 relaunches. The public URL must be an HTTPS origin. The first allowed model is
 used as the provider default. `pi-native` can also be enabled; native CLI account
 flows are otherwise unaffected. This configuration is disabled when omitted.
+
+The global concurrent-request limit applies to each server process. Per-session
+capacity is shared by its main agent and background helpers using the same proxy
+credentials. The default is one request per session with no waiting, preserving
+existing deployments; the example permits four concurrent requests and waits up
+to 30 seconds for a slot. Waiting is bounded by `max_queued_requests` (default 64),
+and the timeout must be between 0 and 120 seconds. Waiting requests do not reserve
+active slots or buffer request bodies. Task cancellation reclaims queue capacity;
+a disconnected queued client is detected when admitted or when its wait expires.
+
+HTTP 429 responses distinguish session/global concurrency, a full waiting queue,
+and timeout, and include `Retry-After: 1`. Capacity is released when each stream
+finishes, fails or is cancelled. Authorization and recorded-spend checks run again
+before contacting the provider after a wait. Helpers share the session's allowed
+models and recorded-spend checks, not separate provider credentials. Every helper
+must report usage for its cost to appear in Omnigent's session totals; an arbitrary
+standalone CLI does not automatically report through the runner. Concurrent calls can exceed a recorded-spend threshold before usage is reported; this is not
+a reservation-based hard billing cap.
 
 Opt a host in before starting it. In PowerShell:
 
