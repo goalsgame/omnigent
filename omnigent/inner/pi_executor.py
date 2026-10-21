@@ -1618,7 +1618,8 @@ def _resolve_pi_skill_args(
       not an error.
 
     Pi's ``--skill`` flag accepts a directory path, not a name, so
-    the resolver looks up named skills under ``<bundle>/skills/``.
+    the resolver uses the bundle parser's bounded namespace discovery and
+    canonical invocation names under ``<bundle>/skills/``.
     Host-installed Pi skills aren't accessible by name without
     knowing Pi's internal extension layout, so the named-list mode
     only resolves bundle skills.
@@ -1633,31 +1634,34 @@ def _resolve_pi_skill_args(
     :returns: A list of CLI tokens to extend ``self._extra_args``
         with. Empty for ``"all"`` when there are no bundle skills.
     """
-    bundle_skills: dict[str, pathlib.Path] = {}
-    if bundle_dir is not None:
-        skills_root = bundle_dir / "skills"
-        if skills_root.is_dir():
-            for child in sorted(skills_root.iterdir()):
-                if child.is_dir() and (child / "SKILL.md").is_file():
-                    bundle_skills[child.name] = child
+    if skills_filter == "none":
+        return ["--no-skills"]
+    if skills_filter != "all" and not isinstance(skills_filter, list):
+        return []
+
+    from omnigent.spec.parser import _discover_skills, _with_legacy_skill_names
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    bundle_skills = (
+        _with_legacy_skill_names(_discover_skills(bundle_dir / "skills"))
+        if bundle_dir is not None
+        else []
+    )
 
     if skills_filter == "all":
         # Pi auto-discovers host skills; we explicitly add bundled
         # ones so the agent definitely sees them regardless of cwd.
         args: list[str] = []
-        for path in bundle_skills.values():
-            args.extend(["--skill", str(path)])
+        for skill in bundle_skills:
+            if skill.skill_dir is not None:
+                args.extend(["--skill", str(skill.skill_dir)])
         return args
-    if skills_filter == "none":
-        # ``--no-skills`` suppresses Pi's discovery walk AND loading.
-        # No ``--skill`` flags either — explicit paths would override
-        # ``--no-skills`` (Pi loads what's explicitly named).
-        return ["--no-skills"]
     if isinstance(skills_filter, list):
         args = ["--no-skills"]
         for name in skills_filter:
-            if name in bundle_skills:
-                args.extend(["--skill", str(bundle_skills[name])])
+            skill = find_skill_by_name(bundle_skills, name)
+            if skill is not None and skill.skill_dir is not None:
+                args.extend(["--skill", str(skill.skill_dir)])
         return args
     # Unknown shape — fall back to Pi's defaults (auto-discovery on,
     # no explicit skills). The harness wrap's resolver should

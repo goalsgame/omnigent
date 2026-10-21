@@ -27,10 +27,16 @@ async def test_operator_skill_reaches_catalog_sdk_and_native_pi(
     pi = shutil.which("pi")
     if pi is None:
         pytest.skip("Pi CLI is required for native discovery")
-    source = tmp_path / "assistant.yaml"
-    source.write_text(
+    source = tmp_path / "assistant"
+    source.mkdir()
+    (source / "assistant.yaml").write_text(
         "name: assistant\nexecutor:\n  harness: pi-native\n"
         "  model: test-model\nprompt: Preserve the original prompt.\n"
+    )
+    namespace_skill = source / "skills/ops/deploy"
+    namespace_skill.mkdir(parents=True)
+    (namespace_skill / "SKILL.md").write_text(
+        "---\nname: deploy\ndescription: Prepare deployment checks\n---\nCheck the plan."
     )
     monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(source))
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "true")
@@ -81,7 +87,7 @@ async def test_operator_skill_reaches_catalog_sdk_and_native_pi(
             result = await client.get("/v1/agents")
             assert result.status_code == 200, result.text
             row = next(agent for agent in result.json()["data"] if agent["name"] == "assistant")
-            assert any(skill["name"] == "review-demo" for skill in row["skills"])
+            assert {"review-demo", "deploy"} <= {skill["name"] for skill in row["skills"]}
         agent = stores.agent_store.get_by_name("assistant")
         assert agent is not None
         loaded = stores.agent_cache.load(agent.id, agent.bundle_location)
@@ -99,7 +105,7 @@ async def test_operator_skill_reaches_catalog_sdk_and_native_pi(
             session_dir=tmp_path / "sessions",
             external_session_id=None,
             bundle_dir=loaded.workdir,
-            skills_filter=["review-demo"],
+            skills_filter=["review-demo", "deploy"],
         )
         # No extension or model invocation is needed to inspect Pi's loaded commands.
         args = args[2:]
@@ -119,7 +125,6 @@ async def test_operator_skill_reaches_catalog_sdk_and_native_pi(
         ]
         command_result = next(item for item in responses if item.get("id") == "skills")
         assert command_result["success"], command_result
-        assert any(
-            command["name"] == "skill:review-demo"
-            for command in command_result["data"]["commands"]
-        )
+        assert {"skill:review-demo", "skill:deploy"} <= {
+            command["name"] for command in command_result["data"]["commands"]
+        }

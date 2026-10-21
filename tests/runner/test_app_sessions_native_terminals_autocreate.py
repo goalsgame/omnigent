@@ -5078,8 +5078,9 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("launch_path", ["initialize", "ensure"])
 @pytest.mark.parametrize("scope", ["root", "child", "unresolved-child"])
+@pytest.mark.parametrize("layout", ["flat", "namespace-all", "namespace-named"])
 async def test_pi_http_launch_preserves_bundle_skills(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_path: str, scope: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_path: str, scope: str, layout: str
 ) -> None:
     """Both public runner launch paths retain the resolved bundle through argv."""
     import omnigent.harnesses.pi_native.credentials as credentials
@@ -5088,7 +5089,7 @@ async def test_pi_http_launch_preserves_bundle_skills(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://test-server")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
     bundle = tmp_path / "bundle"
-    skill = bundle / "skills/review-demo"
+    skill = bundle / ("skills/review-demo" if layout == "flat" else "skills/ops/review-demo")
     (skill / "references").mkdir(parents=True)
     (skill / "SKILL.md").write_text(
         "---\nname: review-demo\ndescription: Review the demo\n---\nReview."
@@ -5099,6 +5100,7 @@ async def test_pi_http_launch_preserves_bundle_skills(
         name="assistant",
         executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
     )
+    spec.skills_filter = ["review-demo"] if layout == "namespace-named" else "all"
     if scope != "root":
         child = AgentSpec(
             spec_version=1,
@@ -5106,9 +5108,14 @@ async def test_pi_http_launch_preserves_bundle_skills(
             executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
             source_rel_dir="worker" if scope == "child" else None,
         )
+        child.skills_filter = ["child-review"] if layout == "namespace-named" else "all"
         spec.sub_agents = [child]
         if scope == "child":
-            skill = bundle / "agents/worker/skills/child-review"
+            skill = bundle / (
+                "agents/worker/skills/child-review"
+                if layout == "flat"
+                else "agents/worker/skills/ops/child-review"
+            )
             (skill / "references").mkdir(parents=True)
             (skill / "SKILL.md").write_text(
                 "---\nname: child-review\ndescription: Review child work\n---\nReview."

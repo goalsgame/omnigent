@@ -3408,7 +3408,9 @@ def _make_pi_skill_dir(root: Path, name: str) -> Path:
     """Create a minimal valid skill directory for the resolver tests."""
     skill_dir = root / name
     skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n")
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Use {name}\n---\n# {name}\n"
+    )
     return skill_dir
 
 
@@ -5739,3 +5741,41 @@ def test_settled_queued_continuation_stays_in_the_turn() -> None:
         assert rpc._line_queue.empty()
 
     _run(_test())
+
+
+@pytest.mark.parametrize("skills_filter", ["all", ["deploy"]])
+def test_resolve_pi_skill_args_uses_bounded_namespace_discovery(
+    tmp_path: Path, skills_filter: str | list[str]
+) -> None:
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    skills = tmp_path / "bundle/skills"
+    deploy = _make_pi_skill_dir(skills / "ops", "deploy")
+    # Resources and deeper namespace levels are not additional skills.
+    _make_pi_skill_dir(deploy / "references", "resource-only")
+    _make_pi_skill_dir(skills / "ops/too-deep", "not-discovered")
+    args = _resolve_pi_skill_args(skills_filter, tmp_path / "bundle")
+    paths = [Path(args[index + 1]) for index, arg in enumerate(args) if arg == "--skill"]
+    assert paths == [deploy]
+    assert ("--no-skills" in args) == isinstance(skills_filter, list)
+
+
+def test_resolve_pi_skill_args_uses_canonical_legacy_names(tmp_path: Path) -> None:
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    skill = tmp_path / "bundle/skills/ops/Code_Review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: code-review\ndescription: Review code\n---\nReview."
+    )
+    args = _resolve_pi_skill_args(["code-review"], tmp_path / "bundle")
+    assert args == ["--no-skills", "--skill", str(skill)]
+
+
+def test_resolve_pi_skill_args_none_does_not_parse_disabled_skills(tmp_path: Path) -> None:
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    skill = tmp_path / "bundle/skills/invalid"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("invalid frontmatter")
+    assert _resolve_pi_skill_args("none", tmp_path / "bundle") == ["--no-skills"]
