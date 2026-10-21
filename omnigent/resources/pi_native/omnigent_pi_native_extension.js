@@ -2085,9 +2085,15 @@ module.exports = function (pi) {
         if (error.code === "ENOENT") return;
         throw new Error("Omnigent economic compaction policy is unreadable");
       }
+      if (!policies || typeof policies !== "object" || Array.isArray(policies)) {
+        throw new Error("Invalid Omnigent economic compaction policies");
+      }
       const key = `${ctx.model.provider}/${ctx.model.id}`;
+      if (!Object.prototype.hasOwnProperty.call(policies, key)) return;
       const policy = policies[key];
-      if (!policy) return;
+      if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+        throw new Error("Invalid Omnigent economic compaction policy entry");
+      }
       if (
         !Number.isSafeInteger(policy.summaryReserveTokens) ||
         policy.summaryReserveTokens < 0 ||
@@ -2110,7 +2116,6 @@ module.exports = function (pi) {
       const runtime = await import(
         require("url").pathToFileURL(runtimePath).href
       );
-      const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
       const preparation = {
         ...event.preparation,
         settings: {
@@ -2121,13 +2126,13 @@ module.exports = function (pi) {
       const compaction = await runtime.compact(
         preparation,
         ctx.model,
-        apiKey,
-        ctx.model.headers,
+        undefined,
+        undefined,
         event.customInstructions,
         event.signal,
         pi.getThinkingLevel(),
+        (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options),
         undefined,
-        process.env,
         undefined,
         undefined,
         ctx.sessionManager.getSessionId(),

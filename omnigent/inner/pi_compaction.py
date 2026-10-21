@@ -71,10 +71,10 @@ def economic_settings(
         recent = _tokens(
             existing.get("keepRecentTokens", ordinary_recent), "model keepRecentTokens"
         )
-        if target <= recent + _DEFAULT_RESERVE:
-            raise ValueError("Compaction target must leave room for retained context and summary")
         if target >= window or window - target <= summary_reserve:
             continue  # Native/tighter limits already compact before this target.
+        if target <= recent + summary_reserve:
+            raise ValueError("Compaction target must leave room for retained context and summary")
         trigger_reserve = window - target
         overrides[key] = {**existing, "reserveTokens": trigger_reserve}
         policy[key] = {

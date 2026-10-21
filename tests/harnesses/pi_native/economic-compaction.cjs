@@ -19,7 +19,7 @@ fs.writeFileSync(path.join(runtime, "cli.js"), "");
 process.argv[1] = path.join(runtime, "cli.js");
 fs.writeFileSync(
   path.join(runtime, "index.js"),
-  `export async function compact(...args){globalThis.compactArgs=args;return {summary:'synthetic summary',firstKeptEntryId:'kept',tokensBefore:210000,details:{readFiles:[]},usage:{input:17,output:9,cost:{total:0.01}}}}`,
+  `export async function compact(...args){globalThis.compactArgs=args;if(globalThis.failStream)await args[7](args[1],{},{});return {summary:'synthetic summary',firstKeptEntryId:'kept',tokensBefore:210000,details:{readFiles:[]},usage:{input:17,output:9,cost:{total:0.01}}}}`,
 );
 const config = path.join(root, "config.json");
 fs.writeFileSync(
@@ -68,8 +68,9 @@ const ctx = {
     headers: { "X-Test": "test" },
   },
   modelRegistry: {
-    async getApiKey() {
-      return "synthetic-key";
+    streamSimple(model, context, options) {
+      globalThis.streamArgs = [model, context, options];
+      return "synthetic-stream";
     },
   },
   sessionManager: {
@@ -88,6 +89,11 @@ const ctx = {
   assert.equal(globalThis.compactArgs[5], abort.signal);
   assert.equal(globalThis.compactArgs[4], event.customInstructions);
   assert.equal(globalThis.compactArgs[11], "native-session");
+  assert.equal(
+    globalThis.compactArgs[7](ctx.model, {}, {}),
+    "synthetic-stream",
+  );
+  assert.equal(globalThis.streamArgs[0], ctx.model);
   assert.equal(event.preparation.settings.reserveTokens, 850000);
   globalThis.compactArgs = null;
   assert.equal(
@@ -105,6 +111,20 @@ const ctx = {
     }),
     undefined,
   );
+  for (const invalid of [
+    null,
+    [],
+    false,
+    { [key]: null },
+    { [key]: false },
+    { [key]: [] },
+    { [key]: "bad" },
+  ]) {
+    fs.writeFileSync(file, JSON.stringify(invalid));
+    assert.deepEqual(await handlers.session_before_compact(event, ctx), {
+      cancel: true,
+    });
+  }
   fs.writeFileSync(file, "{bad");
   assert.deepEqual(await handlers.session_before_compact(event, ctx), {
     cancel: true,
@@ -115,7 +135,8 @@ const ctx = {
       [key]: { triggerReserveTokens: 850000, summaryReserveTokens: 16384 },
     }),
   );
-  ctx.modelRegistry.getApiKey = async () => {
+  globalThis.failStream = true;
+  ctx.modelRegistry.streamSimple = () => {
     throw new Error("secret provider error");
   };
   assert.deepEqual(await handlers.session_before_compact(event, ctx), {

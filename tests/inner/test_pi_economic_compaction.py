@@ -61,6 +61,31 @@ def test_invalid_targets_rejected(raw):
         economic_settings({}, WINDOWS, raw)
 
 
+@pytest.mark.parametrize("per_model", [False, True])
+def test_headroom_uses_resolved_small_summary_reserve(per_model):
+    compaction = (
+        {"modelOverrides": {KEY: {"reserveTokens": 1000}}}
+        if per_model
+        else {"reserveTokens": 1000}
+    )
+    settings, policy = economic_settings(
+        {"compaction": compaction}, WINDOWS, '{"vendor/large-model":25000}'
+    )
+    assert settings["compaction"]["modelOverrides"][KEY]["reserveTokens"] == 1025000
+    assert policy[KEY]["summaryReserveTokens"] == 1000
+
+
+@pytest.mark.parametrize("per_model", [False, True])
+def test_headroom_rejects_large_global_or_model_summary_reserve(per_model):
+    compaction = (
+        {"modelOverrides": {KEY: {"reserveTokens": 100000}}}
+        if per_model
+        else {"reserveTokens": 100000}
+    )
+    with pytest.raises(ValueError, match="leave room"):
+        economic_settings({"compaction": compaction}, WINDOWS, '{"vendor/large-model":50000}')
+
+
 def test_setting_precedence_and_stale_policy_removal(monkeypatch, tmp_path):
     global_dir = tmp_path / "global"
     global_dir.mkdir()
