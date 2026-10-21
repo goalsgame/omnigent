@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from omnigent.spec.parser import _parse_skill
@@ -42,6 +42,7 @@ class OperatorSkills:
 
     library: dict[str, dict[str, str]]
     agents: dict[str, tuple[str, ...]]
+    sources: dict[Path, str] = field(default_factory=dict)
 
     @classmethod
     def parse(cls, raw: object, *, sources: dict[str, Path]) -> OperatorSkills:
@@ -107,7 +108,11 @@ class OperatorSkills:
             agents[name] = tuple(selected)
         if len(json.dumps(raw, ensure_ascii=False).encode("utf-8")) > _MAX_BYTES:
             raise ValueError("operator_skills configuration must be at most 900 KiB")
-        result = cls(library, agents)
+        result = cls(
+            library,
+            agents,
+            {path.absolute(): name for name, path in sources.items() if name in agents},
+        )
         from omnigent.spec import load as load_spec
         from omnigent.spec import materialize_bundle
 

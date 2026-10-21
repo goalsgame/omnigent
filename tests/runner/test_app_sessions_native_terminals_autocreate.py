@@ -5073,3 +5073,122 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launch_path", ["initialize", "ensure"])
+@pytest.mark.parametrize("scope", ["root", "child", "unresolved-child"])
+async def test_pi_http_launch_preserves_bundle_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_path: str, scope: str
+) -> None:
+    """Both public runner launch paths retain the resolved bundle through argv."""
+    import omnigent.harnesses.pi_native.credentials as credentials
+    import omnigent.harnesses.pi_native.main as pi_main
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://test-server")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    bundle = tmp_path / "bundle"
+    skill = bundle / "skills/review-demo"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: review-demo\ndescription: Review the demo\n---\nReview."
+    )
+    (skill / "references/checklist.md").write_text("Check the caller.")
+    spec = AgentSpec(
+        spec_version=1,
+        name="assistant",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+    if scope != "root":
+        child = AgentSpec(
+            spec_version=1,
+            name="worker",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+            source_rel_dir="worker" if scope == "child" else None,
+        )
+        spec.sub_agents = [child]
+        if scope == "child":
+            skill = bundle / "agents/worker/skills/child-review"
+            (skill / "references").mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: child-review\ndescription: Review child work\n---\nReview."
+            )
+            (skill / "references/checklist.md").write_text("Check the caller.")
+    entry = ResolvedSpec(spec=spec, workdir=bundle)
+    session_id = "db5c58bb031348bc80a6c4fa30902e74"
+    agent_id = "79771cc707264c65a6992476bd2b68fe"
+
+    async def resolver(*args: Any) -> ResolvedSpec:
+        return entry
+
+    async def config(**kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://test-server",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    captured: list[Any] = []
+
+    async def launch(self: Any, **kwargs: Any) -> SessionResourceView:
+        captured.append(kwargs["spec"])
+        return SessionResourceView(
+            id="terminal_pi_main",
+            type="terminal",
+            session_id=session_id,
+            name="pi:main",
+            metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+        )
+
+    class SnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            if url == f"/v1/sessions/{session_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": session_id,
+                        "agent_id": agent_id,
+                        **({"sub_agent_name": "worker"} if scope != "root" else {}),
+                    },
+                )
+            return await super().get(url, **kwargs)
+
+    monkeypatch.setattr(pi_main, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(pi_main, "pi_supports_approve", lambda *_args: False)
+    monkeypatch.setattr(credentials, "resolve_pi_native_provider", lambda **_kwargs: None)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._pi_native_launch_config", config)
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "bridge")
+    monkeypatch.setattr(SessionResourceRegistry, "launch_required_terminal", launch)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+        spec_resolver=resolver,
+        server_client=SnapshotClient(),
+        terminal_registry=TerminalRegistry(),
+    )
+    async with _runner_client(app) as client:
+        initialized = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": session_id,
+                "agent_id": agent_id,
+                **({"sub_agent_name": "worker"} if scope != "root" else {}),
+            },
+        )
+        assert initialized.status_code == 201, initialized.text
+        if launch_path == "ensure":
+            captured.clear()
+            ensured = await client.post(
+                f"/v1/sessions/{session_id}/resources/terminals",
+                json={"terminal": "pi", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+    assert len(captured) == 1
+    argv = captured[0].args
+    if scope == "unresolved-child":
+        assert "--skill" not in argv
+        return
+    assert Path(argv[argv.index("--skill") + 1]) == skill
+    assert (
+        Path(argv[argv.index("--skill") + 1]) / "references/checklist.md"
+    ).read_text() == "Check the caller."

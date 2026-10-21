@@ -240,3 +240,42 @@ def test_operator_skills_rejects_frontmatter_name_mismatch(tmp_path: Path) -> No
     files["SKILL.md"] = files["SKILL.md"].replace("name: code-review", "name: different-name")
     with pytest.raises(ValueError, match="name must equal"):
         OperatorSkills.parse(_config(files), sources={"assistant": _source(tmp_path)})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_env", [False, True])
+async def test_mapped_yaml_disappearing_after_validation_fails_lifespan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_init: None, remove_env: bool
+) -> None:
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    source = _source(tmp_path)
+    stores = _independent_seed_stores(tmp_path, "disappearing")
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(source))
+    for helper in (
+        "_ensure_default_native_agents",
+        "_ensure_default_acp_agents",
+        "_ensure_default_debby_agent",
+        "_ensure_default_polly_agent",
+    ):
+        monkeypatch.setattr(server_app, helper, lambda *args: None)
+    uri = f"sqlite:///{tmp_path / 'disappearing.db'}"
+    app = server_app.create_app(
+        agent_store=stores.agent_store,
+        artifact_store=stores.artifact_store,
+        agent_cache=stores.agent_cache,
+        conversation_store=SqlAlchemyConversationStore(uri),
+        file_store=SqlAlchemyFileStore(uri),
+        server_config={"operator_skills": _config()},
+    )
+    source.unlink()
+    if remove_env:
+        monkeypatch.delenv(server_app._EXTRA_BUILTIN_AGENTS_ENV)
+    try:
+        with pytest.raises(FileNotFoundError, match="source not found"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("Mapped agent disappearance must abort startup")
+    finally:
+        await app.state.harness_process_manager.shutdown()
+    assert stores.agent_store.get_by_name("assistant") is None

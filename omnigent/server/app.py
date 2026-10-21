@@ -966,22 +966,26 @@ def _ensure_extra_builtin_agents(
     from omnigent.spec import materialize_bundle
 
     raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "").strip()
-    if not raw:
-        return
-    for entry in raw.split(os.pathsep):
-        entry = entry.strip()
-        if not entry:
-            continue
-        source = Path(entry)
-        name = source.name
+    sources = [Path(entry.strip()) for entry in raw.split(os.pathsep) if entry.strip()]
+    mapped_sources = operator_skills.sources if operator_skills is not None else {}
+    current_paths = {source.absolute() for source in sources}
+    sources.extend(path for path in mapped_sources if path not in current_paths)
+    for source in sources:
+        mapped_name = mapped_sources.get(source.absolute())
+        name = mapped_name or source.name
         try:
-            name = source.stem if source.is_file() else source.name
+            if mapped_name is None:
+                name = source.stem if source.is_file() else source.name
             with tempfile.TemporaryDirectory() as tmpdir:
                 if operator_skills is not None and operator_skills.agents.get(name):
                     operator_skills.check_source(source)
                 bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
                 if operator_skills is not None:
                     operator_skills.apply(bundle_dir, name)
+                    if name in operator_skills.agents:
+                        from omnigent.spec import load as load_spec
+
+                        load_spec(bundle_dir, expand_env=False)
                 bundle_bytes = _tar_gz_dir(bundle_dir)
             _ensure_builtin_agent(
                 agent_store,
