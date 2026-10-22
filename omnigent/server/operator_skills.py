@@ -64,16 +64,15 @@ def _read_skill_dir(skill_dir: Path) -> dict[str, str]:
     # ConfigMap mounts duplicate every file under dot-prefixed ``..data`` directories.
     base = skill_dir.resolve()
     files: dict[str, str] = {}
-    visited: set[Path] = set()
 
     def _fail(error: OSError) -> None:
         raise ValueError(f"operator_skills cannot read library directory: {error}") from error
 
     for dirpath, dirnames, filenames in os.walk(skill_dir, onerror=_fail, followlinks=True):
-        real = Path(dirpath).resolve()
-        if real in visited:
+        parts = Path(dirpath).relative_to(skill_dir).parts
+        ancestors = {skill_dir.joinpath(*parts[:depth]).resolve() for depth in range(len(parts))}
+        if Path(dirpath).resolve() in ancestors:
             raise ValueError("operator_skills library directories must not link to themselves")
-        visited.add(real)
         dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
         for filename in sorted(filenames):
             if filename.startswith("."):

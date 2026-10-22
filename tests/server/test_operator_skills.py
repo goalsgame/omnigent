@@ -397,6 +397,16 @@ def test_operator_skills_rejects_cyclic_library_links(tmp_path: Path) -> None:
         OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
 
 
+def test_operator_skills_accepts_sibling_directory_alias(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    (root / "code-review" / "refs").symlink_to("references")
+    parsed = OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    assert parsed.library["code-review"] == {
+        **_skill(),
+        "refs/checklist.md": "Inspect caller contracts.",
+    }
+
+
 def test_operator_skills_rejects_oversized_library_file(tmp_path: Path) -> None:
     root = _library_dir(tmp_path)
     (root / "code-review" / "references" / "large.md").write_text("x" * (128 * 1024 + 1))
