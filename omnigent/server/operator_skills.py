@@ -44,6 +44,7 @@ class _Budget:
     def __init__(self, inline: dict) -> None:
         self.skills = 0
         self.files = 0
+        self.directories = 0
         self.bytes = 0
         for files in inline.values():
             self.add_skill()
@@ -54,6 +55,13 @@ class _Budget:
         self.skills += 1
         if self.skills > 128:
             raise ValueError("operator_skills supports at most 128 skills and agent mappings")
+
+    def add_directory(self) -> None:
+        self.directories += 1
+        if self.directories > 512:
+            raise ValueError(
+                "operator_skills library directories may contain at most 512 directories"
+            )
 
     def add_file(self, size: int) -> None:
         self.files += 1
@@ -100,6 +108,7 @@ def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
         ancestors = {skill_dir.joinpath(*parts[:depth]).resolve() for depth in range(len(parts))}
         if Path(dirpath).resolve() in ancestors:
             raise ValueError("operator_skills library directories must not link to themselves")
+        budget.add_directory()
         dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
         for filename in sorted(filenames):
             if filename.startswith("."):

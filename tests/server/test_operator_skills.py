@@ -461,3 +461,15 @@ def test_operator_skills_budget_counts_inline_skills(tmp_path: Path) -> None:
         OperatorSkills.parse(
             _dirs_config(root, library=inline), sources={"assistant": _source(tmp_path)}
         )
+
+
+def test_operator_skills_bounds_directory_alias_fan_out(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    skill = root / "code-review"
+    for depth in range(10):
+        (skill / f"d{depth}").mkdir()
+    for depth in range(9):
+        for alias in ("a", "b"):
+            (skill / f"d{depth}" / alias).symlink_to(Path("..") / f"d{depth + 1}")
+    with pytest.raises(ValueError, match="512 directories"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
