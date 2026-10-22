@@ -14,6 +14,7 @@ from omnigent.spec.parser import _parse_skill
 _NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _AGENT_NAME = re.compile(r"[a-zA-Z0-9_-]+\Z")
 _MAX_BYTES = 900 * 1024
+_MAX_FILE_BYTES = 128 * 1024
 
 
 def _name(value: object, label: str) -> str:
@@ -44,6 +45,8 @@ def _library_from_dirs(raw: object) -> dict[str, dict[str, str]]:
     library: dict[str, dict[str, str]] = {}
     for entry in raw:
         root = Path(entry)
+        if not root.is_absolute():
+            raise ValueError(f"operator_skills library directory {entry!r} must be absolute")
         if not root.is_dir():
             raise ValueError(f"operator_skills library directory {entry!r} is not a directory")
         for skill_dir in sorted(root.iterdir()):
@@ -61,7 +64,16 @@ def _read_skill_dir(skill_dir: Path) -> dict[str, str]:
     # ConfigMap mounts duplicate every file under dot-prefixed ``..data`` directories.
     base = skill_dir.resolve()
     files: dict[str, str] = {}
-    for dirpath, dirnames, filenames in os.walk(skill_dir, followlinks=True):
+    visited: set[Path] = set()
+
+    def _fail(error: OSError) -> None:
+        raise ValueError(f"operator_skills cannot read library directory: {error}") from error
+
+    for dirpath, dirnames, filenames in os.walk(skill_dir, onerror=_fail, followlinks=True):
+        real = Path(dirpath).resolve()
+        if real in visited:
+            raise ValueError("operator_skills library directories must not link to themselves")
+        visited.add(real)
         dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
         for filename in sorted(filenames):
             if filename.startswith("."):
@@ -73,8 +85,12 @@ def _read_skill_dir(skill_dir: Path) -> dict[str, str]:
                 raise ValueError(
                     "operator_skills library files must stay inside their skill directory"
                 )
+            with path.open("rb") as handle:
+                data = handle.read(_MAX_FILE_BYTES + 1)
+            if len(data) > _MAX_FILE_BYTES:
+                raise ValueError("operator_skills each file must be at most 128 KiB")
             try:
-                text = path.read_bytes().decode("utf-8")
+                text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError("operator_skills files must contain valid UTF-8 text") from exc
             files[path.relative_to(skill_dir).as_posix()] = text
@@ -128,7 +144,7 @@ class OperatorSkills:
                     raise ValueError(
                         "operator_skills files must contain valid UTF-8 text"
                     ) from exc
-                if size > 128 * 1024:
+                if size > _MAX_FILE_BYTES:
                     raise ValueError("operator_skills each file must be at most 128 KiB")
                 if relative.casefold() in {item.casefold() for item in copied}:
                     raise ValueError("operator_skills contains case-colliding file paths")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,7 @@ def test_operator_skills_rejects_unsafe_paths(tmp_path: Path, path: str) -> None
         },
         {"library_dirs": "not-a-list"},
         {"library_dirs": [""]},
+        {"library_dirs": ["relative/skills"]},
     ],
 )
 def test_operator_skills_rejects_malformed_config(tmp_path: Path, raw: object) -> None:
@@ -386,3 +388,30 @@ def test_operator_skills_library_directory_requires_entrypoint(tmp_path: Path) -
     root = _library_dir(tmp_path, {"references/checklist.md": "no entrypoint"})
     with pytest.raises(ValueError, match=r"SKILL\.md"):
         OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_rejects_cyclic_library_links(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    (root / "code-review" / "references" / "loop").symlink_to("..")
+    with pytest.raises(ValueError, match="must not link to themselves"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_rejects_oversized_library_file(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    (root / "code-review" / "references" / "large.md").write_text("x" * (128 * 1024 + 1))
+    with pytest.raises(ValueError, match="128 KiB"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_rejects_unreadable_library_directory(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    references = root / "code-review" / "references"
+    references.chmod(0)
+    try:
+        if os.access(references, os.R_OK):
+            pytest.skip("directory permissions are not enforced for this user")
+        with pytest.raises(ValueError, match="cannot read library directory"):
+            OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    finally:
+        references.chmod(0o755)
