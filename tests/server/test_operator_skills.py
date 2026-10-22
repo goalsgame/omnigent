@@ -425,3 +425,39 @@ def test_operator_skills_rejects_unreadable_library_directory(tmp_path: Path) ->
             OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
     finally:
         references.chmod(0o755)
+
+
+@pytest.mark.parametrize("limit", ["files", "bytes"])
+def test_operator_skills_stops_reading_library_at_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str
+) -> None:
+    root = _library_dir(tmp_path)
+    references = root / "code-review" / "references"
+    count, body = (600, "x") if limit == "files" else (20, "x" * (100 * 1024))
+    for index in range(count):
+        (references / f"r{index:04}.md").write_text(body)
+    reads: list[Path] = []
+    original = Path.open
+
+    def counting_open(self: Path, *args, **kwargs):
+        reads.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    with pytest.raises(ValueError, match="512 files" if limit == "files" else "900 KiB"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    assert len(reads) < count
+
+
+def test_operator_skills_budget_counts_inline_skills(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    inline = {
+        f"inline-{index}": {
+            "SKILL.md": f"---\nname: inline-{index}\ndescription: Inline\n---\nBody"
+        }
+        for index in range(128)
+    }
+    with pytest.raises(ValueError, match="128 skills"):
+        OperatorSkills.parse(
+            _dirs_config(root, library=inline), sources={"assistant": _source(tmp_path)}
+        )

@@ -38,7 +38,33 @@ def _path(value: object) -> str:
     return value
 
 
-def _library_from_dirs(raw: object) -> dict[str, dict[str, str]]:
+class _Budget:
+    """Library-wide skill, file and byte limits, charged while files are read."""
+
+    def __init__(self, inline: dict) -> None:
+        self.skills = 0
+        self.files = 0
+        self.bytes = 0
+        for files in inline.values():
+            self.add_skill()
+            for text in files.values() if isinstance(files, dict) else ():
+                self.add_file(len(text.encode("utf-8", "replace")) if isinstance(text, str) else 0)
+
+    def add_skill(self) -> None:
+        self.skills += 1
+        if self.skills > 128:
+            raise ValueError("operator_skills supports at most 128 skills and agent mappings")
+
+    def add_file(self, size: int) -> None:
+        self.files += 1
+        self.bytes += size
+        if self.files > 512:
+            raise ValueError("operator_skills supports at most 512 files")
+        if self.bytes > _MAX_BYTES:
+            raise ValueError("operator_skills configuration must be at most 900 KiB")
+
+
+def _library_from_dirs(raw: object, budget: _Budget) -> dict[str, dict[str, str]]:
     """Read ``<dir>/<skill-id>/**`` text files into the inline library shape."""
     if not isinstance(raw, list) or any(not isinstance(item, str) or not item for item in raw):
         raise ValueError("operator_skills library_dirs must be a list of directory paths")
@@ -56,11 +82,12 @@ def _library_from_dirs(raw: object) -> dict[str, dict[str, str]]:
                 raise ValueError(
                     f"operator_skills skill {skill_dir.name!r} appears in more than one library"
                 )
-            library[skill_dir.name] = _read_skill_dir(skill_dir)
+            budget.add_skill()
+            library[skill_dir.name] = _read_skill_dir(skill_dir, budget)
     return library
 
 
-def _read_skill_dir(skill_dir: Path) -> dict[str, str]:
+def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
     # ConfigMap mounts duplicate every file under dot-prefixed ``..data`` directories.
     base = skill_dir.resolve()
     files: dict[str, str] = {}
@@ -88,6 +115,7 @@ def _read_skill_dir(skill_dir: Path) -> dict[str, str]:
                 data = handle.read(_MAX_FILE_BYTES + 1)
             if len(data) > _MAX_FILE_BYTES:
                 raise ValueError("operator_skills each file must be at most 128 KiB")
+            budget.add_file(len(data))
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -118,7 +146,7 @@ class OperatorSkills:
         if not isinstance(library_raw, dict) or not isinstance(agents_raw, dict):
             raise ValueError("operator_skills library and agents must be mappings")
         if "library_dirs" in raw:
-            from_dirs = _library_from_dirs(raw["library_dirs"])
+            from_dirs = _library_from_dirs(raw["library_dirs"], _Budget(library_raw))
             if shared := set(from_dirs) & set(library_raw):
                 raise ValueError(
                     f"operator_skills skill {sorted(shared)[0]!r} appears in more than one library"
