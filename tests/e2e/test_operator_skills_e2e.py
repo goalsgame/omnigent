@@ -19,10 +19,28 @@ from omnigent.tools.builtins.load_skill import LoadSkillTool
 from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 from tests.server.test_app import _independent_seed_stores
 
+_REVIEW_DEMO = {
+    "SKILL.md": "---\nname: review-demo\ndescription: Review the demo\n---\n"
+    "Read [the contract](references/contract.md) before reviewing.",
+    "references/contract.md": "Check caller contracts before reporting defects.",
+}
+
+
+def _library(tmp_path: Path, source: str) -> dict:
+    if source == "inline":
+        return {"library": {"review-demo": dict(_REVIEW_DEMO)}}
+    root = tmp_path / "library"
+    for relative, text in _REVIEW_DEMO.items():
+        path = root / "review-demo" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return {"library_dirs": [str(root)]}
+
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("library_source", ["inline", "directory"])
 async def test_operator_skill_reaches_catalog_sdk_and_native_pi(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, library_source: str
 ) -> None:
     pi = shutil.which("pi")
     if pi is None:
@@ -51,13 +69,7 @@ async def test_operator_skill_reaches_catalog_sdk_and_native_pi(
     uri = f"sqlite:///{tmp_path / 'e2e.db'}"
     config = {
         "operator_skills": {
-            "library": {
-                "review-demo": {
-                    "SKILL.md": "---\nname: review-demo\ndescription: Review the demo\n---\n"
-                    "Read [the contract](references/contract.md) before reviewing.",
-                    "references/contract.md": "Check caller contracts before reporting defects.",
-                }
-            },
+            **_library(tmp_path, library_source),
             "agents": {"assistant": ["review-demo"]},
         }
     }

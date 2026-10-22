@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -13,6 +16,7 @@ from omnigent.spec.parser import _parse_skill
 _NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _AGENT_NAME = re.compile(r"[a-zA-Z0-9_-]+\Z")
 _MAX_BYTES = 900 * 1024
+_MAX_FILE_BYTES = 128 * 1024
 
 
 def _name(value: object, label: str) -> str:
@@ -36,6 +40,143 @@ def _path(value: object) -> str:
     return value
 
 
+class _Budget:
+    """Library-wide skill, file and byte limits, charged while files are read."""
+
+    def __init__(self, inline: dict) -> None:
+        self.skills = 0
+        self.files = 0
+        self.directories = 0
+        self.entries = 0
+        self.bytes = 0
+        for files in inline.values():
+            self.add_skill()
+            for text in files.values() if isinstance(files, dict) else ():
+                self.add_file(len(text.encode("utf-8", "replace")) if isinstance(text, str) else 0)
+
+    def add_skill(self) -> None:
+        self.skills += 1
+        if self.skills > 128:
+            raise ValueError("operator_skills supports at most 128 skills and agent mappings")
+
+    def add_entry(self) -> None:
+        self.entries += 1
+        if self.entries > 4096:
+            raise ValueError("operator_skills library directories may list at most 4096 entries")
+
+    def add_directory(self) -> None:
+        self.directories += 1
+        if self.directories > 512:
+            raise ValueError(
+                "operator_skills library directories may contain at most 512 directories"
+            )
+
+    def add_file(self, size: int) -> None:
+        self.files += 1
+        self.bytes += size
+        if self.files > 512:
+            raise ValueError("operator_skills supports at most 512 files")
+        if self.bytes > _MAX_BYTES:
+            raise ValueError("operator_skills configuration must be at most 900 KiB")
+
+
+@contextmanager
+def _scan(directory: Path, budget: _Budget) -> Generator[Iterator[os.DirEntry[str]]]:
+    """Stream a directory listing, charging each entry before it is used."""
+    try:
+        listing = os.scandir(directory)
+    except OSError as error:
+        raise ValueError(f"operator_skills cannot read library directory: {error}") from error
+
+    def entries() -> Iterator[os.DirEntry[str]]:
+        while True:
+            try:
+                entry = next(listing)
+            except StopIteration:
+                return
+            except OSError as error:
+                raise ValueError(
+                    f"operator_skills cannot read library directory: {error}"
+                ) from error
+            budget.add_entry()
+            yield entry
+
+    with listing:
+        yield entries()
+
+
+def _library_from_dirs(raw: object, budget: _Budget) -> dict[str, dict[str, str]]:
+    """Read ``<dir>/<skill-id>/**`` text files into the inline library shape."""
+    if not isinstance(raw, list) or any(not isinstance(item, str) or not item for item in raw):
+        raise ValueError("operator_skills library_dirs must be a list of directory paths")
+    library: dict[str, dict[str, str]] = {}
+    for entry in raw:
+        root = Path(entry)
+        if not root.is_absolute():
+            raise ValueError(f"operator_skills library directory {entry!r} must be absolute")
+        if not root.is_dir():
+            raise ValueError(f"operator_skills library directory {entry!r} is not a directory")
+        budget.add_directory()
+        with _scan(root, budget) as entries:
+            for entry in entries:
+                skill_dir = Path(entry.path)
+                if entry.name.startswith(".") or not skill_dir.is_dir():
+                    continue
+                if entry.name in library:
+                    raise ValueError(
+                        f"operator_skills skill {entry.name!r} appears in more than one library"
+                    )
+                budget.add_skill()
+                library[entry.name] = _read_skill_dir(skill_dir, budget)
+    return dict(sorted(library.items()))
+
+
+def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
+    # ConfigMap mounts duplicate every file under dot-prefixed ``..data`` directories.
+    base = skill_dir.resolve()
+    files: dict[str, str] = {}
+    pending: list[tuple[Path, PurePosixPath, frozenset[Path]]] = [
+        (base, PurePosixPath(), frozenset({base}))
+    ]
+    while pending:
+        directory, relative, ancestors = pending.pop()
+        budget.add_directory()
+        with _scan(directory, budget) as entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                name = (relative / entry.name).as_posix()
+                real = Path(entry.path).resolve()
+                if not real.is_relative_to(base):
+                    raise ValueError(
+                        "operator_skills library files must stay inside their skill directory"
+                    )
+                if real.is_dir():
+                    if real in ancestors:
+                        raise ValueError(
+                            "operator_skills library directories must not link to themselves"
+                        )
+                    pending.append((real, relative / entry.name, ancestors | {real}))
+                    continue
+                if not real.is_file():
+                    raise ValueError(
+                        f"operator_skills library entry {name!r} is not a readable regular file"
+                    )
+                with real.open("rb") as handle:
+                    data = handle.read(_MAX_FILE_BYTES + 1)
+                if len(data) > _MAX_FILE_BYTES:
+                    raise ValueError("operator_skills each file must be at most 128 KiB")
+                budget.add_file(len(data))
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        "operator_skills files must contain valid UTF-8 text"
+                    ) from exc
+                files[name] = text
+    return dict(sorted(files.items()))
+
+
 @dataclass(frozen=True)
 class OperatorSkills:
     """A bounded text library and explicit per-agent selections."""
@@ -49,12 +190,21 @@ class OperatorSkills:
         """Validate configuration and selected source bundles before startup."""
         if raw is None:
             return cls({}, {})
-        if not isinstance(raw, dict) or set(raw) - {"library", "agents"}:
-            raise ValueError("operator_skills must contain only library and agents mappings")
+        if not isinstance(raw, dict) or set(raw) - {"library", "library_dirs", "agents"}:
+            raise ValueError(
+                "operator_skills must contain only library, library_dirs and agents entries"
+            )
         library_raw = raw.get("library", {})
         agents_raw = raw.get("agents", {})
         if not isinstance(library_raw, dict) or not isinstance(agents_raw, dict):
             raise ValueError("operator_skills library and agents must be mappings")
+        if "library_dirs" in raw:
+            from_dirs = _library_from_dirs(raw["library_dirs"], _Budget(library_raw))
+            if shared := set(from_dirs) & set(library_raw):
+                raise ValueError(
+                    f"operator_skills skill {sorted(shared)[0]!r} appears in more than one library"
+                )
+            library_raw = {**library_raw, **from_dirs}
         if len(library_raw) > 128 or len(agents_raw) > 128:
             raise ValueError("operator_skills supports at most 128 skills and agent mappings")
         library: dict[str, dict[str, str]] = {}
@@ -74,7 +224,7 @@ class OperatorSkills:
                     raise ValueError(
                         "operator_skills files must contain valid UTF-8 text"
                     ) from exc
-                if size > 128 * 1024:
+                if size > _MAX_FILE_BYTES:
                     raise ValueError("operator_skills each file must be at most 128 KiB")
                 if relative.casefold() in {item.casefold() for item in copied}:
                     raise ValueError("operator_skills contains case-colliding file paths")
@@ -106,7 +256,8 @@ class OperatorSkills:
                     "operator_skills agent selections contain duplicate or unknown skills"
                 )
             agents[name] = tuple(selected)
-        if len(json.dumps(raw, ensure_ascii=False).encode("utf-8")) > _MAX_BYTES:
+        serialized = json.dumps({"library": library, "agents": agents}, ensure_ascii=False)
+        if len(serialized.encode("utf-8")) > _MAX_BYTES:
             raise ValueError("operator_skills configuration must be at most 900 KiB")
         result = cls(
             library,
