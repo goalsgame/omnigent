@@ -6,6 +6,8 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -45,6 +47,7 @@ class _Budget:
         self.skills = 0
         self.files = 0
         self.directories = 0
+        self.entries = 0
         self.bytes = 0
         for files in inline.values():
             self.add_skill()
@@ -55,6 +58,11 @@ class _Budget:
         self.skills += 1
         if self.skills > 128:
             raise ValueError("operator_skills supports at most 128 skills and agent mappings")
+
+    def add_entry(self) -> None:
+        self.entries += 1
+        if self.entries > 4096:
+            raise ValueError("operator_skills library directories may list at most 4096 entries")
 
     def add_directory(self) -> None:
         self.directories += 1
@@ -72,6 +80,31 @@ class _Budget:
             raise ValueError("operator_skills configuration must be at most 900 KiB")
 
 
+@contextmanager
+def _scan(directory: Path, budget: _Budget) -> Generator[Iterator[os.DirEntry[str]]]:
+    """Stream a directory listing, charging each entry before it is used."""
+    try:
+        listing = os.scandir(directory)
+    except OSError as error:
+        raise ValueError(f"operator_skills cannot read library directory: {error}") from error
+
+    def entries() -> Iterator[os.DirEntry[str]]:
+        while True:
+            try:
+                entry = next(listing)
+            except StopIteration:
+                return
+            except OSError as error:
+                raise ValueError(
+                    f"operator_skills cannot read library directory: {error}"
+                ) from error
+            budget.add_entry()
+            yield entry
+
+    with listing:
+        yield entries()
+
+
 def _library_from_dirs(raw: object, budget: _Budget) -> dict[str, dict[str, str]]:
     """Read ``<dir>/<skill-id>/**`` text files into the inline library shape."""
     if not isinstance(raw, list) or any(not isinstance(item, str) or not item for item in raw):
@@ -83,16 +116,18 @@ def _library_from_dirs(raw: object, budget: _Budget) -> dict[str, dict[str, str]
             raise ValueError(f"operator_skills library directory {entry!r} must be absolute")
         if not root.is_dir():
             raise ValueError(f"operator_skills library directory {entry!r} is not a directory")
-        for skill_dir in sorted(root.iterdir()):
-            if skill_dir.name.startswith(".") or not skill_dir.is_dir():
-                continue
-            if skill_dir.name in library:
-                raise ValueError(
-                    f"operator_skills skill {skill_dir.name!r} appears in more than one library"
-                )
-            budget.add_skill()
-            library[skill_dir.name] = _read_skill_dir(skill_dir, budget)
-    return library
+        with _scan(root, budget) as entries:
+            for entry in entries:
+                skill_dir = Path(entry.path)
+                if entry.name.startswith(".") or not skill_dir.is_dir():
+                    continue
+                if entry.name in library:
+                    raise ValueError(
+                        f"operator_skills skill {entry.name!r} appears in more than one library"
+                    )
+                budget.add_skill()
+                library[entry.name] = _read_skill_dir(skill_dir, budget)
+    return dict(sorted(library.items()))
 
 
 def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
@@ -102,44 +137,43 @@ def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
 
     def walk(directory: Path, relative: PurePosixPath, ancestors: frozenset[Path]) -> None:
         budget.add_directory()
+        with _scan(directory, budget) as entries:
+            for entry in entries:
+                if not entry.name.startswith("."):
+                    visit(entry, relative, ancestors)
+
+    def visit(
+        entry: os.DirEntry[str], relative: PurePosixPath, ancestors: frozenset[Path]
+    ) -> None:
+        path = Path(entry.path)
+        real = path.resolve()
+        if not real.is_relative_to(base):
+            raise ValueError(
+                "operator_skills library files must stay inside their skill directory"
+            )
+        if path.is_dir():
+            if real in ancestors:
+                raise ValueError("operator_skills library directories must not link to themselves")
+            walk(path, relative / entry.name, ancestors | {real})
+            return
+        if not path.is_file():
+            raise ValueError(
+                f"operator_skills library entry {(relative / entry.name).as_posix()!r} "
+                "is not a readable regular file"
+            )
+        with path.open("rb") as handle:
+            data = handle.read(_MAX_FILE_BYTES + 1)
+        if len(data) > _MAX_FILE_BYTES:
+            raise ValueError("operator_skills each file must be at most 128 KiB")
+        budget.add_file(len(data))
         try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError as error:
-            raise ValueError(f"operator_skills cannot read library directory: {error}") from error
-        for entry in entries:
-            if entry.name.startswith("."):
-                continue
-            path = Path(entry.path)
-            real = path.resolve()
-            if not real.is_relative_to(base):
-                raise ValueError(
-                    "operator_skills library files must stay inside their skill directory"
-                )
-            if path.is_dir():
-                if real in ancestors:
-                    raise ValueError(
-                        "operator_skills library directories must not link to themselves"
-                    )
-                walk(path, relative / entry.name, ancestors | {real})
-                continue
-            if not path.is_file():
-                raise ValueError(
-                    f"operator_skills library entry {(relative / entry.name).as_posix()!r} "
-                    "is not a readable regular file"
-                )
-            with path.open("rb") as handle:
-                data = handle.read(_MAX_FILE_BYTES + 1)
-            if len(data) > _MAX_FILE_BYTES:
-                raise ValueError("operator_skills each file must be at most 128 KiB")
-            budget.add_file(len(data))
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError("operator_skills files must contain valid UTF-8 text") from exc
-            files[(relative / entry.name).as_posix()] = text
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("operator_skills files must contain valid UTF-8 text") from exc
+        files[(relative / entry.name).as_posix()] = text
 
     walk(skill_dir, PurePosixPath(), frozenset({base}))
-    return files
+    return dict(sorted(files.items()))
 
 
 @dataclass(frozen=True)

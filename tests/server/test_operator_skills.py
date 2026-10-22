@@ -501,3 +501,57 @@ def test_operator_skills_resolves_each_directory_once(
     monkeypatch.setattr(Path, "resolve", counting_resolve)
     OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
     assert calls < 1000
+
+
+def _count_listed_entries(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from omnigent.server import operator_skills
+
+    listed: list[str] = []
+    original = os.scandir
+
+    class Counting:
+        def __init__(self, path: object) -> None:
+            self._inner = original(path)
+
+        def __enter__(self) -> Counting:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._inner.close()
+
+        def __iter__(self) -> Counting:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            entry = next(self._inner)
+            listed.append(entry.name)
+            return entry
+
+    monkeypatch.setattr(operator_skills.os, "scandir", Counting)
+    return listed
+
+
+@pytest.mark.parametrize("layout", ["files", "skills", "hidden"])
+def test_operator_skills_stops_listing_at_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    root = _library_dir(tmp_path)
+    if layout == "files":
+        target, count, match = root / "code-review" / "references", 2000, "512 files"
+    elif layout == "skills":
+        target, count, match = root, 2000, "128 skills"
+    else:
+        target, count, match = root / "code-review" / "references", 6000, "4096 entries"
+    for index in range(count):
+        name = f".h{index:05}" if layout == "hidden" else f"e{index:05}"
+        if layout == "skills":
+            (target / name).mkdir()
+            (target / name / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: Skill\n---\nBody"
+            )
+        else:
+            (target / name).write_text("x")
+    listed = _count_listed_entries(monkeypatch)
+    with pytest.raises(ValueError, match=match):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    assert len(listed) < count

@@ -32,7 +32,7 @@ directory whose immediate subdirectories are skills: `<dir>/<skill-id>/SKILL.md`
 plus any reference files beneath it. Files are read as UTF-8 text at startup
 and validated exactly like inline `library` entries; dot-prefixed names are
 skipped, so a Kubernetes ConfigMap mount per skill works as a library
-directory. Traversal follows links within a skill, rejects links back to an ancestor and visits at most 512 directories across all library directories. A skill ID may appear in only one of `library` and `library_dirs`.
+directory. Traversal follows links within a skill, rejects links back to an ancestor and visits at most 512 directories and lists at most 4096 entries across all library directories, stopping as soon as a limit is passed. A skill ID may appear in only one of `library` and `library_dirs`.
 
 ```yaml
 operator_skills:
