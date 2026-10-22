@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -555,3 +557,43 @@ def test_operator_skills_stops_listing_at_budget(
     with pytest.raises(ValueError, match=match):
         OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
     assert len(listed) < count
+
+
+def test_operator_skills_reads_deep_library_tree(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    nested = root / "code-review"
+    for _ in range(200):
+        nested = nested / "d"
+    nested.mkdir(parents=True)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(len(inspect.stack()) + 150)
+    try:
+        parsed = OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    finally:
+        sys.setrecursionlimit(limit)
+    assert parsed.library["code-review"] == _skill()
+
+
+def test_operator_skills_follows_long_alias_chain(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    skill = root / "code-review"
+    current = skill
+    for index in range(45):
+        backing = skill / f".b{index}"
+        backing.mkdir()
+        (current / "nx").symlink_to(backing)
+        current = backing
+    (current / "leaf.md").write_text("chained")
+    parsed = OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    assert parsed.library["code-review"]["nx/" * 45 + "leaf.md"] == "chained"
+
+
+def test_operator_skills_charges_library_roots(tmp_path: Path) -> None:
+    roots = []
+    for index in range(513):
+        root = tmp_path / "roots" / f"r{index}"
+        root.mkdir(parents=True)
+        roots.append(root)
+    config = {"library_dirs": [str(root) for root in roots], "agents": {}}
+    with pytest.raises(ValueError, match="512 directories"):
+        OperatorSkills.parse(config, sources={"assistant": _source(tmp_path)})

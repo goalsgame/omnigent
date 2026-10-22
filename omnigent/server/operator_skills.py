@@ -116,6 +116,7 @@ def _library_from_dirs(raw: object, budget: _Budget) -> dict[str, dict[str, str]
             raise ValueError(f"operator_skills library directory {entry!r} must be absolute")
         if not root.is_dir():
             raise ValueError(f"operator_skills library directory {entry!r} is not a directory")
+        budget.add_directory()
         with _scan(root, budget) as entries:
             for entry in entries:
                 skill_dir = Path(entry.path)
@@ -134,45 +135,45 @@ def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
     # ConfigMap mounts duplicate every file under dot-prefixed ``..data`` directories.
     base = skill_dir.resolve()
     files: dict[str, str] = {}
-
-    def walk(directory: Path, relative: PurePosixPath, ancestors: frozenset[Path]) -> None:
+    pending: list[tuple[Path, PurePosixPath, frozenset[Path]]] = [
+        (base, PurePosixPath(), frozenset({base}))
+    ]
+    while pending:
+        directory, relative, ancestors = pending.pop()
         budget.add_directory()
         with _scan(directory, budget) as entries:
             for entry in entries:
-                if not entry.name.startswith("."):
-                    visit(entry, relative, ancestors)
-
-    def visit(
-        entry: os.DirEntry[str], relative: PurePosixPath, ancestors: frozenset[Path]
-    ) -> None:
-        path = Path(entry.path)
-        real = path.resolve()
-        if not real.is_relative_to(base):
-            raise ValueError(
-                "operator_skills library files must stay inside their skill directory"
-            )
-        if path.is_dir():
-            if real in ancestors:
-                raise ValueError("operator_skills library directories must not link to themselves")
-            walk(path, relative / entry.name, ancestors | {real})
-            return
-        if not path.is_file():
-            raise ValueError(
-                f"operator_skills library entry {(relative / entry.name).as_posix()!r} "
-                "is not a readable regular file"
-            )
-        with path.open("rb") as handle:
-            data = handle.read(_MAX_FILE_BYTES + 1)
-        if len(data) > _MAX_FILE_BYTES:
-            raise ValueError("operator_skills each file must be at most 128 KiB")
-        budget.add_file(len(data))
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("operator_skills files must contain valid UTF-8 text") from exc
-        files[(relative / entry.name).as_posix()] = text
-
-    walk(skill_dir, PurePosixPath(), frozenset({base}))
+                if entry.name.startswith("."):
+                    continue
+                name = (relative / entry.name).as_posix()
+                real = Path(entry.path).resolve()
+                if not real.is_relative_to(base):
+                    raise ValueError(
+                        "operator_skills library files must stay inside their skill directory"
+                    )
+                if real.is_dir():
+                    if real in ancestors:
+                        raise ValueError(
+                            "operator_skills library directories must not link to themselves"
+                        )
+                    pending.append((real, relative / entry.name, ancestors | {real}))
+                    continue
+                if not real.is_file():
+                    raise ValueError(
+                        f"operator_skills library entry {name!r} is not a readable regular file"
+                    )
+                with real.open("rb") as handle:
+                    data = handle.read(_MAX_FILE_BYTES + 1)
+                if len(data) > _MAX_FILE_BYTES:
+                    raise ValueError("operator_skills each file must be at most 128 KiB")
+                budget.add_file(len(data))
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        "operator_skills files must contain valid UTF-8 text"
+                    ) from exc
+                files[name] = text
     return dict(sorted(files.items()))
 
 
