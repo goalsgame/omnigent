@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 from dataclasses import dataclass, field
@@ -36,6 +37,50 @@ def _path(value: object) -> str:
     return value
 
 
+def _library_from_dirs(raw: object) -> dict[str, dict[str, str]]:
+    """Read ``<dir>/<skill-id>/**`` text files into the inline library shape."""
+    if not isinstance(raw, list) or any(not isinstance(item, str) or not item for item in raw):
+        raise ValueError("operator_skills library_dirs must be a list of directory paths")
+    library: dict[str, dict[str, str]] = {}
+    for entry in raw:
+        root = Path(entry)
+        if not root.is_dir():
+            raise ValueError(f"operator_skills library directory {entry!r} is not a directory")
+        for skill_dir in sorted(root.iterdir()):
+            if skill_dir.name.startswith(".") or not skill_dir.is_dir():
+                continue
+            if skill_dir.name in library:
+                raise ValueError(
+                    f"operator_skills skill {skill_dir.name!r} appears in more than one library"
+                )
+            library[skill_dir.name] = _read_skill_dir(skill_dir)
+    return library
+
+
+def _read_skill_dir(skill_dir: Path) -> dict[str, str]:
+    # ConfigMap mounts duplicate every file under dot-prefixed ``..data`` directories.
+    base = skill_dir.resolve()
+    files: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(skill_dir, followlinks=True):
+        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+        for filename in sorted(filenames):
+            if filename.startswith("."):
+                continue
+            path = Path(dirpath, filename)
+            if not path.is_file():
+                continue
+            if not path.resolve().is_relative_to(base):
+                raise ValueError(
+                    "operator_skills library files must stay inside their skill directory"
+                )
+            try:
+                text = path.read_bytes().decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("operator_skills files must contain valid UTF-8 text") from exc
+            files[path.relative_to(skill_dir).as_posix()] = text
+    return files
+
+
 @dataclass(frozen=True)
 class OperatorSkills:
     """A bounded text library and explicit per-agent selections."""
@@ -49,12 +94,21 @@ class OperatorSkills:
         """Validate configuration and selected source bundles before startup."""
         if raw is None:
             return cls({}, {})
-        if not isinstance(raw, dict) or set(raw) - {"library", "agents"}:
-            raise ValueError("operator_skills must contain only library and agents mappings")
+        if not isinstance(raw, dict) or set(raw) - {"library", "library_dirs", "agents"}:
+            raise ValueError(
+                "operator_skills must contain only library, library_dirs and agents entries"
+            )
         library_raw = raw.get("library", {})
         agents_raw = raw.get("agents", {})
         if not isinstance(library_raw, dict) or not isinstance(agents_raw, dict):
             raise ValueError("operator_skills library and agents must be mappings")
+        if "library_dirs" in raw:
+            from_dirs = _library_from_dirs(raw["library_dirs"])
+            if shared := set(from_dirs) & set(library_raw):
+                raise ValueError(
+                    f"operator_skills skill {sorted(shared)[0]!r} appears in more than one library"
+                )
+            library_raw = {**library_raw, **from_dirs}
         if len(library_raw) > 128 or len(agents_raw) > 128:
             raise ValueError("operator_skills supports at most 128 skills and agent mappings")
         library: dict[str, dict[str, str]] = {}
@@ -106,7 +160,8 @@ class OperatorSkills:
                     "operator_skills agent selections contain duplicate or unknown skills"
                 )
             agents[name] = tuple(selected)
-        if len(json.dumps(raw, ensure_ascii=False).encode("utf-8")) > _MAX_BYTES:
+        serialized = json.dumps({"library": library, "agents": agents}, ensure_ascii=False)
+        if len(serialized.encode("utf-8")) > _MAX_BYTES:
             raise ValueError("operator_skills configuration must be at most 900 KiB")
         result = cls(
             library,

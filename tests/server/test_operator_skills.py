@@ -98,6 +98,8 @@ def test_operator_skills_rejects_unsafe_paths(tmp_path: Path, path: str) -> None
             "library": {"code-review": _skill()},
             "agents": {"assistant": ["code-review", "code-review"]},
         },
+        {"library_dirs": "not-a-list"},
+        {"library_dirs": [""]},
     ],
 )
 def test_operator_skills_rejects_malformed_config(tmp_path: Path, raw: object) -> None:
@@ -279,3 +281,108 @@ async def test_mapped_yaml_disappearing_after_validation_fails_lifespan(
     finally:
         await app.state.harness_process_manager.shutdown()
     assert stores.agent_store.get_by_name("assistant") is None
+
+
+def _library_dir(tmp_path: Path, files: dict[str, str] | None = None) -> Path:
+    root = tmp_path / "skills"
+    for relative, text in (files or _skill()).items():
+        path = root / "code-review" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def _dirs_config(*roots: Path, library: dict | None = None) -> dict:
+    config: dict = {
+        "library_dirs": [str(root) for root in roots],
+        "agents": {"assistant": ["code-review"]},
+    }
+    if library is not None:
+        config["library"] = library
+    return config
+
+
+def test_operator_skills_reads_library_directories(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    (root / "code-review" / ".hidden.md").write_text("ignored")
+    (root / ".DS_Store").write_text("ignored")
+    parsed = OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    assert parsed.library == {"code-review": _skill()}
+    assert parsed.agents == {"assistant": ("code-review",)}
+
+
+def test_operator_skills_reads_configmap_style_mounts(tmp_path: Path) -> None:
+    mount = tmp_path / "skills" / "code-review"
+    data = mount / "..2026_10_22_12_00_00.123"
+    for relative, text in _skill().items():
+        path = data / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    (mount / "..data").symlink_to(data.name)
+    (mount / "SKILL.md").symlink_to(Path("..data") / "SKILL.md")
+    (mount / "references").symlink_to(Path("..data") / "references")
+    parsed = OperatorSkills.parse(
+        _dirs_config(mount.parent), sources={"assistant": _source(tmp_path)}
+    )
+    assert parsed.library == {"code-review": _skill()}
+
+
+def test_operator_skills_library_directory_seeds_like_inline_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(source))
+    stores = _independent_seed_stores(tmp_path, "operator-dirs")
+    root = _library_dir(tmp_path)
+    parsed = OperatorSkills.parse(_dirs_config(root), sources={"assistant": source})
+    server_app._ensure_extra_builtin_agents(
+        stores.agent_store, stores.artifact_store, stores.agent_cache, parsed
+    )
+    row = stores.agent_store.get_by_name("assistant")
+    assert row is not None
+    spec = stores.agent_cache.load(row.id, row.bundle_location).spec
+    assert [skill.name for skill in spec.skills] == ["code-review"]
+    assert (spec.skills[0].skill_dir / "references/checklist.md").read_text() == (
+        "Inspect caller contracts."
+    )
+
+
+def test_operator_skills_rejects_missing_library_directory(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not a directory"):
+        OperatorSkills.parse(
+            _dirs_config(tmp_path / "absent"), sources={"assistant": _source(tmp_path)}
+        )
+
+
+def test_operator_skills_rejects_skill_in_two_libraries(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    with pytest.raises(ValueError, match="more than one library"):
+        OperatorSkills.parse(
+            _dirs_config(root, library={"code-review": _skill()}),
+            sources={"assistant": _source(tmp_path)},
+        )
+    other = _library_dir(tmp_path / "other")
+    with pytest.raises(ValueError, match="more than one library"):
+        OperatorSkills.parse(_dirs_config(root, other), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_rejects_library_file_outside_its_directory(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("leaked")
+    (root / "code-review" / "references" / "leak.md").symlink_to(outside)
+    with pytest.raises(ValueError, match="inside their skill directory"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_rejects_binary_library_file(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    (root / "code-review" / "references" / "image.png").write_bytes(b"\x89PNG\xff\xfe")
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_library_directory_requires_entrypoint(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path, {"references/checklist.md": "no entrypoint"})
+    with pytest.raises(ValueError, match=r"SKILL\.md"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
