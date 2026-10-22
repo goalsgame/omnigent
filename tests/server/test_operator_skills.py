@@ -473,3 +473,31 @@ def test_operator_skills_bounds_directory_alias_fan_out(tmp_path: Path) -> None:
             (skill / f"d{depth}" / alias).symlink_to(Path("..") / f"d{depth + 1}")
     with pytest.raises(ValueError, match="512 directories"):
         OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_rejects_dangling_library_link(tmp_path: Path) -> None:
+    root = _library_dir(tmp_path)
+    (root / "code-review" / "references" / "missing.md").symlink_to("absent.md")
+    with pytest.raises(ValueError, match="not a readable regular file"):
+        OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+
+
+def test_operator_skills_resolves_each_directory_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _library_dir(tmp_path)
+    nested = root / "code-review"
+    for depth in range(100):
+        nested = nested / f"d{depth}"
+    nested.mkdir(parents=True)
+    calls = 0
+    original = Path.resolve
+
+    def counting_resolve(self: Path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+    OperatorSkills.parse(_dirs_config(root), sources={"assistant": _source(tmp_path)})
+    assert calls < 1000

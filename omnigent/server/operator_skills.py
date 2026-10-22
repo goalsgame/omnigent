@@ -100,25 +100,32 @@ def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
     base = skill_dir.resolve()
     files: dict[str, str] = {}
 
-    def _fail(error: OSError) -> None:
-        raise ValueError(f"operator_skills cannot read library directory: {error}") from error
-
-    for dirpath, dirnames, filenames in os.walk(skill_dir, onerror=_fail, followlinks=True):
-        parts = Path(dirpath).relative_to(skill_dir).parts
-        ancestors = {skill_dir.joinpath(*parts[:depth]).resolve() for depth in range(len(parts))}
-        if Path(dirpath).resolve() in ancestors:
-            raise ValueError("operator_skills library directories must not link to themselves")
+    def walk(directory: Path, relative: PurePosixPath, ancestors: frozenset[Path]) -> None:
         budget.add_directory()
-        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
-        for filename in sorted(filenames):
-            if filename.startswith("."):
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise ValueError(f"operator_skills cannot read library directory: {error}") from error
+        for entry in entries:
+            if entry.name.startswith("."):
                 continue
-            path = Path(dirpath, filename)
-            if not path.is_file():
-                continue
-            if not path.resolve().is_relative_to(base):
+            path = Path(entry.path)
+            real = path.resolve()
+            if not real.is_relative_to(base):
                 raise ValueError(
                     "operator_skills library files must stay inside their skill directory"
+                )
+            if path.is_dir():
+                if real in ancestors:
+                    raise ValueError(
+                        "operator_skills library directories must not link to themselves"
+                    )
+                walk(path, relative / entry.name, ancestors | {real})
+                continue
+            if not path.is_file():
+                raise ValueError(
+                    f"operator_skills library entry {(relative / entry.name).as_posix()!r} "
+                    "is not a readable regular file"
                 )
             with path.open("rb") as handle:
                 data = handle.read(_MAX_FILE_BYTES + 1)
@@ -129,7 +136,9 @@ def _read_skill_dir(skill_dir: Path, budget: _Budget) -> dict[str, str]:
                 text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError("operator_skills files must contain valid UTF-8 text") from exc
-            files[path.relative_to(skill_dir).as_posix()] = text
+            files[(relative / entry.name).as_posix()] = text
+
+    walk(skill_dir, PurePosixPath(), frozenset({base}))
     return files
 
 
