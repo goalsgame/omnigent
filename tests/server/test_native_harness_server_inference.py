@@ -187,3 +187,25 @@ def test_codex_excludes_chat_only_vertex_routes(monkeypatch):
                 "harnesses": ["codex-native"],
             }
         )
+
+
+def test_claude_gateway_launch_rewrites_canonical_fallback_ids(tmp_path):
+    from omnigent.harnesses.claude_native.main import _native_claude_config_from_entry
+    from omnigent.inference_config import resolve_bound_provider
+
+    opus = "anthropic/claude-opus-4.8"
+    proxy = {
+        "url": URL,
+        "grant": "g" * 64,
+        "harness": "claude-native",
+        "models": [opus],
+        "model_apis": {opus: "anthropic-messages"},
+    }
+    config = prepare({"server_inference": proxy}, tmp_path / "grants")
+    entry = resolve_bound_provider(config, "claude-native")
+    assert entry is not None
+    launch = _native_claude_config_from_entry(entry, refresh_models=False)
+    assert launch is not None
+    assert launch.model_overrides["claude-opus-4-8"] == opus
+    assert launch.model_overrides["claude-opus-4.8"] == opus
+    assert set(launch.model_overrides.values()) == {opus}

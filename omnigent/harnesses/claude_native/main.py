@@ -38,7 +38,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if sys.platform != "win32":
     import termios
     import tty
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -3109,7 +3109,17 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
                 ]
             )
         ),
+        model_overrides=_gateway_canonical_overrides(family.models.values()),
     )
+
+
+def _gateway_canonical_overrides(models: Iterable[str]) -> dict[str, str]:
+    """Canonical Claude ids, dotted or dashed, rewritten to the gateway's served spelling."""
+    overrides: dict[str, str] = {}
+    for canonical, served in served_canonical_overrides(models).items():
+        overrides.setdefault(canonical, served)
+        overrides.setdefault(canonical.replace(".", "-"), served)
+    return overrides
 
 
 def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
