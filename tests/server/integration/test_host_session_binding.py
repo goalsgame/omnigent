@@ -2050,18 +2050,42 @@ async def test_initial_item_delivery_dispatches_after_the_launch_settles(
     assert order == ["relay", "dispatch:first", "dispatch:second"]
 
 
-async def test_initial_item_delivery_skips_a_failed_launch(
-    monkeypatch: pytest.MonkeyPatch,
+def _kickoff_event():
+    from omnigent.server.schemas import SessionEventInput
+
+    return SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "kick off"}]},
+    )
+
+
+@pytest.mark.parametrize("failure", ["launch", "runner"])
+async def test_undelivered_initial_items_are_kept_as_history(
+    monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     from omnigent.server.managed_hosts import ManagedLaunch
     from omnigent.server.routes._sessions import orchestration
 
     order = _delivery_env(monkeypatch)
-    launch = ManagedLaunch(settled=asyncio.Event(), error="managed sandbox failed to launch")
+    if failure == "runner":
+
+        async def no_runner(session_id, router, conversation=None):
+            return None
+
+        monkeypatch.setattr(orchestration, "_get_runner_client", no_runner)
+    launch = ManagedLaunch(
+        settled=asyncio.Event(),
+        error="managed sandbox failed to launch" if failure == "launch" else None,
+    )
     launch.settled.set()
-    _start_delivery(launch)
+    _start_delivery(launch, items=[_kickoff_event()])
     await orchestration.await_initial_item_delivery("sess")
     assert order == []
+    store = orchestration._test_store
+    store.append.assert_called_once()
+    session_id, appended = store.append.call_args.args
+    assert session_id == "sess"
+    assert [item.type for item in appended] == ["message"]
 
 
 async def test_follow_up_waits_for_the_initial_items(monkeypatch: pytest.MonkeyPatch) -> None:

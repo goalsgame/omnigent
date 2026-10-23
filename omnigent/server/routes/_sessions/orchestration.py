@@ -11428,17 +11428,24 @@ def _deliver_initial_items_after_launch(
     Failures are logged; the launch tracker already reports a failed launch.
     """
 
+    async def keep_as_history() -> None:
+        # Undelivered, the kickoff would otherwise exist nowhere on the server.
+        new_items = [_build_new_item(item, "seed", created_by=created_by) for item in items]
+        await asyncio.to_thread(conversation_store.append, session_id, new_items)
+
     async def deliver() -> None:
         try:
             try:
                 await asyncio.wait_for(launch.settled.wait(), _LAUNCH_SETTLE_TIMEOUT_S)
             except TimeoutError:
                 _logger.warning(
-                    "Managed launch did not settle; initial items not delivered for %s",
+                    "Managed launch did not settle; initial items kept as history for %s",
                     session_id,
                 )
+                await keep_as_history()
                 return
             if launch.error is not None:
+                await keep_as_history()
                 return
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None or conv.archived:
@@ -11446,9 +11453,10 @@ def _deliver_initial_items_after_launch(
             runner_client = await _get_runner_client(session_id, runner_router, conversation=conv)
             if runner_client is None:
                 _logger.warning(
-                    "No runner after managed launch; initial items not delivered for %s",
+                    "No runner after managed launch; initial items kept as history for %s",
                     session_id,
                 )
+                await keep_as_history()
                 return
             await _ensure_runner_relay_ready(
                 session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
