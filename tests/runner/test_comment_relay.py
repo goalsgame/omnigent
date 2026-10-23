@@ -1491,3 +1491,43 @@ async def test_slow_mcp_listing_does_not_replace_a_newer_agents_relay(
             await c.delete(f"/v1/sessions/{session_id}")
     finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_session_deleted_during_mcp_listing_gets_no_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listing that finishes after the session was deleted installs nothing."""
+    import asyncio
+
+    from omnigent.runner import app as runner_app
+
+    listing_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def schemas_for(self: object, spec: AgentSpec) -> Any:
+        listing_started.set()
+        await release.wait()
+        return _mcp_result(["backstage_find_entity"])
+
+    monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
+    agent_id = "ag_connectors"
+    app = _switch_app(
+        tmp_path, _SwitchableServerClient(agent_id), {agent_id: _connectors_spec("connectors")}
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as c:
+            launch = asyncio.create_task(_launch_terminal(c, session_id, bridge_inject_dir=True))
+            await asyncio.wait_for(listing_started.wait(), 10)
+            await c.delete(f"/v1/sessions/{session_id}")
+            release.set()
+            await launch
+            assert not relay_file.exists()
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)

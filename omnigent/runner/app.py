@@ -4729,25 +4729,28 @@ def create_runner_app(
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
             _unwrap_spec_entry(spec_entry)
         )
+        relay_generation = _session_cache_generation(session_id)
+        relay_before = _session_comment_relays.get(session_id)
         mcp_schemas, mcp_complete = await _native_relay_mcp_schemas(
             session_id,
             _unwrap_spec_entry(spec_entry),
             {str(schema["name"]) for schema in relay_schemas},
         )
         relay_schemas.extend(mcp_schemas)
-        # The MCP listing awaited the network: a newer ensure may have switched
-        # the agent or already installed a matching relay in the meantime.
+        # The MCP listing awaited the network: the session may have been reset or
+        # deleted, or a newer ensure may have installed its own relay meanwhile.
+        if not _session_cache_generation_is_current(session_id, relay_generation):
+            return
+        if _session_comment_relays.get(session_id) is not relay_before:
+            return
         try:
             if await _resolve_session_spec_entry(session_id) is not spec_entry:
                 return
         except OmnigentError:
             pass
-        latest = _session_comment_relays.get(session_id)
         if (
-            latest is not None
-            and latest is not current
-            and latest.spec_entry is spec_entry
-            and latest.bridge_dir == bridge_dir
+            not _session_cache_generation_is_current(session_id, relay_generation)
+            or _session_comment_relays.get(session_id) is not relay_before
         ):
             return
 
