@@ -2094,6 +2094,19 @@ async def test_follow_up_waits_for_the_initial_items(monkeypatch: pytest.MonkeyP
             "data": {"role": "assistant", "content": [{"type": "output_text", "text": "x"}]},
         },
         {"type": "interrupt", "data": {}},
+        {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": "payload.zip",
+                        "file_data": "data:application/zip;base64,UEs=",
+                    }
+                ],
+            },
+        },
     ],
 )
 async def test_managed_native_create_rejects_invalid_initial_items(

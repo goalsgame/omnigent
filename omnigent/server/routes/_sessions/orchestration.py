@@ -11213,6 +11213,8 @@ async def _create_session_from_existing_agent(
         ):
             # A native terminal records no seeded history, so its runner never
             # replays one; hand the items to the terminal once the sandbox is up.
+            from omnigent.inner.native_attachments import inline_filesystem_attachment_name
+
             for item in body.initial_items:
                 if item.type != "message" or item.data.get("role") != "user":
                     raise OmnigentError(
@@ -11220,6 +11222,13 @@ async def _create_session_from_existing_agent(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 _build_new_item(item, "seed", created_by=_attribution_user(user_id))
+                inline_name = inline_filesystem_attachment_name(item.data.get("content"))
+                if inline_name is not None:
+                    raise OmnigentError(
+                        f"Attachment {inline_name!r} must be uploaded to the session's "
+                        "files and referenced by file_id.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
             _pending_native_kickoffs[conv.id] = _PendingKickoff(
                 items=list(body.initial_items),
                 agent_name=agent.name,
