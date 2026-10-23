@@ -68,7 +68,12 @@ def _refresh_command(args: list[str]) -> str:
 def _validate_target(proxy: dict) -> None:
     if not _valid_url(proxy.get("url")):
         raise ValueError("Server inference requires HTTPS")
-    if proxy.get("harness") not in ("openai-agents", "pi-native") or (
+    if proxy.get("harness") not in (
+        "openai-agents",
+        "pi-native",
+        "claude-native",
+        "codex-native",
+    ) or (
         not isinstance(proxy.get("models"), list)
         or not proxy["models"]
         or any(not isinstance(model, str) or not model for model in proxy["models"])
@@ -98,8 +103,18 @@ def _validate_target(proxy: dict) -> None:
     apis = proxy.get("model_apis", {})
     if (
         not isinstance(apis, dict)
-        or (apis and (proxy["harness"] != "pi-native" or set(apis) != set(proxy["models"])))
+        or (
+            apis
+            and (
+                proxy["harness"] not in ("pi-native", "claude-native")
+                or set(apis) != set(proxy["models"])
+            )
+        )
         or any(api not in ("openai-completions", "anthropic-messages") for api in apis.values())
+        or (
+            proxy["harness"] == "claude-native"
+            and (not apis or any(api != "anthropic-messages" for api in apis.values()))
+        )
     ):
         raise ValueError("Invalid inference model API mapping")
 
@@ -146,13 +161,34 @@ def prepare(config: dict, directory: Path, *, credential_files: list[Path] | Non
     return result
 
 
+def claude_model_pins(models: list[str]) -> dict[str, str]:
+    """Pin Claude Code's model aliases to permitted ids, so background calls stay routable."""
+    pins: dict[str, str] = {"default": models[0]}
+    for alias in ("fable", "opus", "sonnet", "haiku"):
+        match = next((model for model in models if alias in model.rsplit("/", 1)[-1]), None)
+        if match is not None:
+            pins[alias] = match
+    if "haiku" not in pins:
+        pins["haiku"] = pins.get("sonnet", models[0])
+    return pins
+
+
 def runtime_config(proxy: dict, credential: Path) -> dict:
     _validate_target(proxy)
     url = proxy["url"]
     args = [sys.executable, "-P", "-m", "omnigent.host.inference_proxy", str(credential)]
     command = _refresh_command(args)
     apis = proxy.get("model_apis", {})
-    anthropic = {"base_url": url, "auth_command": command, "auth_refresh_interval_ms": 60000}
+    anthropic = {
+        "base_url": url,
+        "auth_command": command,
+        "auth_refresh_interval_ms": 60000,
+        **(
+            {"models": claude_model_pins(proxy["models"])}
+            if proxy["harness"] == "claude-native"
+            else {}
+        ),
+    }
     return {
         "providers": {
             "server-inference": {
@@ -161,7 +197,7 @@ def runtime_config(proxy: dict, credential: Path) -> dict:
                 "openai": {
                     "base_url": url,
                     "auth_command": command,
-                    "wire_api": "chat",
+                    "wire_api": "responses" if proxy["harness"] == "codex-native" else "chat",
                     "auth_refresh_interval_ms": 60000,
                 },
             }
