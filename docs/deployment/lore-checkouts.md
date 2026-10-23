@@ -32,6 +32,12 @@ Allowed URLs must match the upstream host and port, and cannot contain
 credentials, query strings, fragments, escaping or traversal. Session refs are
 not included in the repository allowlist.
 
+A key ending in `/*` (for example `lores://lore.example.com/goalables/*`) admits
+any remote that starts with the key minus `*` followed by exactly one non-empty
+path segment, and uses that entry's `view`. Nested paths are not admitted, the
+match is case-sensitive, and `*` is only valid as the final `/*`. An exact key
+takes precedence over prefix keys; among prefix keys the longest wins.
+
 The identity provider must allow renewable token exchange. Tokens must retain
 the owner's subject, have the configured audience and identify the exchanging
 client. Lore and its auth bridge must trust that issuer, audience and client,

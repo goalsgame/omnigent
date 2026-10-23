@@ -100,7 +100,8 @@ def create_host_credentials_router(
             broker = getattr(request.app.state, "lore_identity_broker", None)
             if broker is None:
                 raise HTTPException(404, "Lore access is not configured")
-            if remote not in broker.lore_config.repositories:
+            repository = broker.lore_config.match_repository(remote)
+            if repository is None:
                 raise HTTPException(403, "Lore repository is not configured")
             try:
                 token = await asyncio.to_thread(broker.credential, managed.user_id)
@@ -113,7 +114,7 @@ def create_host_credentials_router(
             return {
                 "connected": True,
                 "token": token,
-                "view": broker.lore_config.repositories[remote],
+                "view": broker.lore_config.repositories[repository],
             }
         if provider == "openrouter" and openrouter_wif_broker is not None:
             try:

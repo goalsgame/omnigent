@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -174,6 +175,92 @@ print('ok')
         assert "renew delegation" in denied.stderr
         assert "launch-token" not in denied.stderr and "--identity-token" not in denied.stderr
 
+    finally:
+        server.shutdown()
+        server.server_close()
+        client.close()
+
+
+@pytest.mark.parametrize("view", ["/Content\n", None])
+def test_lore_prefix_entry_checkout_applies_configured_view(
+    tmp_path: Path, db_uri, monkeypatch, view
+):
+    base, _claims, _exchanges = test_oidc_mcp.broker.__wrapped__(db_uri, monkeypatch)
+    monkeypatch.setenv("LORE_TEST_CLIENT_SECRET", "secret")
+    prefix = "lores://lore.example.test/goalables/*"
+    parsed = LoreConfig.parse(
+        {
+            "upstream_url": "https://lore.example.test",
+            "audience": "lore",
+            "scope": "openid lore-access",
+            "machine_client_id": "machine-exchange",
+            "machine_client_secret_env": "LORE_TEST_CLIENT_SECRET",
+            "repositories": {prefix: {"view": view} if view else {}},
+        }
+    )
+    assert parsed is not None
+    config = LoreConfig(base.config, parsed.repositories, ())
+    broker = LoreDelegationBroker(config, base.oidc, base.store, base.auth, base.client)
+    broker.capture("alice@example.com", "person-sub", "original")
+    app = FastAPI()
+    app.state.lore_identity_broker = broker
+    app.include_router(
+        create_host_credentials_router(
+            _FakeHostStore("host1", "launch-token", "alice@example.com")
+        ),
+        prefix="/v1",
+    )
+    client = TestClient(app)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            response = client.get(self.path, headers=dict(self.headers))
+            self.send_response(response.status_code)
+            self.send_header("Content-Length", str(len(response.content)))
+            self.end_headers()
+            self.wfile.write(response.content)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    home = tmp_path / "home"
+    home.mkdir()
+    binary = tmp_path / "bin/lore"
+    binary.parent.mkdir()
+    binary.write_text(f"""#!{sys.executable}
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+assert args[:2] == ['--identity-token', 'access']
+if 'clone' in args:
+    dest = Path(args[-1])
+    (dest / '.lore').mkdir(parents=True)
+    (dest / 'hello.txt').write_text('hello')
+    expected = {view!r}
+    if expected is None:
+        assert '--view' not in args, args
+    else:
+        assert Path(args[args.index('--view')+1]).read_text() == expected
+print('ok')
+""")
+    binary.chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(binary.parent) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-token")
+    workspace = home / "workspace"
+    repo = parse_repo_workspace("lores://lore.example.test/goalables/app#main@369")
+    command = _render_workspace_prep_command(
+        str(workspace), [repo], server_url=url, host_id="host1"
+    )
+    script = command[-1].replace("python3 -I", shlex.quote(sys.executable) + " -I")
+    try:
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert (workspace / "app" / "hello.txt").read_text() == "hello"
     finally:
         server.shutdown()
         server.server_close()
