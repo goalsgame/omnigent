@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias, overload
@@ -113,11 +114,18 @@ class _CommentRelayBinding:
         the spec could not be resolved and the fallback surface was used.
     :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
         e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    :param mcp_retry_at: Monotonic time after which an incomplete MCP tool
+        listing is retried, or ``None`` when every declared server listed.
     """
 
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
+    mcp_retry_at: float | None = None
+
+    def mcp_retry_due(self) -> bool:
+        """Whether an incomplete MCP tool listing should be retried now."""
+        return self.mcp_retry_at is not None and time.monotonic() >= self.mcp_retry_at
 
 
 def _require_full_native_lock_coverage(

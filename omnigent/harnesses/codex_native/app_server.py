@@ -4208,6 +4208,8 @@ def normalize_codex_permission_launch_args(
       permission mode is presented as automatic. ``auto_review`` keeps the
       workspace-write sandbox and approval boundaries but lets Codex's
       automatic reviewer settle eligible requests instead of prompting.
+      When ``OMNIGENT_CODEX_SANDBOX_MODE`` names a Codex sandbox mode, the
+      default stance also gains that ``sandbox_mode``.
       Any explicit approval/sandbox/reviewer/profile choice wins untouched.
     """
     args = canonical_codex_launch_args(terminal_launch_args or ())
@@ -4258,7 +4260,14 @@ def normalize_codex_permission_launch_args(
         or has_permission_profile
     ):
         args.extend(["-c", 'approvals_reviewer="auto_review"'])
+        sandbox_mode = os.environ.get(CODEX_SANDBOX_MODE_ENV, "").strip()
+        if sandbox_mode in _CODEX_SANDBOX_MODES:
+            args.extend(["-c", f'sandbox_mode="{sandbox_mode}"'])
     return args
+
+
+CODEX_SANDBOX_MODE_ENV = "OMNIGENT_CODEX_SANDBOX_MODE"
+_CODEX_SANDBOX_MODES = frozenset({"read-only", "workspace-write", "danger-full-access"})
 
 
 def _codex_config_string(raw_value: str) -> str:

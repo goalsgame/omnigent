@@ -209,6 +209,8 @@ from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.startup_timing import startup_span, startup_timed
 from omnigent.util.json_types import JsonObject as _JsonObject
 
+# Seconds before a relay whose MCP tool listing was incomplete lists again.
+_MCP_RELAY_RETRY_S = 30.0
 _logger = logging.getLogger(__name__)
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
@@ -4614,6 +4616,33 @@ def create_runner_app(
         del _session_comment_relays[session_id]
         relay.close()
 
+    async def _native_relay_mcp_schemas(
+        session_id: str, spec: Any, registered: set[str]
+    ) -> tuple[list[_JsonObject], bool]:
+        """The agent's MCP tools via the server's MCP proxy, and whether every server listed."""
+        if server_client is None or spec is None or not getattr(spec, "mcp_servers", None):
+            return [], True
+        try:
+            result = await ProxyMcpManager(session_id, server_client).schemas_for(spec)
+        except Exception:  # noqa: BLE001 — external tools are additive
+            _logger.warning(
+                "Failed to list MCP tools for native session %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return [], False
+        for server, error in result.failures.items():
+            _logger.warning(
+                "Native MCP %r unavailable for session %s: %s",
+                server,
+                session_id,
+                error,
+                extra={"session_id": session_id},
+            )
+        schemas = [schema for schema in result.schemas if schema["name"] not in registered]
+        return schemas, not result.failures
+
     async def _ensure_comment_relay_started(
         session_id: str,
         *,
@@ -4665,7 +4694,12 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and known_bridge_dir is None
+            and not current.mcp_retry_due()
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -4686,6 +4720,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
+            and not current.mcp_retry_due()
         ):
             return
 
@@ -4694,6 +4729,30 @@ def create_runner_app(
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
             _unwrap_spec_entry(spec_entry)
         )
+        relay_generation = _session_cache_generation(session_id)
+        relay_before = _session_comment_relays.get(session_id)
+        mcp_schemas, mcp_complete = await _native_relay_mcp_schemas(
+            session_id,
+            _unwrap_spec_entry(spec_entry),
+            {str(schema["name"]) for schema in relay_schemas},
+        )
+        relay_schemas.extend(mcp_schemas)
+        # The MCP listing awaited the network: the session may have been reset or
+        # deleted, or a newer ensure may have installed its own relay meanwhile.
+        if not _session_cache_generation_is_current(session_id, relay_generation):
+            return
+        if _session_comment_relays.get(session_id) is not relay_before:
+            return
+        try:
+            if await _resolve_session_spec_entry(session_id) is not spec_entry:
+                return
+        except OmnigentError:
+            pass
+        if (
+            not _session_cache_generation_is_current(session_id, relay_generation)
+            or _session_comment_relays.get(session_id) is not relay_before
+        ):
+            return
 
         _captured_session_id = session_id
 
@@ -4780,6 +4839,7 @@ def create_runner_app(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
+            mcp_retry_at=None if mcp_complete else time.monotonic() + _MCP_RELAY_RETRY_S,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that

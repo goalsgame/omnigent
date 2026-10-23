@@ -13108,3 +13108,49 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+@pytest.mark.parametrize(
+    ("configured", "launch_args", "expected_tail"),
+    [
+        (
+            "danger-full-access",
+            [],
+            ["-c", 'approvals_reviewer="auto_review"', "-c", 'sandbox_mode="danger-full-access"'],
+        ),
+        ("", [], ["-c", 'approvals_reviewer="auto_review"']),
+        ("not-a-mode", [], ["-c", 'approvals_reviewer="auto_review"']),
+        ("danger-full-access", ["--sandbox", "read-only"], ["--sandbox", "read-only"]),
+    ],
+)
+def test_default_codex_stance_takes_the_deployment_sandbox_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+    launch_args: list[str],
+    expected_tail: list[str],
+) -> None:
+    from omnigent.harnesses.codex_native.app_server import (
+        CODEX_SANDBOX_MODE_ENV,
+        normalize_codex_permission_launch_args,
+    )
+
+    monkeypatch.setenv(CODEX_SANDBOX_MODE_ENV, configured)
+    args = normalize_codex_permission_launch_args(launch_args)
+    assert args[-len(expected_tail) :] == expected_tail
+    assert ('sandbox_mode="danger-full-access"' in args) == (
+        configured == "danger-full-access" and not launch_args
+    )
+
+
+def test_codex_sandbox_mode_reaches_host_runners() -> None:
+    from omnigent.host.connect import _build_runner_env
+
+    env = _build_runner_env(
+        {"PATH": "/usr/bin", "OMNIGENT_CODEX_SANDBOX_MODE": "danger-full-access"},
+        server_url="",
+        runner_id="",
+        binding_token="",
+        workspace="/tmp",
+        parent_pid=0,
+    )
+    assert env["OMNIGENT_CODEX_SANDBOX_MODE"] == "danger-full-access"
