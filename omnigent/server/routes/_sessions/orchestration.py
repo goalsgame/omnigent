@@ -11428,12 +11428,18 @@ def _deliver_initial_items_after_launch(
     Failures are logged; the launch tracker already reports a failed launch.
     """
 
+    delivered = 0
+
     async def keep_as_history() -> None:
         # Undelivered, the kickoff would otherwise exist nowhere on the server.
-        new_items = [_build_new_item(item, "seed", created_by=created_by) for item in items]
-        await asyncio.to_thread(conversation_store.append, session_id, new_items)
+        new_items = [
+            _build_new_item(item, "seed", created_by=created_by) for item in items[delivered:]
+        ]
+        if new_items:
+            await asyncio.to_thread(conversation_store.append, session_id, new_items)
 
     async def deliver() -> None:
+        nonlocal delivered
         try:
             try:
                 await asyncio.wait_for(launch.settled.wait(), _LAUNCH_SETTLE_TIMEOUT_S)
@@ -11477,12 +11483,21 @@ def _deliver_initial_items_after_launch(
                     background_titles_enabled=background_titles_enabled,
                     agent_revision=agent_revision,
                 )
+                delivered += 1
         except Exception:  # noqa: BLE001 — background delivery must not crash the loop
             _logger.warning(
-                "Failed to deliver initial items for native session %s",
+                "Failed to deliver initial items for native session %s; %d of %d kept as history",
                 session_id,
+                len(items) - delivered,
+                len(items),
                 exc_info=True,
             )
+            try:
+                await keep_as_history()
+            except Exception:  # noqa: BLE001 — the warning above already reports the loss
+                _logger.warning(
+                    "Failed to keep initial items as history for %s", session_id, exc_info=True
+                )
         finally:
             if _initial_item_deliveries.get(session_id) is asyncio.current_task():
                 del _initial_item_deliveries[session_id]

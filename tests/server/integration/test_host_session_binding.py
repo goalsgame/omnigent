@@ -2303,3 +2303,48 @@ async def test_managed_native_kickoff_passes_the_input_policy_first(
     else:
         assert resp.status_code == 201, resp.text
         assert scheduled == [resp.json()["id"]]
+
+
+@pytest.mark.parametrize("fails_at", ["relay", "second"])
+async def test_failed_delivery_keeps_the_rest_as_history(
+    monkeypatch: pytest.MonkeyPatch, fails_at: str
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    _delivery_env(monkeypatch)
+    sent: list[str] = []
+
+    async def relay_ready(*args, **kwargs):
+        if fails_at == "relay":
+            raise TimeoutError("relay not ready")
+
+    async def dispatch(session_id, conv, item, *args, **kwargs):
+        text = item.data["content"][0]["text"]
+        if fails_at == "second" and text == "second":
+            raise RuntimeError("forward rejected")
+        sent.append(text)
+
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", relay_ready)
+    monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
+    from omnigent.server.schemas import SessionEventInput
+
+    items = [
+        SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        )
+        for text in ("first", "second", "third")
+    ]
+    launch = ManagedLaunch(settled=asyncio.Event())
+    launch.settled.set()
+    _start_delivery(launch, items=items)
+    await orchestration.await_initial_item_delivery("sess")
+    _, kept = orchestration._test_store.append.call_args.args
+    kept_texts = [item.data.model_dump()["content"][0]["text"] for item in kept]
+    if fails_at == "relay":
+        assert sent == []
+        assert kept_texts == ["first", "second", "third"]
+    else:
+        assert sent == ["first"]
+        assert kept_texts == ["second", "third"]
