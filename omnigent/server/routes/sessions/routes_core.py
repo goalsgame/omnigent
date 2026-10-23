@@ -187,7 +187,9 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_archive_stop,
     _validate_session_model_selection,
     cancel_initial_item_delivery,
+    discard_native_kickoff,
     ensure_runner_connected,
+    start_native_kickoff,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -935,6 +937,16 @@ def register_core_routes(
         launch_host_id = body.host_id or resp.host_id
         if body.host_type == "managed" and resp.runner_id is None:
             try:
+                await start_native_kickoff(
+                    request,
+                    resp.id,
+                    user_id=user_id,
+                    conversation_store=conversation_store,
+                    agent_store=agent_store,
+                    runner_router=runner_router,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                )
                 await _schedule_managed_launch(
                     request,
                     session_id=resp.id,
@@ -944,10 +956,12 @@ def register_core_routes(
                     workspaces=body.managed_repo_workspaces(),
                 )
             except BaseException:
+                discard_native_kickoff(resp.id)
                 cancel_initial_item_delivery(
                     resp.id, getattr(request.app.state, "managed_launches", None)
                 )
                 raise
+        discard_native_kickoff(resp.id)
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must

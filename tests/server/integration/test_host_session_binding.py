@@ -2220,14 +2220,27 @@ async def test_managed_native_kickoff_passes_the_input_policy_first(
         "_deliver_initial_items_after_launch",
         lambda session_id, *args, **kwargs: scheduled.append(session_id),
     )
+    from omnigent.server.routes.sessions import routes_core
+
     approval = asyncio.Event()
+    events: list[str] = []
+    actors: list[object] = []
+    announce = routes_core._announce_session_added
+
+    def announced(*args, **kwargs):
+        events.append("announced")
+        return announce(*args, **kwargs)
 
     async def policy(request, session_id, conv, item, *args, **kwargs):
+        events.append("policy")
+        actors.append(kwargs.get("actor"))
         if verdict == "deny":
             return {"verdict": "deny", "reason": "kickoffs are not allowed here"}
         await approval.wait()
         return None
 
+    monkeypatch.setattr(routes_core, "_announce_session_added", announced)
+    monkeypatch.setattr(orchestration, "_build_actor", lambda user_id: {"run_as": "creator"})
     monkeypatch.setattr(orchestration, "_evaluate_input_policy", policy)
     agent = await create_test_agent(
         env.client,
@@ -2243,6 +2256,9 @@ async def test_managed_native_kickoff_passes_the_input_policy_first(
         approval.set()
     resp = await asyncio.wait_for(create, 15)
     gate.set()
+    assert "policy" in events, events
+    assert events.index("announced") < events.index("policy")
+    assert actors == [{"run_as": "creator"}]
     if verdict == "deny":
         assert resp.status_code == 403, resp.text
         assert "kickoffs are not allowed here" in resp.text

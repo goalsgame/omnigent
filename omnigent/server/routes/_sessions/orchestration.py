@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -239,6 +240,7 @@ from omnigent.server.routes._sessions.helpers import (
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
+    _build_actor,
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
@@ -11218,35 +11220,11 @@ async def _create_session_from_existing_agent(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 _build_new_item(item, "seed", created_by=_attribution_user(user_id))
-            for item in body.initial_items:
-                verdict = await _evaluate_input_policy(
-                    request,
-                    conv.id,
-                    conv,
-                    item,
-                    conversation_store,
-                    agent_store,
-                    runner_router,
-                    file_store=file_store,
-                    artifact_store=artifact_store,
-                )
-                if verdict is not None:
-                    raise OmnigentError(
-                        str(verdict.get("reason") or "Denied by policy"),
-                        code=ErrorCode.FORBIDDEN,
-                    )
-            _deliver_initial_items_after_launch(
-                conv.id,
-                list(body.initial_items),
-                _managed_tracker.begin(conv.id),
-                conversation_store=conversation_store,
-                runner_router=runner_router,
+            _pending_native_kickoffs[conv.id] = _PendingKickoff(
+                items=list(body.initial_items),
                 agent_name=agent.name,
                 agent_revision=agent.bundle_location,
-                file_store=file_store,
-                artifact_store=artifact_store,
                 created_by=_attribution_user(user_id),
-                host_store=getattr(request.app.state, "host_store", None),
                 background_titles_enabled=background_session_titles_enabled(request.headers),
             )
         elif runner_client is None:
@@ -11321,6 +11299,83 @@ async def _create_session_from_existing_agent(
 _LAUNCH_SETTLE_TIMEOUT_S = 30 * 60.0
 
 _initial_item_deliveries: dict[str, asyncio.Task[None]] = {}
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingKickoff:
+    """A native session's validated initial items, waiting for the create to finish."""
+
+    items: list[Any]
+    agent_name: str
+    agent_revision: str | None
+    created_by: str | None
+    background_titles_enabled: bool
+
+
+_pending_native_kickoffs: dict[str, _PendingKickoff] = {}
+
+
+def discard_native_kickoff(session_id: str) -> None:
+    """Drop a native kickoff the create did not go on to schedule."""
+    _pending_native_kickoffs.pop(session_id, None)
+
+
+async def start_native_kickoff(
+    request: Request,
+    session_id: str,
+    *,
+    user_id: str | None,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    runner_router: RunnerRouter | None,
+    file_store: Any,
+    artifact_store: Any,
+) -> None:
+    """
+    Check a native session's kickoff against the REQUEST policy, then schedule it.
+
+    Runs once the creator owns the session, so an approval it parks on can be
+    seen and resolved; the policy gets the creator as actor, as ``POST /events``
+    does. A denial raises 403 and nothing is scheduled.
+    """
+    pending = _pending_native_kickoffs.pop(session_id, None)
+    tracker = getattr(request.app.state, "managed_launches", None)
+    if pending is None or tracker is None:
+        return
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None:
+        return
+    for item in pending.items:
+        verdict = await _evaluate_input_policy(
+            request,
+            session_id,
+            conv,
+            item,
+            conversation_store,
+            agent_store,
+            runner_router,
+            actor=_build_actor(user_id),
+            file_store=file_store,
+            artifact_store=artifact_store,
+        )
+        if verdict is not None:
+            raise OmnigentError(
+                str(verdict.get("reason") or "Denied by policy"), code=ErrorCode.FORBIDDEN
+            )
+    _deliver_initial_items_after_launch(
+        session_id,
+        pending.items,
+        tracker.begin(session_id),
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        agent_name=pending.agent_name,
+        agent_revision=pending.agent_revision,
+        file_store=file_store,
+        artifact_store=artifact_store,
+        created_by=pending.created_by,
+        host_store=getattr(request.app.state, "host_store", None),
+        background_titles_enabled=pending.background_titles_enabled,
+    )
 
 
 def cancel_initial_item_delivery(session_id: str, tracker: Any) -> None:
