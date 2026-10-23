@@ -21,6 +21,12 @@ class InferenceUpstream:
     def api(self) -> str:
         return "anthropic-messages" if self.kind == "vertex-anthropic" else "openai-completions"
 
+    def serves_anthropic_messages(self, model: str) -> bool:
+        """Whether this upstream accepts the Anthropic messages API for ``model``."""
+        return self.kind == "vertex-anthropic" or (
+            self.kind == "openrouter" and model.startswith("anthropic/")
+        )
+
     @classmethod
     def parse(cls, raw: object) -> InferenceUpstream:
         if not isinstance(raw, dict):
@@ -107,6 +113,10 @@ class InferenceUpstream:
             body["anthropic_version"] = "vertex-2023-10-16"
             action = "streamRawPredict" if body.get("stream") else "rawPredict"
             return f"{self.base_url}/publishers/anthropic/models/{model}:{action}", body
+        if endpoint == "v1/messages":
+            if not self.serves_anthropic_messages(model):
+                raise ValueError("This model does not support the Anthropic messages API")
+            return f"{self.base_url}/messages", body
         if endpoint not in ("chat/completions", "responses"):
             raise ValueError("This model requires an OpenAI-compatible API")
         if self.kind == "vertex-openai":

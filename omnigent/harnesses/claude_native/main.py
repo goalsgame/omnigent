@@ -38,7 +38,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if sys.platform != "win32":
     import termios
     import tty
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -121,6 +121,7 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_ENV_VAR,
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
+    canonical_claude_id,
     claude_model_alias,
     served_canonical_overrides,
 )
@@ -3109,7 +3110,23 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
                 ]
             )
         ),
+        model_overrides=_gateway_canonical_overrides(family.models.values()),
     )
+
+
+def _gateway_canonical_overrides(models: Iterable[str]) -> dict[str, str]:
+    """Canonical Claude ids, dotted or dashed, rewritten to the gateway's served spelling."""
+    served_ids = [model.strip() for model in models]
+    served = set(served_ids)
+    overrides: dict[str, str] = {}
+    for model in served_ids:
+        canonical = canonical_claude_id(model)
+        if canonical is None:
+            continue
+        for spelling in (canonical, canonical.replace(".", "-")):
+            if spelling not in served:
+                overrides.setdefault(spelling, model)
+    return overrides
 
 
 def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:

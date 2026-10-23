@@ -51,6 +51,9 @@ def _finite_json_float(value: str) -> float:
     return result
 
 
+SERVER_INFERENCE_HARNESSES = ("openai-agents", "pi-native", "claude-native", "codex-native")
+
+
 @dataclass(frozen=True)
 class InferenceProxyConfig:
     public_url: str
@@ -81,6 +84,21 @@ class InferenceProxyConfig:
         return self.upstreams[route.upstream], route.model
 
     def model_apis(self, harness: str) -> dict[str, str]:
+        if harness == "claude-native":
+            return {
+                model: "anthropic-messages"
+                for model in self.models
+                if self.upstream_for(model)[0].serves_anthropic_messages(
+                    self.upstream_for(model)[1]
+                )
+            }
+        if harness == "codex-native":
+            return {
+                model: self.upstream_for(model)[0].api
+                for model in self.models
+                if self.upstream_for(model)[0].api != "anthropic-messages"
+                and self.upstream_for(model)[0].kind != "vertex-openai"
+            }
         return {
             model: self.upstream_for(model)[0].api
             for model in self.models
@@ -150,9 +168,11 @@ class InferenceProxyConfig:
         if (
             not isinstance(harnesses, list)
             or not harnesses
-            or any(h not in ("openai-agents", "pi-native") for h in harnesses)
+            or any(h not in SERVER_INFERENCE_HARNESSES for h in harnesses)
         ):
-            raise ValueError("inference_proxy supports openai-agents and pi-native")
+            raise ValueError(
+                "inference_proxy supports openai-agents, pi-native, claude-native and codex-native"
+            )
         limits = {}
         for name, default in (
             ("max_request_bytes", 8 * 1024 * 1024),
@@ -356,6 +376,8 @@ class InferenceProxy:
 
     def _protocol_metadata(self, harness: str) -> dict[str, Any]:
         apis = self.config.model_apis(harness)
+        if harness == "claude-native":
+            return {"model_apis": apis}
         if harness != "pi-native":
             return {}
         return {
@@ -758,7 +780,7 @@ class InferenceProxy:
                             self.conversations.set_labels, session_id, {key: target_model}
                         )
                 provider_headers = {}
-                if selected.kind == "vertex-anthropic" and "anthropic-beta" in request.headers:
+                if endpoint == "v1/messages" and "anthropic-beta" in request.headers:
                     beta = request.headers["anthropic-beta"]
                     if len(beta) > 2048 or re.fullmatch(r"[A-Za-z0-9_, -]+", beta) is None:
                         raise HTTPException(400, "Invalid Anthropic beta features")

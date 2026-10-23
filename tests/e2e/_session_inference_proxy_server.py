@@ -40,6 +40,12 @@ def main() -> None:
         artifact_store=artifacts,
     )
     named_route = os.environ.get("OMNIGENT_E2E_NAMED_ROUTE") == "1"
+    native = os.environ.get("OMNIGENT_E2E_NATIVE", "")
+    native_model = {
+        "claude-native": "anthropic/claude-test",
+        "codex-native": "openai/gpt-test",
+    }.get(native)
+    native_endpoint = {"claude-native": "messages", "codex-native": "responses"}.get(native)
     budget_test = os.environ.get("OMNIGENT_E2E_BUDGET") == "1"
     if budget_test:
         from omnigent.llms import context_window
@@ -63,7 +69,8 @@ def main() -> None:
             "inference_proxy": {
                 "public_url": f"https://127.0.0.1:{port}",
                 "signing_key_env": "OMNIGENT_E2E_SIGNING_KEY",
-                "models": ["friendly-alias" if named_route else "test-model"],
+                "models": [native_model or ("friendly-alias" if named_route else "test-model")],
+                **({"harnesses": [native]} if native else {}),
                 "max_concurrent_requests_per_session": 4,
                 "capacity_wait_timeout_seconds": 5,
                 **({"session_cost_limits": {"local": 0.001}} if budget_test else {}),
@@ -104,12 +111,13 @@ def main() -> None:
             self.inner = httpx.AsyncHTTPTransport()
 
         async def handle_async_request(self, request):
+            endpoint = native_endpoint or "chat/completions"
             expected_url = (
                 "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/endpoints/openapi/chat/completions"
                 if named_route and not budget_test
-                else "https://openrouter.ai/api/v1/chat/completions"
+                else f"https://openrouter.ai/api/v1/{endpoint}"
             )
-            assert str(request.url) == expected_url
+            assert request.url.copy_with(query=None) == httpx.URL(expected_url)
             calls.append(
                 {
                     "authorized": request.headers["authorization"]
@@ -118,7 +126,7 @@ def main() -> None:
                     "vertex": named_route and not budget_test,
                 }
             )
-            request.url = httpx.URL(os.environ["OMNIGENT_E2E_PROVIDER"] + "/v1/chat/completions")
+            request.url = httpx.URL(os.environ["OMNIGENT_E2E_PROVIDER"] + f"/v1/{endpoint}")
             return await self.inner.handle_async_request(request)
 
         async def aclose(self):

@@ -157,6 +157,30 @@ def app(runtime_init: None, db_uri: str, tmp_path, request, monkeypatch) -> Fast
                 "models": ["model-a"],
             },
         }
+    if getattr(request, "param", None) == "native-proxy":
+        from omnigent.server.auth import UnifiedAuthProvider
+        from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+        auth_provider = UnifiedAuthProvider(source="header")
+        permission_store = SqlAlchemyPermissionStore(db_uri)
+        monkeypatch.setenv("TEST_PROXY_KEY", "k" * 32)
+        server_config = {
+            "openrouter_wif": {"policy_id": "test-policy"},
+            "inference_proxy": {
+                "public_url": "https://server.example",
+                "signing_key_env": "TEST_PROXY_KEY",
+                "models": ["anthropic/claude-sonnet-test", "openai/gpt-test"],
+                "harnesses": ["claude-native", "codex-native"],
+                "upstreams": {"router": {"kind": "openrouter"}},
+                "model_routes": {
+                    "anthropic/claude-sonnet-test": {
+                        "upstream": "router",
+                        "model": "anthropic/claude-sonnet-test",
+                    },
+                    "openai/gpt-test": {"upstream": "router", "model": "openai/gpt-test"},
+                },
+            },
+        }
     return create_app(
         server_config=server_config,
         auth_provider=auth_provider,
@@ -4927,3 +4951,104 @@ async def test_hostless_child_snapshot_omits_unrelated_parent_host(client, db_ur
     response = await client.get(f"/v1/sessions/{child.id}")
     assert response.status_code == 200, response.text
     assert response.json()["routing_host_id"] is None
+
+
+@pytest.mark.parametrize("app", ["native-proxy"], indirect=True)
+@pytest.mark.parametrize(
+    "harness,model,endpoint,upstream",
+    [
+        (
+            "claude-native",
+            "anthropic/claude-sonnet-test",
+            "v1/messages?beta=true",
+            "https://openrouter.ai/api/v1/messages",
+        ),
+        ("codex-native", "openai/gpt-test", "responses", "https://openrouter.ai/api/v1/responses"),
+    ],
+)
+async def test_native_cli_session_reaches_the_provider_through_server_inference(
+    client, app, tmp_path, harness, model, endpoint, upstream
+):
+    from omnigent.harnesses.claude_native.main import _native_claude_config_from_entry
+    from omnigent.harnesses.codex_native.app_server import _codex_provider_launch
+    from omnigent.host.inference_proxy import prepare
+    from omnigent.inference_config import binding_for_harness, resolve_bound_provider
+
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHarnessReadinessFrame(configured_harnesses={harness: "needs-auth"})
+            ),
+        }
+    )
+    registry = app.state.host_registry
+    async with asyncio.timeout(budget(2.0)):
+        while not registry.needs_server_inference(registry.get(_HOST_ID), harness):
+            await asyncio.sleep(0.01)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}, include_llm=False
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    assert created.status_code == 201, created.text
+    frame = await responder
+    proxy = frame.inference_config["server_inference"]
+    assert proxy["harness"] == harness
+    assert proxy["models"] == (
+        [model] if harness == "claude-native" else ["anthropic/claude-sonnet-test", model]
+    )
+
+    config = prepare(frame.inference_config, tmp_path / "grants")
+    assert binding_for_harness(config, harness) is not None
+    entry = resolve_bound_provider(config, harness)
+    assert entry is not None
+    if harness == "claude-native":
+        launch = _native_claude_config_from_entry(entry, refresh_models=False)
+        assert launch is not None
+        assert launch.env["ANTHROPIC_BASE_URL"] == proxy["url"]
+        assert launch.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == model
+        assert launch.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == model
+        assert launch.api_key_helper == entry.family("anthropic").auth_command
+    else:
+        launch = _codex_provider_launch(entry, None)
+        assert launch is not None
+        assert launch.model == proxy["models"][0]
+        overrides = "\n".join(launch.config_overrides)
+        assert proxy["url"] in overrides
+        assert "responses" in overrides
+
+    path = proxy["url"].removeprefix("https://server.example")
+    token = await client.post(
+        path + "/token", headers={"Authorization": "Bearer " + proxy["grant"]}
+    )
+    assert token.status_code == 200, token.text
+    bearer = token.json()["token"]
+
+    seen: list[tuple[str, str]] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers["authorization"]))
+        return httpx.Response(200, json={"id": "ok", "model": model})
+
+    inference = app.state.inference_proxy
+
+    async def credential():
+        return {"token": "server-only-provider"}
+
+    inference.broker.credential = credential
+    inference.transport = httpx.MockTransport(provider)
+    response = await client.post(
+        path + "/" + endpoint,
+        headers={"Authorization": "Bearer " + bearer},
+        json={"model": model, "input": "hi"}
+        if harness == "codex-native"
+        else {"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert seen == [(upstream, "Bearer server-only-provider")]
