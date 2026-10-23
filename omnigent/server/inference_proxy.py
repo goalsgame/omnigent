@@ -92,6 +92,13 @@ class InferenceProxyConfig:
                     self.upstream_for(model)[1]
                 )
             }
+        if harness == "codex-native":
+            return {
+                model: self.upstream_for(model)[0].api
+                for model in self.models
+                if self.upstream_for(model)[0].api != "anthropic-messages"
+                and self.upstream_for(model)[0].kind != "vertex-openai"
+            }
         return {
             model: self.upstream_for(model)[0].api
             for model in self.models

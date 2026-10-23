@@ -249,7 +249,16 @@ def resolve_bound_provider(
             family.resolve_model_tier(family.default_model) if family.default_model else None
         )
         if binding.model_allowlist is not None:
-            models = {f"model_{i}": model for i, model in enumerate(binding.model_allowlist)}
+            allowed = set(binding.model_allowlist)
+            aliases = {
+                key: model
+                for key, model in family.models.items()
+                if key != "default" and model in allowed
+            }
+            models = {
+                **aliases,
+                **{f"model_{i}": model for i, model in enumerate(binding.model_allowlist)},
+            }
         if default is not None:
             models["default"] = default
         families[name] = replace(family, models=models)

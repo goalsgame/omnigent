@@ -208,7 +208,7 @@ def runtime_config(proxy: dict, credential: Path) -> dict:
                     "provider": "server-inference",
                     "model_allowlist": proxy["models"],
                     "default_model": proxy["models"][0],
-                    **({"model_apis": apis} if apis else {}),
+                    **({"model_apis": apis} if apis and proxy["harness"] == "pi-native" else {}),
                     **({"model_limits": proxy["model_limits"]} if "model_limits" in proxy else {}),
                     **(
                         {"model_reasoning": proxy["model_reasoning"]}

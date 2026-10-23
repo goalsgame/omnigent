@@ -134,3 +134,56 @@ def test_claude_pins_fall_back_when_a_tier_is_missing():
         "sonnet": "anthropic/claude-sonnet-5.5",
         "haiku": "anthropic/claude-sonnet-5.5",
     }
+
+
+def test_claude_binding_parses_and_keeps_alias_pins(tmp_path):
+    from omnigent.inference_config import binding_for_harness, resolve_bound_provider
+
+    sonnet = "anthropic/claude-sonnet-5.5"
+    proxy = {
+        "url": URL,
+        "grant": "g" * 64,
+        "harness": "claude-native",
+        "models": [sonnet],
+        "model_apis": {sonnet: "anthropic-messages"},
+    }
+    config = prepare({"server_inference": proxy}, tmp_path / "grants")
+    assert "model_apis" not in config["inference"]["harnesses"]["claude-native"]
+    assert binding_for_harness(config, "claude-native") is not None
+    entry = resolve_bound_provider(config, "claude-native")
+    assert entry is not None
+    models = entry.family("anthropic").models
+    assert models["sonnet"] == sonnet
+    assert models["haiku"] == sonnet
+    assert models["default"] == sonnet
+
+
+def test_codex_excludes_chat_only_vertex_routes(monkeypatch):
+    vertex = {"kind": "vertex-openai", "project": "example-project", "location": "global"}
+    monkeypatch.setenv("TEST_SIGNING_KEY", "k" * 32)
+    base = {
+        "public_url": "https://server.example",
+        "signing_key_env": "TEST_SIGNING_KEY",
+        "models": ["google/gemini-test", "openai/gpt-test"],
+        "upstreams": {"vertex": vertex, "router": {"kind": "openrouter"}},
+        "model_routes": {
+            "google/gemini-test": {"upstream": "vertex", "model": "gemini-test"},
+            "openai/gpt-test": {"upstream": "router", "model": "openai/gpt-test"},
+        },
+    }
+    config = InferenceProxyConfig.parse({**base, "harnesses": ["codex-native", "openai-agents"]})
+    assert config is not None
+    assert list(config.model_apis("codex-native")) == ["openai/gpt-test"]
+    assert set(config.model_apis("openai-agents")) == {"google/gemini-test", "openai/gpt-test"}
+    with pytest.raises(ValueError, match="compatible model"):
+        InferenceProxyConfig.parse(
+            {
+                **base,
+                "models": ["google/gemini-test"],
+                "upstreams": {"vertex": vertex},
+                "model_routes": {
+                    "google/gemini-test": {"upstream": "vertex", "model": "gemini-test"}
+                },
+                "harnesses": ["codex-native"],
+            }
+        )
