@@ -209,3 +209,16 @@ def test_claude_gateway_launch_rewrites_canonical_fallback_ids(tmp_path):
     assert launch.model_overrides["claude-opus-4-8"] == opus
     assert launch.model_overrides["claude-opus-4.8"] == opus
     assert set(launch.model_overrides.values()) == {opus}
+
+
+@pytest.mark.parametrize(
+    "served", ["anthropic/claude-opus-4.8", "claude-opus-4.8", "claude-opus-4-8"]
+)
+def test_gateway_overrides_cover_every_spelling_of_a_served_claude_id(served):
+    from omnigent.harnesses.claude_native.main import _gateway_canonical_overrides
+
+    overrides = _gateway_canonical_overrides([served, "openai/gpt-test"])
+    if served != "claude-opus-4-8":
+        assert overrides["claude-opus-4-8"] == served
+    assert served not in overrides
+    assert set(overrides.values()) <= {served}

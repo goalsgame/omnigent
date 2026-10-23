@@ -121,6 +121,7 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_ENV_VAR,
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
+    canonical_claude_id,
     claude_model_alias,
     served_canonical_overrides,
 )
@@ -3116,9 +3117,14 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
 def _gateway_canonical_overrides(models: Iterable[str]) -> dict[str, str]:
     """Canonical Claude ids, dotted or dashed, rewritten to the gateway's served spelling."""
     overrides: dict[str, str] = {}
-    for canonical, served in served_canonical_overrides(models).items():
-        overrides.setdefault(canonical, served)
-        overrides.setdefault(canonical.replace(".", "-"), served)
+    for model in models:
+        served = model.strip()
+        canonical = canonical_claude_id(served)
+        if canonical is None:
+            continue
+        for spelling in (canonical, canonical.replace(".", "-")):
+            if spelling != served:
+                overrides.setdefault(spelling, served)
     return overrides
 
 
