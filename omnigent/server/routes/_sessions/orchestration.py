@@ -11218,6 +11218,23 @@ async def _create_session_from_existing_agent(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 _build_new_item(item, "seed", created_by=_attribution_user(user_id))
+            for item in body.initial_items:
+                verdict = await _evaluate_input_policy(
+                    request,
+                    conv.id,
+                    conv,
+                    item,
+                    conversation_store,
+                    agent_store,
+                    runner_router,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                )
+                if verdict is not None:
+                    raise OmnigentError(
+                        str(verdict.get("reason") or "Denied by policy"),
+                        code=ErrorCode.FORBIDDEN,
+                    )
             _deliver_initial_items_after_launch(
                 conv.id,
                 list(body.initial_items),
@@ -11360,7 +11377,7 @@ def _deliver_initial_items_after_launch(
             if launch.error is not None:
                 return
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
+            if conv is None or conv.archived:
                 return
             runner_client = await _get_runner_client(session_id, runner_router, conversation=conv)
             if runner_client is None:

@@ -1983,7 +1983,7 @@ def _delivery_env(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     from omnigent.server.routes._sessions import orchestration
 
     order: list[str] = []
-    conv = SimpleNamespace(id="sess", runner_id="runner-1")
+    conv = SimpleNamespace(id="sess", runner_id="runner-1", archived=False)
 
     async def runner_client(session_id, router, conversation=None):
         return object()
@@ -2001,6 +2001,7 @@ def _delivery_env(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", relay_ready)
     monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
     monkeypatch.setattr(orchestration, "_test_store", store, raising=False)
+    monkeypatch.setattr(orchestration, "_test_conv", conv, raising=False)
     return order
 
 
@@ -2170,3 +2171,82 @@ async def test_rejected_managed_create_abandons_initial_delivery(
     assert orchestration._initial_item_deliveries == before
     tracker = env.app.state.managed_launches
     assert all(entry.settled.is_set() for entry in tracker._by_session.values())
+
+
+async def test_initial_item_delivery_skips_an_archived_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    order = _delivery_env(monkeypatch)
+    orchestration._test_conv.archived = True
+    launch = ManagedLaunch(settled=asyncio.Event())
+    launch.settled.set()
+    _start_delivery(launch)
+    await orchestration.await_initial_item_delivery("sess")
+    assert order == []
+
+
+def _kickoff_body(agent_id: str) -> dict:
+    return {
+        "agent_id": agent_id,
+        "host_type": "managed",
+        "initial_items": [
+            {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "kick off"}]},
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("verdict", ["deny", "approve"])
+async def test_managed_native_kickoff_passes_the_input_policy_first(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch, verdict: str
+) -> None:
+    import threading
+
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    gate = threading.Event()
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(provision_gate=gate, fail_on_host_start=True)
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_deliver_initial_items_after_launch",
+        lambda session_id, *args, **kwargs: scheduled.append(session_id),
+    )
+    approval = asyncio.Event()
+
+    async def policy(request, session_id, conv, item, *args, **kwargs):
+        if verdict == "deny":
+            return {"verdict": "deny", "reason": "kickoffs are not allowed here"}
+        await approval.wait()
+        return None
+
+    monkeypatch.setattr(orchestration, "_evaluate_input_policy", policy)
+    agent = await create_test_agent(
+        env.client,
+        name=f"managed-policy-{verdict}-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    create = asyncio.create_task(env.client.post("/v1/sessions", json=_kickoff_body(agent["id"])))
+    if verdict == "approve":
+        await asyncio.sleep(0.2)
+        assert not create.done()
+        assert scheduled == []
+        approval.set()
+    resp = await asyncio.wait_for(create, 15)
+    gate.set()
+    if verdict == "deny":
+        assert resp.status_code == 403, resp.text
+        assert "kickoffs are not allowed here" in resp.text
+        assert scheduled == []
+    else:
+        assert resp.status_code == 201, resp.text
+        assert scheduled == [resp.json()["id"]]
