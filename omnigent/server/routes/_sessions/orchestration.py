@@ -11202,7 +11202,30 @@ async def _create_session_from_existing_agent(
             runner_router,
             conversation=conv,
         )
-        if runner_client is None:
+        _managed_tracker = getattr(request.app.state, "managed_launches", None)
+        if (
+            runner_client is None
+            and body.host_type == "managed"
+            and _managed_tracker is not None
+            and _is_native_terminal_session(conv)
+        ):
+            # A native terminal records no seeded history, so its runner never
+            # replays one; hand the items to the terminal once the sandbox is up.
+            _deliver_initial_items_after_launch(
+                conv.id,
+                list(body.initial_items),
+                _managed_tracker,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                agent_name=agent.name,
+                agent_revision=agent.bundle_location,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                created_by=_attribution_user(user_id),
+                host_store=getattr(request.app.state, "host_store", None),
+                background_titles_enabled=background_session_titles_enabled(request.headers),
+            )
+        elif runner_client is None:
             # No runner bound — persist initial items as history-only
             # seed via the conversation store. No execution fires; the
             # caller is responsible for binding a runner and posting a
@@ -11268,6 +11291,89 @@ async def _create_session_from_existing_agent(
         request=request,
     )
     return response, conv
+
+
+_initial_item_deliveries: set[asyncio.Task[None]] = set()
+
+
+_LAUNCH_REGISTRATION_TIMEOUT_S = 30.0
+
+
+def _deliver_initial_items_after_launch(
+    session_id: str,
+    items: list[Any],
+    tracker: Any,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    agent_name: str,
+    agent_revision: str | None,
+    file_store: Any,
+    artifact_store: Any,
+    created_by: str | None,
+    host_store: Any,
+    background_titles_enabled: bool,
+) -> None:
+    """
+    Dispatch a native session's initial items once its managed launch settles.
+
+    The same rendezvous a first ``POST /events`` takes, run in the background so
+    the create still returns before the sandbox exists. The create registers the
+    launch after its initial items, so this first waits for that registration.
+    Failures are logged; the launch tracker already reports a failed launch.
+    """
+
+    async def deliver() -> None:
+        try:
+            deadline = time.monotonic() + _LAUNCH_REGISTRATION_TIMEOUT_S
+            while (launch := tracker.get(session_id)) is None:
+                if time.monotonic() > deadline:
+                    _logger.warning(
+                        "Managed launch never registered; initial items not delivered for %s",
+                        session_id,
+                    )
+                    return
+                await asyncio.sleep(0.05)
+            await _await_settled_managed_launch(launch)
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                return
+            runner_client = await _get_runner_client(session_id, runner_router, conversation=conv)
+            if runner_client is None:
+                _logger.warning(
+                    "No runner after managed launch; initial items not delivered for %s",
+                    session_id,
+                )
+                return
+            await _ensure_runner_relay_ready(
+                session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
+            )
+            for item in items:
+                await _dispatch_session_event_to_runner(
+                    session_id,
+                    conv,
+                    item,
+                    conversation_store,
+                    runner_client,
+                    agent_name=agent_name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                    created_by=created_by,
+                    runner_router=runner_router,
+                    host_store=host_store,
+                    background_titles_enabled=background_titles_enabled,
+                    agent_revision=agent_revision,
+                )
+        except Exception:  # noqa: BLE001 — background delivery must not crash the loop
+            _logger.warning(
+                "Failed to deliver initial items for native session %s",
+                session_id,
+                exc_info=True,
+            )
+
+    task = asyncio.create_task(deliver(), name=f"initial-items-{session_id}")
+    _initial_item_deliveries.add(task)
+    task.add_done_callback(_initial_item_deliveries.discard)
 
 
 def _create_session_from_bundle(

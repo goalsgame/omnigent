@@ -1913,3 +1913,126 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     assert getattr(events[0], "attributes", {})["runner_id"] == "runner_crashed"
     # The tunnel survived the callback error, so the host is still registered.
     assert app.state.host_registry.get(_HOST_ID) is not None
+
+
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi-native", "openai-agents"]
+)
+async def test_managed_native_create_hands_initial_items_to_the_terminal(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+) -> None:
+    """A managed native session's kickoff reaches its terminal once the sandbox is up.
+
+    A native terminal records no seeded history, so storing the kickoff as a
+    seed leaves it unanswered. An in-process harness keeps the seed path,
+    which its runner replays.
+    """
+    import threading
+
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    gate = threading.Event()
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(provision_gate=gate, fail_on_host_start=True)
+    )
+    deliveries: list[tuple[str, list]] = []
+
+    def capture(session_id, items, launch, **kwargs):
+        deliveries.append((session_id, items))
+
+    monkeypatch.setattr(orchestration, "_deliver_initial_items_after_launch", capture)
+    agent = await create_test_agent(
+        env.client,
+        name=f"managed-{harness}-agent",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "kick off"}],
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    items = (await env.client.get(f"/v1/sessions/{session_id}")).json().get("items") or []
+    if harness != "openai-agents":
+        assert [session for session, _ in deliveries] == [session_id]
+        assert deliveries[0][1][0].data["content"][0]["text"] == "kick off"
+        assert not [item for item in items if item.get("type") == "message"]
+    else:
+        assert deliveries == []
+        assert [item["type"] for item in items] == ["message"]
+    gate.set()
+
+
+async def test_initial_item_delivery_waits_for_the_launch_then_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    order: list[str] = []
+    launch_done = asyncio.Event()
+    conv = SimpleNamespace(id="sess", runner_id="runner-1")
+
+    async def settled(launch):
+        assert launch == "launch"
+        await launch_done.wait()
+        order.append("settled")
+
+    tracker = SimpleNamespace(entries={})
+    tracker.get = tracker.entries.get
+
+    async def runner_client(session_id, router, conversation=None):
+        return object()
+
+    async def relay_ready(*args, **kwargs):
+        order.append("relay")
+
+    async def dispatch(session_id, conv, item, *args, **kwargs):
+        order.append(f"dispatch:{item}")
+
+    store = Mock()
+    store.get_conversation.return_value = conv
+    monkeypatch.setattr(orchestration, "_await_settled_managed_launch", settled)
+    monkeypatch.setattr(orchestration, "_get_runner_client", runner_client)
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", relay_ready)
+    monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
+    orchestration._deliver_initial_items_after_launch(
+        "sess",
+        ["first", "second"],
+        tracker,
+        conversation_store=store,
+        runner_router=None,
+        agent_name="goals-claude",
+        agent_revision=None,
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        host_store=None,
+        background_titles_enabled=False,
+    )
+    await asyncio.sleep(0.1)
+    assert order == []
+    tracker.entries["sess"] = "launch"
+    await asyncio.sleep(0.1)
+    assert order == []
+    launch_done.set()
+    for _ in range(20):
+        if len(order) == 4:
+            break
+        await asyncio.sleep(0.01)
+    assert order == ["settled", "relay", "dispatch:first", "dispatch:second"]
