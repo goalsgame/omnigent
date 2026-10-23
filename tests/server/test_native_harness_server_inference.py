@@ -222,3 +222,14 @@ def test_gateway_overrides_cover_every_spelling_of_a_served_claude_id(served):
         assert overrides["claude-opus-4-8"] == served
     assert served not in overrides
     assert set(overrides.values()) <= {served}
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_gateway_overrides_never_redirect_a_served_id(first):
+    from omnigent.harnesses.claude_native.main import _gateway_canonical_overrides
+
+    models = ["anthropic/claude-opus-4.8", "claude-opus-4-8"]
+    overrides = _gateway_canonical_overrides(models if first else list(reversed(models)))
+    assert "claude-opus-4-8" not in overrides
+    assert "anthropic/claude-opus-4.8" not in overrides
+    assert overrides["claude-opus-4.8"] in models

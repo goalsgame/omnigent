@@ -3116,15 +3116,16 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
 
 def _gateway_canonical_overrides(models: Iterable[str]) -> dict[str, str]:
     """Canonical Claude ids, dotted or dashed, rewritten to the gateway's served spelling."""
+    served_ids = [model.strip() for model in models]
+    served = set(served_ids)
     overrides: dict[str, str] = {}
-    for model in models:
-        served = model.strip()
-        canonical = canonical_claude_id(served)
+    for model in served_ids:
+        canonical = canonical_claude_id(model)
         if canonical is None:
             continue
         for spelling in (canonical, canonical.replace(".", "-")):
-            if spelling != served:
-                overrides.setdefault(spelling, served)
+            if spelling not in served:
+                overrides.setdefault(spelling, model)
     return overrides
 
 
