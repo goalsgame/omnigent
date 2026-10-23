@@ -1377,3 +1377,117 @@ async def test_relay_advertises_agent_mcp_tools_through_the_server_proxy(
             await c.delete(f"/v1/sessions/{session_id}")
     finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+def _connectors_spec(name: str) -> AgentSpec:
+    from omnigent.spec.types import MCPServerConfig
+
+    return AgentSpec(
+        spec_version=1,
+        name=name,
+        mcp_servers=[
+            MCPServerConfig(
+                name="connectors",
+                transport="stdio",
+                command="python3",
+                args=["-m", "omnigent.host.mcp_identity"],
+            )
+        ],
+    )
+
+
+def _mcp_result(names: list[str], failures: dict[str, str] | None = None) -> Any:
+    from omnigent.runner.mcp_manager import McpSchemasResult
+
+    return McpSchemasResult(
+        schemas=[{"name": n, "description": n, "parameters": {}} for n in names],
+        tool_names=set(names),
+        failures=failures or {},
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_retries_an_incomplete_mcp_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connector that failed to list is listed again on a later relay ensure."""
+    from omnigent.runner import app as runner_app
+
+    results = [
+        _mcp_result([], {"connectors": "temporarily unavailable"}),
+        _mcp_result(["backstage_find_entity"]),
+    ]
+
+    async def schemas_for(self: object, spec: AgentSpec) -> Any:
+        return results.pop(0)
+
+    monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
+    monkeypatch.setattr(runner_app, "_MCP_RELAY_RETRY_S", 0.0)
+    agent_id = "ag_connectors"
+    app = _switch_app(
+        tmp_path, _SwitchableServerClient(agent_id), {agent_id: _connectors_spec("connectors")}
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as c:
+            await _launch_bridged(c, session_id)
+            assert "backstage_find_entity" not in _relay_tool_names(relay_file)
+            await _launch_bridged(c, session_id)
+            assert "backstage_find_entity" in _relay_tool_names(relay_file)
+            assert results == []
+            await c.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_slow_mcp_listing_does_not_replace_a_newer_agents_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent switch during agent A's MCP listing keeps agent B's relay."""
+    import asyncio
+
+    from omnigent.runner import app as runner_app
+
+    listing_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def schemas_for(self: object, spec: AgentSpec) -> Any:
+        listing_started.set()
+        await release.wait()
+        return _mcp_result(["backstage_find_entity"])
+
+    monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
+    agent_a, agent_b = "ag_connectors", "ag_plain"
+    server_client = _SwitchableServerClient(agent_a)
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {agent_a: _connectors_spec("connectors"), agent_b: _spec_without_terminals()},
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as c:
+            first = asyncio.create_task(_launch_terminal(c, session_id, bridge_inject_dir=True))
+            await asyncio.wait_for(listing_started.wait(), 10)
+            server_client.agent_id = agent_b
+            await _reset_state(c, session_id)
+            await _launch_bridged(c, session_id)
+            assert "backstage_find_entity" not in _relay_tool_names(relay_file)
+            release.set()
+            await first
+            assert "backstage_find_entity" not in _relay_tool_names(relay_file)
+            assert "list_comments" in _relay_tool_names(relay_file)
+            await c.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)

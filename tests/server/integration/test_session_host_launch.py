@@ -5055,9 +5055,12 @@ async def test_native_cli_session_reaches_the_provider_through_server_inference(
 
 
 @pytest.mark.parametrize("app", ["native-proxy"], indirect=True)
-@pytest.mark.parametrize("asks_for_between_tools", [True, False])
+@pytest.mark.parametrize(
+    "thinking,asks_for_between_tools",
+    [({"type": "disabled"}, True), ({"type": "disabled"}, False), (True, True), ("x", True)],
+)
 async def test_messages_proxy_retries_disabled_thinking_as_between_tools(
-    client, app, asks_for_between_tools
+    client, app, thinking, asks_for_between_tools
 ):
     client.headers["X-Forwarded-Email"] = "alice@example.com"
     comm = await _connect_host(app, inference=True)
@@ -5101,7 +5104,7 @@ async def test_messages_proxy_retries_disabled_thinking_as_between_tools(
     def provider(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         sent.append(body)
-        if body["thinking"]["type"] == "disabled":
+        if body["thinking"] != {"type": "between_tools"}:
             return httpx.Response(
                 400,
                 json={
@@ -5124,11 +5127,11 @@ async def test_messages_proxy_retries_disabled_thinking_as_between_tools(
         json={
             "model": "anthropic/claude-sonnet-test",
             "max_tokens": 16,
-            "thinking": {"type": "disabled"},
+            "thinking": thinking,
             "messages": [{"role": "user", "content": "classify"}],
         },
     )
-    if asks_for_between_tools:
+    if asks_for_between_tools and isinstance(thinking, dict):
         assert response.status_code == 200, response.text
         assert [body["thinking"] for body in sent] == [
             {"type": "disabled"},
@@ -5136,4 +5139,4 @@ async def test_messages_proxy_retries_disabled_thinking_as_between_tools(
         ]
     else:
         assert response.status_code == 502
-        assert [body["thinking"] for body in sent] == [{"type": "disabled"}]
+        assert [body["thinking"] for body in sent] == [thinking]

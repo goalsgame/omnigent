@@ -55,10 +55,12 @@ async def _refuses_disabled_thinking(
     endpoint: str, payload: dict[str, Any], response: httpx.Response
 ) -> bool:
     """Whether a messages upstream refused ``thinking: disabled`` for ``between_tools``."""
+    thinking = payload.get("thinking")
     if (
         endpoint != "v1/messages"
         or response.status_code != 400
-        or (payload.get("thinking") or {}).get("type") != "disabled"
+        or not isinstance(thinking, dict)
+        or thinking.get("type") != "disabled"
     ):
         return False
     body = await response.aread()
