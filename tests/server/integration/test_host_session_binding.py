@@ -2092,6 +2092,7 @@ async def test_follow_up_waits_for_the_initial_items(monkeypatch: pytest.MonkeyP
             "type": "message",
             "data": {"role": "assistant", "content": [{"type": "output_text", "text": "x"}]},
         },
+        {"type": "interrupt", "data": {}},
     ],
 )
 async def test_managed_native_create_rejects_invalid_initial_items(
@@ -2125,3 +2126,47 @@ async def test_managed_native_create_rejects_invalid_initial_items(
     gate.set()
     assert 400 <= resp.status_code < 500, resp.text
     assert scheduled == []
+
+
+async def test_rejected_managed_create_abandons_initial_delivery(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    scheduled: list[str] = []
+    original = orchestration._deliver_initial_items_after_launch
+
+    def record(session_id, *args, **kwargs):
+        scheduled.append(session_id)
+        original(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "_deliver_initial_items_after_launch", record)
+    monkeypatch.setattr(env.app.state, "sandbox_config", None)
+    before = dict(orchestration._initial_item_deliveries)
+    agent = await create_test_agent(
+        env.client,
+        name="managed-rejected-native-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "managed hosts are not configured" in resp.text
+    assert len(scheduled) == 1
+    await asyncio.sleep(0)
+    assert orchestration._initial_item_deliveries == before
+    tracker = env.app.state.managed_launches
+    assert all(entry.settled.is_set() for entry in tracker._by_session.values())

@@ -186,6 +186,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _run_managed_launch,
     _spawn_archive_stop,
     _validate_session_model_selection,
+    cancel_initial_item_delivery,
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
@@ -933,14 +934,20 @@ def register_core_routes(
         # synchronously.
         launch_host_id = body.host_id or resp.host_id
         if body.host_type == "managed" and resp.runner_id is None:
-            await _schedule_managed_launch(
-                request,
-                session_id=resp.id,
-                agent_id=conv.agent_id if conv is not None else None,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=body.managed_repo_workspaces(),
-            )
+            try:
+                await _schedule_managed_launch(
+                    request,
+                    session_id=resp.id,
+                    agent_id=conv.agent_id if conv is not None else None,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=body.managed_repo_workspaces(),
+                )
+            except BaseException:
+                cancel_initial_item_delivery(
+                    resp.id, getattr(request.app.state, "managed_launches", None)
+                )
+                raise
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must

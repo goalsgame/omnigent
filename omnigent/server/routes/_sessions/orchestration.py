@@ -11212,12 +11212,12 @@ async def _create_session_from_existing_agent(
             # A native terminal records no seeded history, so its runner never
             # replays one; hand the items to the terminal once the sandbox is up.
             for item in body.initial_items:
-                _build_new_item(item, "seed", created_by=_attribution_user(user_id))
                 if item.type != "message" or item.data.get("role") != "user":
                     raise OmnigentError(
                         "A native session's initial items must be user messages",
                         code=ErrorCode.INVALID_INPUT,
                     )
+                _build_new_item(item, "seed", created_by=_attribution_user(user_id))
             _deliver_initial_items_after_launch(
                 conv.id,
                 list(body.initial_items),
@@ -11304,6 +11304,16 @@ async def _create_session_from_existing_agent(
 _LAUNCH_SETTLE_TIMEOUT_S = 30 * 60.0
 
 _initial_item_deliveries: dict[str, asyncio.Task[None]] = {}
+
+
+def cancel_initial_item_delivery(session_id: str, tracker: Any) -> None:
+    """Abandon a session's pending initial delivery when its managed launch was not scheduled."""
+    task = _initial_item_deliveries.pop(session_id, None)
+    if task is not None:
+        task.cancel()
+    launch = tracker.get(session_id) if tracker is not None else None
+    if launch is not None and not launch.settled.is_set():
+        tracker.fail(session_id, "managed launch was not scheduled")
 
 
 async def await_initial_item_delivery(session_id: str) -> None:
