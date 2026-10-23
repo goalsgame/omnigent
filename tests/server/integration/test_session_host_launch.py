@@ -5052,3 +5052,88 @@ async def test_native_cli_session_reaches_the_provider_through_server_inference(
     )
     assert response.status_code == 200, response.text
     assert seen == [(upstream, "Bearer server-only-provider")]
+
+
+@pytest.mark.parametrize("app", ["native-proxy"], indirect=True)
+@pytest.mark.parametrize("asks_for_between_tools", [True, False])
+async def test_messages_proxy_retries_disabled_thinking_as_between_tools(
+    client, app, asks_for_between_tools
+):
+    client.headers["X-Forwarded-Email"] = "alice@example.com"
+    comm = await _connect_host(app, inference=True)
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHarnessReadinessFrame(configured_harnesses={"claude-native": "needs-auth"})
+            ),
+        }
+    )
+    registry = app.state.host_registry
+    async with asyncio.timeout(budget(2.0)):
+        while not registry.needs_server_inference(registry.get(_HOST_ID), "claude-native"):
+            await asyncio.sleep(0.01)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    assert created.status_code == 201, created.text
+    proxy = (await responder).inference_config["server_inference"]
+    path = proxy["url"].removeprefix("https://server.example")
+    token = await client.post(
+        path + "/token", headers={"Authorization": "Bearer " + proxy["grant"]}
+    )
+    bearer = token.json()["token"]
+
+    sent: list[dict] = []
+    refusal = (
+        'To turn thinking off on this model, send "thinking": {"type": "between_tools"}'
+        if asks_for_between_tools
+        else "max_tokens is too large"
+    )
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sent.append(body)
+        if body["thinking"]["type"] == "disabled":
+            return httpx.Response(
+                400,
+                json={
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": refusal},
+                },
+            )
+        return httpx.Response(200, json={"id": "ok", "type": "message", "content": []})
+
+    inference = app.state.inference_proxy
+
+    async def credential():
+        return {"token": "server-only-provider"}
+
+    inference.broker.credential = credential
+    inference.transport = httpx.MockTransport(provider)
+    response = await client.post(
+        path + "/v1/messages?beta=true",
+        headers={"Authorization": "Bearer " + bearer},
+        json={
+            "model": "anthropic/claude-sonnet-test",
+            "max_tokens": 16,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "classify"}],
+        },
+    )
+    if asks_for_between_tools:
+        assert response.status_code == 200, response.text
+        assert [body["thinking"] for body in sent] == [
+            {"type": "disabled"},
+            {"type": "between_tools"},
+        ]
+    else:
+        assert response.status_code == 502
+        assert [body["thinking"] for body in sent] == [{"type": "disabled"}]

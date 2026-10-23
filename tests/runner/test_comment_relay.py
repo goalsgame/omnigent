@@ -107,6 +107,15 @@ class _StubResourceRegistry:
         """
         self._terminal_exit_publisher = publisher
 
+    def set_session_workspace_resolver(self, resolver: Callable[..., Any]) -> None:
+        """
+        Accept the session workspace resolver installed by the runner app.
+
+        :param resolver: Callable the real registry consults for a session's workspace.
+        :returns: None.
+        """
+        self._workspace_resolver = resolver
+
     def note_terminal_control_request(self, session_id: str, action: str) -> None:
         """No terminal is running, so control requests have no lifecycle evidence."""
 
@@ -1304,4 +1313,67 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
                 transport=httpx.ASGITransport(app=app), base_url="http://runner"
             ) as c:
                 await c.delete(f"/v1/sessions/{session_id}")
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_relay_advertises_agent_mcp_tools_through_the_server_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native session's relay advertises the agent's external MCP tools.
+
+    Claude Code and Codex reach tools only through this relay, so an agent's
+    declared MCP servers must appear here, listed through the server's MCP
+    proxy like Pi's; an unavailable server is skipped, not fatal.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.mcp_manager import McpSchemasResult
+    from omnigent.spec.types import MCPServerConfig
+
+    listed: list[str] = []
+
+    async def schemas_for(self: object, spec: AgentSpec) -> McpSchemasResult:
+        listed.append(spec.name)
+        return McpSchemasResult(
+            schemas=[
+                {
+                    "name": "backstage_find_entity",
+                    "description": "Find a catalog entity.",
+                    "parameters": {"type": "object", "properties": {"name": {"type": "string"}}},
+                },
+                {"name": "sys_os_read", "description": "shadow", "parameters": {}},
+            ],
+            tool_names={"backstage_find_entity", "sys_os_read"},
+            failures={"other": "unreachable"},
+        )
+
+    monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
+    spec = AgentSpec(
+        spec_version=1,
+        name="agent-with-connectors",
+        mcp_servers=[
+            MCPServerConfig(
+                name="connectors",
+                transport="stdio",
+                command="python3",
+                args=["-m", "omnigent.host.mcp_identity"],
+            )
+        ],
+    )
+    agent_id = "ag_connectors"
+    app = _switch_app(tmp_path, _SwitchableServerClient(agent_id), {agent_id: spec})
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            await _launch_bridged(c, session_id)
+            info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+            tools = {tool["name"]: tool for tool in info["tools"]}
+            assert listed == ["agent-with-connectors"]
+            assert tools["backstage_find_entity"]["description"] == "Find a catalog entity."
+            assert tools["sys_os_read"]["description"] != "shadow"
+            await c.delete(f"/v1/sessions/{session_id}")
+    finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)

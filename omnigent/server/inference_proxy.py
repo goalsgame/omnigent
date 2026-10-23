@@ -51,6 +51,20 @@ def _finite_json_float(value: str) -> float:
     return result
 
 
+async def _refuses_disabled_thinking(
+    endpoint: str, payload: dict[str, Any], response: httpx.Response
+) -> bool:
+    """Whether a messages upstream refused ``thinking: disabled`` for ``between_tools``."""
+    if (
+        endpoint != "v1/messages"
+        or response.status_code != 400
+        or (payload.get("thinking") or {}).get("type") != "disabled"
+    ):
+        return False
+    body = await response.aread()
+    return b"between_tools" in body
+
+
 SERVER_INFERENCE_HARNESSES = ("openai-agents", "pi-native", "claude-native", "codex-native")
 
 
@@ -808,20 +822,29 @@ class InferenceProxy:
                     conv, _ = await self.authorize(session_id, access, workspace_id=workspace)
                     with workspace_scope(workspace):
                         await asyncio.to_thread(self._check_cost_limit, conv)
+                    headers = {
+                        "Authorization": "Bearer " + upstream_token,
+                        "Content-Type": "application/json",
+                        "Accept-Encoding": "identity",
+                        **provider_headers,
+                    }
                     upstream = await client.send(
                         client.build_request(
-                            "POST",
-                            target_url,
-                            json=upstream_payload,
-                            headers={
-                                "Authorization": "Bearer " + upstream_token,
-                                "Content-Type": "application/json",
-                                "Accept-Encoding": "identity",
-                                **provider_headers,
-                            },
+                            "POST", target_url, json=upstream_payload, headers=headers
                         ),
                         stream=True,
                     )
+                    if await _refuses_disabled_thinking(endpoint, upstream_payload, upstream):
+                        await upstream.aclose()
+                        upstream = await client.send(
+                            client.build_request(
+                                "POST",
+                                target_url,
+                                json={**upstream_payload, "thinking": {"type": "between_tools"}},
+                                headers=headers,
+                            ),
+                            stream=True,
+                        )
 
                 async def disconnected():
                     while True:

@@ -4614,6 +4614,32 @@ def create_runner_app(
         del _session_comment_relays[session_id]
         relay.close()
 
+    async def _native_relay_mcp_schemas(
+        session_id: str, spec: Any, registered: set[str]
+    ) -> list[_JsonObject]:
+        """The agent's external MCP tools, reached through the server's MCP proxy."""
+        if server_client is None or spec is None or not getattr(spec, "mcp_servers", None):
+            return []
+        try:
+            result = await ProxyMcpManager(session_id, server_client).schemas_for(spec)
+        except Exception:  # noqa: BLE001 — external tools are additive
+            _logger.warning(
+                "Failed to list MCP tools for native session %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return []
+        for server, error in result.failures.items():
+            _logger.warning(
+                "Native MCP %r unavailable for session %s: %s",
+                server,
+                session_id,
+                error,
+                extra={"session_id": session_id},
+            )
+        return [schema for schema in result.schemas if schema["name"] not in registered]
+
     async def _ensure_comment_relay_started(
         session_id: str,
         *,
@@ -4693,6 +4719,13 @@ def create_runner_app(
 
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
             _unwrap_spec_entry(spec_entry)
+        )
+        relay_schemas.extend(
+            await _native_relay_mcp_schemas(
+                session_id,
+                _unwrap_spec_entry(spec_entry),
+                {str(schema["name"]) for schema in relay_schemas},
+            )
         )
 
         _captured_session_id = session_id
