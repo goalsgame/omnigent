@@ -263,10 +263,12 @@ def test_lore_credentials_bind_host_owner_and_repository() -> None:
     from types import SimpleNamespace
     from unittest.mock import Mock
 
+    from omnigent.server.lore import LoreConfig
+
     remote = "lores://lore.example.test/game"
     app = FastAPI()
     broker = SimpleNamespace(
-        lore_config=SimpleNamespace(repositories={remote: "/Content\n"}),
+        lore_config=LoreConfig(None, {remote: "/Content\n"}, ()),
         credential=Mock(return_value="short-lived"),
     )
     app.state.lore_identity_broker = broker
@@ -287,3 +289,45 @@ def test_lore_credentials_bind_host_owner_and_repository() -> None:
     assert response.headers["cache-control"] == "no-store"
     assert response.json() == {"connected": True, "token": "short-lived", "view": "/Content\n"}
     broker.credential.assert_called_once_with("alice@example.com")
+
+
+@pytest.mark.parametrize(
+    ("remote", "status", "view"),
+    [
+        ("lores://lore.example.test/goalables/app", 200, "/Prefix\n"),
+        ("lores://lore.example.test/goalables/exact", 200, "/Exact\n"),
+        ("lores://lore.example.test/goalables/a/b", 403, None),
+        ("lores://lore.example.test/goalables/..", 403, None),
+        ("lores://lore.example.test/goalables/app?x=1", 403, None),
+        ("lores://lore.example.test/goalables/", 403, None),
+        ("lores://lore.example.test/Goalables/app", 403, None),
+    ],
+)
+def test_lore_prefix_credentials(remote, status, view) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omnigent.server.lore import LoreConfig
+
+    app = FastAPI()
+    app.state.lore_identity_broker = SimpleNamespace(
+        lore_config=LoreConfig(
+            None,
+            {
+                "lores://lore.example.test/goalables/*": "/Prefix\n",
+                "lores://lore.example.test/goalables/exact": "/Exact\n",
+            },
+            (),
+        ),
+        credential=Mock(return_value="short-lived"),
+    )
+    app.include_router(
+        create_host_credentials_router(_FakeHostStore("host1", "launch-tok", "alice@example.com")),
+        prefix="/v1",
+    )
+    response = TestClient(app).get(
+        "/v1/hosts/host1/credentials/lore", params={"remote": remote}, headers=_HDR
+    )
+    assert response.status_code == status
+    if view is not None:
+        assert response.json()["view"] == view

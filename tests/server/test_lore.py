@@ -110,3 +110,67 @@ def test_lore_refs_and_git_policy_remain_separate():
     launcher.provider = "modal"
     with pytest.raises(HTTPException, match="Lore checkouts require"):
         _apply_git_clone_options(launcher, [lore], GitCloneOptions())
+
+
+def _prefix_config(repositories):
+    return LoreConfig(None, repositories, ())
+
+
+def test_match_repository_rules():
+    prefix = "lores://lore.example.test/goalables/*"
+    config = _prefix_config({prefix: None, "lores://lore.example.test/goalables/exact": "x"})
+    assert config.match_repository("lores://lore.example.test/goalables/app") == prefix
+    assert (
+        config.match_repository("lores://lore.example.test/goalables/exact")
+        == "lores://lore.example.test/goalables/exact"
+    )
+    for remote in (
+        "lores://lore.example.test/goalables/a/b",
+        "lores://lore.example.test/goalables/",
+        "lores://lore.example.test/goalables",
+        "lores://lore.example.test/goalables/..",
+        "lores://lore.example.test/goalables//x",
+        "lores://lore.example.test/goalables/app?x=1",
+        "lores://lore.example.test/goalables/app#f",
+        "lores://lore.example.test/Goalables/app",
+        "lores://lore.example.test/goalables-x/app",
+    ):
+        assert config.match_repository(remote) is None, remote
+
+
+def test_match_repository_without_wildcard_is_not_a_prefix():
+    config = _prefix_config({"lores://lore.example.test/goalables": None})
+    assert config.match_repository("lores://lore.example.test/goalables/app") is None
+
+
+def test_match_repository_longest_prefix_wins():
+    wide = "lores://lore.example.test/a/*"
+    narrow = "lores://lore.example.test/a/b/*"
+    config = _prefix_config({wide: None, narrow: None})
+    assert config.match_repository("lores://lore.example.test/a/b/c") == narrow
+    assert config.match_repository("lores://lore.example.test/a/c") == wide
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "lores://lore.example.test/goalables/*/x",
+        "lores://lore.example.test/*",
+        "lores://lore.example.test/goal*/*",
+        "lores://lore.example.test/goalables/**",
+        "lores://lore.example.test/*/",
+    ],
+)
+def test_config_rejects_misplaced_wildcard(monkeypatch, remote):
+    monkeypatch.setenv("LORE_TEST_CLIENT_SECRET", "secret")
+    with pytest.raises(ValueError):
+        LoreConfig.parse(
+            {
+                "upstream_url": "https://lore.example.test",
+                "audience": "lore",
+                "scope": "openid lore-access",
+                "machine_client_id": "machine-exchange",
+                "machine_client_secret_env": "LORE_TEST_CLIENT_SECRET",
+                "repositories": {remote: {}},
+            }
+        )

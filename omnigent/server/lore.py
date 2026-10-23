@@ -44,7 +44,9 @@ class LoreConfig:
         for remote, options in raw.items():
             if not isinstance(remote, str):
                 raise ValueError("Lore repository URLs must be strings")
-            lore_remote(remote)
+            lore_remote(remote.removesuffix("/*") if remote.endswith("/*") else remote)
+            if "*" in remote.removesuffix("/*"):
+                raise ValueError("Lore repository URLs only accept a trailing /* wildcard")
             parsed = urlsplit(remote)
             if parsed.netloc != origin.netloc:
                 raise ValueError("Lore repositories must match the configured upstream origin")
@@ -65,6 +67,32 @@ class LoreConfig:
         ):
             raise ValueError("Lore machine_principals must list machine owner identities")
         return cls(delegation, repositories, tuple(machines))
+
+    def match_repository(self, remote: str) -> str | None:
+        """Return the configured key that admits ``remote``, or None.
+
+        An exact key wins. A key ending in ``/*`` admits a remote that starts with
+        the key minus ``*`` followed by exactly one path segment; the longest such
+        key wins. Matching is case-sensitive.
+        """
+        if remote in self.repositories:
+            return remote
+        if not isinstance(remote, str):
+            return None
+        try:
+            lore_remote(remote)
+        except ValueError:
+            return None
+        best: str | None = None
+        for key in self.repositories:
+            if not key.endswith("/*"):
+                continue
+            prefix = key[:-1]
+            rest = remote[len(prefix) :]
+            if remote.startswith(prefix) and rest and "/" not in rest:
+                if best is None or len(key) > len(best):
+                    best = key
+        return best
 
 
 class LoreDelegationBroker(MCPDelegationBroker):
