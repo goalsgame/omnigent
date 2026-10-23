@@ -514,17 +514,25 @@ class ManagedLaunchTracker:
         """Initialize the empty session-id → launch index."""
         self._by_session: dict[str, ManagedLaunch] = {}
 
-    def begin(self, session_id: str) -> None:
+    def begin(self, session_id: str) -> ManagedLaunch:
         """
-        Register a new in-flight launch for *session_id*.
+        Register an in-flight launch for *session_id* and return it.
 
-        Replaces any prior entry (e.g. a retained failure from an
-        earlier attempt).
+        An entry that has not settled yet is kept, so a waiter that
+        registered it before the launch was scheduled sees the same
+        settlement. A settled one (e.g. a retained failure from an
+        earlier attempt) is replaced.
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :returns: The in-flight entry.
         """
-        self._by_session[session_id] = ManagedLaunch(settled=asyncio.Event())
+        current = self._by_session.get(session_id)
+        if current is not None and not current.settled.is_set():
+            return current
+        entry = ManagedLaunch(settled=asyncio.Event())
+        self._by_session[session_id] = entry
+        return entry
 
     def get(self, session_id: str) -> ManagedLaunch | None:
         """

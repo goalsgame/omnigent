@@ -1979,22 +1979,11 @@ async def test_managed_native_create_hands_initial_items_to_the_terminal(
     gate.set()
 
 
-async def test_initial_item_delivery_waits_for_the_launch_then_dispatches(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _delivery_env(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     from omnigent.server.routes._sessions import orchestration
 
     order: list[str] = []
-    launch_done = asyncio.Event()
     conv = SimpleNamespace(id="sess", runner_id="runner-1")
-
-    async def settled(launch):
-        assert launch == "launch"
-        await launch_done.wait()
-        order.append("settled")
-
-    tracker = SimpleNamespace(entries={})
-    tracker.get = tracker.entries.get
 
     async def runner_client(session_id, router, conversation=None):
         return object()
@@ -2003,19 +1992,26 @@ async def test_initial_item_delivery_waits_for_the_launch_then_dispatches(
         order.append("relay")
 
     async def dispatch(session_id, conv, item, *args, **kwargs):
+        await asyncio.sleep(0)
         order.append(f"dispatch:{item}")
 
     store = Mock()
     store.get_conversation.return_value = conv
-    monkeypatch.setattr(orchestration, "_await_settled_managed_launch", settled)
     monkeypatch.setattr(orchestration, "_get_runner_client", runner_client)
     monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", relay_ready)
     monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr(orchestration, "_test_store", store, raising=False)
+    return order
+
+
+def _start_delivery(launch, items=("first", "second")) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
     orchestration._deliver_initial_items_after_launch(
         "sess",
-        ["first", "second"],
-        tracker,
-        conversation_store=store,
+        list(items),
+        launch,
+        conversation_store=orchestration._test_store,
         runner_router=None,
         agent_name="goals-claude",
         agent_revision=None,
@@ -2025,14 +2021,107 @@ async def test_initial_item_delivery_waits_for_the_launch_then_dispatches(
         host_store=None,
         background_titles_enabled=False,
     )
-    await asyncio.sleep(0.1)
-    assert order == []
-    tracker.entries["sess"] = "launch"
-    await asyncio.sleep(0.1)
-    assert order == []
-    launch_done.set()
-    for _ in range(20):
-        if len(order) == 4:
-            break
+
+
+async def _until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline
         await asyncio.sleep(0.01)
-    assert order == ["settled", "relay", "dispatch:first", "dispatch:second"]
+
+
+@pytest.mark.parametrize("settled_first", [False, True])
+async def test_initial_item_delivery_dispatches_after_the_launch_settles(
+    monkeypatch: pytest.MonkeyPatch, settled_first: bool
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+
+    order = _delivery_env(monkeypatch)
+    launch = ManagedLaunch(settled=asyncio.Event())
+    if settled_first:
+        launch.settled.set()
+    _start_delivery(launch)
+    if not settled_first:
+        await asyncio.sleep(0.05)
+        assert order == []
+        launch.settled.set()
+    await _until(lambda: len(order) == 3)
+    assert order == ["relay", "dispatch:first", "dispatch:second"]
+
+
+async def test_initial_item_delivery_skips_a_failed_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    order = _delivery_env(monkeypatch)
+    launch = ManagedLaunch(settled=asyncio.Event(), error="managed sandbox failed to launch")
+    launch.settled.set()
+    _start_delivery(launch)
+    await orchestration.await_initial_item_delivery("sess")
+    assert order == []
+
+
+async def test_follow_up_waits_for_the_initial_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    order = _delivery_env(monkeypatch)
+    launch = ManagedLaunch(settled=asyncio.Event())
+    _start_delivery(launch)
+
+    async def follow_up() -> None:
+        await orchestration.await_initial_item_delivery("sess")
+        order.append("follow-up")
+
+    waiter = asyncio.create_task(follow_up())
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+    launch.settled.set()
+    await asyncio.wait_for(waiter, 2)
+    assert order == ["relay", "dispatch:first", "dispatch:second", "follow-up"]
+    await orchestration.await_initial_item_delivery("sess")
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "message", "data": {}},
+        {
+            "type": "message",
+            "data": {"role": "assistant", "content": [{"type": "output_text", "text": "x"}]},
+        },
+    ],
+)
+async def test_managed_native_create_rejects_invalid_initial_items(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch, item: dict
+) -> None:
+    import threading
+
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    gate = threading.Event()
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(provision_gate=gate, fail_on_host_start=True)
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_deliver_initial_items_after_launch",
+        lambda session_id, *args, **kwargs: scheduled.append(session_id),
+    )
+    agent = await create_test_agent(
+        env.client,
+        name="managed-invalid-initial-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed", "initial_items": [item]},
+    )
+    gate.set()
+    assert 400 <= resp.status_code < 500, resp.text
+    assert scheduled == []

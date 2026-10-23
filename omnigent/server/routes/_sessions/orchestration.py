@@ -11211,10 +11211,17 @@ async def _create_session_from_existing_agent(
         ):
             # A native terminal records no seeded history, so its runner never
             # replays one; hand the items to the terminal once the sandbox is up.
+            for item in body.initial_items:
+                _build_new_item(item, "seed", created_by=_attribution_user(user_id))
+                if item.type != "message" or item.data.get("role") != "user":
+                    raise OmnigentError(
+                        "A native session's initial items must be user messages",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
             _deliver_initial_items_after_launch(
                 conv.id,
                 list(body.initial_items),
-                _managed_tracker,
+                _managed_tracker.begin(conv.id),
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 agent_name=agent.name,
@@ -11293,16 +11300,23 @@ async def _create_session_from_existing_agent(
     return response, conv
 
 
-_initial_item_deliveries: set[asyncio.Task[None]] = set()
+# A launch still unsettled after this long is treated as lost.
+_LAUNCH_SETTLE_TIMEOUT_S = 30 * 60.0
+
+_initial_item_deliveries: dict[str, asyncio.Task[None]] = {}
 
 
-_LAUNCH_REGISTRATION_TIMEOUT_S = 30.0
+async def await_initial_item_delivery(session_id: str) -> None:
+    """Wait for a session's initial items to reach its terminal, if they are in flight."""
+    task = _initial_item_deliveries.get(session_id)
+    if task is not None and task is not asyncio.current_task():
+        await asyncio.shield(task)
 
 
 def _deliver_initial_items_after_launch(
     session_id: str,
     items: list[Any],
-    tracker: Any,
+    launch: Any,
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
@@ -11317,24 +11331,24 @@ def _deliver_initial_items_after_launch(
     """
     Dispatch a native session's initial items once its managed launch settles.
 
-    The same rendezvous a first ``POST /events`` takes, run in the background so
-    the create still returns before the sandbox exists. The create registers the
-    launch after its initial items, so this first waits for that registration.
+    The same delivery a first ``POST /events`` gets, run in the background so
+    the create still returns before the sandbox exists. Later messages wait for
+    it through :func:`await_initial_item_delivery`, keeping the kickoff first.
     Failures are logged; the launch tracker already reports a failed launch.
     """
 
     async def deliver() -> None:
         try:
-            deadline = time.monotonic() + _LAUNCH_REGISTRATION_TIMEOUT_S
-            while (launch := tracker.get(session_id)) is None:
-                if time.monotonic() > deadline:
-                    _logger.warning(
-                        "Managed launch never registered; initial items not delivered for %s",
-                        session_id,
-                    )
-                    return
-                await asyncio.sleep(0.05)
-            await _await_settled_managed_launch(launch)
+            try:
+                await asyncio.wait_for(launch.settled.wait(), _LAUNCH_SETTLE_TIMEOUT_S)
+            except TimeoutError:
+                _logger.warning(
+                    "Managed launch did not settle; initial items not delivered for %s",
+                    session_id,
+                )
+                return
+            if launch.error is not None:
+                return
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 return
@@ -11370,10 +11384,13 @@ def _deliver_initial_items_after_launch(
                 session_id,
                 exc_info=True,
             )
+        finally:
+            if _initial_item_deliveries.get(session_id) is asyncio.current_task():
+                del _initial_item_deliveries[session_id]
 
-    task = asyncio.create_task(deliver(), name=f"initial-items-{session_id}")
-    _initial_item_deliveries.add(task)
-    task.add_done_callback(_initial_item_deliveries.discard)
+    _initial_item_deliveries[session_id] = asyncio.create_task(
+        deliver(), name=f"initial-items-{session_id}"
+    )
 
 
 def _create_session_from_bundle(
