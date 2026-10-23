@@ -5760,3 +5760,17 @@ async def test_lifespan_waits_for_sdk_import_before_ready(
         release.set()
         await asyncio.wait_for(task, timeout=20)
     assert ready.is_set()
+
+
+async def test_launch_tracker_begin_keeps_an_unsettled_entry() -> None:
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+
+    tracker = ManagedLaunchTracker()
+    first = tracker.begin("sess")
+    assert tracker.begin("sess") is first
+    tracker.fail("sess", "boom")
+    retry = tracker.begin("sess")
+    assert retry is not first
+    assert not retry.settled.is_set()
+    tracker.finish("sess")
+    assert retry.settled.is_set() and retry.error is None

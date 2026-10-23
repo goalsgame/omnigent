@@ -251,6 +251,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
+    await_initial_item_delivery,
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
@@ -2366,6 +2367,8 @@ def register_events_routes(
                 if conv is None:
                     raise _session_not_found()
                 runner_client = await _get_runner_client(session_id, runner_router)
+        # A native session's create-time kickoff goes first.
+        await await_initial_item_delivery(session_id)
         # Check for a wrong-replica routing miss before attempting healing or
         # dispatch. The runner tunnel is registered on the same replica as its
         # host; when the tunnel is absent here but the host is live elsewhere,

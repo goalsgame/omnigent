@@ -1913,3 +1913,478 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     assert getattr(events[0], "attributes", {})["runner_id"] == "runner_crashed"
     # The tunnel survived the callback error, so the host is still registered.
     assert app.state.host_registry.get(_HOST_ID) is not None
+
+
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi-native", "openai-agents"]
+)
+async def test_managed_native_create_hands_initial_items_to_the_terminal(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+) -> None:
+    """A managed native session's kickoff reaches its terminal once the sandbox is up.
+
+    A native terminal records no seeded history, so storing the kickoff as a
+    seed leaves it unanswered. An in-process harness keeps the seed path,
+    which its runner replays.
+    """
+    import threading
+
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    gate = threading.Event()
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(provision_gate=gate, fail_on_host_start=True)
+    )
+    deliveries: list[tuple[str, list]] = []
+
+    def capture(session_id, items, launch, **kwargs):
+        deliveries.append((session_id, items))
+
+    monkeypatch.setattr(orchestration, "_deliver_initial_items_after_launch", capture)
+    agent = await create_test_agent(
+        env.client,
+        name=f"managed-{harness}-agent",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "kick off"}],
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    items = (await env.client.get(f"/v1/sessions/{session_id}")).json().get("items") or []
+    if harness != "openai-agents":
+        assert [session for session, _ in deliveries] == [session_id]
+        assert deliveries[0][1][0].data["content"][0]["text"] == "kick off"
+        assert not [item for item in items if item.get("type") == "message"]
+    else:
+        assert deliveries == []
+        assert [item["type"] for item in items] == ["message"]
+    gate.set()
+
+
+def _delivery_env(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from omnigent.server.routes._sessions import orchestration
+
+    order: list[str] = []
+    conv = SimpleNamespace(id="sess", runner_id="runner-1", archived=False)
+
+    async def runner_client(session_id, router, conversation=None):
+        return object()
+
+    async def relay_ready(*args, **kwargs):
+        order.append("relay")
+
+    async def dispatch(session_id, conv, item, *args, **kwargs):
+        await asyncio.sleep(0)
+        order.append(f"dispatch:{item}")
+
+    store = Mock()
+    store.get_conversation.return_value = conv
+    monkeypatch.setattr(orchestration, "_get_runner_client", runner_client)
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", relay_ready)
+    monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr(orchestration, "_test_store", store, raising=False)
+    monkeypatch.setattr(orchestration, "_test_conv", conv, raising=False)
+    failures: list[tuple[str, object, object]] = []
+
+    async def record_failure(session_id, conv, item, store, error, router, *, created_by):
+        failures.append((session_id, item, error))
+        return "item-1"
+
+    monkeypatch.setattr(orchestration, "_persist_native_terminal_failure", record_failure)
+    monkeypatch.setattr(orchestration, "_test_failures", failures, raising=False)
+    return order
+
+
+def _start_delivery(launch, items=("first", "second")) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    orchestration._deliver_initial_items_after_launch(
+        "sess",
+        list(items),
+        launch,
+        conversation_store=orchestration._test_store,
+        runner_router=None,
+        agent_name="goals-claude",
+        agent_revision=None,
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        host_store=None,
+        background_titles_enabled=False,
+    )
+
+
+async def _until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("settled_first", [False, True])
+async def test_initial_item_delivery_dispatches_after_the_launch_settles(
+    monkeypatch: pytest.MonkeyPatch, settled_first: bool
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+
+    order = _delivery_env(monkeypatch)
+    launch = ManagedLaunch(settled=asyncio.Event())
+    if settled_first:
+        launch.settled.set()
+    _start_delivery(launch)
+    if not settled_first:
+        await asyncio.sleep(0.05)
+        assert order == []
+        launch.settled.set()
+    await _until(lambda: len(order) == 3)
+    assert order == ["relay", "dispatch:first", "dispatch:second"]
+
+
+def _kickoff_event():
+    from omnigent.server.schemas import SessionEventInput
+
+    return SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "kick off"}]},
+    )
+
+
+@pytest.mark.parametrize("failure", ["launch", "runner"])
+async def test_undelivered_initial_items_are_kept_as_history(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    order = _delivery_env(monkeypatch)
+    if failure == "runner":
+
+        async def no_runner(session_id, router, conversation=None):
+            return None
+
+        monkeypatch.setattr(orchestration, "_get_runner_client", no_runner)
+    launch = ManagedLaunch(
+        settled=asyncio.Event(),
+        error="managed sandbox failed to launch" if failure == "launch" else None,
+    )
+    launch.settled.set()
+    kickoff = _kickoff_event()
+    _start_delivery(launch, items=[kickoff])
+    await orchestration.await_initial_item_delivery("sess")
+    assert order == []
+    [(session_id, item, error)] = orchestration._test_failures
+    assert (session_id, item) == ("sess", kickoff)
+    assert error.code == "initial_message_not_delivered"
+    assert "Send it again" in error.message
+    orchestration._test_store.append.assert_not_called()
+
+
+async def test_follow_up_waits_for_the_initial_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    order = _delivery_env(monkeypatch)
+    launch = ManagedLaunch(settled=asyncio.Event())
+    _start_delivery(launch)
+
+    async def follow_up() -> None:
+        await orchestration.await_initial_item_delivery("sess")
+        order.append("follow-up")
+
+    waiter = asyncio.create_task(follow_up())
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+    launch.settled.set()
+    await asyncio.wait_for(waiter, 2)
+    assert order == ["relay", "dispatch:first", "dispatch:second", "follow-up"]
+    await orchestration.await_initial_item_delivery("sess")
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "message", "data": {}},
+        {
+            "type": "message",
+            "data": {"role": "assistant", "content": [{"type": "output_text", "text": "x"}]},
+        },
+        {"type": "interrupt", "data": {}},
+        {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": "payload.zip",
+                        "file_data": "data:application/zip;base64,UEs=",
+                    }
+                ],
+            },
+        },
+    ],
+)
+async def test_managed_native_create_rejects_invalid_initial_items(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch, item: dict
+) -> None:
+    import threading
+
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    gate = threading.Event()
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(provision_gate=gate, fail_on_host_start=True)
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_deliver_initial_items_after_launch",
+        lambda session_id, *args, **kwargs: scheduled.append(session_id),
+    )
+    agent = await create_test_agent(
+        env.client,
+        name="managed-invalid-initial-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed", "initial_items": [item]},
+    )
+    gate.set()
+    assert 400 <= resp.status_code < 500, resp.text
+    assert scheduled == []
+
+
+async def test_rejected_managed_create_abandons_initial_delivery(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    scheduled: list[str] = []
+    original = orchestration._deliver_initial_items_after_launch
+
+    def record(session_id, *args, **kwargs):
+        scheduled.append(session_id)
+        original(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "_deliver_initial_items_after_launch", record)
+    monkeypatch.setattr(env.app.state, "sandbox_config", None)
+    before = dict(orchestration._initial_item_deliveries)
+    agent = await create_test_agent(
+        env.client,
+        name="managed-rejected-native-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "managed hosts are not configured" in resp.text
+    assert len(scheduled) == 1
+    await asyncio.sleep(0)
+    assert orchestration._initial_item_deliveries == before
+    tracker = env.app.state.managed_launches
+    assert all(entry.settled.is_set() for entry in tracker._by_session.values())
+
+
+async def test_initial_item_delivery_skips_an_archived_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    order = _delivery_env(monkeypatch)
+    orchestration._test_conv.archived = True
+    launch = ManagedLaunch(settled=asyncio.Event())
+    launch.settled.set()
+    _start_delivery(launch)
+    await orchestration.await_initial_item_delivery("sess")
+    assert order == []
+
+
+def _kickoff_body(agent_id: str) -> dict:
+    return {
+        "agent_id": agent_id,
+        "host_type": "managed",
+        "initial_items": [
+            {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "kick off"}]},
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("verdict", ["deny", "approve"])
+async def test_managed_native_kickoff_passes_the_input_policy_first(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch, verdict: str
+) -> None:
+    import threading
+
+    from omnigent.server.routes._sessions import orchestration
+
+    env = managed_session_env
+    gate = threading.Event()
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(provision_gate=gate, fail_on_host_start=True)
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_deliver_initial_items_after_launch",
+        lambda session_id, *args, **kwargs: scheduled.append(session_id),
+    )
+    from omnigent.server.routes.sessions import routes_core
+
+    approval = asyncio.Event()
+    events: list[str] = []
+    actors: list[object] = []
+    announce = routes_core._announce_session_added
+
+    def announced(*args, **kwargs):
+        events.append("announced")
+        return announce(*args, **kwargs)
+
+    async def policy(request, session_id, conv, item, *args, **kwargs):
+        events.append("policy")
+        actors.append(kwargs.get("actor"))
+        if verdict == "deny":
+            return {"verdict": "deny", "reason": "kickoffs are not allowed here"}
+        await approval.wait()
+        return None
+
+    monkeypatch.setattr(routes_core, "_announce_session_added", announced)
+    monkeypatch.setattr(orchestration, "_build_actor", lambda user_id: {"run_as": "creator"})
+    monkeypatch.setattr(orchestration, "_evaluate_input_policy", policy)
+    agent = await create_test_agent(
+        env.client,
+        name=f"managed-policy-{verdict}-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    create = asyncio.create_task(env.client.post("/v1/sessions", json=_kickoff_body(agent["id"])))
+    if verdict == "approve":
+        await asyncio.sleep(0.2)
+        assert not create.done()
+        assert scheduled == []
+        approval.set()
+    resp = await asyncio.wait_for(create, 15)
+    gate.set()
+    assert "policy" in events, events
+    assert events.index("announced") < events.index("policy")
+    assert actors == [{"run_as": "creator"}]
+    if verdict == "deny":
+        assert resp.status_code == 403, resp.text
+        assert "kickoffs are not allowed here" in resp.text
+        assert scheduled == []
+    else:
+        assert resp.status_code == 201, resp.text
+        assert scheduled == [resp.json()["id"]]
+
+
+@pytest.mark.parametrize("fails_at", ["relay", "second"])
+async def test_failed_delivery_keeps_the_rest_as_history(
+    monkeypatch: pytest.MonkeyPatch, fails_at: str
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunch
+    from omnigent.server.routes._sessions import orchestration
+
+    _delivery_env(monkeypatch)
+    sent: list[str] = []
+
+    async def relay_ready(*args, **kwargs):
+        if fails_at == "relay":
+            raise TimeoutError("relay not ready")
+
+    async def dispatch(session_id, conv, item, *args, **kwargs):
+        text = item.data["content"][0]["text"]
+        if fails_at == "second" and text == "second":
+            raise RuntimeError("forward rejected")
+        sent.append(text)
+
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", relay_ready)
+    monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
+    from omnigent.server.schemas import SessionEventInput
+
+    items = [
+        SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        )
+        for text in ("first", "second", "third")
+    ]
+    launch = ManagedLaunch(settled=asyncio.Event())
+    launch.settled.set()
+    _start_delivery(launch, items=items)
+    await orchestration.await_initial_item_delivery("sess")
+    [(_, failed_item, error)] = orchestration._test_failures
+    assert error.code == "initial_message_not_delivered"
+    _, kept = orchestration._test_store.append.call_args.args
+    kept_texts = [item.data.model_dump()["content"][0]["text"] for item in kept]
+    failed_text = failed_item.data["content"][0]["text"]
+    if fails_at == "relay":
+        assert sent == []
+        assert (failed_text, kept_texts) == ("first", ["second", "third"])
+    else:
+        assert sent == ["first"]
+        assert (failed_text, kept_texts) == ("second", ["third"])
+
+
+async def test_failed_managed_launch_shows_the_undelivered_kickoff(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = managed_session_env
+    install_fake_modal_launcher(monkeypatch, FakeSandboxLauncher(fail_on_host_start=True))
+    agent = await create_test_agent(
+        env.client,
+        name="managed-failing-native-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    resp = await env.client.post("/v1/sessions", json=_kickoff_body(agent["id"]))
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    deadline = time.monotonic() + 15
+    while True:
+        items = (await env.client.get(f"/v1/sessions/{session_id}")).json().get("items") or []
+        types = [item.get("type") for item in items]
+        if "error" in types:
+            break
+        assert time.monotonic() < deadline, items
+        await asyncio.sleep(0.1)
+    message = next(item for item in items if item.get("type") == "message")
+    assert "kick off" in json.dumps(message)
+    error = next(item for item in items if item.get("type") == "error")
+    assert "initial_message_not_delivered" in json.dumps(error)

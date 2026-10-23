@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -239,6 +240,7 @@ from omnigent.server.routes._sessions.helpers import (
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
+    _build_actor,
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
@@ -11202,7 +11204,39 @@ async def _create_session_from_existing_agent(
             runner_router,
             conversation=conv,
         )
-        if runner_client is None:
+        _managed_tracker = getattr(request.app.state, "managed_launches", None)
+        if (
+            runner_client is None
+            and body.host_type == "managed"
+            and _managed_tracker is not None
+            and _is_native_terminal_session(conv)
+        ):
+            # A native terminal records no seeded history, so its runner never
+            # replays one; hand the items to the terminal once the sandbox is up.
+            from omnigent.inner.native_attachments import inline_filesystem_attachment_name
+
+            for item in body.initial_items:
+                if item.type != "message" or item.data.get("role") != "user":
+                    raise OmnigentError(
+                        "A native session's initial items must be user messages",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                _build_new_item(item, "seed", created_by=_attribution_user(user_id))
+                inline_name = inline_filesystem_attachment_name(item.data.get("content"))
+                if inline_name is not None:
+                    raise OmnigentError(
+                        f"Attachment {inline_name!r} must be uploaded to the session's "
+                        "files and referenced by file_id.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            _pending_native_kickoffs[conv.id] = _PendingKickoff(
+                items=list(body.initial_items),
+                agent_name=agent.name,
+                agent_revision=agent.bundle_location,
+                created_by=_attribution_user(user_id),
+                background_titles_enabled=background_session_titles_enabled(request.headers),
+            )
+        elif runner_client is None:
             # No runner bound — persist initial items as history-only
             # seed via the conversation store. No execution fires; the
             # caller is responsible for binding a runner and posting a
@@ -11268,6 +11302,226 @@ async def _create_session_from_existing_agent(
         request=request,
     )
     return response, conv
+
+
+# A launch still unsettled after this long is treated as lost.
+_LAUNCH_SETTLE_TIMEOUT_S = 30 * 60.0
+
+_initial_item_deliveries: dict[str, asyncio.Task[None]] = {}
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingKickoff:
+    """A native session's validated initial items, waiting for the create to finish."""
+
+    items: list[Any]
+    agent_name: str
+    agent_revision: str | None
+    created_by: str | None
+    background_titles_enabled: bool
+
+
+_pending_native_kickoffs: dict[str, _PendingKickoff] = {}
+
+
+def discard_native_kickoff(session_id: str) -> None:
+    """Drop a native kickoff the create did not go on to schedule."""
+    _pending_native_kickoffs.pop(session_id, None)
+
+
+async def start_native_kickoff(
+    request: Request,
+    session_id: str,
+    *,
+    user_id: str | None,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    runner_router: RunnerRouter | None,
+    file_store: Any,
+    artifact_store: Any,
+) -> None:
+    """
+    Check a native session's kickoff against the REQUEST policy, then schedule it.
+
+    Runs once the creator owns the session, so an approval it parks on can be
+    seen and resolved; the policy gets the creator as actor, as ``POST /events``
+    does. A denial raises 403 and nothing is scheduled.
+    """
+    pending = _pending_native_kickoffs.pop(session_id, None)
+    tracker = getattr(request.app.state, "managed_launches", None)
+    if pending is None or tracker is None:
+        return
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None:
+        return
+    for item in pending.items:
+        verdict = await _evaluate_input_policy(
+            request,
+            session_id,
+            conv,
+            item,
+            conversation_store,
+            agent_store,
+            runner_router,
+            actor=_build_actor(user_id),
+            file_store=file_store,
+            artifact_store=artifact_store,
+        )
+        if verdict is not None:
+            raise OmnigentError(
+                str(verdict.get("reason") or "Denied by policy"), code=ErrorCode.FORBIDDEN
+            )
+    _deliver_initial_items_after_launch(
+        session_id,
+        pending.items,
+        tracker.begin(session_id),
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        agent_name=pending.agent_name,
+        agent_revision=pending.agent_revision,
+        file_store=file_store,
+        artifact_store=artifact_store,
+        created_by=pending.created_by,
+        host_store=getattr(request.app.state, "host_store", None),
+        background_titles_enabled=pending.background_titles_enabled,
+    )
+
+
+def cancel_initial_item_delivery(session_id: str, tracker: Any) -> None:
+    """Abandon a session's pending initial delivery when its managed launch was not scheduled."""
+    task = _initial_item_deliveries.pop(session_id, None)
+    if task is not None:
+        task.cancel()
+    launch = tracker.get(session_id) if tracker is not None else None
+    if launch is not None and not launch.settled.is_set():
+        tracker.fail(session_id, "managed launch was not scheduled")
+
+
+async def await_initial_item_delivery(session_id: str) -> None:
+    """Wait for a session's initial items to reach its terminal, if they are in flight."""
+    task = _initial_item_deliveries.get(session_id)
+    if task is not None and task is not asyncio.current_task():
+        await asyncio.shield(task)
+
+
+def _deliver_initial_items_after_launch(
+    session_id: str,
+    items: list[Any],
+    launch: Any,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    agent_name: str,
+    agent_revision: str | None,
+    file_store: Any,
+    artifact_store: Any,
+    created_by: str | None,
+    host_store: Any,
+    background_titles_enabled: bool,
+) -> None:
+    """
+    Dispatch a native session's initial items once its managed launch settles.
+
+    The same delivery a first ``POST /events`` gets, run in the background so
+    the create still returns before the sandbox exists. Later messages wait for
+    it through :func:`await_initial_item_delivery`, keeping the kickoff first.
+    Failures are logged; the launch tracker already reports a failed launch.
+    """
+
+    delivered = 0
+
+    async def keep_as_history(reason: str) -> None:
+        # Undelivered, the kickoff would otherwise exist nowhere on the server.
+        remaining = items[delivered:]
+        if not remaining:
+            return
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            return
+        await _persist_native_terminal_failure(
+            session_id,
+            conv,
+            remaining[0],
+            conversation_store,
+            ErrorData(
+                source="execution",
+                code="initial_message_not_delivered",
+                message=f"This message was not delivered to the agent ({reason}). Send it again.",
+            ),
+            runner_router,
+            created_by=created_by,
+        )
+        rest = [_build_new_item(item, "seed", created_by=created_by) for item in remaining[1:]]
+        if rest:
+            await asyncio.to_thread(conversation_store.append, session_id, rest)
+
+    async def deliver() -> None:
+        nonlocal delivered
+        try:
+            try:
+                await asyncio.wait_for(launch.settled.wait(), _LAUNCH_SETTLE_TIMEOUT_S)
+            except TimeoutError:
+                _logger.warning(
+                    "Managed launch did not settle; initial items kept as history for %s",
+                    session_id,
+                )
+                await keep_as_history("the sandbox did not finish launching")
+                return
+            if launch.error is not None:
+                await keep_as_history("the sandbox failed to launch")
+                return
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None or conv.archived:
+                return
+            runner_client = await _get_runner_client(session_id, runner_router, conversation=conv)
+            if runner_client is None:
+                _logger.warning(
+                    "No runner after managed launch; initial items kept as history for %s",
+                    session_id,
+                )
+                await keep_as_history("no runner was available after launch")
+                return
+            await _ensure_runner_relay_ready(
+                session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
+            )
+            for item in items:
+                await _dispatch_session_event_to_runner(
+                    session_id,
+                    conv,
+                    item,
+                    conversation_store,
+                    runner_client,
+                    agent_name=agent_name,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                    created_by=created_by,
+                    runner_router=runner_router,
+                    host_store=host_store,
+                    background_titles_enabled=background_titles_enabled,
+                    agent_revision=agent_revision,
+                )
+                delivered += 1
+        except Exception:  # noqa: BLE001 — background delivery must not crash the loop
+            _logger.warning(
+                "Failed to deliver initial items for native session %s; %d of %d kept as history",
+                session_id,
+                len(items) - delivered,
+                len(items),
+                exc_info=True,
+            )
+            try:
+                await keep_as_history("delivery to the terminal failed")
+            except Exception:  # noqa: BLE001 — the warning above already reports the loss
+                _logger.warning(
+                    "Failed to keep initial items as history for %s", session_id, exc_info=True
+                )
+        finally:
+            if _initial_item_deliveries.get(session_id) is asyncio.current_task():
+                del _initial_item_deliveries[session_id]
+
+    _initial_item_deliveries[session_id] = asyncio.create_task(
+        deliver(), name=f"initial-items-{session_id}"
+    )
 
 
 def _create_session_from_bundle(
