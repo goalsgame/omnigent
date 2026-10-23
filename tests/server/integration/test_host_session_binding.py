@@ -2002,6 +2002,14 @@ def _delivery_env(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
     monkeypatch.setattr(orchestration, "_test_store", store, raising=False)
     monkeypatch.setattr(orchestration, "_test_conv", conv, raising=False)
+    failures: list[tuple[str, object, object]] = []
+
+    async def record_failure(session_id, conv, item, store, error, router, *, created_by):
+        failures.append((session_id, item, error))
+        return "item-1"
+
+    monkeypatch.setattr(orchestration, "_persist_native_terminal_failure", record_failure)
+    monkeypatch.setattr(orchestration, "_test_failures", failures, raising=False)
     return order
 
 
@@ -2078,14 +2086,15 @@ async def test_undelivered_initial_items_are_kept_as_history(
         error="managed sandbox failed to launch" if failure == "launch" else None,
     )
     launch.settled.set()
-    _start_delivery(launch, items=[_kickoff_event()])
+    kickoff = _kickoff_event()
+    _start_delivery(launch, items=[kickoff])
     await orchestration.await_initial_item_delivery("sess")
     assert order == []
-    store = orchestration._test_store
-    store.append.assert_called_once()
-    session_id, appended = store.append.call_args.args
-    assert session_id == "sess"
-    assert [item.type for item in appended] == ["message"]
+    [(session_id, item, error)] = orchestration._test_failures
+    assert (session_id, item) == ("sess", kickoff)
+    assert error.code == "initial_message_not_delivered"
+    assert "Send it again" in error.message
+    orchestration._test_store.append.assert_not_called()
 
 
 async def test_follow_up_waits_for_the_initial_items(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2340,11 +2349,42 @@ async def test_failed_delivery_keeps_the_rest_as_history(
     launch.settled.set()
     _start_delivery(launch, items=items)
     await orchestration.await_initial_item_delivery("sess")
+    [(_, failed_item, error)] = orchestration._test_failures
+    assert error.code == "initial_message_not_delivered"
     _, kept = orchestration._test_store.append.call_args.args
     kept_texts = [item.data.model_dump()["content"][0]["text"] for item in kept]
+    failed_text = failed_item.data["content"][0]["text"]
     if fails_at == "relay":
         assert sent == []
-        assert kept_texts == ["first", "second", "third"]
+        assert (failed_text, kept_texts) == ("first", ["second", "third"])
     else:
         assert sent == ["first"]
-        assert kept_texts == ["second", "third"]
+        assert (failed_text, kept_texts) == ("second", ["third"])
+
+
+async def test_failed_managed_launch_shows_the_undelivered_kickoff(
+    managed_session_env: ManagedSessionEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = managed_session_env
+    install_fake_modal_launcher(monkeypatch, FakeSandboxLauncher(fail_on_host_start=True))
+    agent = await create_test_agent(
+        env.client,
+        name="managed-failing-native-agent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        include_llm=False,
+    )
+    resp = await env.client.post("/v1/sessions", json=_kickoff_body(agent["id"]))
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    deadline = time.monotonic() + 15
+    while True:
+        items = (await env.client.get(f"/v1/sessions/{session_id}")).json().get("items") or []
+        types = [item.get("type") for item in items]
+        if "error" in types:
+            break
+        assert time.monotonic() < deadline, items
+        await asyncio.sleep(0.1)
+    message = next(item for item in items if item.get("type") == "message")
+    assert "kick off" in json.dumps(message)
+    error = next(item for item in items if item.get("type") == "error")
+    assert "initial_message_not_delivered" in json.dumps(error)

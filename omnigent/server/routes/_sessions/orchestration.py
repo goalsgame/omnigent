@@ -11430,13 +11430,30 @@ def _deliver_initial_items_after_launch(
 
     delivered = 0
 
-    async def keep_as_history() -> None:
+    async def keep_as_history(reason: str) -> None:
         # Undelivered, the kickoff would otherwise exist nowhere on the server.
-        new_items = [
-            _build_new_item(item, "seed", created_by=created_by) for item in items[delivered:]
-        ]
-        if new_items:
-            await asyncio.to_thread(conversation_store.append, session_id, new_items)
+        remaining = items[delivered:]
+        if not remaining:
+            return
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            return
+        await _persist_native_terminal_failure(
+            session_id,
+            conv,
+            remaining[0],
+            conversation_store,
+            ErrorData(
+                source="execution",
+                code="initial_message_not_delivered",
+                message=f"This message was not delivered to the agent ({reason}). Send it again.",
+            ),
+            runner_router,
+            created_by=created_by,
+        )
+        rest = [_build_new_item(item, "seed", created_by=created_by) for item in remaining[1:]]
+        if rest:
+            await asyncio.to_thread(conversation_store.append, session_id, rest)
 
     async def deliver() -> None:
         nonlocal delivered
@@ -11448,10 +11465,10 @@ def _deliver_initial_items_after_launch(
                     "Managed launch did not settle; initial items kept as history for %s",
                     session_id,
                 )
-                await keep_as_history()
+                await keep_as_history("the sandbox did not finish launching")
                 return
             if launch.error is not None:
-                await keep_as_history()
+                await keep_as_history("the sandbox failed to launch")
                 return
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None or conv.archived:
@@ -11462,7 +11479,7 @@ def _deliver_initial_items_after_launch(
                     "No runner after managed launch; initial items kept as history for %s",
                     session_id,
                 )
-                await keep_as_history()
+                await keep_as_history("no runner was available after launch")
                 return
             await _ensure_runner_relay_ready(
                 session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
@@ -11493,7 +11510,7 @@ def _deliver_initial_items_after_launch(
                 exc_info=True,
             )
             try:
-                await keep_as_history()
+                await keep_as_history("delivery to the terminal failed")
             except Exception:  # noqa: BLE001 — the warning above already reports the loss
                 _logger.warning(
                     "Failed to keep initial items as history for %s", session_id, exc_info=True
