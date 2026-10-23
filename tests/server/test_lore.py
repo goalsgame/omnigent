@@ -159,6 +159,8 @@ def test_match_repository_longest_prefix_wins():
         "lores://lore.example.test/goal*/*",
         "lores://lore.example.test/goalables/**",
         "lores://lore.example.test/*/",
+        "lores://lore.example.test/goalables?/*",
+        "lores://lore.example.test/goalables#/*",
     ],
 )
 def test_config_rejects_misplaced_wildcard(monkeypatch, remote):

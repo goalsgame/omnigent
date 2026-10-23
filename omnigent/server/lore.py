@@ -44,7 +44,11 @@ class LoreConfig:
         for remote, options in raw.items():
             if not isinstance(remote, str):
                 raise ValueError("Lore repository URLs must be strings")
-            lore_remote(remote.removesuffix("/*") if remote.endswith("/*") else remote)
+            if remote.endswith("/*"):
+                lore_remote(remote.removesuffix("/*"))
+                lore_remote(remote.removesuffix("*") + "x")
+            else:
+                lore_remote(remote)
             if "*" in remote.removesuffix("/*"):
                 raise ValueError("Lore repository URLs only accept a trailing /* wildcard")
             parsed = urlsplit(remote)
