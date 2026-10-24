@@ -218,7 +218,7 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       git tmux procps lsof bubblewrap curl ca-certificates unzip bzip2 \
-      iproute2 nftables \
+      iproute2 nftables build-essential \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenShell-required non-root user (see the header note). UID/GID in the high
@@ -381,6 +381,29 @@ RUN set -eu; \
       exit 1; \
     fi; \
     echo "gh ${GH_VERSION} pinned (sha256 verified)"
+
+# Bazelisk as `bazel` — builds in managed workspaces (e.g. Goalable apps) call
+# `bazel`; bazelisk fetches the version a repository pins in .bazelversion.
+# Pinned + SHA256-verified per arch, like gh above; to bump, update
+# BAZELISK_VERSION and both SHA256s from the release's asset digests at
+# https://github.com/bazelbuild/bazelisk/releases.
+ARG BAZELISK_VERSION=1.30.0
+ARG BAZELISK_SHA256_AMD64=a248ae2b2b62b5baebb748f6fba7203bff1a27e5d01b55399a8406744cb539e8
+ARG BAZELISK_SHA256_ARM64=b2bcc040c213b44586b121bda6d983c35df121b917c3a7a66fb16f2fa0df1a4f
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$BAZELISK_SHA256_AMD64" ;; \
+      arm64) sha="$BAZELISK_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$arch' for bazelisk" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/bazelisk \
+      "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${arch}"; \
+    echo "${sha}  /tmp/bazelisk" | sha256sum -c -; \
+    install -m 0755 /tmp/bazelisk /usr/local/bin/bazel; \
+    rm -f /tmp/bazelisk; \
+    test -x /usr/local/bin/bazel; \
+    echo "bazelisk ${BAZELISK_VERSION} pinned (sha256 verified)"
 
 # Copy the venv and source tree. The editable install's .pth files reference
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
