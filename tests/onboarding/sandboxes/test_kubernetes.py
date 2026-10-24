@@ -2248,3 +2248,14 @@ python3() {{
     assert (tmp_path / "lore-finished").exists()
     if failure == "conflict":
         assert (workspace / "git/preserve.txt").read_text() == "unsaved"
+
+
+def test_launch_token_with_leading_dash_reaches_clone_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch token starting with ``-`` is not parsed as a helper option."""
+    result, _argv, _paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, host_token="-leading-dash-token", clone_succeeds=True
+    )
+    assert "expected one argument" not in result.stderr
+    assert result.returncode == 0, result.stderr
