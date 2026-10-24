@@ -515,7 +515,7 @@ def _render_workspace_prep_command(
         helper_source = (
             "import os,sys; from omnigent.git_credential_github import main; "
             f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
-            f"'--host-token',os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
+            f"'--host-token='+os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
         )
         helper = f"!python3 -Ic {shlex.quote(helper_source)}"
         helper_key = "credential.https://github.com.helper"
