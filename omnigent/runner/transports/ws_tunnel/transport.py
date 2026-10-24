@@ -25,6 +25,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 
+import anyio
 import httpx
 
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -55,6 +56,7 @@ class _TunneledByteStream(httpx.AsyncByteStream):
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         state = self._state
+        finished = False
         try:
             while True:
                 item = await state.body_queue.get()
@@ -62,16 +64,20 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                     raise state.aborted_with
                 if item is None:
                     # Sentinel: end-event signalled, no more chunks.
+                    finished = True
                     break
                 # Mypy/runtime: item must be a ResponseBodyFrame here.
                 if isinstance(item, ResponseBodyFrame):
                     yield decode_body(item.body, item.encoding)
         finally:
-            self._registry.close_request(
-                self._runner_id,
-                self._req_id,
-                session=state.session,
-            )
+            if finished:
+                self._registry.close_request(
+                    self._runner_id,
+                    self._req_id,
+                    session=state.session,
+                )
+            else:
+                await self.aclose()
 
     async def aclose(self) -> None:
         # Close the request from the caller side — typically called
@@ -80,18 +86,19 @@ class _TunneledByteStream(httpx.AsyncByteStream):
         # request.cancel frame so the runner aborts.
         state = self._state
         if self._registry.request_is_open(state.session, self._req_id):
-            try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
-                await self._registry.send_text(
-                    state.session,
-                    encode_frame(
-                        RequestCancelFrame(
-                            id=self._req_id,
-                            reason="client_disconnected",
-                        )
-                    ),
-                )
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
+            with anyio.CancelScope(shield=True):
+                try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
+                    await self._registry.send_text(
+                        state.session,
+                        encode_frame(
+                            RequestCancelFrame(
+                                id=self._req_id,
+                                reason="client_disconnected",
+                            )
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
         self._registry.close_request(
             self._runner_id,
             self._req_id,

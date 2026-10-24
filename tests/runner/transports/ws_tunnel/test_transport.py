@@ -242,6 +242,29 @@ async def test_tunneled_byte_stream_aclose_cleans_up() -> None:
     assert "req1" not in session.in_flight
 
 
+@pytest.mark.asyncio
+async def test_cancelled_body_read_sends_request_cancel() -> None:
+    """Cancelling a pending body read tells the runner to abort before the slot is dropped."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    state = reg.open_request("r1", "req1")
+    stream = _TunneledByteStream(reg, "r1", "req1", state)
+
+    async def _read() -> None:
+        async for _ in stream:
+            pass
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await _read()
+
+    queued = []
+    while not session.outbound_queue.empty():
+        queued.append(session.outbound_queue.get_nowait().data)
+    assert any("request.cancel" in frame and "req1" in frame for frame in queued)
+    assert "req1" not in session.in_flight
+
+
 # ── WSTunnelTransport.aclose ────────────────────────────
 
 
