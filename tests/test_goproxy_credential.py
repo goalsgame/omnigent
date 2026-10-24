@@ -88,6 +88,7 @@ def test_relay_serves_only_marked_requests_for_a_url(home, monkeypatch):
     assert get({"url": URL}, {}).status_code == 403
     assert get({}, marked).status_code == 403
     assert get({"url": URL, "x": "y"}, marked).status_code == 403
+    assert get({"url": URL, "x": "1", "y": "2"}, marked).status_code == 403
     assert calls == []
     ok = get({"url": URL}, marked)
     assert ok.status_code == 200

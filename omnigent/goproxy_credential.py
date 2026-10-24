@@ -93,7 +93,7 @@ class GoProxyHandler(BaseHTTPRequestHandler):
                 "connected": True,
             }
             status = 200
-        except GoProxyAccessError:
+        except (GoProxyAccessError, ValueError):
             payload = {"error": "Go proxy identity unavailable"}
             status = 403
         body = json.dumps(payload).encode()
