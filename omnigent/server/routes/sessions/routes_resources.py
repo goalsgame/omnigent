@@ -107,6 +107,9 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
+# Bound on the wait for a download's first body chunk; the tunnel transport has no read timeout.
+_FIRST_CHUNK_TIMEOUT_SECONDS = 45.0
+
 
 async def _prefixed(first_chunk: bytes, rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
     """Yield an already-read first chunk, then the rest of the stream."""
@@ -440,8 +443,9 @@ def register_resources_routes(
             }
             chunks = resp.aiter_raw()
             try:
-                first_chunk = await anext(chunks, b"")
-            except (httpx.HTTPError, ConnectionError) as exc:
+                async with asyncio.timeout(_FIRST_CHUNK_TIMEOUT_SECONDS):
+                    first_chunk = await anext(chunks, b"")
+            except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
                 await resp.aclose()
                 raise HTTPException(
                     status_code=502,

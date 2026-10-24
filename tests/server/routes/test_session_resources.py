@@ -8894,3 +8894,40 @@ async def test_filesystem_download_runner_failing_mid_stream_is_not_complete(
         except httpx.HTTPError:
             return
     assert len(resp.content) < 5000
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_runner_stalling_before_first_byte_is_502(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that sends headers and then stalls is cut off and closed, not held open."""
+    import omnigent.server.routes.sessions.routes_resources as routes_resources
+
+    monkeypatch.setattr(routes_resources, "_FIRST_CHUNK_TIMEOUT_SECONDS", 0.05)
+    closed = asyncio.Event()
+
+    class _StalledStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            await asyncio.sleep(3600)
+            yield b""
+
+        async def aclose(self) -> None:
+            closed.set()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            headers={"Content-Disposition": 'attachment; filename="f.bin"'},
+            stream=_StalledStream(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as runner_http:
+        set_runner_router(_FakeRunnerRouter(runner_http))  # type: ignore[arg-type]
+        async with _stacked_client(app) as c:
+            resp = await c.get(_DOWNLOAD_URL)
+    assert resp.status_code == 502
+    assert closed.is_set()
