@@ -108,6 +108,14 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
 
+async def _prefixed(first_chunk: bytes, rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Yield an already-read first chunk, then the rest of the stream."""
+    if first_chunk:
+        yield first_chunk
+    async for chunk in rest:
+        yield chunk
+
+
 class _RunnerStreamResponse(StreamingResponse):
     """Stream a runner response body and close it however the send ends.
 
@@ -120,8 +128,16 @@ class _RunnerStreamResponse(StreamingResponse):
     :param headers: Response headers to forward.
     """
 
-    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+    def __init__(
+        self,
+        upstream: httpx.Response,
+        *,
+        headers: Mapping[str, str],
+        first_chunk: bytes = b"",
+        chunks: AsyncIterator[bytes] | None = None,
+    ) -> None:
+        body = chunks if chunks is not None else upstream.aiter_raw()
+        super().__init__(_prefixed(first_chunk, body), headers=headers)
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -422,7 +438,21 @@ def register_resources_routes(
                 )
                 if name in resp.headers
             }
-            return _RunnerStreamResponse(resp, headers=forwarded)
+            chunks = resp.aiter_raw()
+            try:
+                first_chunk = await anext(chunks, b"")
+            except (httpx.HTTPError, ConnectionError) as exc:
+                await resp.aclose()
+                raise HTTPException(
+                    status_code=502,
+                    detail="runner download interrupted",
+                ) from exc
+            except BaseException:
+                await resp.aclose()
+                raise
+            return _RunnerStreamResponse(
+                resp, headers=forwarded, first_chunk=first_chunk, chunks=chunks
+            )
         try:
             await resp.aread()
         finally:

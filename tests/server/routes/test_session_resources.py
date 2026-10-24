@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
@@ -8795,3 +8797,100 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+class _PassthroughMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        return await call_next(request)
+
+
+class _DroppingStream(httpx.AsyncByteStream):
+    """Upstream body that yields ``chunks`` and then fails like a closed tunnel."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+        raise httpx.ReadError("tunnel closed")
+
+
+@contextlib.asynccontextmanager
+async def _dropping_runner(chunks: list[bytes], content_length: int) -> AsyncIterator[None]:
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Disposition": 'attachment; filename="f.bin"',
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(content_length),
+            },
+            stream=_DroppingStream(chunks),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as runner_http:
+        set_runner_router(_FakeRunnerRouter(runner_http))  # type: ignore[arg-type]
+        yield
+
+
+@contextlib.asynccontextmanager
+async def _stacked_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    app.add_middleware(_PassthroughMiddleware)
+    app.add_middleware(_PassthroughMiddleware)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [0, 50, 5000, 3 * 1024 * 1024])
+@pytest.mark.parametrize("accept_encoding", ["identity", "gzip, deflate"])
+async def test_filesystem_download_through_base_http_middleware(
+    app: FastAPI,
+    tmp_path: Path,
+    size: int,
+    accept_encoding: str,
+) -> None:
+    """A relayed download survives ``BaseHTTPMiddleware`` at any size and Accept-Encoding."""
+    payload = os.urandom(size)
+    (tmp_path / "f.bin").write_bytes(payload)
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> FileResponse:
+        del session_id, environment_id, relative_path
+        return FileResponse(tmp_path / "f.bin", filename="f.bin")
+
+    async with _runner_app_client(runner), _stacked_client(app) as c:
+        resp = await c.get(_DOWNLOAD_URL, headers={"Accept-Encoding": accept_encoding})
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert "content-encoding" not in resp.headers
+    assert resp.headers["content-length"] == str(size)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_runner_failing_before_first_byte_is_502(
+    app: FastAPI,
+) -> None:
+    """A runner stream that dies before any byte surfaces as a 502, not a middleware assertion."""
+    async with _dropping_runner([], 5000), _stacked_client(app) as c:
+        resp = await c.get(_DOWNLOAD_URL, headers={"Accept-Encoding": "gzip"})
+    assert resp.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_runner_failing_mid_stream_is_not_complete(
+    app: FastAPI,
+) -> None:
+    """A runner that drops after the first chunk never yields a body that looks complete."""
+    async with _dropping_runner([b"a" * 1000], 5000), _stacked_client(app) as c:
+        try:
+            resp = await c.get(_DOWNLOAD_URL, headers={"Accept-Encoding": "gzip"})
+        except httpx.HTTPError:
+            return
+    assert len(resp.content) < 5000
