@@ -73,13 +73,15 @@ def create_host_credentials_router(
         response: Response,
         x_omnigent_host_token: str | None = Header(default=None),
         remote: str | None = None,
+        url: str | None = None,
     ) -> dict[str, object]:
         """Return the session owner's *provider* credential for *host_id*.
 
         Authenticated by the launch token (constant-time, expiry-aware, and
         bound to *host_id*), exactly like the host tunnel. ``401`` when the
         token doesn't resolve; ``404`` for a provider with no broker resolver or
-        not configured on this server; ``{"connected": false}`` when the owner
+        not configured on this server; ``403`` when *remote* (Lore) or *url* (``goproxy``)
+        is not one the operator configured; ``{"connected": false}`` when the owner
         hasn't linked it, so a caller can fall back cleanly. Human GitHub
         accounts include ``reason: not_connected`` only for a missing connection.
         Machines without authorized App access include ``reason: machine_not_authorized``;
@@ -115,6 +117,28 @@ def create_host_credentials_router(
                 "connected": True,
                 "token": token,
                 "view": broker.lore_config.repositories[repository],
+            }
+        if provider == "goproxy":
+            from omnigent.server.oidc_mcp import DelegationUnavailable
+
+            broker = getattr(request.app.state, "goproxy_identity_broker", None)
+            if broker is None:
+                raise HTTPException(404, "Go proxy access is not configured")
+            if not broker.goproxy_config.matches(url):
+                raise HTTPException(403, "Go proxy is not configured")
+            try:
+                token = await asyncio.to_thread(broker.credential, managed.user_id)
+            except DelegationUnavailable:
+                raise HTTPException(
+                    403, "Go proxy identity unavailable; sign in again or renew delegation"
+                ) from None
+            except Exception:  # noqa: BLE001 - no provider details in responses
+                raise HTTPException(503, "Go proxy credentials temporarily unavailable") from None
+            return {
+                "connected": True,
+                "token": token,
+                "url": broker.goproxy_config.url,
+                "prefix": broker.goproxy_config.prefix,
             }
         if provider == "openrouter" and openrouter_wif_broker is not None:
             try:

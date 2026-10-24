@@ -2046,6 +2046,36 @@ def create_app(
     app.state.lore_identity_broker = lore_broker
     if lore_broker is not None:
         lore_broker.login_broker = login_broker
+
+    from omnigent.server.goproxy import GoProxyBroker, GoProxyConfig
+
+    goproxy_config = GoProxyConfig.parse(resolved_server_config.get("oidc_goproxy"))
+    goproxy_broker = None
+    if goproxy_config is not None:
+        from omnigent.stores.credential_store import CredentialStore, build_secret_cipher
+
+        oidc = getattr(auth_provider, "_oidc_config", None)
+        cipher = build_secret_cipher()
+        if (
+            not isinstance(auth_provider, UnifiedAuthProvider)
+            or oidc is None
+            or cipher is None
+            or host_store is None
+            or permission_store is None
+            or login_broker is None
+        ):
+            raise RuntimeError(
+                "oidc_goproxy requires OIDC, offline delegation, credential encryption "
+                "and managed hosts"
+            )
+        goproxy_broker = GoProxyBroker(
+            goproxy_config,
+            oidc,
+            CredentialStore(permission_store.storage_location, cipher),
+            auth_provider,
+        )
+        goproxy_broker.login_broker = login_broker
+    app.state.goproxy_identity_broker = goproxy_broker
     delegation_brokers = [broker for broker in (mcp_broker, lore_broker) if broker is not None]
     if delegation_brokers:
 
