@@ -5233,9 +5233,11 @@ def _serve_host_until_exit(
         configure_host_git,
         start_host_gh_refresh,
     )
+    from omnigent.goproxy_credential import configure as configure_host_goproxy
     from omnigent.lore_checkout import configure as configure_host_lore
 
     configure_host_lore(server_url, identity.host_id)
+    configure_host_goproxy(server_url, identity.host_id)
     configure_host_git(server_url, identity.host_id)
     # Managed images fetch gh credentials per invocation, independent of expiry timers.
     # Keep hosts.yml and its refresh loop for compatibility with custom images.

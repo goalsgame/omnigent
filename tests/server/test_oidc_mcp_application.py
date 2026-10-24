@@ -1,5 +1,6 @@
 """API session writes capture verified IdP owners through application middleware."""
 
+import dataclasses
 from urllib.parse import parse_qs
 
 import httpx
@@ -160,3 +161,65 @@ def test_disabled_renewal_keeps_revocation_available(delegation_app):
     revoker = app.state.oidc_login_revoker
     assert revoker is not None
     assert not hasattr(revoker, "state")
+
+
+def _goproxy_app(db_uri, tmp_path, monkeypatch, oidc, human, verifier, server_config):
+    monkeypatch.setattr(
+        "omnigent.stores.credential_store.build_secret_cipher", lambda: _FakeCipher()
+    )
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        host_store=HostStore(db_uri),
+        auth_provider=UnifiedAuthProvider(
+            "oidc", oidc_config=oidc, human_verifier=human, machine_verifier=verifier
+        ),
+        server_config=server_config,
+    )
+
+
+def test_goproxy_is_off_without_configuration(
+    db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier
+):
+    app = _goproxy_app(db_uri, tmp_path, monkeypatch, oidc, human, verifier, {})
+    assert app.state.goproxy_identity_broker is None
+
+
+def test_goproxy_requires_offline_delegation(
+    db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier
+):
+    monkeypatch.delenv("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", raising=False)
+    config = {
+        "oidc_goproxy": {
+            "url": "https://go.example.test",
+            "audience": "goproxy",
+            "scope": "openid goproxy",
+        }
+    }
+    with pytest.raises(RuntimeError, match="oidc_goproxy requires"):
+        _goproxy_app(db_uri, tmp_path, monkeypatch, oidc, human, verifier, config)
+
+
+def test_goproxy_broker_is_wired_to_the_login_broker(
+    db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier
+):
+    monkeypatch.setenv("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", "1")
+    oidc = dataclasses.replace(oidc, scopes="openid offline_access")
+    config = {
+        "oidc_goproxy": {
+            "url": "https://go.example.test",
+            "audience": "goproxy",
+            "scope": "openid goproxy",
+        }
+    }
+    app = _goproxy_app(db_uri, tmp_path, monkeypatch, oidc, human, verifier, config)
+    broker = app.state.goproxy_identity_broker
+    assert broker.provider == "oidc_goproxy"
+    assert broker.login_broker is app.state.oidc_login_broker is not None
+    assert app.state.lore_identity_broker is None
+    broker.client.close()

@@ -331,3 +331,72 @@ def test_lore_prefix_credentials(remote, status, view) -> None:
     assert response.status_code == status
     if view is not None:
         assert response.json()["view"] == view
+
+
+def _goproxy_client(broker) -> TestClient:
+    app = FastAPI()
+    if broker is not None:
+        app.state.goproxy_identity_broker = broker
+    app.include_router(
+        create_host_credentials_router(_FakeHostStore("host1", "launch-tok", "alice@example.com")),
+        prefix="/v1",
+    )
+    return TestClient(app)
+
+
+def _goproxy_broker(token="short-lived", error=None):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omnigent.server.goproxy import GoProxyConfig
+
+    config = GoProxyConfig(
+        "https://go.example.test", "go.example.test", "goproxy", "openid goproxy"
+    )
+    credential = Mock(return_value=token, side_effect=error)
+    return SimpleNamespace(goproxy_config=config, credential=credential)
+
+
+def test_goproxy_credentials_bind_host_owner_and_url() -> None:
+    broker = _goproxy_broker()
+    client = _goproxy_client(broker)
+    endpoint = "/v1/hosts/host1/credentials/goproxy"
+    url = "https://go.example.test"
+    assert client.get(endpoint, params={"url": url}).status_code == 401
+    for bad in (None, "https://evil.test", "http://go.example.test", url + "/path"):
+        params = {} if bad is None else {"url": bad}
+        assert client.get(endpoint, params=params, headers=_HDR).status_code == 403
+    broker.credential.assert_not_called()
+    response = client.get(endpoint, params={"url": url + "/"}, headers=_HDR)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "connected": True,
+        "token": "short-lived",
+        "url": url,
+        "prefix": "go.example.test",
+    }
+    broker.credential.assert_called_once_with("alice@example.com")
+
+
+def test_goproxy_is_off_unless_configured() -> None:
+    response = _goproxy_client(None).get(
+        "/v1/hosts/host1/credentials/goproxy",
+        params={"url": "https://go.example.test"},
+        headers=_HDR,
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(("error", "status"), [("delegation", 403), ("fault", 503)])
+def test_goproxy_failures_do_not_leak_details(error, status) -> None:
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    raised = DelegationUnavailable("SECRET") if error == "delegation" else RuntimeError("SECRET")
+    response = _goproxy_client(_goproxy_broker(error=raised)).get(
+        "/v1/hosts/host1/credentials/goproxy",
+        params={"url": "https://go.example.test"},
+        headers=_HDR,
+    )
+    assert response.status_code == status
+    assert "SECRET" not in response.text
