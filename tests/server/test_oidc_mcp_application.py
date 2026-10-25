@@ -223,3 +223,257 @@ def test_goproxy_broker_is_wired_to_the_login_broker(
     assert broker.login_broker is app.state.oidc_login_broker is not None
     assert app.state.lore_identity_broker is None
     broker.client.close()
+
+
+@pytest.fixture(params=["oidc_mcp", "oidc_lore"])
+def login_app(request, db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier):
+    monkeypatch.setenv("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", "1")
+    monkeypatch.setenv("TEST_MCP_CLIENT_SECRET", "fixture-secret")
+    oidc = dataclasses.replace(oidc, scopes="openid email offline_access")
+    server_config = {
+        request.param: {
+            "upstream_url": "https://tools.example.test",
+            "audience": "tools-api",
+            "scope": "openid tools-api",
+            "machine_client_id": "machine-exchange",
+            "machine_client_secret_env": "TEST_MCP_CLIENT_SECRET",
+            **(
+                {
+                    "repositories": {"lores://tools.example.test/game": {}},
+                    "machine_principals": [PRINCIPAL],
+                }
+                if request.param == "oidc_lore"
+                else {}
+            ),
+        },
+        "oidc_goproxy": {
+            "url": "https://go.example.test",
+            "audience": "tools-api",
+            "scope": "openid tools-api",
+        },
+    }
+    app = _goproxy_app(db_uri, tmp_path, monkeypatch, oidc, human, verifier, server_config)
+    app.state.test_identity_broker = getattr(
+        app.state,
+        "lore_identity_broker" if request.param == "oidc_lore" else "mcp_identity_broker",
+    )
+    yield app
+    app.state.test_identity_broker.client.close()
+    app.state.goproxy_identity_broker.client.close()
+    app.state.oidc_login_broker.client.close()
+
+
+class _Idp:
+    """Token endpoint stand-in recording each request against the login or delegation client."""
+
+    def __init__(self, signing_key, oidc, *, login=None, subject="human-subject"):
+        self.signing_key, self.oidc, self.subject = signing_key, oidc, subject
+        self.login = login or self._grant
+        self.requests = []
+
+    def _grant(self, form):
+        access = signed_token(
+            self.signing_key,
+            sub=self.subject,
+            azp=self.oidc.client_id,
+            email="person@example.test",
+            aud="web",
+        )
+        return httpx.Response(
+            200,
+            json={
+                "access_token": access,
+                "refresh_token": "offline-refresh",
+                "expires_in": 300,
+                "refresh_expires_in": 0,
+                "scope": "openid email offline_access",
+                "token_type": "Bearer",
+            },
+        )
+
+    def handler(self, request):
+        form = parse_qs(request.content.decode())
+        self.requests.append(form)
+        if form["client_id"] == [self.oidc.client_id] and form["grant_type"] != [
+            "urn:ietf:params:oauth:grant-type:token-exchange"
+        ]:
+            return self._grant(form)
+        if form.get("requested_token_type") == ["urn:ietf:params:oauth:token-type:refresh_token"]:
+            return self.login(form)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": signed_token(
+                    self.signing_key,
+                    sub=self.subject,
+                    azp=self.oidc.client_id,
+                    aud="tools-api",
+                ),
+                "expires_in": 300,
+                "token_type": "Bearer",
+            },
+        )
+
+    def attach(self, app):
+        for broker in (
+            app.state.test_identity_broker,
+            app.state.goproxy_identity_broker,
+            app.state.oidc_login_broker,
+        ):
+            broker.client.close()
+            broker.client = httpx.Client(transport=httpx.MockTransport(self.handler))
+
+
+async def _post_session(app, token):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://app.example.test"
+    ) as client:
+        return await client.post(
+            "/v1/sessions", headers={"Authorization": f"Bearer {token}"}, json={}
+        )
+
+
+@pytest.mark.asyncio
+async def test_bearer_without_login_state_captures_offline_grant(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc)
+    idp.attach(login_app)
+    token = human_token(signing_key)
+    response = await _post_session(login_app, token)
+    assert response.status_code in (404, 422), response.text
+    exchange = next(
+        form
+        for form in idp.requests
+        if form.get("requested_token_type") == ["urn:ietf:params:oauth:token-type:refresh_token"]
+    )
+    assert exchange["subject_token"] == [token]
+    assert exchange["client_id"] == [oidc.client_id]
+    assert "offline_access" in exchange["scope"][0].split()
+    login = login_app.state.oidc_login_broker
+    state = login.state("person@example.test")
+    assert state["subject"] == "human-subject"
+    assert state["refresh_token"] == "offline-refresh"
+    assert login_app.state.test_identity_broker.credential("person@example.test")
+    goproxy = login_app.state.goproxy_identity_broker
+    assert goproxy.credential("person@example.test")
+    assert goproxy.store.get("person@example.test", "oidc_goproxy") is not None
+
+
+@pytest.mark.asyncio
+async def test_existing_login_state_is_reused_without_a_new_exchange(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc)
+    idp.attach(login_app)
+    token = human_token(signing_key)
+    await _post_session(login_app, token)
+    exchanges = [f for f in idp.requests if "requested_token_type" in f]
+    await _post_session(login_app, token)
+    assert [f for f in idp.requests if "requested_token_type" in f] == exchanges
+
+
+@pytest.mark.asyncio
+async def test_subject_mismatch_never_overwrites_an_existing_grant(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc)
+    idp.attach(login_app)
+    await _post_session(login_app, human_token(signing_key))
+    login = login_app.state.oidc_login_broker
+    before = login.state("person@example.test")["generation"]
+    idp.subject = "other-subject"
+    response = await _post_session(login_app, human_token(signing_key, sub="other-subject"))
+    assert response.status_code == 403
+    assert "re-login" not in response.json()["detail"]
+    assert login.state("person@example.test")["generation"] == before
+    assert login.state("person@example.test")["subject"] == "human-subject"
+
+
+@pytest.mark.asyncio
+async def test_subject_mismatch_against_an_expired_grant_is_refused(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc)
+    idp.attach(login_app)
+    await _post_session(login_app, human_token(signing_key))
+    login = login_app.state.oidc_login_broker
+    current = login.store.get("person@example.test", "oidc_login", account_id="current")
+    login.revoke("person@example.test", current.metadata["generation"])
+    exchanges = [f for f in idp.requests if "requested_token_type" in f]
+    idp.subject = "other-subject"
+    response = await _post_session(login_app, human_token(signing_key, sub="other-subject"))
+    assert response.status_code == 403
+    assert [f for f in idp.requests if "requested_token_type" in f] == exchanges
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(400, json={"error": "invalid_scope"}),
+        httpx.Response(400, json={"error": "invalid_grant"}),
+        httpx.Response(
+            200,
+            json={
+                "access_token": "unused",
+                "refresh_token": "r",
+                "expires_in": 300,
+                "scope": "openid email",
+            },
+        ),
+        httpx.Response(200, json={"access_token": "unused", "expires_in": 300}),
+    ],
+)
+async def test_non_renewable_bearer_returns_distinct_403(login_app, signing_key, oidc, reply):
+    idp = _Idp(signing_key, oidc, login=lambda form: reply)
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403
+    assert response.json()["detail"].endswith("requires re-login with offline_access")
+    assert response.headers["cache-control"] == "no-store"
+    assert login_app.state.oidc_login_broker.known_subject("person@example.test") is None
+
+
+@pytest.mark.asyncio
+async def test_exchange_outage_returns_503(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, login=lambda form: httpx.Response(503))
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 503
+    assert response.json() == {"error": "temporarily_unavailable"}
+    assert response.headers["retry-after"] == "5"
+
+
+@pytest.mark.asyncio
+async def test_other_exchange_rejection_keeps_generic_403(login_app, signing_key, oidc):
+    idp = _Idp(
+        signing_key, oidc, login=lambda form: httpx.Response(403, json={"error": "access_denied"})
+    )
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403
+    assert response.json()["detail"].endswith("renew your IdP session")
+
+
+@pytest.mark.asyncio
+async def test_machine_owner_ignores_the_login_broker(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, subject=SUBJECT)
+
+    def machine_exchange(request):
+        form = parse_qs(request.content.decode())
+        idp.requests.append(form)
+        assert form["client_id"] == ["machine-exchange"]
+        return httpx.Response(
+            200,
+            json={
+                "access_token": signed_token(
+                    signing_key, sub=SUBJECT, azp="machine-exchange", aud="tools-api"
+                ),
+                "refresh_token": "machine-refresh",
+                "expires_in": 300,
+                "token_type": "Bearer",
+            },
+        )
+
+    broker = login_app.state.test_identity_broker
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(machine_exchange))
+    response = await _post_session(login_app, signed_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    grant = broker.store.get(PRINCIPAL, broker.provider, with_secret=True)
+    assert grant.secret["refresh_token"] == "machine-refresh"
+    assert grant.metadata == {"issuer": oidc.issuer, "subject": SUBJECT}
+    assert login_app.state.oidc_login_broker.known_subject(PRINCIPAL) is None

@@ -26,6 +26,10 @@ class DelegationUnavailable(Exception):
     """No usable owner credential; callers must never substitute another identity."""
 
 
+class DelegationNotRenewable(DelegationUnavailable):
+    """The caller's IdP session cannot yield an offline grant; the person must sign in again."""
+
+
 @dataclass(frozen=True)
 class MCPDelegationConfig:
     upstream_url: str
@@ -158,9 +162,7 @@ class MCPDelegationBroker:
     def capture(self, owner: str, subject: str, token: str) -> None:
         """Persist a grant only after the caller's IdP token and owner have been verified."""
         if self.login_broker is not None and not owner.startswith("oidc-machine:"):
-            if self.login_broker.state(owner)["subject"] != subject:
-                raise DelegationUnavailable("Sign in again to renew identity delegation")
-            self.credential(owner)
+            self._capture_login(owner, subject, token)
             return
         tokens = self._tokens(
             owner,
@@ -184,6 +186,25 @@ class MCPDelegationBroker:
             secret=tokens,
             metadata={"issuer": self.oidc.issuer, "subject": subject},
         )
+
+    def _capture_login(self, owner: str, subject: str, token: str) -> None:
+        """Reuse the owner's offline login grant, creating it from the bearer when absent."""
+        login = self.login_broker
+        assert login is not None
+        try:
+            state = login.state(owner)
+        except DelegationUnavailable:
+            state = None
+        if state is not None:
+            if state["subject"] != subject:
+                raise DelegationUnavailable("Sign in again to renew identity delegation")
+            self.credential(owner)
+            return
+        known = login.known_subject(owner)
+        if known is not None and known != subject:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        login.capture_exchanged(owner, subject, token)
+        self.credential(owner)
 
     def credential(self, owner: str) -> str:
         """Resolve only the stored owner's grant and serialize refresh across replicas."""

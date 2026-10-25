@@ -15,7 +15,7 @@ import jwt
 from omnigent.db.group_authority import group_name, verified_groups
 from omnigent.server.oidc import OIDCConfig, mint_session_token
 from omnigent.server.oidc_machine_auth import _BoundedJWKClient
-from omnigent.server.oidc_mcp import DelegationUnavailable
+from omnigent.server.oidc_mcp import DelegationNotRenewable, DelegationUnavailable
 from omnigent.stores.credential_store import CredentialStore
 
 PROVIDER = "oidc_login"
@@ -218,6 +218,57 @@ class OIDCLoginBroker(OIDCLoginRevoker):
             return state
         except (jwt.PyJWTError, KeyError, TypeError, ValueError):
             raise DelegationUnavailable("Sign in again to renew identity delegation") from None
+
+    def known_subject(self, owner: str) -> str | None:
+        """Subject of the owner's most recent login grant, even if expired or unrenewable."""
+        current = self.store.get(owner, PROVIDER, account_id="current")
+        if current is None:
+            current = self.store.get(owner, PROVIDER)
+        subject = current.metadata.get("subject") if current is not None else None
+        return subject if isinstance(subject, str) and subject else None
+
+    def capture_exchanged(self, owner: str, subject: str, token: str) -> dict[str, Any]:
+        """Store an offline grant obtained by exchanging a verified access token."""
+        try:
+            response = self.client.post(
+                self.config.token_endpoint,
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                    "subject_token": token,
+                    "requested_token_type": "urn:ietf:params:oauth:token-type:refresh_token",
+                    "scope": self.config.scopes,
+                    "client_id": self.config.client_id,
+                    "client_secret": self.config.client_secret,
+                },
+            )
+        except httpx.TransportError:
+            raise DelegationTemporarilyUnavailable(
+                "Identity provider temporarily unavailable"
+            ) from None
+        except httpx.HTTPError:
+            raise DelegationUnavailable("Sign in again to renew identity delegation") from None
+        if response.status_code >= 500 or response.status_code in (408, 429):
+            raise DelegationTemporarilyUnavailable("Identity provider temporarily unavailable")
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        if response.status_code != 200:
+            if body.get("error") in ("invalid_grant", "invalid_scope"):
+                raise DelegationNotRenewable("Sign in again with offline access")
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        scope = body.get("scope")
+        if (
+            not isinstance(body.get("refresh_token"), str)
+            or not body["refresh_token"]
+            or not isinstance(scope, str)
+            or "offline_access" not in scope.split()
+        ):
+            raise DelegationNotRenewable("Sign in again with offline access")
+        return self.capture(owner, subject, body)
 
     def _secret(
         self, tokens: dict[str, Any], claims: dict[str, Any], refresh: str
