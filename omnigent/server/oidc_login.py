@@ -74,7 +74,7 @@ class OIDCLoginRevoker:
         if connection is None:
             return False
         if self.store.get(owner, PROVIDER, account_id="current") is None:
-            self.store.upsert(
+            self.store.upsert_if_metadata(
                 owner,
                 PROVIDER,
                 account_id="current",
@@ -84,6 +84,7 @@ class OIDCLoginRevoker:
                     "issuer": connection.metadata.get("issuer"),
                     "subject": connection.metadata.get("subject"),
                 },
+                expected_metadata=None,
             )
         return self.store.delete(
             owner,

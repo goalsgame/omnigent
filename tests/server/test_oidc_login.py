@@ -1384,3 +1384,32 @@ def test_other_subject_published_during_exchange_is_not_overwritten(login, exist
         if c.provider == PROVIDER and c.account_id != "current"
     ]
     assert stored.count(SUBJECT) == (1 if existing else 0)
+
+
+def test_revoke_does_not_replace_a_pointer_published_during_revocation(login):
+    broker, _token, _tokens, _calls = login
+    broker.store.upsert(
+        OWNER,
+        PROVIDER,
+        account_id="",
+        secret={"access_token": "stale", "refresh_token": "legacy", "expires_at": 0},
+        metadata={
+            "issuer": broker.config.issuer,
+            "subject": SUBJECT,
+            "generation": "legacy",
+            "deadline": time.time() + 3600,
+        },
+    )
+    newer = {"generation": "newer", "issuer": broker.config.issuer, "subject": "other-subject"}
+    original_get = broker.store.get
+
+    def racing_get(owner, provider, *args, **kwargs):
+        result = original_get(owner, provider, *args, **kwargs)
+        if kwargs.get("account_id") == "current" and result is None:
+            broker.store.upsert(owner, provider, account_id="current", secret={}, metadata=newer)
+        return result
+
+    broker.store.get = racing_get
+    assert broker.revoke(OWNER, "legacy")
+    broker.store.get = original_get
+    assert original_get(OWNER, PROVIDER, account_id="current").metadata == newer
