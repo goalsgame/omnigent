@@ -191,6 +191,9 @@ class MCPDelegationBroker:
         """Reuse the owner's offline login grant, creating it from the bearer when absent."""
         login = self.login_broker
         assert login is not None
+        known = login.known_subject(owner)
+        if known is not None and known != subject:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
         try:
             state = login.state(owner)
         except DelegationUnavailable:

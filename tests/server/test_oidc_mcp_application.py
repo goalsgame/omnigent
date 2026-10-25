@@ -1,6 +1,7 @@
 """API session writes capture verified IdP owners through application middleware."""
 
 import dataclasses
+import time
 from urllib.parse import parse_qs
 
 import httpx
@@ -477,3 +478,43 @@ async def test_machine_owner_ignores_the_login_broker(login_app, signing_key, oi
     assert grant.secret["refresh_token"] == "machine-refresh"
     assert grant.metadata == {"issuer": oidc.issuer, "subject": SUBJECT}
     assert login_app.state.oidc_login_broker.known_subject(PRINCIPAL) is None
+
+
+@pytest.mark.asyncio
+async def test_other_subject_refused_against_legacy_grant_whose_refresh_is_rejected(
+    login_app, signing_key, oidc
+):
+    owner = "person@example.test"
+    login = login_app.state.oidc_login_broker
+    login.store.upsert(
+        owner,
+        "oidc_login",
+        account_id="",
+        secret={
+            "access_token": "stale",
+            "refresh_token": "legacy-refresh",
+            "expires_at": 0,
+        },
+        metadata={
+            "issuer": oidc.issuer,
+            "subject": "human-subject",
+            "generation": "legacy",
+            "deadline": time.time() + 3600,
+        },
+    )
+    idp = _Idp(signing_key, oidc, subject="other-subject")
+
+    def reject_refresh(request):
+        form = parse_qs(request.content.decode())
+        idp.requests.append(form)
+        if form["grant_type"] == ["refresh_token"]:
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        return idp.handler(request)
+
+    for broker in (login_app.state.test_identity_broker, login):
+        broker.client.close()
+        broker.client = httpx.Client(transport=httpx.MockTransport(reject_refresh))
+    response = await _post_session(login_app, human_token(signing_key, sub="other-subject"))
+    assert response.status_code == 403
+    assert not [f for f in idp.requests if "requested_token_type" in f]
+    assert login.known_subject(owner) == "human-subject"
