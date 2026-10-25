@@ -2081,7 +2081,7 @@ def create_app(
 
         @app.middleware("http")
         async def capture_delegated_identity(request: Request, call_next):
-            from omnigent.server.oidc_mcp import DelegationUnavailable
+            from omnigent.server.oidc_mcp import DelegationNotRenewable, DelegationUnavailable
 
             path = request.url.path.removeprefix(resolved_base_path)
             bearer = request.headers.get("authorization", "")
@@ -2099,6 +2099,15 @@ def create_app(
                         {"error": "temporarily_unavailable"},
                         status_code=503,
                         headers={"Cache-Control": "no-store", "Retry-After": "5"},
+                    )
+                except DelegationNotRenewable:
+                    return JSONResponse(
+                        {
+                            "detail": ("Lore" if broker is lore_broker else "MCP")
+                            + " identity delegation requires re-login with offline_access"
+                        },
+                        status_code=403,
+                        headers={"Cache-Control": "no-store"},
                     )
                 except DelegationUnavailable:
                     return JSONResponse(

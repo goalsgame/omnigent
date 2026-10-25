@@ -37,7 +37,7 @@ def sandbox(tmp_path: Path, db_uri, monkeypatch):
         base.client,
     )
     broker.login_broker = SimpleNamespace(
-        state=lambda owner: {
+        state=lambda owner, generation=None: {
             "subject": "person-sub",
             "generation": "gen-1",
             "access_token": "login-token",

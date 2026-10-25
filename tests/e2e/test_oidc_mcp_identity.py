@@ -28,9 +28,24 @@ from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.conftest import mock_llm, runtime_init
 from tests.server.test_credential_store import _FakeCipher
-from tests.server.test_oidc_machine_auth import oidc, signing_key
+from tests.server.test_oidc_human_auth import human, human_token
+from tests.server.test_oidc_machine_auth import (
+    machine_config,
+    oidc,
+    signed_token,
+    signing_key,
+    verifier,
+)
 
-__all__ = ["mock_llm", "oidc", "runtime_init", "signing_key"]
+__all__ = [
+    "human",
+    "machine_config",
+    "mock_llm",
+    "oidc",
+    "runtime_init",
+    "signing_key",
+    "verifier",
+]
 
 
 @pytest.mark.asyncio
@@ -254,6 +269,203 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
                 assert not result.isError
                 assert result.content[0].text == subject
             assert callers and set(callers) == {subject}
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=15)
+        sock.close()
+
+
+@pytest.mark.asyncio
+async def test_bearer_only_owner_invokes_mcp_from_managed_stdio_host(
+    db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier, signing_key
+):
+    owner, subject = "person@example.test", "human-subject"
+    host_id = uuid.uuid4().hex
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    base = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    oidc = dataclasses.replace(oidc, scopes="openid email offline_access")
+    monkeypatch.setenv("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", "168")
+    monkeypatch.setattr(
+        "omnigent.stores.credential_store.build_secret_cipher", lambda: _FakeCipher()
+    )
+    monkeypatch.setenv("TEST_MCP_CLIENT_SECRET", "fixture-secret")
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    hosts = HostStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        host_store=hosts,
+        auth_provider=UnifiedAuthProvider(
+            "oidc", oidc_config=oidc, human_verifier=human, machine_verifier=verifier
+        ),
+        server_config={
+            "oidc_mcp": {
+                "upstream_url": "https://tools.example.test/mcp",
+                "audience": "tools-api",
+                "scope": "openid tools-api",
+                "machine_client_id": "machine-exchange",
+                "machine_client_secret_env": "TEST_MCP_CLIENT_SECRET",
+            }
+        },
+    )
+    bearer = human_token(signing_key)
+    exchanges = []
+
+    def idp(request):
+        form = parse_qs(request.content.decode())
+        exchanges.append(form)
+        assert form["client_id"] == [oidc.client_id]
+        if form["requested_token_type"] == ["urn:ietf:params:oauth:token-type:refresh_token"]:
+            assert form["subject_token"] == [bearer]
+            assert "offline_access" in form["scope"][0].split()
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": signed_token(
+                        signing_key,
+                        sub=subject,
+                        azp=oidc.client_id,
+                        aud="web",
+                        email=owner,
+                    ),
+                    "refresh_token": "offline-refresh",
+                    "expires_in": 300,
+                    "refresh_expires_in": 0,
+                    "scope": "openid email offline_access",
+                    "token_type": "Bearer",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "access_token": signed_token(
+                    signing_key, sub=subject, azp=oidc.client_id, aud="tools-api"
+                ),
+                "expires_in": 300,
+                "token_type": "Bearer",
+            },
+        )
+
+    for broker in (app.state.mcp_identity_broker, app.state.oidc_login_broker):
+        broker.client.close()
+        broker.client = httpx.Client(transport=httpx.MockTransport(idp))
+    callers = []
+
+    def upstream(request):
+        claims = jwt.decode(
+            request.headers["authorization"].removeprefix("Bearer "),
+            signing_key.public_key(),
+            algorithms=["RS256"],
+            issuer=oidc.issuer,
+            audience="tools-api",
+        )
+        callers.append(claims["sub"])
+        if request.method != "POST":
+            return httpx.Response(405)
+        message = json.loads(request.content)
+        if "id" not in message:
+            return httpx.Response(202)
+        if message["method"] == "initialize":
+            result = {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "identity-fixture", "version": "1"},
+            }
+        elif message["method"] == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "whoami",
+                        "description": "Return verified owner",
+                        "inputSchema": {"type": "object"},
+                    }
+                ]
+            }
+        else:
+            result = {"content": [{"type": "text", "text": claims["sub"]}], "isError": False}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    from omnigent.server.routes import mcp_identity
+
+    monkeypatch.setattr(
+        mcp_identity,
+        "httpx",
+        SimpleNamespace(
+            AsyncClient=lambda **kwargs: httpx.AsyncClient(
+                transport=httpx.MockTransport(upstream), **kwargs
+            ),
+            Timeout=httpx.Timeout,
+            HTTPError=httpx.HTTPError,
+        ),
+    )
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
+    task = asyncio.create_task(server.serve(sockets=[sock]))
+    try:
+        async with asyncio.timeout(30):
+            while not server.started:
+                if task.done():
+                    await task
+                    pytest.fail("Server did not start")
+                await asyncio.sleep(0.01)
+            assert app.state.oidc_login_broker.known_subject(owner) is None
+            async with httpx.AsyncClient(base_url=base) as api:
+                response = await api.post(
+                    "/v1/sessions/missing/events",
+                    headers={"Authorization": f"Bearer {bearer}"},
+                    json={},
+                )
+            assert response.status_code != 403, response.text
+            assert app.state.oidc_login_broker.state(owner)["subject"] == subject
+            hosts.register_managed_host(
+                host_id=host_id,
+                name="fixture",
+                user_id=owner,
+                token="fixture-launch-token",
+                provider="agent_sandbox",
+                sandbox_id="fixture-sandbox",
+                token_expires_at=int(time.time()) + 300,
+            )
+            hosts.upsert_on_connect(
+                host_id, "fixture", owner, managed_token="fixture-launch-token"
+            )
+            coords = tmp_path / "host-credentials.json"
+            coords.write_text(
+                json.dumps(
+                    {"server": base, "host_id": host_id, "host_token": "fixture-launch-token"}
+                )
+            )
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-c",
+                    "import sys; from pathlib import Path; import anyio; "
+                    "import omnigent.host.mcp_identity as bridge; "
+                    "bridge._coords_path=lambda: Path(sys.argv[1]); anyio.run(bridge.main)",
+                    str(coords),
+                ],
+            )
+            async with (
+                stdio_client(params) as (read, write),
+                ClientSession(read, write) as session,
+            ):
+                await session.initialize()
+                result = await session.call_tool("whoami", {})
+                assert not result.isError
+                assert result.content[0].text == subject
+            assert callers and set(callers) == {subject}
+            assert (
+                sum(
+                    f["requested_token_type"] == ["urn:ietf:params:oauth:token-type:refresh_token"]
+                    for f in exchanges
+                )
+                == 1
+            )
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, timeout=15)

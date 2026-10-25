@@ -70,7 +70,7 @@ def login_state(base, generation="gen-1"):
     from types import SimpleNamespace
 
     base.login_broker = SimpleNamespace(
-        state=lambda owner: {
+        state=lambda owner, generation=None: {
             "subject": "person-sub",
             "generation": generation,
             "access_token": "login-token",
