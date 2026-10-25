@@ -73,6 +73,18 @@ class OIDCLoginRevoker:
         connection = self._connection(owner, generation, require_current_identity=False)
         if connection is None:
             return False
+        if self.store.get(owner, PROVIDER, account_id="current") is None:
+            self.store.upsert(
+                owner,
+                PROVIDER,
+                account_id="current",
+                secret={},
+                metadata={
+                    "generation": generation,
+                    "issuer": connection.metadata.get("issuer"),
+                    "subject": connection.metadata.get("subject"),
+                },
+            )
         return self.store.delete(
             owner,
             PROVIDER,

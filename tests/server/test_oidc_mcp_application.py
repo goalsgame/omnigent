@@ -518,3 +518,72 @@ async def test_other_subject_refused_against_legacy_grant_whose_refresh_is_rejec
     assert response.status_code == 403
     assert not [f for f in idp.requests if "requested_token_type" in f]
     assert login.known_subject(owner) == "human-subject"
+
+
+@pytest.mark.asyncio
+async def test_revoked_legacy_grant_keeps_its_subject_binding(login_app, signing_key, oidc):
+    owner = "person@example.test"
+    login = login_app.state.oidc_login_broker
+    login.store.upsert(
+        owner,
+        "oidc_login",
+        account_id="",
+        secret={"access_token": "stale", "refresh_token": "legacy-refresh", "expires_at": 0},
+        metadata={
+            "issuer": oidc.issuer,
+            "subject": "human-subject",
+            "generation": "legacy",
+            "deadline": time.time() + 3600,
+        },
+    )
+    idp = _Idp(signing_key, oidc, login=lambda form: httpx.Response(403, json={"error": "denied"}))
+
+    def handler(request):
+        form = parse_qs(request.content.decode())
+        if form["grant_type"] == ["refresh_token"]:
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        return idp.handler(request)
+
+    for broker in (login_app.state.test_identity_broker, login):
+        broker.client.close()
+        broker.client = httpx.Client(transport=httpx.MockTransport(handler))
+    first = await _post_session(login_app, human_token(signing_key))
+    assert first.status_code == 403
+    idp.login = idp._grant
+    idp.subject = "other-subject"
+    second = await _post_session(login_app, human_token(signing_key, sub="other-subject"))
+    assert second.status_code == 403
+    assert login.known_subject(owner) == "human-subject"
+
+
+@pytest.mark.asyncio
+async def test_identity_displaced_between_capture_and_credential_is_rejected(
+    login_app, signing_key, oidc
+):
+    owner = "person@example.test"
+    idp = _Idp(signing_key, oidc)
+    idp.attach(login_app)
+    login = login_app.state.oidc_login_broker
+    capture = login.capture_exchanged
+
+    def displaced(owner_, subject_, token_):
+        state = capture(owner_, subject_, token_)
+        other = idp._grant({})
+        body = other.json()
+        body["access_token"] = signed_token(
+            signing_key,
+            sub="other-subject",
+            azp=oidc.client_id,
+            email=owner,
+            aud="web",
+        )
+        login.capture(owner, "other-subject", body)
+        return state
+
+    login.capture_exchanged = displaced
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403
+    grant = login_app.state.test_identity_broker.store.get(
+        owner, login_app.state.test_identity_broker.provider
+    )
+    assert grant is None or grant.metadata["subject"] == "human-subject"

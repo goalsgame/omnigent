@@ -206,14 +206,19 @@ class MCPDelegationBroker:
         known = login.known_subject(owner)
         if known is not None and known != subject:
             raise DelegationUnavailable("Sign in again to renew identity delegation")
-        login.capture_exchanged(owner, subject, token)
-        self.credential(owner)
+        captured = login.capture_exchanged(owner, subject, token)
+        self.credential(owner, generation=captured["generation"])
+        if login.known_subject(owner) != subject:
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
 
-    def credential(self, owner: str) -> str:
-        """Resolve only the stored owner's grant and serialize refresh across replicas."""
+    def credential(self, owner: str, *, generation: str | None = None) -> str:
+        """Resolve only the stored owner's grant and serialize refresh across replicas.
+
+        ``generation`` pins resolution to one login grant instead of the owner's current one.
+        """
         self._client_credentials(owner)
         if self.login_broker is not None and not owner.startswith("oidc-machine:"):
-            state = self.login_broker.state(owner)
+            state = self.login_broker.state(owner, generation)
             # Only short-lived access tokens leave the shared offline login broker.
             current = self.store.get(owner, self.provider, with_secret=True)
             if (
