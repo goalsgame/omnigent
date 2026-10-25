@@ -198,18 +198,28 @@ class CredentialStore:
     ) -> bool:
         """Write the row only if its metadata still equals ``expected_metadata``.
 
+        The existing row is locked (``FOR UPDATE`` on PostgreSQL) while it is compared.
+
         ``expected_metadata=None`` requires the row to be absent. Returns ``False`` when
         another writer changed the row since it was read.
         """
         now = now_epoch()
         workspace_id = current_workspace_id()
-        pk = (workspace_id, user_id, provider, account_id)
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
 
         def write(session: Session) -> bool:
             require_active_account(session, user_id)
-            row = session.get(SqlConnection, pk)
+            row = session.scalar(
+                select(SqlConnection)
+                .where(
+                    SqlConnection.workspace_id == workspace_id,
+                    SqlConnection.user_id == user_id,
+                    SqlConnection.provider == provider,
+                    SqlConnection.account_id == account_id,
+                )
+                .with_for_update()
+            )
             if row is None:
                 if expected_metadata is not None:
                     return False

@@ -222,3 +222,25 @@ def test_sqlite_refresh_obeys_lock_held_by_legacy_worker(db_uri):
             assert not called.wait(0.2), "A new worker bypassed the legacy refresh lock"
         assert future.result(timeout=10).secret == {"token": "rotated"}
     assert called.is_set()
+
+
+def test_upsert_if_metadata_is_compare_and_set(db_uri: str) -> None:
+    store = _store(db_uri)
+
+    def cas(metadata, expected):
+        return store.upsert_if_metadata(
+            "alice",
+            "p",
+            secret={"k": "new"},
+            account_id="current",
+            metadata=metadata,
+            expected_metadata=expected,
+        )
+
+    assert not cas({"v": 2}, {"v": 1})
+    assert cas({"v": 1}, None)
+    assert not cas({"v": 9}, None)
+    assert not cas({"v": 9}, {"v": 0})
+    assert cas({"v": 2}, {"v": 1})
+    row = store.get("alice", "p", account_id="current", with_secret=True)
+    assert row is not None and row.metadata == {"v": 2} and row.secret == {"k": "new"}
