@@ -186,6 +186,61 @@ class CredentialStore:
 
         return run_write_transaction(self._session_immediate, "upsert_retry", conflict_write)
 
+    def upsert_if_metadata(
+        self,
+        user_id: str,
+        provider: str,
+        *,
+        secret: dict[str, Any],
+        metadata: dict[str, Any],
+        expected_metadata: dict[str, Any] | None,
+        account_id: str = "",
+    ) -> bool:
+        """Write the row only if its metadata still equals ``expected_metadata``.
+
+        ``expected_metadata=None`` requires the row to be absent. Returns ``False`` when
+        another writer changed the row since it was read.
+        """
+        now = now_epoch()
+        workspace_id = current_workspace_id()
+        pk = (workspace_id, user_id, provider, account_id)
+        context = _enc_context(workspace_id, user_id, provider, account_id)
+        secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            row = session.get(SqlConnection, pk)
+            if row is None:
+                if expected_metadata is not None:
+                    return False
+                session.add(
+                    SqlConnection(
+                        user_id=user_id,
+                        provider=provider,
+                        account_id=account_id,
+                        secret_enc=secret_enc,
+                        metadata_json=json.dumps(metadata),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                if (
+                    expected_metadata is None
+                    or _safe_json_obj(row.metadata_json) != expected_metadata
+                ):
+                    return False
+                row.secret_enc = secret_enc
+                row.metadata_json = json.dumps(metadata)
+                row.updated_at = now
+            session.flush()
+            return True
+
+        try:
+            return run_write_transaction(self._session_immediate, "upsert_if_metadata", write)
+        except IntegrityError:
+            return False
+
     def update_secret(
         self,
         user_id: str,

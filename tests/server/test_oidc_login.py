@@ -1332,3 +1332,55 @@ def test_generationless_delegation_recovers_from_invalid_newest_refresh(login):
     )
     assert broker.state(OWNER)["generation"] == older["generation"]
     assert not broker.active(OWNER, newest["generation"])
+
+
+def _exchange_reply(tokens, **overrides):
+    return httpx.Response(200, json={**tokens(), **overrides})
+
+
+def test_exchanged_grant_without_scope_field_uses_requested_scopes(login):
+    broker, _token, tokens, _calls = login
+    body = tokens()
+    body.pop("scope")
+    broker.client.close()
+    broker.client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=body))
+    )
+    assert broker.capture_exchanged(OWNER, SUBJECT, "bearer")["subject"] == SUBJECT
+
+
+def test_exchanged_grant_with_reduced_scope_is_not_renewable(login):
+    from omnigent.server.oidc_mcp import DelegationNotRenewable
+
+    broker, _token, tokens, _calls = login
+    broker.client.close()
+    broker.client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: _exchange_reply(tokens, scope="openid email"))
+    )
+    with pytest.raises(DelegationNotRenewable):
+        broker.capture_exchanged(OWNER, SUBJECT, "bearer")
+    assert broker.known_subject(OWNER) is None
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_other_subject_published_during_exchange_is_not_overwritten(login, existing):
+    broker, token, tokens, _calls = login
+    if existing:
+        broker.capture(OWNER, SUBJECT, tokens())
+
+    def exchange(request):
+        other = {**tokens(), "access_token": token(subject="other-subject")}
+        broker.capture(OWNER, "other-subject", other)
+        return _exchange_reply(tokens)
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(exchange))
+    with pytest.raises(DelegationUnavailable):
+        broker.capture_exchanged(OWNER, SUBJECT, "bearer")
+    assert broker.known_subject(OWNER) == "other-subject"
+    stored = [
+        c.metadata["subject"]
+        for c in broker.store.list_for_user(OWNER)
+        if c.provider == PROVIDER and c.account_id != "current"
+    ]
+    assert stored.count(SUBJECT) == (1 if existing else 0)

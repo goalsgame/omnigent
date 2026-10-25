@@ -19,6 +19,7 @@ from omnigent.server.oidc_mcp import DelegationNotRenewable, DelegationUnavailab
 from omnigent.stores.credential_store import CredentialStore
 
 PROVIDER = "oidc_login"
+_UNGUARDED: Any = object()
 
 
 class DelegationTemporarilyUnavailable(Exception):
@@ -154,9 +155,20 @@ class OIDCLoginBroker(OIDCLoginRevoker):
         return claims
 
     def capture(
-        self, owner: str, subject: str, tokens: dict[str, Any], *, auth_time: int | None = None
+        self,
+        owner: str,
+        subject: str,
+        tokens: dict[str, Any],
+        *,
+        auth_time: int | None = None,
+        expected_current: Any = _UNGUARDED,
     ) -> dict[str, Any]:
-        """Capture a refresh credential only from the trusted login code exchange."""
+        """Capture a refresh credential only from the trusted login code exchange.
+
+        ``expected_current`` is the owner's current-slot metadata read before the grant was
+        obtained (``None`` when absent); the grant is published only if no other subject took
+        the slot since.
+        """
         try:
             refresh = self._refresh_token(tokens["refresh_token"])
             scope = tokens.get("scope", self.config.scopes)
@@ -189,17 +201,17 @@ class OIDCLoginBroker(OIDCLoginRevoker):
                     "deadline": deadline,
                 },
             )
-            self.store.upsert(
-                owner,
-                PROVIDER,
-                account_id="current",
-                secret={},
-                metadata={
-                    "generation": generation,
-                    "issuer": self.config.issuer,
-                    "subject": subject,
-                },
-            )
+            pointer = {
+                "generation": generation,
+                "issuer": self.config.issuer,
+                "subject": subject,
+            }
+            if expected_current is not _UNGUARDED:
+                self._publish_guarded(owner, subject, generation, pointer, expected_current)
+            else:
+                self.store.upsert(
+                    owner, PROVIDER, account_id="current", secret={}, metadata=pointer
+                )
             for previous in self.store.list_for_user(owner):
                 if (
                     previous.provider == PROVIDER
@@ -219,6 +231,38 @@ class OIDCLoginBroker(OIDCLoginRevoker):
         except (jwt.PyJWTError, KeyError, TypeError, ValueError):
             raise DelegationUnavailable("Sign in again to renew identity delegation") from None
 
+    def _current_metadata(self, owner: str) -> dict[str, Any] | None:
+        current = self.store.get(owner, PROVIDER, account_id="current")
+        return current.metadata if current is not None else None
+
+    def _publish_guarded(
+        self,
+        owner: str,
+        subject: str,
+        generation: str,
+        pointer: dict[str, Any],
+        observed: dict[str, Any] | None,
+    ) -> None:
+        for _ in range(3):
+            if observed is not None and observed.get("subject") != subject:
+                break
+            if self.store.upsert_if_metadata(
+                owner,
+                PROVIDER,
+                account_id="current",
+                secret={},
+                metadata=pointer,
+                expected_metadata=observed,
+            ):
+                return
+            observed = self._current_metadata(owner)
+        connection = self.store.get(owner, PROVIDER, account_id=generation)
+        if connection is not None:
+            self.store.delete(
+                owner, PROVIDER, account_id=generation, expected_metadata=connection.metadata
+            )
+        raise DelegationUnavailable("Sign in again to renew identity delegation")
+
     def known_subject(self, owner: str) -> str | None:
         """Subject of the owner's most recent login grant, even if expired or unrenewable."""
         current = self.store.get(owner, PROVIDER, account_id="current")
@@ -229,6 +273,7 @@ class OIDCLoginBroker(OIDCLoginRevoker):
 
     def capture_exchanged(self, owner: str, subject: str, token: str) -> dict[str, Any]:
         """Store an offline grant obtained by exchanging a verified access token."""
+        observed = self._current_metadata(owner)
         try:
             response = self.client.post(
                 self.config.token_endpoint,
@@ -260,7 +305,7 @@ class OIDCLoginBroker(OIDCLoginRevoker):
             if body.get("error") in ("invalid_grant", "invalid_scope"):
                 raise DelegationNotRenewable("Sign in again with offline access")
             raise DelegationUnavailable("Sign in again to renew identity delegation")
-        scope = body.get("scope")
+        scope = body.get("scope", self.config.scopes)
         if (
             not isinstance(body.get("refresh_token"), str)
             or not body["refresh_token"]
@@ -268,7 +313,7 @@ class OIDCLoginBroker(OIDCLoginRevoker):
             or "offline_access" not in scope.split()
         ):
             raise DelegationNotRenewable("Sign in again with offline access")
-        return self.capture(owner, subject, body)
+        return self.capture(owner, subject, body, expected_current=observed)
 
     def _secret(
         self, tokens: dict[str, Any], claims: dict[str, Any], refresh: str
