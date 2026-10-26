@@ -104,6 +104,90 @@ async def test_invalid_exchange_fails_closed_without_response_disclosure(respons
     assert not broker._token
 
 
+def _raise(error):
+    def handle(request):
+        raise error
+
+    return handle
+
+
+@pytest.mark.parametrize(
+    ("handle", "reason"),
+    [
+        (_raise(httpx.ReadTimeout("secret-subject")), "token exchange timed out"),
+        (_raise(httpx.ConnectError("secret-subject")), "token exchange connection failed"),
+        (lambda _: httpx.Response(403, text="secret-subject"), "token exchange returned HTTP 403"),
+        (
+            lambda _: httpx.Response(200, text="secret-subject"),
+            "token exchange returned an invalid response",
+        ),
+        (lambda _: _token(expires_in=60), "token exchange returned an invalid response"),
+    ],
+)
+async def test_exchange_failure_reason_is_logged_without_secrets(handle, reason, tmp_path, caplog):
+    path = tmp_path / "jwt"
+    path.write_text("secret-subject")
+    broker = wif.OpenRouterWIFBroker(
+        wif.OpenRouterWIFConfig("policy", subject_token_file=str(path)),
+        transport=httpx.MockTransport(handle),
+    )
+    with caplog.at_level("WARNING", logger=wif.__name__):
+        with pytest.raises(wif.OpenRouterWIFError) as caught:
+            await broker.credential()
+    assert caught.value.reason == reason
+    assert str(caught.value) == "OpenRouter workload identity exchange failed"
+    assert caplog.messages == [f"OpenRouter workload identity exchange failed: {reason}"]
+    assert "secret" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("handle", "reason"),
+    [
+        (_raise(httpx.ConnectTimeout("secret")), "identity token timed out"),
+        (lambda _: httpx.Response(404, text="secret"), "identity token returned HTTP 404"),
+    ],
+)
+async def test_metadata_failure_names_the_identity_step(handle, reason):
+    broker = wif.OpenRouterWIFBroker(
+        wif.OpenRouterWIFConfig("policy"), transport=httpx.MockTransport(handle)
+    )
+    with pytest.raises(wif.OpenRouterWIFError) as caught:
+        await broker.credential()
+    assert caught.value.reason == reason
+
+
+async def test_unreadable_subject_file_names_the_identity_step(tmp_path):
+    broker = wif.OpenRouterWIFBroker(
+        wif.OpenRouterWIFConfig("policy", subject_token_file=str(tmp_path / "missing")),
+        transport=httpx.MockTransport(lambda _: _token()),
+    )
+    with pytest.raises(wif.OpenRouterWIFError) as caught:
+        await broker.credential()
+    assert caught.value.reason == "identity token could not be read"
+
+
+async def test_backoff_repeats_the_last_failure_reason(tmp_path, monkeypatch):
+    path = tmp_path / "jwt"
+    path.write_text("subject")
+    clock = [100.0]
+    monkeypatch.setattr(wif, "time", type("Clock", (), {"monotonic": lambda: clock[0]}))
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        raise httpx.ReadTimeout("timeout")
+
+    broker = wif.OpenRouterWIFBroker(
+        wif.OpenRouterWIFConfig("policy", subject_token_file=str(path)),
+        transport=httpx.MockTransport(handle),
+    )
+    for _ in range(2):
+        with pytest.raises(wif.OpenRouterWIFError) as caught:
+            await broker.credential()
+        assert caught.value.reason == "token exchange timed out"
+    assert len(calls) == 1
+
+
 async def test_failed_renewal_does_not_return_cached_token(tmp_path, monkeypatch):
     path = tmp_path / "jwt"
     path.write_text("subject")

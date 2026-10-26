@@ -212,6 +212,32 @@ async def test_provider_failures_release_capacity_and_hide_secrets(setup, failur
 
 
 @pytest.mark.asyncio
+async def test_openrouter_exchange_failure_reason_reaches_the_client(setup):
+    from omnigent.server.openrouter_wif import OpenRouterWIFError
+
+    service, app, conv, _, calls = setup
+
+    async def unavailable():
+        raise OpenRouterWIFError("token exchange timed out")
+
+    service.broker.credential = unavailable
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="https://server.example"
+    ) as client:
+        token = await access(client, service, conv)
+        response = await client.post(
+            "/v1/inference/sessions/session/responses",
+            json={"model": "model-a"},
+            headers={"Authorization": "Bearer " + token},
+        )
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "Inference authentication unavailable: OpenRouter token exchange timed out"
+    }
+    assert not calls and service.active_requests == 0
+
+
+@pytest.mark.asyncio
 async def test_request_limits_and_endpoint_allowlist(setup):
     from dataclasses import replace
 
