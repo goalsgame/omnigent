@@ -574,6 +574,7 @@ def main() -> None:
         resolved = build_app(resolved_config)
 
         import uvicorn
+        from uvicorn.main import STARTUP_FAILURE
 
         from omnigent.server.graceful_server import (
             graceful_shutdown_timeout_s,
@@ -594,7 +595,10 @@ def main() -> None:
             **uvicorn_tunnel_kwargs(),
             timeout_graceful_shutdown=graceful_shutdown_timeout_s(),
         )
-        shutdown_signaling_server(config).run()
+        server = shutdown_signaling_server(config)
+        server.run()
+        if not server.started:
+            sys.exit(STARTUP_FAILURE)
     except Exception:
         telemetry.init("omni-server")
         logger.exception("FATAL: omnigent server failed to start")

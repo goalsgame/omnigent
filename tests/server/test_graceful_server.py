@@ -41,7 +41,12 @@ async def _endless_stream(scope, receive, send):
 
 
 @pytest.mark.parametrize("timeout", [1])
-async def test_open_stream_cannot_hold_shutdown_past_the_timeout(unused_tcp_port, timeout):
+async def test_open_stream_cannot_hold_shutdown_past_the_timeout(
+    unused_tcp_port, timeout, monkeypatch
+):
+    from omnigent.server import shutdown_state
+
+    monkeypatch.setattr(shutdown_state, "_marked_at", None)
     config = uvicorn.Config(
         _endless_stream,
         host="127.0.0.1",
