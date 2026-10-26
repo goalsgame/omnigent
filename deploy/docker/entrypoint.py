@@ -575,10 +575,14 @@ def main() -> None:
 
         import uvicorn
 
+        from omnigent.server.graceful_server import (
+            graceful_shutdown_timeout_s,
+            shutdown_signaling_server,
+        )
         from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
-        uvicorn.run(
+        config = uvicorn.Config(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
@@ -588,7 +592,9 @@ def main() -> None:
             # tunnel: without the keepalive budget uvicorn's 20 s default closes
             # a busy-but-healthy one with 1011 after a client-path stall.
             **uvicorn_tunnel_kwargs(),
+            timeout_graceful_shutdown=graceful_shutdown_timeout_s(),
         )
+        shutdown_signaling_server(config).run()
     except Exception:
         telemetry.init("omni-server")
         logger.exception("FATAL: omnigent server failed to start")

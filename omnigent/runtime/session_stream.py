@@ -373,7 +373,7 @@ def shutdown_all() -> None:
     Broadcasts the end-of-stream sentinel to every queued subscriber so
     SSE generators return at their next iteration without waiting for a
     heartbeat timeout or forced task cancellation. Called from the asyncio
-    event loop (``_ShutdownSignalingServer.shutdown`` in ``cli.py``) before
+    event loop (the shutdown server in ``omnigent/server/graceful_server.py``) before
     uvicorn's graceful-shutdown wait starts, so streams drain within the
     window rather than being force-cancelled. Sync callers should use
     :func:`close` per-conversation instead.
