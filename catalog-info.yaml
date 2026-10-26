@@ -1,0 +1,67 @@
+# Backstage Software Catalog for the goalsgame/omnigent fork.
+# The omnigent System and omnigent-server Component are defined in
+# goalsgame/omnigent-internal.
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: omnigent-runner
+  title: Omnigent runner
+  description: >-
+    Per-session sandbox runner. The server starts one runner Pod for each
+    managed session; it runs the agent harness and connects back to the server.
+  tags:
+    - python
+    - kubernetes
+  annotations:
+    github.com/project-slug: goalsgame/omnigent
+    backstage.io/source-location: url:https://github.com/goalsgame/omnigent/tree/goals/operator-agent-catalog/omnigent/
+spec:
+  type: service
+  lifecycle: production
+  owner: cloud
+  system: omnigent
+  consumesApis:
+    - omnigent-api
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: omnigent-cli
+  title: omnigent CLI
+  description: >-
+    The omnigent command-line tool. Starts local servers and hosts, and drives
+    sessions against an Omnigent server.
+  tags:
+    - python
+    - cli
+  annotations:
+    github.com/project-slug: goalsgame/omnigent
+    backstage.io/source-location: url:https://github.com/goalsgame/omnigent/tree/goals/operator-agent-catalog/omnigent/
+spec:
+  type: tool
+  lifecycle: production
+  owner: cloud
+  system: omnigent
+  consumesApis:
+    - omnigent-api
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: omnigent-api
+  title: Omnigent Server API
+  description: REST and Server-Sent Events API for sessions, agents, hosts, runners, policies and session resources
+  tags:
+    - http
+    - rest
+    - sse
+  annotations:
+    github.com/project-slug: goalsgame/omnigent
+spec:
+  type: openapi
+  lifecycle: production
+  owner: cloud
+  system: omnigent
+  definition:
+    $text: ./openapi.json
