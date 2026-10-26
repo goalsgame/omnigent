@@ -32,6 +32,7 @@ from omnigent.server.inference_upstreams import (
     parse_upstreams,
 )
 from omnigent.server.inference_vertex import vertex_response_bytes
+from omnigent.server.openrouter_wif import OpenRouterWIFError
 from omnigent.stores.host_store import host_is_live
 
 _AUDIENCE = "omnigent-session-inference"
@@ -819,7 +820,16 @@ class InferenceProxy:
                                 or any(c.isspace() for c in upstream_token)
                             ):
                                 raise ValueError("Upstream credential unavailable")
-                    except Exception:  # noqa: BLE001 — authentication errors may contain credentials
+                    except OpenRouterWIFError as exc:
+                        raise HTTPException(
+                            502, f"Inference authentication unavailable: OpenRouter {exc.reason}"
+                        ) from None
+                    except Exception as exc:  # noqa: BLE001 — authentication errors may contain credentials
+                        _logger.warning(
+                            "Inference credential for %s upstream unavailable: %s",
+                            selected.kind,
+                            type(exc).__name__,
+                        )
                         raise HTTPException(502, "Inference authentication unavailable") from None
                     conv, _ = await self.authorize(session_id, access, workspace_id=workspace)
                     with workspace_scope(workspace):

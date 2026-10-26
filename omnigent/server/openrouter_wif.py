@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ _METADATA_URL = (
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
 )
 _TOKEN_URL = "https://openrouter.ai/api/v1/oauth/token"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,15 @@ class OpenRouterWIFConfig:
 
 
 class OpenRouterWIFError(RuntimeError):
-    """A sanitized exchange error, safe to return without upstream response bodies."""
+    """A sanitized exchange error, safe to return without upstream response bodies.
+
+    :param reason: Which step failed and how, built only from fixed phrases and
+        HTTP status codes, e.g. ``"token exchange timed out"``.
+    """
+
+    def __init__(self, reason: str = "exchange failed") -> None:
+        super().__init__("OpenRouter workload identity exchange failed")
+        self.reason = reason
 
 
 class OpenRouterWIFBroker:
@@ -57,20 +67,23 @@ class OpenRouterWIFBroker:
         self._token = ""
         self._expires_at = 0.0
         self._retry_at = 0.0
+        self._failure = "exchange failed"
 
     async def credential(self) -> dict[str, object]:
         async with self._lock:
             if time.monotonic() < self._retry_at:
-                raise OpenRouterWIFError("OpenRouter workload identity exchange failed")
+                raise OpenRouterWIFError(self._failure)
             try:
                 if int(self._expires_at - time.monotonic()) <= 120:
                     await self._refresh()
                 remaining = int(self._expires_at - time.monotonic())
                 if remaining <= 120:
-                    raise OpenRouterWIFError("OpenRouter workload identity exchange failed")
-            except OpenRouterWIFError:
+                    raise OpenRouterWIFError("token lifetime too short")
+            except OpenRouterWIFError as exc:
                 # Queued requests share the failure instead of retrying upstream.
                 self._retry_at = time.monotonic() + 5
+                self._failure = exc.reason
+                _LOGGER.warning("OpenRouter workload identity exchange failed: %s", exc.reason)
                 raise
             self._retry_at = 0.0
             return {
@@ -80,6 +93,7 @@ class OpenRouterWIFBroker:
 
     async def _refresh(self) -> None:
         started = time.monotonic()
+        stage = "identity token"
         try:
             # Never send a metadata identity or access token through ambient proxies.
             async with httpx.AsyncClient(
@@ -99,6 +113,7 @@ class OpenRouterWIFBroker:
                     subject = identity.text.strip()
                 if not subject or len(subject.encode()) > 16384:
                     raise ValueError("invalid subject token")
+                stage = "token exchange"
                 response = await client.post(
                     _TOKEN_URL,
                     data={
@@ -126,6 +141,17 @@ class OpenRouterWIFBroker:
                 raise ValueError("insufficient remaining token lifetime")
             self._token = token
             self._expires_at = expires_at
-        except (httpx.HTTPError, OSError, ValueError, AttributeError, TypeError):
-            # Response bodies and exception messages may contain either bearer.
-            raise OpenRouterWIFError("OpenRouter workload identity exchange failed") from None
+        # Response bodies and exception messages may contain either bearer.
+        except httpx.TimeoutException:
+            reason = f"{stage} timed out"
+        except httpx.HTTPStatusError as exc:
+            reason = f"{stage} returned HTTP {exc.response.status_code}"
+        except httpx.HTTPError:
+            reason = f"{stage} connection failed"
+        except OSError:
+            reason = f"{stage} could not be read"
+        except (ValueError, AttributeError, TypeError):
+            reason = f"{stage} returned an invalid response"
+        else:
+            return
+        raise OpenRouterWIFError(reason) from None
