@@ -15,7 +15,6 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import uvicorn
@@ -119,19 +118,59 @@ def test_docker_entrypoint_hands_the_tunnel_budget_to_uvicorn(
     finally:
         sys.path.remove(str(_REPO_ROOT))
 
-    captured: dict[str, Any] = {}
+    from omnigent.server import graceful_server
+
+    captured: list[uvicorn.Config] = []
     built = entrypoint._BuiltApp(app=object(), host="0.0.0.0", port=8000)  # type: ignore[arg-type]
     resolved_config = SimpleNamespace(database_url="postgresql://stub/omnigent")
     monkeypatch.setattr(entrypoint, "_resolve_config", lambda: resolved_config)
     monkeypatch.setattr(entrypoint, "run_migrations", lambda url: None)
     monkeypatch.setattr(entrypoint, "build_app", lambda cfg: built)
-    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.update(kw))
+    monkeypatch.setattr(
+        graceful_server,
+        "shutdown_signaling_server",
+        lambda config: captured.append(config) or SimpleNamespace(run=lambda: None, started=True),
+    )
 
     entrypoint.main()
 
-    assert captured, "main() never reached uvicorn.run"
-    for key, value in uvicorn_tunnel_kwargs().items():
-        assert captured.get(key) == value, key
+    assert captured, "main() never built the uvicorn server"
+    config = captured[0]
+    assert config.ws_max_size == RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+    assert config.ws_ping_interval == TUNNEL_KEEPALIVE_PING_INTERVAL_S
+    assert config.ws_ping_timeout == TUNNEL_KEEPALIVE_PING_TIMEOUT_S
+    assert config.timeout_graceful_shutdown == graceful_server.GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT
+
+
+def test_docker_entrypoint_exits_nonzero_when_startup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed ASGI lifespan startup must not end the container with status 0."""
+    import sys
+
+    from uvicorn.main import STARTUP_FAILURE
+
+    from omnigent.server import graceful_server
+
+    sys.path.insert(0, str(_REPO_ROOT))
+    try:
+        entrypoint = importlib.import_module("deploy.docker.entrypoint")
+    finally:
+        sys.path.remove(str(_REPO_ROOT))
+
+    built = entrypoint._BuiltApp(app=object(), host="0.0.0.0", port=8000)  # type: ignore[arg-type]
+    monkeypatch.setattr(entrypoint, "_resolve_config", lambda: SimpleNamespace(database_url="x"))
+    monkeypatch.setattr(entrypoint, "run_migrations", lambda url: None)
+    monkeypatch.setattr(entrypoint, "build_app", lambda cfg: built)
+    monkeypatch.setattr(
+        graceful_server,
+        "shutdown_signaling_server",
+        lambda config: SimpleNamespace(run=lambda: None, started=False),
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        entrypoint.main()
+    assert exited.value.code == STARTUP_FAILURE
 
 
 def test_every_deploy_entrypoint_spreads_the_budget_into_uvicorn() -> None:
@@ -149,9 +188,10 @@ def test_every_deploy_entrypoint_spreads_the_budget_into_uvicorn() -> None:
     )
     for relative in entrypoints:
         source = (_REPO_ROOT / relative).read_text()
-        run_call = source[source.index("uvicorn.run(") :]
+        start = source.find("uvicorn.Config(")
+        run_call = source[start if start >= 0 else source.index("uvicorn.run(") :]
         run_call = run_call[: run_call.index(")\n")]
         assert "uvicorn_tunnel_kwargs()" in run_call, (
-            f"{relative} calls uvicorn.run without spreading uvicorn_tunnel_kwargs(), "
+            f"{relative} serves uvicorn without spreading uvicorn_tunnel_kwargs(), "
             "so it serves tunnels on uvicorn's 20 s keepalive and 16 MiB frame cap"
         )

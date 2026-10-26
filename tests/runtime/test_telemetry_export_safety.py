@@ -102,11 +102,12 @@ def test_docker_preserves_runtime_logging_after_migrations(monkeypatch) -> None:
     root = logging.getLogger()
     monkeypatch.setattr(root, "level", root.level)
     monkeypatch.setattr(entrypoint, "run_migrations", lambda _: root.setLevel(logging.WARNING))
-    run = Mock()
-    monkeypatch.setattr("uvicorn.run", run)
+    build = Mock()
+    monkeypatch.setattr("omnigent.server.graceful_server.shutdown_signaling_server", build)
     entrypoint.main()
     assert root.level == logging.INFO
-    assert run.call_args.kwargs["log_config"] is None
+    assert build.call_args.args[0].log_config is None
+    build.return_value.run.assert_called_once_with()
 
 
 def test_docker_startup_failure_is_instrumented_before_config(monkeypatch, caplog) -> None:
