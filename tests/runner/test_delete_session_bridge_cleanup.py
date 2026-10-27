@@ -133,6 +133,28 @@ async def test_delete_session_removes_native_bridge_dir(
     assert not cached.exists()
 
 
+async def test_delete_session_uses_cleanup_labels_for_rotated_bridge_id(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """A ``cleanup_labels`` body resolves a rotated bridge dir without a server lookup."""
+    from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+
+    session_id = f"conv_{uuid.uuid4().hex}"
+    rotated_id = f"rotated_{uuid.uuid4().hex}"
+    rotated_dir = prepare_bridge_dir(rotated_id, workspace=tmp_path)
+    assert (rotated_dir / "bridge.json").exists()
+
+    resp = await client.request(
+        "DELETE",
+        f"/v1/sessions/{session_id}",
+        json={"cleanup_labels": {BRIDGE_ID_LABEL_KEY: rotated_id}},
+    )
+
+    assert resp.status_code == 200
+    assert not rotated_dir.exists()
+
+
 @pytest.mark.parametrize("family", sorted(BRIDGE_DIR_RESOLVERS))
 @pytest.mark.parametrize("bridge_present", [True, False])
 async def test_cleanup_resources_removes_native_bridge_dir(

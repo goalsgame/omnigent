@@ -5102,11 +5102,11 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         The check and the delete share one transaction. The subtree counts
         as engaged if any conversation in it carries a pinned label or has
-        a user message created after ``finished_at``; nothing is deleted
-        then.
+        a user message created at or after ``finished_at`` (timestamps are whole
+        seconds, so an equal second counts); nothing is deleted then.
 
         :param conversation_id: Root conversation identifier.
-        :param finished_at: Unix epoch seconds after which a user message
+        :param finished_at: Unix epoch seconds from which a user message
             counts as engagement.
         :returns: ``"deleted"``, ``"engaged"`` (kept), or ``"missing"``
             (no such conversation).
@@ -5136,7 +5136,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationItem.workspace_id == current_workspace_id(),
                     SqlConversationItem.conversation_id.in_(subtree_ids),
                     SqlConversationItem.type == encode_item_type("message"),
-                    SqlConversationItem.created_at > finished_at,
+                    SqlConversationItem.created_at >= finished_at,
                 )
             )
             .scalars()

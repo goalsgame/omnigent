@@ -133,11 +133,16 @@ def test_finished_run_session_is_deleted_and_run_kept(retention_server: tuple[st
     )
 
     deadline = time.monotonic() + _DELETE_TIMEOUT_SECONDS
-    while conversations.get_conversation(expired.id) is not None:
-        assert time.monotonic() < deadline, "expired session was not deleted"
+    while True:
+        runs = {r.id: r for r in tasks.list_runs(task_id)[0]}
+        if (
+            conversations.get_conversation(expired.id) is None
+            and runs[expired_run].conversation_id is None
+        ):
+            break
+        assert time.monotonic() < deadline, "expired session was not deleted and unlinked"
         time.sleep(POLL_INTERVAL_S)
 
-    runs = {r.id: r for r in tasks.list_runs(task_id)[0]}
     assert runs[expired_run].conversation_id is None
     assert runs[expired_run].status == "succeeded"
     assert runs[pinned_run].conversation_id == pinned.id

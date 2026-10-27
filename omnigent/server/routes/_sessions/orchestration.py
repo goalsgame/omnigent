@@ -657,6 +657,7 @@ async def _best_effort_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     descendant_ids: list[str] | None = None,
+    conversations: Mapping[str, Conversation] | None = None,
 ) -> None:
     """Stop a running session before a destructive lifecycle action.
 
@@ -678,6 +679,8 @@ async def _best_effort_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param descendant_ids: Pre-collected descendant ids, for callers that
         already removed the conversation rows. ``None`` looks them up.
+    :param conversations: Pre-loaded rows (the session and its descendants) used
+        to resolve each runner, for callers that already deleted the rows.
     """
     try:
         if descendant_ids is None:
@@ -706,7 +709,12 @@ async def _best_effort_stop(
 
     async def _stop(target_id: str) -> None:
         try:
-            await _stop_session_via_runner(target_id, runner_router)
+            if conversations is None:
+                await _stop_session_via_runner(target_id, runner_router)
+            else:
+                await _stop_session_via_runner(
+                    target_id, runner_router, conversation=conversations.get(target_id)
+                )
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Best-effort stop failed for %s; proceeding anyway",

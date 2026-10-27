@@ -1941,10 +1941,10 @@ class ConversationStore(ABC):
 
         The engagement check and the delete are atomic. The subtree is
         engaged if any conversation in it is pinned or has a user message
-        created after ``finished_at``; nothing is deleted then.
+        created at or after ``finished_at``; nothing is deleted then.
 
         :param conversation_id: Root conversation identifier.
-        :param finished_at: Unix epoch seconds after which a user message
+        :param finished_at: Unix epoch seconds from which a user message
             counts as engagement.
         :returns: ``"deleted"``, ``"engaged"`` (kept) or ``"missing"``.
         """

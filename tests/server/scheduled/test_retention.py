@@ -23,6 +23,11 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemySche
 RETENTION_S = 3600
 
 
+def _wait_until_second(target: int) -> None:
+    while int(time.time()) < target:
+        time.sleep(0.05)
+
+
 def _uid(seed: str) -> str:
     return uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex
 
@@ -48,6 +53,7 @@ class _Harness:
         self.task_store = task_store
         self.conversation_store = conversation_store
         self.deleted: list[str] = []
+        self.finished_at: dict[str, int] = {}
         # Items are stamped with the real clock, so runs finish at or after
         # ``base`` and the sweeper's clock is placed well past it.
         self.base = int(time.time())
@@ -86,13 +92,20 @@ class _Harness:
         status: str = "succeeded",
         finished_ago: int | None = RETENTION_S + 60,  # seconds before the sweeper clock
         labels: dict[str, str] | None = None,
+        finish_after_prompt: bool = False,
     ) -> tuple[str, str]:
-        """Create a run and its session; returns ``(run_id, conversation_id)``."""
+        """Create a run and its session; returns ``(run_id, conversation_id)``.
+
+        ``finish_after_prompt`` finishes the run one second after the prompt was stored.
+        """
         conv = self.conversation_store.create_conversation()
-        self.conversation_store.append(conv.id, [self._message("user")])
+        (prompt,) = self.conversation_store.append(conv.id, [self._message("user")])
         if labels:
             self.conversation_store.set_labels(conv.id, labels)
         finished_at = None if finished_ago is None else self.now - finished_ago
+        if finish_after_prompt:
+            finished_at = prompt.created_at + 1
+            self.finished_at[conv.id] = finished_at
         run_id = _uid(f"run_{seed}")
         self.task_store.create_run(
             run_id,
@@ -186,8 +199,8 @@ async def test_keeps_session_with_canonical_pinned_label(harness: _Harness) -> N
 
 
 async def test_keeps_session_continued_after_finish(harness: _Harness) -> None:
-    run_id, conv_id = harness.add_run("continued", finished_ago=harness.now - harness.base)
-    time.sleep(1.1)
+    run_id, conv_id = harness.add_run("continued", finish_after_prompt=True)
+    _wait_until_second(harness.finished_at[conv_id])
     harness.conversation_store.append(conv_id, [harness._message("user")])
 
     await harness.sweeper.sweep_once()
@@ -196,11 +209,23 @@ async def test_keeps_session_continued_after_finish(harness: _Harness) -> None:
     assert harness.run_conversation_id(run_id) == conv_id
 
 
+async def test_user_message_in_the_finish_second_counts_as_engagement(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("same_second", finish_after_prompt=True)
+    finished_at = harness.finished_at[conv_id]
+    _wait_until_second(finished_at)
+    (message,) = harness.conversation_store.append(conv_id, [harness._message("user")])
+    assert message.created_at == finished_at
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.run_conversation_id(run_id) == conv_id
+
+
 async def test_assistant_message_after_finish_does_not_count_as_engagement(
     harness: _Harness,
 ) -> None:
-    _, conv_id = harness.add_run("assistant_only", finished_ago=harness.now - harness.base)
-    time.sleep(1.1)
+    _, conv_id = harness.add_run("assistant_only", finish_after_prompt=True)
+    _wait_until_second(harness.finished_at[conv_id])
     harness.conversation_store.append(conv_id, [harness._message("assistant")])
 
     await harness.sweeper.sweep_once()
@@ -281,8 +306,8 @@ async def test_pages_past_kept_sessions(
 
 
 async def test_message_arriving_during_delete_keeps_session(harness: _Harness) -> None:
-    run_id, conv_id = harness.add_run("race", finished_ago=harness.now - harness.base)
-    time.sleep(1.1)
+    run_id, conv_id = harness.add_run("race", finish_after_prompt=True)
+    _wait_until_second(harness.finished_at[conv_id])
     real_delete = harness.sweeper._delete_session
 
     async def delete_after_user_message(
@@ -325,9 +350,9 @@ async def test_keeps_everything_when_a_descendant_is_pinned(harness: _Harness) -
 async def test_keeps_everything_when_a_descendant_has_a_later_user_message(
     harness: _Harness,
 ) -> None:
-    run_id, conv_id = harness.add_run("continued_child", finished_ago=harness.now - harness.base)
+    run_id, conv_id = harness.add_run("continued_child", finish_after_prompt=True)
     child = harness.conversation_store.create_conversation(parent_conversation_id=conv_id)
-    time.sleep(1.1)
+    _wait_until_second(harness.finished_at[conv_id])
     harness.conversation_store.append(child.id, [harness._message("user")])
 
     assert await harness.sweeper.sweep_once() == 0
@@ -339,8 +364,8 @@ async def test_keeps_everything_when_a_descendant_has_a_later_user_message(
 async def test_user_message_followed_by_many_assistant_messages_is_still_engagement(
     harness: _Harness,
 ) -> None:
-    run_id, conv_id = harness.add_run("chatty", finished_ago=harness.now - harness.base)
-    time.sleep(1.1)
+    run_id, conv_id = harness.add_run("chatty", finish_after_prompt=True)
+    _wait_until_second(harness.finished_at[conv_id])
     harness.conversation_store.append(conv_id, [harness._message("user")])
     harness.conversation_store.append(conv_id, [harness._message("assistant")] * 60)
 

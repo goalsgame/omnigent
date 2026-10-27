@@ -27,6 +27,24 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import _best_effort_stop
 
 
+def _bridge_cleanup_labels(conv: Conversation) -> dict[str, str]:
+    """The labels the runner needs to resolve rotated native bridge directories."""
+    from omnigent.harnesses.antigravity_native.bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY
+
+    keys = (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+        BRIDGE_ID_LABEL_KEY,
+        CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+        OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    return {key: conv.labels[key] for key in keys if key in conv.labels}
+
+
 async def purge_session(
     session_id: str,
     conv: Conversation,
@@ -57,20 +75,32 @@ async def purge_session(
     :param request: Request for host access; required for ``delete_branch``.
     :param delete_branch: Remove the session's git worktree and branch.
     :param unengaged_since: Epoch seconds; when set, the session is kept if its
-        subtree is pinned or has a user message created after it.
+        subtree is pinned or has a user message created at or after it.
     :returns: ``"deleted"``, ``"engaged"`` (kept, nothing torn down) or
         ``"missing"`` (the conversation row was already gone).
     """
     descendant_ids: list[str] | None = None
+    snapshot: dict[str, Conversation] | None = None
+    cleanup_labels: dict[str, str] | None = None
     if unengaged_since is not None:
+        # Everything teardown reads from rows is captured before the delete.
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        snapshot = {session_id: conv}
+        snapshot.update(
+            await asyncio.to_thread(conversation_store.get_conversations, descendant_ids)
+        )
+        cleanup_labels = _bridge_cleanup_labels(conv)
         outcome = await conversation_store.delete_conversation_if_unengaged(
             session_id, unengaged_since
         )
         if outcome != "deleted":
             return outcome
     await _best_effort_stop(
-        session_id, conversation_store, runner_router, descendant_ids=descendant_ids
+        session_id,
+        conversation_store,
+        runner_router,
+        descendant_ids=descendant_ids,
+        conversations=snapshot,
     )
     # Runner-side resource cleanup is best-effort: if the bound
     # runner is offline or unbound, the session must still be
@@ -92,10 +122,15 @@ async def purge_session(
     if runner_client is not None:
         try:
             # Allow initialization, forwarder, and resource cleanup to finish.
-            await runner_client.delete(
-                f"/v1/sessions/{session_id}",
-                timeout=60.0,
-            )
+            if cleanup_labels is None:
+                await runner_client.delete(f"/v1/sessions/{session_id}", timeout=60.0)
+            else:
+                await runner_client.request(
+                    "DELETE",
+                    f"/v1/sessions/{session_id}",
+                    json={"cleanup_labels": cleanup_labels},
+                    timeout=60.0,
+                )
         except (httpx.HTTPError, ConnectionError):
             _logger.warning(
                 "Runner cleanup failed for %s, falling back",

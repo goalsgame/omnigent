@@ -27,7 +27,7 @@ DEFAULT_SWEEP_INTERVAL_SECONDS = 300
 _SWEEP_PAGE_SIZE = 100
 
 # ``delete_session(session_id, conversation, finished_at)`` deletes the session
-# unless it is engaged (pinned, or a user message after ``finished_at`` in its
+# unless it is engaged (pinned, or a user message at or after ``finished_at`` in its
 # subtree) and returns ``"deleted"``, ``"engaged"`` or ``"missing"``.
 DeleteSession = Callable[
     [str, Conversation, int], Awaitable[Literal["deleted", "engaged", "missing"]]

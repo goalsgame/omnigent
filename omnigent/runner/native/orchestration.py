@@ -9099,6 +9099,7 @@ async def _delete_native_bridge_dirs(
     *,
     server_client: httpx.AsyncClient | None,
     session_id: str,
+    labels: dict[str, str] | None = None,
 ) -> None:
     """
     Remove native-harness bridge directories and attachment caches for a session.
@@ -9119,6 +9120,8 @@ async def _delete_native_bridge_dirs(
     :param server_client: Omnigent server client used to resolve rotated bridge
         id labels. ``None`` skips label resolution (session_id keys only).
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param labels: The session's labels when the caller already has them (the
+        server deleted the row). Skips the server lookup.
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -9167,12 +9170,13 @@ async def _delete_native_bridge_dirs(
     )
     from omnigent.inner.native_attachments import attachment_cache_dir
 
-    labels: dict[str, str] = {}
-    if server_client is not None:
-        labels = await _session_labels_for_runner_spawn(
-            server_client=server_client,
-            session_id=session_id,
-        )
+    if labels is None:
+        labels = {}
+        if server_client is not None:
+            labels = await _session_labels_for_runner_spawn(
+                server_client=server_client,
+                session_id=session_id,
+            )
 
     targets = {
         antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
