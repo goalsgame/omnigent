@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -2092,6 +2092,24 @@ class ConversationStore(ABC):
         :param include_subdirectories: Also protect sessions inside this worktree root.
         :returns: ``True`` when at least one other live conversation
             references the pair, else ``False``.
+        """
+        ...
+
+    @abstractmethod
+    async def delete_conversation_if_unengaged(
+        self, conversation_id: str, finished_at: int
+    ) -> Literal["deleted", "engaged", "missing"]:
+        """
+        Delete a conversation subtree unless a person engaged with it.
+
+        The engagement check and the delete are atomic. The subtree is
+        engaged if any conversation in it is pinned or has a user message
+        created at or after ``finished_at``; nothing is deleted then.
+
+        :param conversation_id: Root conversation identifier.
+        :param finished_at: Unix epoch seconds from which a user message
+            counts as engagement.
+        :returns: ``"deleted"``, ``"engaged"`` (kept) or ``"missing"``.
         """
         ...
 

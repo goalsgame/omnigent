@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 from typing import Any
 
-from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
@@ -496,6 +496,64 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _run_to_entity(row)
 
         return run_write_transaction(self._session_immediate, "update_task_run", write)
+
+    def list_expired_session_runs(
+        self,
+        finished_before: int,
+        *,
+        limit: int = 100,
+        after: tuple[int, str] | None = None,
+    ) -> builtins.list[tuple[int, ScheduledTaskRun]]:
+        """List terminal runs still referencing a conversation, across workspaces.
+
+        A run's finish time is ``COALESCE(finished_at, fired_at, scheduled_at)``.
+        """
+        terminal_codes = [
+            encode_scheduled_task_run_status(status)
+            for status in ("succeeded", "failed", "skipped")
+        ]
+        finished = func.coalesce(
+            SqlScheduledTaskRun.finished_at,
+            SqlScheduledTaskRun.fired_at,
+            SqlScheduledTaskRun.scheduled_at,
+        )
+        with self._session("list_expired_session_runs") as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.status.in_(terminal_codes))
+                .where(SqlScheduledTaskRun.conversation_id.is_not(None))
+                .where(finished <= finished_before)
+                .order_by(asc(finished), asc(SqlScheduledTaskRun.id))
+                .limit(limit)
+            )
+            if after is not None:
+                stmt = stmt.where(tuple_(finished, SqlScheduledTaskRun.id) > after)
+            rows = session.execute(stmt).scalars().all()
+            return [(r.workspace_id or DEFAULT_WORKSPACE_ID, _run_to_entity(r)) for r in rows]
+
+    def clear_run_conversation(self, run_id: str) -> bool:
+        """Null a run's ``conversation_id`` and the task's matching pointer atomically."""
+
+        def write(session: Session) -> bool:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            if row is None:
+                return False
+            conversation_id = row.conversation_id
+            row.conversation_id = None
+            if conversation_id is not None:
+                session.execute(
+                    update(SqlScheduledTask)
+                    .where(
+                        SqlScheduledTask.workspace_id == current_workspace_id(),
+                        SqlScheduledTask.id == row.scheduled_task_id,
+                        SqlScheduledTask.last_run_conversation_id == conversation_id,
+                    )
+                    .values(last_run_conversation_id=None)
+                )
+            session.flush()
+            return True
+
+        return run_write_transaction(self._session_immediate, "clear_task_run_conversation", write)
 
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.

@@ -83,6 +83,20 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 
 `ScheduledTaskRun` also declares a `scheduled` status, but no code path writes it: a run row is created at dispatch, so `running` is the earliest state a client can observe.
 
+## Session retention
+
+The server deletes the session a run started one hour after the run finishes (`succeeded`, `failed` or `skipped`), with the same cleanup as `DELETE /v1/sessions/{id}`: runner, sandbox, files and artifacts. The run row stays in the history with `conversation_id` set to `null`. A sweep runs every five minutes against the persisted `finished_at`, so the window survives server restarts.
+
+A session is kept, and its run keeps its `conversation_id`, if it or any of its sub-agent sessions is pinned, or if a user message was sent after the run finished. The check and the delete happen in one database transaction. Runs recorded without a `finished_at` age from `fired_at`, then `scheduled_at`.
+
+Set the window in the server config. A value of `null` or `0` keeps sessions indefinitely:
+
+```yaml
+scheduled_tasks:
+  session_retention_seconds: 3600          # default: 1 hour
+  retention_sweep_interval_seconds: 300    # default: 5 minutes
+```
+
 ## Lifecycle
 
 A task is `active`, `paused`, or `deleted`. `PATCH /v1/scheduled-tasks/{id}` changes supported mutable fields and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`). Omitting a field normally leaves it unchanged. Moving a task to a different `agent_id` clears `model_override`, `reasoning_effort`, and `permission_mode` unless the same request resends them, because a harness switch invalidates the settings stored beside the agent -- so re-pin an automation's execution controls in the request that switches its agent, or it fires the new agent on defaults. `max_cost_usd` is not agent-bound and survives the switch. Sending `permission_mode: null` clears the permission override, and `max_cost_usd: null` clears the cost cap. An explicit `null` for `workspace` or `host_id` is rejected -- the rejection is on the presence of the key, so it applies even to a task where that field is currently unset; there is no direct null-based way to clear either one.

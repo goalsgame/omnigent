@@ -46,6 +46,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
+from omnigent.entities import Conversation
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -97,6 +98,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.routes._sessions.session_purge import purge_session
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -123,6 +125,11 @@ from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.scheduled.retention import (
+    DEFAULT_SESSION_RETENTION_SECONDS,
+    DEFAULT_SWEEP_INTERVAL_SECONDS,
+    ScheduledSessionRetention,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1331,6 +1338,8 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    scheduled_session_retention_seconds: int | None = DEFAULT_SESSION_RETENTION_SECONDS,
+    scheduled_session_retention_sweep_interval_seconds: int = DEFAULT_SWEEP_INTERVAL_SECONDS,
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
@@ -1387,6 +1396,11 @@ def create_app(
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
+    :param scheduled_session_retention_seconds: Seconds a finished scheduled
+        run's session is kept before the retention sweep deletes it. ``None``
+        disables the sweep.
+    :param scheduled_session_retention_sweep_interval_seconds: Seconds between
+        retention sweeps.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -1823,6 +1837,32 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        scheduled_session_retention: ScheduledSessionRetention | None = None
+        if scheduled_task_store is not None and scheduled_session_retention_seconds:
+
+            async def _delete_scheduled_session(
+                session_id: str, conv: Conversation, finished_at: int
+            ) -> Literal["deleted", "engaged", "missing", "other_replica"]:
+                return await purge_session(
+                    session_id,
+                    conv,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                    app_state=app_inst.state,
+                    unengaged_since=finished_at,
+                )
+
+            scheduled_session_retention = ScheduledSessionRetention(
+                store=scheduled_task_store,
+                conversation_store=conversation_store,
+                delete_session=_delete_scheduled_session,
+                retention_seconds=scheduled_session_retention_seconds,
+                sweep_interval_seconds=scheduled_session_retention_sweep_interval_seconds,
+            )
+            await scheduled_session_retention.start()
+
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
         if sandbox_config is not None and sandbox_config.reaper.enabled:
             if host_store is None:
@@ -1867,6 +1907,8 @@ def create_app(
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
+            if scheduled_session_retention is not None:
+                await scheduled_session_retention.shutdown()
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()

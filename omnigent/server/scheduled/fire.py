@@ -999,6 +999,7 @@ def _record_run_sync(
         scheduled_at,
         conversation_id=conversation_id,
         fired_at=now,
+        finished_at=now if status in ("failed", "skipped") else None,
         error=error,
         error_code=error_code,
     )
