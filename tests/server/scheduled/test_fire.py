@@ -70,6 +70,9 @@ class FakeAgentStore:
     def get(self, agent_id: str) -> _FakeAgent | None:
         return self.agents.get(agent_id)
 
+    def is_catalog_agent(self, name: str) -> bool:
+        return True
+
 
 class _FakeExecutor:
     def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
@@ -546,6 +549,7 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
+    assert store.runs[0]["finished_at"] == store.runs[0]["fired_at"]
     assert "alice" in store.runs[0]["error"]
 
 

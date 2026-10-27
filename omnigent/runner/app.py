@@ -3325,7 +3325,19 @@ def create_runner_app(
         )
 
     @app.delete("/v1/sessions/{session_id}")
-    async def delete_session(session_id: str) -> JSONResponse:
+    async def delete_session(session_id: str, request: Request) -> JSONResponse:
+        # Optional ``cleanup_labels``: the session's labels, sent by a server
+        # that already deleted the row so bridge dirs resolve without a lookup.
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = None
+        raw_labels = payload.get("cleanup_labels") if isinstance(payload, dict) else None
+        cleanup_labels = (
+            {str(k): str(v) for k, v in raw_labels.items()}
+            if isinstance(raw_labels, dict)
+            else None
+        )
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
@@ -3406,6 +3418,7 @@ def create_runner_app(
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
+            labels=cleanup_labels,
         )
 
         # The SDK harnesses' router is started here (not by a terminal launch

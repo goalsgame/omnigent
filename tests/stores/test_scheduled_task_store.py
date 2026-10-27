@@ -1292,3 +1292,105 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
     with workspace_scope(11):
         found = store.get_running_run_by_conversation(_uid("conv_ws"))
         assert found is not None and found.id == _uid("run_ws")
+
+
+# ── expired session runs ────────────────────────────────────────────────────
+
+
+def _make_task(store: SqlAlchemyScheduledTaskStore) -> str:
+    store.create(
+        scheduled_task_id=_uid("st_exp"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY",
+        user_id=None,
+        agent_id=_uid("ag_exp"),
+        timezone="UTC",
+    )
+    return _uid("st_exp")
+
+
+def test_list_expired_session_runs_filters_and_pages(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Only terminal, finished-by-cutoff runs with a conversation come back, across workspaces."""
+    task_id = _make_task(store)
+    store.create_run(
+        _uid("r_old"), task_id, "succeeded", 1, conversation_id=_uid("c1"), finished_at=10
+    )
+    store.create_run(
+        _uid("r_old2"), task_id, "failed", 1, conversation_id=_uid("c2"), finished_at=20
+    )
+    store.create_run(
+        _uid("r_new"), task_id, "succeeded", 1, conversation_id=_uid("c3"), finished_at=500
+    )
+    store.create_run(_uid("r_run"), task_id, "running", 1, conversation_id=_uid("c4"))
+    store.create_run(_uid("r_none"), task_id, "succeeded", 1, finished_at=10)
+    with workspace_scope(9):
+        other_task = _make_task(store)
+        store.create_run(
+            _uid("r_ws"), other_task, "skipped", 1, conversation_id=_uid("c5"), finished_at=30
+        )
+
+    page1 = store.list_expired_session_runs(100, limit=2)
+    assert [(ws, r.id) for ws, r in page1] == [(0, _uid("r_old")), (0, _uid("r_old2"))]
+
+    last = page1[-1][1]
+    page2 = store.list_expired_session_runs(100, limit=2, after=(last.finished_at, last.id))
+    assert [(ws, r.id) for ws, r in page2] == [(9, _uid("r_ws"))]
+
+
+def test_clear_run_conversation_nulls_only_that_run(store: SqlAlchemyScheduledTaskStore) -> None:
+    task_id = _make_task(store)
+    store.create_run(
+        _uid("r1"), task_id, "succeeded", 1, conversation_id=_uid("c1"), finished_at=10
+    )
+    store.create_run(
+        _uid("r2"), task_id, "succeeded", 2, conversation_id=_uid("c2"), finished_at=10
+    )
+
+    assert store.clear_run_conversation(_uid("r1")) is True
+    assert store.clear_run_conversation(_uid("missing")) is False
+
+    runs, _ = store.list_runs(task_id)
+    assert {r.id: r.conversation_id for r in runs} == {_uid("r1"): None, _uid("r2"): _uid("c2")}
+
+
+def test_expired_runs_fall_back_to_fired_at_then_scheduled_at(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A terminal run without ``finished_at`` ages from ``fired_at``, then ``scheduled_at``."""
+    task_id = _make_task(store)
+    store.create_run(
+        _uid("r_fired"), task_id, "failed", 500, conversation_id=_uid("c1"), fired_at=10
+    )
+    store.create_run(_uid("r_sched"), task_id, "skipped", 20, conversation_id=_uid("c2"))
+    store.create_run(
+        _uid("r_recent"), task_id, "failed", 500, conversation_id=_uid("c3"), fired_at=400
+    )
+
+    expired = [r.id for _, r in store.list_expired_session_runs(100)]
+
+    assert expired == [_uid("r_fired"), _uid("r_sched")]
+
+
+def test_clear_run_conversation_clears_task_pointer_only_when_it_matches(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task_id = _make_task(store)
+    store.create_run(
+        _uid("r1"), task_id, "succeeded", 1, conversation_id=_uid("c1"), finished_at=1
+    )
+
+    store.update(task_id, last_run_conversation_id=_uid("c_other"))
+    store.clear_run_conversation(_uid("r1"))
+    task = store.get(task_id)
+    assert task is not None
+    assert task.last_run_conversation_id == _uid("c_other")
+
+    store.create_run(
+        _uid("r2"), task_id, "succeeded", 2, conversation_id=_uid("c2"), finished_at=1
+    )
+    store.update(task_id, last_run_conversation_id=_uid("c2"))
+    store.clear_run_conversation(_uid("r2"))
+    task = store.get(task_id)
+    assert task is not None
+    assert task.last_run_conversation_id is None
