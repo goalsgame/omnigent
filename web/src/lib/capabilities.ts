@@ -147,6 +147,8 @@ export interface ServerInfo {
   public_sharing_enabled: boolean;
   /** Whether verified OIDC group sharing is available. Fails closed to false. */
   group_sharing_enabled?: boolean;
+  /** Exact verified OIDC group used for deployment-internal read-only sharing. */
+  internal_sharing_group?: string | null;
   /**
    * Installed omnigent server version (same value as ``/api/version``),
    * e.g. ``"0.3.0.dev0"``. Shown in the session info popover's version
@@ -362,6 +364,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
           group_sharing_enabled: data.group_sharing_enabled === true,
+          internal_sharing_group:
+            typeof data.internal_sharing_group === "string" && data.group_sharing_enabled === true
+              ? data.internal_sharing_group
+              : null,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: smartRoutingEnabled,
           smart_routing_sources: parseSmartRoutingSources(

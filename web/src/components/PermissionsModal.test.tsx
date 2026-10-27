@@ -263,12 +263,76 @@ describe("PermissionsModal", () => {
     expect(screen.getAllByRole("combobox")).toHaveLength(2); // bob's row + grant form
   });
 
+  it("shares internally with only the configured read-only group", async () => {
+    listMock.mockResolvedValue([]);
+    grantMock.mockResolvedValue({
+      user_id: "oidc-group:encoded",
+      conversation_id: "conv_abc",
+      level: 1,
+      principal_type: "group",
+      group_name: "employees",
+    });
+    render(<PermissionsModal sessionId="conv_abc" open onOpenChange={vi.fn()} />, {
+      wrapper: createInfoWrapper({
+        group_sharing_enabled: true,
+        internal_sharing_group: "employees",
+        public_sharing_enabled: false,
+      }),
+    });
+    const toggle = await screen.findByRole("switch", { name: "Share internally" });
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    expect(screen.queryByText("Public access")).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "employees", 1, "group"),
+    );
+  });
+
+  it("revokes the encoded internal grant and exposes old public grants for removal", async () => {
+    listMock.mockResolvedValue([
+      {
+        user_id: "oidc-group:encoded",
+        conversation_id: "conv_abc",
+        level: 1,
+        principal_type: "group",
+        group_name: "employees",
+      },
+      { user_id: "__public__", conversation_id: "conv_abc", level: 1 },
+    ]);
+    render(<PermissionsModal sessionId="conv_abc" open onOpenChange={vi.fn()} />, {
+      wrapper: createInfoWrapper({
+        group_sharing_enabled: true,
+        internal_sharing_group: "employees",
+        public_sharing_enabled: false,
+      }),
+    });
+    const toggle = await screen.findByRole("switch", { name: "Share internally" });
+    await waitFor(() => expect(toggle).toBeChecked());
+    fireEvent.click(toggle);
+    await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "oidc-group:encoded"));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke public-link access" }));
+    await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
+  });
+
+  it("does not offer an internal audience without verified group support", async () => {
+    listMock.mockResolvedValue([]);
+    render(<PermissionsModal sessionId="conv_abc" open onOpenChange={vi.fn()} />, {
+      wrapper: createInfoWrapper({
+        group_sharing_enabled: false,
+        internal_sharing_group: "employees",
+        public_sharing_enabled: false,
+      }),
+    });
+    await screen.findByTestId("share-grants");
+    expect(screen.queryByRole("switch", { name: "Share internally" })).not.toBeInTheDocument();
+  });
+
   it("toggles public access via grant/revoke of __public__ sentinel", async () => {
     listMock.mockResolvedValue([]);
     grantMock.mockResolvedValue({ user_id: "__public__", conversation_id: "conv_abc", level: 1 });
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
-      wrapper: createWrapper(),
+      wrapper: createInfoWrapper({ public_sharing_enabled: true }),
     });
 
     await waitFor(() => expect(listMock).toHaveBeenCalled());

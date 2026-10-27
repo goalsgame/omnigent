@@ -161,6 +161,13 @@ def register_permissions_routes(
                 raise OmnigentError(
                     "Group sharing requires OIDC authentication", code=ErrorCode.INVALID_INPUT
                 )
+            if (
+                body.user_id == getattr(request.app.state, "internal_sharing_group", None)
+                and body.level != LEVEL_READ
+            ):
+                raise OmnigentError(
+                    "Internal audience access is read-only", code=ErrorCode.INVALID_INPUT
+                )
             try:
                 target_id = group_principal(body.user_id)
             except ValueError as exc:

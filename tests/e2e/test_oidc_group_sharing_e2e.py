@@ -121,6 +121,83 @@ async def test_group_grant_list_access_manage_and_revoke(
         assert all(item["id"] != session_id for item in listed.json()["data"])
 
 
+@pytest.fixture
+def internal_app(monkeypatch, request):
+    monkeypatch.setenv("OMNIGENT_INTERNAL_SHARING_GROUP", "/engineering")
+    return request.getfixturevalue("machine_app")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_kind", ["browser", "connector"])
+async def test_internal_sharing_end_to_end_is_read_only_and_revocable(
+    internal_app,
+    oidc,
+    signing_key,
+    client_kind,
+):
+    await test_group_grant_list_access_manage_and_revoke(
+        internal_app,
+        oidc,
+        signing_key,
+        1,
+        client_kind,
+    )
+
+
+@pytest.mark.asyncio
+async def test_internal_deployment_disables_public_and_rejects_group_edit(
+    internal_app,
+    db_uri,
+    oidc,
+):
+    from tests.server.routes.test_session_updates_ws import _seed_session
+
+    store = SqlAlchemyPermissionStore(db_uri)
+    session_id = _seed_session(
+        (SqlAlchemyConversationStore(db_uri), SqlAlchemyAgentStore(db_uri), store),
+        owner="owner@example.test",
+        title="Internal conversation",
+    )
+    owner = {
+        "Authorization": "Bearer "
+        + mint_session_token(
+            "owner@example.test",
+            oidc.cookie_secret,
+            300,
+            "oidc",
+        )
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=internal_app), base_url="https://app.example.test"
+    ) as client:
+        info = await client.get("/v1/info", headers=owner)
+        assert info.json()["internal_sharing_group"] == "/engineering"
+        assert info.json()["public_sharing_enabled"] is False
+        for level in [2, 3]:
+            response = await client.put(
+                f"/v1/sessions/{session_id}/permissions",
+                headers=owner,
+                json={"principal_type": "group", "user_id": "/engineering", "level": level},
+            )
+            assert response.status_code == 400, response.text
+        public = await client.put(
+            f"/v1/sessions/{session_id}/permissions",
+            headers=owner,
+            json={"user_id": "__public__", "level": 1},
+        )
+        assert public.status_code == 403, public.text
+        anonymous = await client.get(f"/v1/sessions/{session_id}")
+        assert anonymous.status_code == 401, anonymous.text
+        # Old broad grants remain visible/revocable; configuration never silently migrates ACLs.
+        store.grant("__public__", session_id, 1)
+        grants = await client.get(f"/v1/sessions/{session_id}/permissions", headers=owner)
+        assert any(p["user_id"] == "__public__" for p in grants.json()["permissions"])
+        revoked = await client.delete(
+            f"/v1/sessions/{session_id}/permissions/__public__", headers=owner
+        )
+        assert revoked.status_code == 204
+
+
 @pytest.mark.asyncio
 async def test_legacy_individual_group_key_is_listed_as_user_and_cannot_be_converted(
     machine_app, db_uri, oidc, signing_key
