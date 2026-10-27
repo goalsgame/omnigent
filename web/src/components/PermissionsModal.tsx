@@ -86,7 +86,9 @@ export function PermissionsModal({
     sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
   // Public (anyone-with-the-link) access is a separate server switch from the
   // sharing tiers; when off, hide the toggle (the server rejects the grant too).
-  const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
+  const publicSharingEnabled = info !== "loading" && info.public_sharing_enabled;
+  const internalGroup =
+    info !== "loading" && info.group_sharing_enabled ? info.internal_sharing_group : null;
   // In "off" mode never fetch the grant list — the modal short-circuits to a
   // notice below, so the request would be wasted (and the server rejects any
   // grant anyway).
@@ -118,7 +120,12 @@ export function PermissionsModal({
   const hasWorkspace = !!session?.workspace;
   const workspaceShared = session?.shareWorkspaceFiles ?? false;
 
-  const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
+  const internalGrant = (permissions ?? []).find(
+    (p) => p.principal_type === "group" && p.group_name === internalGroup,
+  );
+  const userGrants = (permissions ?? []).filter(
+    (p) => p.user_id !== PUBLIC_USER && p !== internalGrant,
+  );
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const isPublic = !!publicGrant;
 
@@ -216,6 +223,60 @@ export function PermissionsModal({
             </div>
           </DialogDescription>
         </DialogHeader>
+
+        {internalGroup && (
+          <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
+            <div className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">
+              <p className="text-ui font-medium">Share internally</p>
+              <p className="text-sm text-muted-foreground">
+                Signed-in members of {internalGroup} can read this conversation. No editing access.
+              </p>
+              {internalGrant && internalGrant.level > 1 && (
+                <p className="text-sm text-destructive">
+                  An older group grant allows editing or management. Turn sharing off, then on to
+                  replace it with read-only access.
+                </p>
+              )}
+            </div>
+            <Switch
+              aria-label="Share internally"
+              checked={!!internalGrant}
+              onCheckedChange={(checked) => {
+                setError(null);
+                if (checked) {
+                  grant.mutate(
+                    { userId: internalGroup, principalType: "group", level: 1 },
+                    { onError: (err) => setError(err.message) },
+                  );
+                } else if (internalGrant) {
+                  handleRevoke(internalGrant.user_id);
+                }
+              }}
+              disabled={
+                isLoading ||
+                grant.isPending ||
+                revoke.isPending ||
+                (workspaceBlocked && !internalGrant)
+              }
+              componentId="diagnostics.permissions.internal_toggle"
+            />
+          </div>
+        )}
+        {isPublic && !publicSharingEnabled && (
+          <div className="rounded-lg border px-3 py-2">
+            <p className="text-ui font-medium">Existing public-link access</p>
+            <p className="text-sm text-muted-foreground">
+              This older grant is broader than internal sharing. Revoke it to restrict access.
+            </p>
+            <Button
+              variant="outline"
+              disabled={revoke.isPending}
+              onClick={() => handleRevoke(PUBLIC_USER)}
+            >
+              Revoke public-link access
+            </Button>
+          </div>
+        )}
 
         {/* Public toggle — hidden when the server disables public access. */}
         {publicSharingEnabled && (

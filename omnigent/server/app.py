@@ -181,6 +181,7 @@ class ServerInfoResponse(BaseModel):
     machine_google_cloud_enabled: bool = False
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     group_sharing_enabled: bool = False
+    internal_sharing_group: str | None = None
     public_sharing_enabled: bool
     server_version: str
     smart_routing_enabled: bool
@@ -2197,6 +2198,13 @@ def create_app(
         _sharing_static = SharingMode.coerce(sharing_mode)
         app.state.sharing_mode = lambda: _sharing_static
         app.state.sharing_mode_writable = False
+    from omnigent.server.internal_sharing import internal_sharing_group
+
+    app.state.internal_sharing_group = internal_sharing_group(auth_provider)
+    if app.state.internal_sharing_group is not None:
+        # An explicit internal-only deployment policy cannot be relaxed by saved UI settings.
+        public_sharing = False
+
     # Public (anyone-with-the-link) access policy, same shape as sharing_mode
     # above and independent of it. ``None`` reads ``OMNIGENT_PUBLIC_SHARING``
     # (default enabled) with a ``<data_dir>/public_sharing`` file override,
@@ -3334,6 +3342,7 @@ def create_app(
                 "machine_google_cloud_enabled": app.state.google_cloud_machine_broker is not None,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
+                "internal_sharing_group": app.state.internal_sharing_group,
                 "group_sharing_enabled": isinstance(auth_provider, UnifiedAuthProvider)
                 and auth_provider.supports_group_sharing,
                 "server_version": _server_version(),
