@@ -5261,8 +5261,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return await self._delete_conversation(conversation_id, unengaged_since=finished_at)
 
-    def _subtree_engaged(self, session: Session, subtree_ids: list[str], finished_at: int) -> bool:
-        """Whether any conversation in the subtree is pinned or has a later user message."""
+    def _subtree_engaged(
+        self, session: Session, root_id: str, subtree_ids: list[str], finished_at: int
+    ) -> bool:
+        """Whether any conversation in the subtree is pinned or has a later user message.
+
+        The root's first user message is the scheduled prompt and never counts.
+        """
         pinned_prefix = f"{PINNED_LABEL_KEY}."
         pinned = session.execute(
             select(SqlConversationLabel.conversation_id)
@@ -5278,21 +5283,38 @@ class SqlAlchemyConversationStore(ConversationStore):
         ).first()
         if pinned is not None:
             return True
-        stored = (
-            session.execute(
-                select(SqlConversationItem.data).where(
-                    SqlConversationItem.workspace_id == current_workspace_id(),
-                    SqlConversationItem.conversation_id.in_(subtree_ids),
-                    SqlConversationItem.type == encode_item_type("message"),
-                    SqlConversationItem.created_at >= finished_at,
-                )
+        message_type = encode_item_type("message")
+        first_rows = session.execute(
+            select(SqlConversationItem.id, SqlConversationItem.data)
+            .where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == root_id,
+                SqlConversationItem.type == message_type,
             )
-            .scalars()
-            .all()
+            .order_by(asc(SqlConversationItem.position))
+            .limit(10)
+        ).all()
+        first_decoded = self._decode_item_data_batch([row.data for row in first_rows])
+        prompt_id = next(
+            (
+                row.id
+                for row, data in zip(first_rows, first_decoded, strict=True)
+                if json.loads(data).get("role") == "user"
+            ),
+            None,
         )
+        later = session.execute(
+            select(SqlConversationItem.id, SqlConversationItem.data).where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id.in_(subtree_ids),
+                SqlConversationItem.type == message_type,
+                SqlConversationItem.created_at >= finished_at,
+            )
+        ).all()
+        later = [row for row in later if row.id != prompt_id]
         return any(
             json.loads(data).get("role") == "user"
-            for data in self._decode_item_data_batch(list(stored))
+            for data in self._decode_item_data_batch([row.data for row in later])
         )
 
     async def _delete_conversation(
@@ -5328,7 +5350,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 cast(str, result[0]) for result in ap_sess.execute(select(cte.c.id)).fetchall()
             ]
             if unengaged_since is not None and self._subtree_engaged(
-                ap_sess, subtree_ids, unengaged_since
+                ap_sess, conversation_id, subtree_ids, unengaged_since
             ):
                 return "engaged"
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))

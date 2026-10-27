@@ -93,6 +93,7 @@ class _Harness:
         finished_ago: int | None = RETENTION_S + 60,  # seconds before the sweeper clock
         labels: dict[str, str] | None = None,
         finish_after_prompt: bool = False,
+        finish_at_prompt: bool = False,
     ) -> tuple[str, str]:
         """Create a run and its session; returns ``(run_id, conversation_id)``.
 
@@ -103,6 +104,9 @@ class _Harness:
         if labels:
             self.conversation_store.set_labels(conv.id, labels)
         finished_at = None if finished_ago is None else self.now - finished_ago
+        if finish_at_prompt:
+            finished_at = prompt.created_at
+            self.finished_at[conv.id] = finished_at
         if finish_after_prompt:
             finished_at = prompt.created_at + 1
             self.finished_at[conv.id] = finished_at
@@ -215,6 +219,24 @@ async def test_user_message_in_the_finish_second_counts_as_engagement(harness: _
     _wait_until_second(finished_at)
     (message,) = harness.conversation_store.append(conv_id, [harness._message("user")])
     assert message.created_at == finished_at
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.run_conversation_id(run_id) == conv_id
+
+
+async def test_scheduled_prompt_in_the_finish_second_is_not_engagement(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("fast_finish", finish_at_prompt=True)
+
+    assert await harness.sweeper.sweep_once() == 1
+
+    assert harness.conversation_store.get_conversation(conv_id) is None
+    assert harness.run_conversation_id(run_id) is None
+
+
+async def test_reply_in_the_prompt_second_is_still_engagement(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("fast_reply", finish_at_prompt=True)
+    harness.conversation_store.append(conv_id, [harness._message("user")])
 
     assert await harness.sweeper.sweep_once() == 0
 
