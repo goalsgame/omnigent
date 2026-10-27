@@ -7,7 +7,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import PureWindowsPath
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -5092,16 +5092,77 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """
+        return await self._delete_conversation(conversation_id, unengaged_since=None) == "deleted"
+
+    async def delete_conversation_if_unengaged(
+        self, conversation_id: str, finished_at: int
+    ) -> Literal["deleted", "engaged", "missing"]:
+        """
+        Delete a conversation subtree unless a person engaged with it.
+
+        The check and the delete share one transaction. The subtree counts
+        as engaged if any conversation in it carries a pinned label or has
+        a user message created at or after ``finished_at`` (timestamps are whole
+        seconds, so an equal second counts); nothing is deleted then.
+
+        :param conversation_id: Root conversation identifier.
+        :param finished_at: Unix epoch seconds from which a user message
+            counts as engagement.
+        :returns: ``"deleted"``, ``"engaged"`` (kept), or ``"missing"``
+            (no such conversation).
+        """
+        return await self._delete_conversation(conversation_id, unengaged_since=finished_at)
+
+    def _subtree_engaged(self, session: Session, subtree_ids: list[str], finished_at: int) -> bool:
+        """Whether any conversation in the subtree is pinned or has a later user message."""
+        pinned_prefix = f"{PINNED_LABEL_KEY}."
+        pinned = session.execute(
+            select(SqlConversationLabel.conversation_id)
+            .where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id.in_(subtree_ids),
+                or_(
+                    SqlConversationLabel.key == PINNED_LABEL_KEY,
+                    SqlConversationLabel.key.startswith(pinned_prefix, autoescape=True),
+                ),
+            )
+            .limit(1)
+        ).first()
+        if pinned is not None:
+            return True
+        stored = (
+            session.execute(
+                select(SqlConversationItem.data).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id.in_(subtree_ids),
+                    SqlConversationItem.type == encode_item_type("message"),
+                    SqlConversationItem.created_at >= finished_at,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return any(
+            json.loads(data).get("role") == "user"
+            for data in self._decode_item_data_batch(list(stored))
+        )
+
+    async def _delete_conversation(
+        self, conversation_id: str, *, unengaged_since: int | None
+    ) -> Literal["deleted", "engaged", "missing"]:
+        """Shared delete body; ``unengaged_since`` adds the engagement guard."""
         # AP rows are deleted first so the conversation is immediately unreachable;
         # Omnigent-side rows (metadata/comments/policies/permissions) are cleaned up
         # second. A failure of the second transaction leaves orphaned Omnigent rows
         # for a conversation that no longer exists — an acceptable best-effort tradeoff.
         encoded_session_agent_kind = encode_agent_kind("session")
 
-        def delete_ap(ap_sess: Session) -> tuple[list[str], set[str]] | None:
+        def delete_ap(
+            ap_sess: Session,
+        ) -> tuple[list[str], set[str]] | Literal["missing", "engaged"]:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
-                return None
+                return "missing"
             cte = (
                 select(SqlConversation.id)
                 .where(
@@ -5119,6 +5180,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             subtree_ids = [
                 cast(str, result[0]) for result in ap_sess.execute(select(cte.c.id)).fetchall()
             ]
+            if unengaged_since is not None and self._subtree_engaged(
+                ap_sess, subtree_ids, unengaged_since
+            ):
+                return "engaged"
             # Collect the subtree's agent bindings before their rows go, so
             # the Omnigent transaction below can delete the session-scoped
             # agent rows that backed these conversations. Only include agents
@@ -5181,8 +5246,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             "delete_conversation_rows",
             delete_ap,
         )
-        if ap_result is None:
-            return False
+        if isinstance(ap_result, str):
+            return ap_result
         subtree_ids, bound_agent_ids = ap_result
 
         def delete_metadata(session: Session) -> None:
@@ -5229,4 +5294,4 @@ class SqlAlchemyConversationStore(ConversationStore):
             delete_metadata,
         )
 
-        return True
+        return "deleted"

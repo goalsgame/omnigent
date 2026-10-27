@@ -4550,6 +4550,13 @@ def server(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
+    from omnigent.server.scheduled.retention import parse_scheduled_tasks_config
+
+    try:
+        scheduled_tasks_config = parse_scheduled_tasks_config(cfg.get("scheduled_tasks"))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     # GitHub App integration (per-user "Connect GitHub"). Enabled only
     # when OMNIGENT_GITHUB_APP_* env supplies a client id/secret + a
     # resolvable redirect URI; otherwise both stay None and the feature
@@ -4650,6 +4657,10 @@ def server(
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
+        scheduled_session_retention_seconds=scheduled_tasks_config.session_retention_seconds,
+        scheduled_session_retention_sweep_interval_seconds=(
+            scheduled_tasks_config.retention_sweep_interval_seconds
+        ),
         project_store=project_store,
         auth_provider=auth_provider,
         host_store=host_store,

@@ -508,6 +508,7 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
+    assert store.runs[0]["finished_at"] == store.runs[0]["fired_at"]
     assert "alice" in store.runs[0]["error"]
 
 

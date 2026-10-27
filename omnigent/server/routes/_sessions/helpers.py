@@ -6873,6 +6873,8 @@ async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
 async def _stop_session_via_runner_impl(
     session_id: str,
     runner_router: Any,
+    *,
+    conversation: Conversation | None = None,
 ) -> bool:
     """
     Forward a ``stop_session`` request to the bound runner, surfacing
@@ -6901,6 +6903,8 @@ async def _stop_session_via_runner_impl(
         ``"conv_abc123"``.
     :param runner_router: The session's ``RunnerRouter`` (may be
         ``None`` in tests / in-process setups).
+    :param conversation: The session's already-loaded row, for callers that
+        stop after the row was deleted.
     :returns: ``True`` if the stop was delivered to a runner (2xx),
         ``False`` if no runner client resolved (nothing forwarded).
     :raises OmnigentError: ``RUNNER_UNAVAILABLE`` (HTTP 503) if the
@@ -6911,7 +6915,11 @@ async def _stop_session_via_runner_impl(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(
+        session_id,
+        runner_router,
+        **({} if conversation is None else {"conversation": conversation}),
+    )
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
