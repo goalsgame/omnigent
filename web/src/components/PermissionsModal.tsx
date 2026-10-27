@@ -225,8 +225,8 @@ export function PermissionsModal({
         </DialogHeader>
 
         {internalGroup && (
-          <div className="flex items-center justify-between rounded-lg border px-3 py-2">
-            <div>
+          <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
+            <div className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">
               <p className="text-ui font-medium">Share internally</p>
               <p className="text-sm text-muted-foreground">
                 Signed-in members of {internalGroup} can read this conversation. No editing access.

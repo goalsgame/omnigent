@@ -288,6 +288,24 @@ describe("PermissionsModal", () => {
     );
   });
 
+  it("keeps long exact group names in a shrinking wrapping container", async () => {
+    listMock.mockResolvedValue([]);
+    const group = "x".repeat(87);
+    render(<PermissionsModal sessionId="conv_abc" open onOpenChange={vi.fn()} />, {
+      wrapper: createInfoWrapper({
+        group_sharing_enabled: true,
+        internal_sharing_group: group,
+        public_sharing_enabled: false,
+      }),
+    });
+    const toggle = await screen.findByRole("switch", { name: "Share internally" });
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    const text = screen.getByText(
+      `Signed-in members of ${group} can read this conversation. No editing access.`,
+    );
+    expect(text.parentElement).toHaveClass("min-w-0", "flex-1", "[overflow-wrap:anywhere]");
+  });
+
   it("revokes the encoded internal grant and exposes old public grants for removal", async () => {
     listMock.mockResolvedValue([
       {

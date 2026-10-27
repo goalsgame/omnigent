@@ -138,6 +138,35 @@ describe("resolveServerInfo group sharing", () => {
   );
 });
 
+describe("resolveServerInfo internal sharing audience", () => {
+  it("retains the exact internal group without normalization", async () => {
+    const parsed = await probe({
+      group_sharing_enabled: true,
+      internal_sharing_group: "/Exact Group",
+    });
+    expect(parsed.internal_sharing_group).toBe("/Exact Group");
+  });
+
+  it.each([undefined, false, null, "true", 1])(
+    "fails closed without verified support: %j",
+    async (support) => {
+      const parsed = await probe({
+        group_sharing_enabled: support,
+        internal_sharing_group: "employees",
+      });
+      expect(parsed.internal_sharing_group).toBeNull();
+    },
+  );
+
+  it.each([undefined, null, 7, {}, []])(
+    "ignores missing or non-string audience: %j",
+    async (value) => {
+      const parsed = await probe({ group_sharing_enabled: true, internal_sharing_group: value });
+      expect(parsed.internal_sharing_group).toBeNull();
+    },
+  );
+});
+
 describe("resolveServerInfo release features", () => {
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({

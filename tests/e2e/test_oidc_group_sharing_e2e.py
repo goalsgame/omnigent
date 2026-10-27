@@ -190,12 +190,28 @@ async def test_internal_deployment_disables_public_and_rejects_group_edit(
         assert anonymous.status_code == 401, anonymous.text
         # Old broad grants remain visible/revocable; configuration never silently migrates ACLs.
         store.grant("__public__", session_id, 1)
+        outsider = {
+            "Authorization": "Bearer "
+            + mint_session_token(
+                "outsider@example.test",
+                oidc.cookie_secret,
+                300,
+                "oidc",
+            )
+        }
+        assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 401
+        assert (
+            await client.get(f"/v1/sessions/{session_id}", headers=outsider)
+        ).status_code == 200
         grants = await client.get(f"/v1/sessions/{session_id}/permissions", headers=owner)
         assert any(p["user_id"] == "__public__" for p in grants.json()["permissions"])
         revoked = await client.delete(
             f"/v1/sessions/{session_id}/permissions/__public__", headers=owner
         )
         assert revoked.status_code == 204
+        assert (
+            await client.get(f"/v1/sessions/{session_id}", headers=outsider)
+        ).status_code == 404
 
 
 @pytest.mark.asyncio
