@@ -278,6 +278,42 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def list_expired_session_runs(
+        self,
+        finished_before: int,
+        *,
+        limit: int = 100,
+        after: tuple[int, str] | None = None,
+    ) -> builtins.list[tuple[int, ScheduledTaskRun]]:
+        """
+        List terminal runs that still reference a conversation, across every workspace.
+
+        Returns runs whose status is ``succeeded``, ``failed`` or ``skipped``,
+        whose ``finished_at`` is at or before ``finished_before`` and whose
+        ``conversation_id`` is set. Runs outside any request workspace scope, so
+        each result carries its owning workspace id.
+
+        :param finished_before: Unix epoch seconds; only runs finished at or before it.
+        :param limit: Maximum number of runs to return.
+        :param after: ``(finished_at, run_id)`` of the last run of the previous
+            page; only runs ordered strictly after it are returned.
+        :returns: ``(workspace_id, run)`` pairs ordered by ``finished_at`` ascending.
+        """
+        ...
+
+    @abstractmethod
+    def clear_run_conversation(self, run_id: str) -> bool:
+        """
+        Null a run's ``conversation_id`` after its conversation was deleted.
+
+        Workspace-scoped to ``current_workspace_id()``.
+
+        :param run_id: The run to update.
+        :returns: ``True`` if a run was updated, ``False`` if it does not exist.
+        """
+        ...
+
+    @abstractmethod
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """
         Return the ``running`` run for a conversation, or ``None``.

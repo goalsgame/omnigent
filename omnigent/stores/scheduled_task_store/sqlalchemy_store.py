@@ -497,6 +497,48 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "update_task_run", write)
 
+    def list_expired_session_runs(
+        self,
+        finished_before: int,
+        *,
+        limit: int = 100,
+        after: tuple[int, str] | None = None,
+    ) -> builtins.list[tuple[int, ScheduledTaskRun]]:
+        """List terminal runs still referencing a conversation, across workspaces."""
+        terminal_codes = [
+            encode_scheduled_task_run_status(status)
+            for status in ("succeeded", "failed", "skipped")
+        ]
+        with self._session("list_expired_session_runs") as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.status.in_(terminal_codes))
+                .where(SqlScheduledTaskRun.conversation_id.is_not(None))
+                .where(SqlScheduledTaskRun.finished_at.is_not(None))
+                .where(SqlScheduledTaskRun.finished_at <= finished_before)
+                .order_by(asc(SqlScheduledTaskRun.finished_at), asc(SqlScheduledTaskRun.id))
+                .limit(limit)
+            )
+            if after is not None:
+                stmt = stmt.where(
+                    tuple_(SqlScheduledTaskRun.finished_at, SqlScheduledTaskRun.id) > after
+                )
+            rows = session.execute(stmt).scalars().all()
+            return [(r.workspace_id or DEFAULT_WORKSPACE_ID, _run_to_entity(r)) for r in rows]
+
+    def clear_run_conversation(self, run_id: str) -> bool:
+        """Null a run's ``conversation_id`` in the current workspace."""
+
+        def write(session: Session) -> bool:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            if row is None:
+                return False
+            row.conversation_id = None
+            session.flush()
+            return True
+
+        return run_write_transaction(self._session_immediate, "clear_task_run_conversation", write)
+
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.
 
