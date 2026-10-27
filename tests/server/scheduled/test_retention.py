@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -94,13 +95,17 @@ class _Harness:
         labels: dict[str, str] | None = None,
         finish_after_prompt: bool = False,
         finish_at_prompt: bool = False,
+        prompt_dispatched: bool = True,
     ) -> tuple[str, str]:
         """Create a run and its session; returns ``(run_id, conversation_id)``.
 
         ``finish_after_prompt`` finishes the run one second after the prompt was stored.
         """
         conv = self.conversation_store.create_conversation()
-        (prompt,) = self.conversation_store.append(conv.id, [self._message("user")])
+        if prompt_dispatched:
+            (prompt,) = self.conversation_store.append(conv.id, [self._message("user")])
+        else:
+            prompt = SimpleNamespace(created_at=int(time.time()))
         if labels:
             self.conversation_store.set_labels(conv.id, labels)
         finished_at = None if finished_ago is None else self.now - finished_ago
@@ -236,6 +241,16 @@ async def test_scheduled_prompt_in_the_finish_second_is_not_engagement(harness: 
 
 async def test_reply_in_the_prompt_second_is_still_engagement(harness: _Harness) -> None:
     run_id, conv_id = harness.add_run("fast_reply", finish_at_prompt=True)
+    harness.conversation_store.append(conv_id, [harness._message("user")])
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.run_conversation_id(run_id) == conv_id
+
+
+async def test_human_message_after_failed_launch_is_engagement(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("no_prompt", finish_at_prompt=True, prompt_dispatched=False)
+    _wait_until_second(harness.finished_at[conv_id] + 1)
     harness.conversation_store.append(conv_id, [harness._message("user")])
 
     assert await harness.sweeper.sweep_once() == 0

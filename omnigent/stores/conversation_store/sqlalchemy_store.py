@@ -5266,7 +5266,8 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> bool:
         """Whether any conversation in the subtree is pinned or has a later user message.
 
-        The root's first user message is the scheduled prompt and never counts.
+        The root's first user message is the scheduled prompt and does not count
+        when it was stored no later than ``finished_at``.
         """
         pinned_prefix = f"{PINNED_LABEL_KEY}."
         pinned = session.execute(
@@ -5285,7 +5286,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             return True
         message_type = encode_item_type("message")
         first_rows = session.execute(
-            select(SqlConversationItem.id, SqlConversationItem.data)
+            select(
+                SqlConversationItem.id, SqlConversationItem.data, SqlConversationItem.created_at
+            )
             .where(
                 SqlConversationItem.workspace_id == current_workspace_id(),
                 SqlConversationItem.conversation_id == root_id,
@@ -5299,7 +5302,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             (
                 row.id
                 for row, data in zip(first_rows, first_decoded, strict=True)
-                if json.loads(data).get("role") == "user"
+                if row.created_at <= finished_at and json.loads(data).get("role") == "user"
             ),
             None,
         )
