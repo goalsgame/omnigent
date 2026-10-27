@@ -144,17 +144,73 @@ async def test_guarded_purge_skips_session_whose_runner_is_on_another_replica(
     assert store.get_conversation(root.id) is not None
 
 
-async def test_guarded_purge_skips_when_only_a_descendant_runner_is_remote(db_uri: str) -> None:
+async def test_split_subtree_is_deleted_by_exactly_the_root_owner(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
-    root = store.create_conversation(host_id="a" * 32, workspace="/w", runner_id="runner_local")
+    root = store.create_conversation(host_id="a" * 32, workspace="/w", runner_id="runner_a")
     child = store.create_conversation(
-        parent_conversation_id=root.id, host_id="b" * 32, workspace="/w", runner_id="runner_remote"
+        parent_conversation_id=root.id, host_id="b" * 32, workspace="/w", runner_id="runner_b"
     )
+    _session_status_cache[child.id] = "running"
+    replica_b = _app_state(local_hosts={"b" * 32})
+    replica_a = _app_state(local_hosts={"a" * 32})
 
-    outcome = await _purge(store, root.id, _app_state(local_hosts={"a" * 32}))
+    outcome_b = await _purge(store, root.id, replica_b)
 
-    assert outcome == "other_replica"
-    assert store.get_conversation(child.id) is not None
+    assert outcome_b == "other_replica"
+    assert store.get_conversation(root.id) is not None
+
+    stops: list[str] = []
+
+    async def fake_stop(target_id: str, router: Any, *, conversation: Any = None) -> bool:
+        stops.append(target_id)
+        return True
+
+    with patch.object(sessions_orchestration, "_stop_session_via_runner", fake_stop):
+        outcome_a = await _purge(store, root.id, replica_a)
+
+    assert outcome_a == "deleted"
+    assert store.get_conversation(child.id) is None
+    assert stops == []
+    _session_status_cache.pop(child.id, None)
+
+
+async def test_root_owner_still_stops_descendants_on_this_replica(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation(host_id="a" * 32, workspace="/w", runner_id="runner_a")
+    child = store.create_conversation(
+        parent_conversation_id=root.id, host_id="a" * 32, workspace="/w", runner_id="runner_a2"
+    )
+    _session_status_cache[child.id] = "running"
+    stops: list[str] = []
+
+    async def fake_stop(target_id: str, router: Any, *, conversation: Any = None) -> bool:
+        stops.append(target_id)
+        return True
+
+    row = store.get_conversation(root.id)
+    assert row is not None
+    with (
+        patch("omnigent.server.routes.sessions.routes_events.host_is_live", return_value=True),
+        patch.object(sessions_orchestration, "_stop_session_via_runner", fake_stop),
+        patch(
+            "omnigent.server.routes._sessions.session_purge._get_runner_client_for_resource_access",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        outcome = await purge_session(
+            root.id,
+            row,
+            conversation_store=store,
+            runner_router=None,
+            file_store=None,
+            artifact_store=None,
+            app_state=_app_state(local_hosts={"a" * 32}),
+            unengaged_since=1,
+        )
+
+    assert outcome == "deleted"
+    assert stops == [child.id]
+    _session_status_cache.pop(child.id, None)
 
 
 async def test_guarded_purge_proceeds_when_runner_is_on_this_replica(db_uri: str) -> None:

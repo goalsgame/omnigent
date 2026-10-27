@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
 from typing import Any, Literal
 
 import httpx
@@ -47,20 +46,19 @@ def _bridge_cleanup_labels(conv: Conversation) -> dict[str, str]:
 
 
 async def _runner_on_another_replica(
-    conversations: Iterable[Conversation],
+    candidate: Conversation,
     conversation_store: Any,
     app_state: Any,
 ) -> bool:
-    """Whether any conversation's runner host is live on a different replica."""
+    """Whether the conversation's runner host is live on a different replica."""
     from omnigent.server.routes.sessions.routes_events import _raise_if_runner_on_another_replica
 
-    for candidate in conversations:
-        try:
-            await _raise_if_runner_on_another_replica(candidate, app_state, conversation_store)
-        except OmnigentError as exc:
-            if exc.code == ErrorCode.WRONG_REPLICA:
-                return True
-            raise
+    try:
+        await _raise_if_runner_on_another_replica(candidate, app_state, conversation_store)
+    except OmnigentError as exc:
+        if exc.code == ErrorCode.WRONG_REPLICA:
+            return True
+        raise
     return False
 
 
@@ -97,8 +95,9 @@ async def purge_session(
         subtree is pinned or has a user message created at or after it.
     :returns: ``"deleted"``, ``"engaged"`` (kept, nothing torn down),
         ``"missing"`` (the conversation row was already gone) or
-        ``"other_replica"`` (a runner is held by another replica, which must
-        expire the session; only returned with ``unengaged_since``).
+        ``"other_replica"`` (the root's runner is held by another replica, which
+        must expire the session; only returned with ``unengaged_since``).
+        Descendants on other replicas are logged and not stopped from here.
     """
     descendant_ids: list[str] | None = None
     snapshot: dict[str, Conversation] | None = None
@@ -111,8 +110,24 @@ async def purge_session(
             await asyncio.to_thread(conversation_store.get_conversations, descendant_ids)
         )
         cleanup_labels = _bridge_cleanup_labels(conv)
-        if await _runner_on_another_replica(snapshot.values(), conversation_store, app_state):
+        if await _runner_on_another_replica(conv, conversation_store, app_state):
             return "other_replica"
+        remote_descendants = [
+            descendant_id
+            for descendant_id in descendant_ids
+            if descendant_id in snapshot
+            and await _runner_on_another_replica(
+                snapshot[descendant_id], conversation_store, app_state
+            )
+        ]
+        if remote_descendants:
+            _logger.info(
+                "Not stopping descendants of %s whose runners are on another replica: %s",
+                session_id,
+                remote_descendants,
+            )
+            descendant_ids = [d for d in descendant_ids if d not in remote_descendants]
+            snapshot = {k: v for k, v in snapshot.items() if k not in remote_descendants}
         outcome = await conversation_store.delete_conversation_if_unengaged(
             session_id, unengaged_since
         )
