@@ -87,13 +87,14 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 
 The server deletes the session a run started one hour after the run finishes (`succeeded`, `failed` or `skipped`), with the same cleanup as `DELETE /v1/sessions/{id}`: runner, sandbox, files and artifacts. The run row stays in the history with `conversation_id` set to `null`. A sweep runs every five minutes against the persisted `finished_at`, so the window survives server restarts.
 
-A session is kept, and its run keeps its `conversation_id`, if it is pinned or if a user message was sent after the run finished.
+A session is kept, and its run keeps its `conversation_id`, if it or any of its sub-agent sessions is pinned, or if a user message was sent after the run finished. The check and the delete happen in one database transaction. Runs recorded without a `finished_at` age from `fired_at`, then `scheduled_at`.
 
 Set the window in the server config. A value of `null` or `0` keeps sessions indefinitely:
 
 ```yaml
 scheduled_tasks:
-  session_retention_seconds: 3600   # default: 1 hour
+  session_retention_seconds: 3600          # default: 1 hour
+  retention_sweep_interval_seconds: 300    # default: 5 minutes
 ```
 
 ## Lifecycle

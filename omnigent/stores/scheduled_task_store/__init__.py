@@ -289,15 +289,17 @@ class ScheduledTaskStore(ABC):
         List terminal runs that still reference a conversation, across every workspace.
 
         Returns runs whose status is ``succeeded``, ``failed`` or ``skipped``,
-        whose ``finished_at`` is at or before ``finished_before`` and whose
-        ``conversation_id`` is set. Runs outside any request workspace scope, so
+        whose finish time is at or before ``finished_before`` and whose
+        ``conversation_id`` is set. The finish time is
+        ``COALESCE(finished_at, fired_at, scheduled_at)``, so legacy terminal
+        rows with no ``finished_at`` still age out. Runs outside any request workspace scope, so
         each result carries its owning workspace id.
 
         :param finished_before: Unix epoch seconds; only runs finished at or before it.
         :param limit: Maximum number of runs to return.
-        :param after: ``(finished_at, run_id)`` of the last run of the previous
+        :param after: ``(finish time, run_id)`` of the last run of the previous
             page; only runs ordered strictly after it are returned.
-        :returns: ``(workspace_id, run)`` pairs ordered by ``finished_at`` ascending.
+        :returns: ``(workspace_id, run)`` pairs ordered by finish time ascending.
         """
         ...
 
@@ -306,6 +308,8 @@ class ScheduledTaskStore(ABC):
         """
         Null a run's ``conversation_id`` after its conversation was deleted.
 
+        In the same transaction, clears the owning task's
+        ``last_run_conversation_id`` only if it still equals that conversation.
         Workspace-scoped to ``current_workspace_id()``.
 
         :param run_id: The run to update.

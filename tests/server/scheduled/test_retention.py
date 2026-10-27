@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from typing import Literal
 
 import pytest
 
@@ -13,7 +14,7 @@ from omnigent.entities import Conversation, MessageData, NewConversationItem
 from omnigent.server.scheduled.retention import (
     DEFAULT_SESSION_RETENTION_SECONDS,
     ScheduledSessionRetention,
-    parse_session_retention_seconds,
+    parse_scheduled_tasks_config,
 )
 from omnigent.stores.conversation_store import PINNED_LABEL_KEY, pinned_label_key
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -68,9 +69,15 @@ class _Harness:
             timezone="UTC",
         )
 
-    async def _delete(self, session_id: str, conv: Conversation) -> bool:
-        self.deleted.append(session_id)
-        return await self.conversation_store.delete_conversation(session_id)
+    async def _delete(
+        self, session_id: str, conv: Conversation, finished_at: int
+    ) -> Literal["deleted", "engaged", "missing"]:
+        outcome = await self.conversation_store.delete_conversation_if_unengaged(
+            session_id, finished_at
+        )
+        if outcome == "deleted":
+            self.deleted.append(session_id)
+        return outcome
 
     def add_run(
         self,
@@ -226,10 +233,12 @@ async def test_failed_delete_keeps_run_link_and_continues(harness: _Harness) -> 
     bad_run, bad_conv = harness.add_run("bad")
     good_run, _ = harness.add_run("good")
 
-    async def flaky_delete(session_id: str, conv: Conversation) -> bool:
+    async def flaky_delete(
+        session_id: str, conv: Conversation, finished_at: int
+    ) -> Literal["deleted", "engaged", "missing"]:
         if session_id == bad_conv:
             raise RuntimeError("runner exploded")
-        return await harness._delete(session_id, conv)
+        return await harness._delete(session_id, conv, finished_at)
 
     harness.sweeper._delete_session = flaky_delete
 
@@ -271,6 +280,88 @@ async def test_pages_past_kept_sessions(
     assert harness.deleted == [conv_id]
 
 
+async def test_message_arriving_during_delete_keeps_session(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("race", finished_ago=harness.now - harness.base)
+    time.sleep(1.1)
+    real_delete = harness.sweeper._delete_session
+
+    async def delete_after_user_message(
+        session_id: str, conv: Conversation, finished_at: int
+    ) -> Literal["deleted", "engaged", "missing"]:
+        harness.conversation_store.append(conv_id, [harness._message("user")])
+        return await real_delete(session_id, conv, finished_at)
+
+    harness.sweeper._delete_session = delete_after_user_message
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.conversation_store.get_conversation(conv_id) is not None
+    assert harness.run_conversation_id(run_id) == conv_id
+
+
+async def test_deletes_session_with_unprotected_descendants(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("tree")
+    child = harness.conversation_store.create_conversation(parent_conversation_id=conv_id)
+
+    assert await harness.sweeper.sweep_once() == 1
+
+    assert harness.conversation_store.get_conversation(child.id) is None
+    assert harness.run_conversation_id(run_id) is None
+
+
+async def test_keeps_everything_when_a_descendant_is_pinned(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("pinned_child")
+    child = harness.conversation_store.create_conversation(parent_conversation_id=conv_id)
+    grandchild = harness.conversation_store.create_conversation(parent_conversation_id=child.id)
+    harness.conversation_store.set_labels(grandchild.id, {pinned_label_key("alice"): "1"})
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.conversation_store.get_conversation(conv_id) is not None
+    assert harness.conversation_store.get_conversation(grandchild.id) is not None
+    assert harness.run_conversation_id(run_id) == conv_id
+
+
+async def test_keeps_everything_when_a_descendant_has_a_later_user_message(
+    harness: _Harness,
+) -> None:
+    run_id, conv_id = harness.add_run("continued_child", finished_ago=harness.now - harness.base)
+    child = harness.conversation_store.create_conversation(parent_conversation_id=conv_id)
+    time.sleep(1.1)
+    harness.conversation_store.append(child.id, [harness._message("user")])
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.conversation_store.get_conversation(child.id) is not None
+    assert harness.run_conversation_id(run_id) == conv_id
+
+
+async def test_user_message_followed_by_many_assistant_messages_is_still_engagement(
+    harness: _Harness,
+) -> None:
+    run_id, conv_id = harness.add_run("chatty", finished_ago=harness.now - harness.base)
+    time.sleep(1.1)
+    harness.conversation_store.append(conv_id, [harness._message("user")])
+    harness.conversation_store.append(conv_id, [harness._message("assistant")] * 60)
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.run_conversation_id(run_id) == conv_id
+
+
+async def test_task_pointer_to_newer_session_is_left_alone(harness: _Harness) -> None:
+    _, old_conv = harness.add_run("old_run")
+    _, newer_conv = harness.add_run("newer_run", finished_ago=RETENTION_S - 60)
+    harness.task_store.update(_uid("task"), last_run_conversation_id=newer_conv)
+
+    await harness.sweeper.sweep_once()
+
+    assert harness.deleted == [old_conv]
+    task = harness.task_store.get(_uid("task"))
+    assert task is not None
+    assert task.last_run_conversation_id == newer_conv
+
+
 def test_sweeper_rejects_non_positive_retention() -> None:
     with pytest.raises(ValueError, match="positive"):
         ScheduledSessionRetention(
@@ -292,7 +383,13 @@ def test_sweeper_rejects_non_positive_retention() -> None:
     ],
 )
 def test_parse_session_retention_seconds(raw: object, expected: int | None) -> None:
-    assert parse_session_retention_seconds(raw) == expected
+    assert parse_scheduled_tasks_config(raw).session_retention_seconds == expected
+
+
+def test_parse_sweep_interval() -> None:
+    assert parse_scheduled_tasks_config({}).retention_sweep_interval_seconds == 300
+    config = parse_scheduled_tasks_config({"retention_sweep_interval_seconds": 2})
+    assert config.retention_sweep_interval_seconds == 2
 
 
 @pytest.mark.parametrize(
@@ -303,8 +400,10 @@ def test_parse_session_retention_seconds(raw: object, expected: int | None) -> N
         {"session_retention_seconds": -1},
         {"session_retention_seconds": "1h"},
         {"session_retention_seconds": True},
+        {"retention_sweep_interval_seconds": 0},
+        {"retention_sweep_interval_seconds": "5"},
     ],
 )
-def test_parse_session_retention_seconds_rejects_malformed(raw: object) -> None:
+def test_parse_scheduled_tasks_config_rejects_malformed(raw: object) -> None:
     with pytest.raises(ValueError, match="scheduled_tasks"):
-        parse_session_retention_seconds(raw)
+        parse_scheduled_tasks_config(raw)

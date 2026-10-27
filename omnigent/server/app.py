@@ -124,6 +124,7 @@ from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.scheduled.retention import (
     DEFAULT_SESSION_RETENTION_SECONDS,
+    DEFAULT_SWEEP_INTERVAL_SECONDS,
     ScheduledSessionRetention,
 )
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -1311,6 +1312,7 @@ def create_app(
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
     scheduled_session_retention_seconds: int | None = DEFAULT_SESSION_RETENTION_SECONDS,
+    scheduled_session_retention_sweep_interval_seconds: int = DEFAULT_SWEEP_INTERVAL_SECONDS,
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
@@ -1368,6 +1370,8 @@ def create_app(
     :param scheduled_session_retention_seconds: Seconds a finished scheduled
         run's session is kept before the retention sweep deletes it. ``None``
         disables the sweep.
+    :param scheduled_session_retention_sweep_interval_seconds: Seconds between
+        retention sweeps.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -1769,7 +1773,9 @@ def create_app(
         scheduled_session_retention: ScheduledSessionRetention | None = None
         if scheduled_task_store is not None and scheduled_session_retention_seconds:
 
-            async def _delete_scheduled_session(session_id: str, conv: Conversation) -> bool:
+            async def _delete_scheduled_session(
+                session_id: str, conv: Conversation, finished_at: int
+            ) -> Literal["deleted", "engaged", "missing"]:
                 return await purge_session(
                     session_id,
                     conv,
@@ -1778,6 +1784,7 @@ def create_app(
                     file_store=file_store,
                     artifact_store=artifact_store,
                     app_state=app_inst.state,
+                    unengaged_since=finished_at,
                 )
 
             scheduled_session_retention = ScheduledSessionRetention(
@@ -1785,6 +1792,7 @@ def create_app(
                 conversation_store=conversation_store,
                 delete_session=_delete_scheduled_session,
                 retention_seconds=scheduled_session_retention_seconds,
+                sweep_interval_seconds=scheduled_session_retention_sweep_interval_seconds,
             )
             await scheduled_session_retention.start()
 

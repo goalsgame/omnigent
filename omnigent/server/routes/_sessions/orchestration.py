@@ -656,6 +656,7 @@ async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
     runner_router: Any,
+    descendant_ids: list[str] | None = None,
 ) -> None:
     """Stop a running session before a destructive lifecycle action.
 
@@ -675,9 +676,14 @@ async def _best_effort_stop(
     :param conversation_store: Store for descendant-id lookup.
     :param runner_router: The ``RunnerRouter`` for runner-client
         resolution, or ``None`` in tests / in-process setups.
+    :param descendant_ids: Pre-collected descendant ids, for callers that
+        already removed the conversation rows. ``None`` looks them up.
     """
     try:
-        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        if descendant_ids is None:
+            descendant_ids = await _collect_descendant_conversation_ids(
+                conversation_store, session_id
+            )
         status = _session_status_with_child_rollup(session_id, descendant_ids)
         own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001

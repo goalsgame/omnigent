@@ -1,9 +1,10 @@
 """Retention sweep that deletes the sessions scheduled-task runs started.
 
 A run that reached a terminal state keeps its session for the configured
-retention window. The sweep reads the persisted ``finished_at`` of each run, so
+retention window. The sweep reads the persisted finish time of each run, so
 retention survives server restarts. A session a person pinned or continued is
-kept and its run keeps its ``conversation_id``.
+kept and its run keeps its ``conversation_id``; the engagement check and the
+delete are one transaction in the conversation store.
 """
 
 from __future__ import annotations
@@ -12,47 +13,71 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation, ScheduledTaskRun
-from omnigent.stores.conversation_store import PINNED_LABEL_KEY
 
 _logger = logging.getLogger(__name__)
 
 DEFAULT_SESSION_RETENTION_SECONDS = 3600
 DEFAULT_SWEEP_INTERVAL_SECONDS = 300
 _SWEEP_PAGE_SIZE = 100
-_RECENT_MESSAGE_SCAN_LIMIT = 50
 
-# ``delete_session(session_id, conversation)`` returns False if the row was already gone.
-DeleteSession = Callable[[str, Conversation], Awaitable[bool]]
+# ``delete_session(session_id, conversation, finished_at)`` deletes the session
+# unless it is engaged (pinned, or a user message after ``finished_at`` in its
+# subtree) and returns ``"deleted"``, ``"engaged"`` or ``"missing"``.
+DeleteSession = Callable[
+    [str, Conversation, int], Awaitable[Literal["deleted", "engaged", "missing"]]
+]
 
 
-def parse_session_retention_seconds(raw: object) -> int | None:
+@dataclass(frozen=True)
+class ScheduledTasksConfig:
+    """The server config's ``scheduled_tasks:`` section.
+
+    :param session_retention_seconds: Seconds a finished run's session is kept,
+        or ``None`` when retention is disabled.
+    :param retention_sweep_interval_seconds: Seconds between retention sweeps.
+    """
+
+    session_retention_seconds: int | None = DEFAULT_SESSION_RETENTION_SECONDS
+    retention_sweep_interval_seconds: int = DEFAULT_SWEEP_INTERVAL_SECONDS
+
+
+def parse_scheduled_tasks_config(raw: object) -> ScheduledTasksConfig:
     """Parse the server config's ``scheduled_tasks:`` section.
 
+    ``session_retention_seconds`` defaults to
+    :data:`DEFAULT_SESSION_RETENTION_SECONDS`; null or 0 disables retention.
+    ``retention_sweep_interval_seconds`` must be a positive integer.
+
     :param raw: The raw ``scheduled_tasks`` value, or ``None`` when absent.
-    :returns: Retention in seconds, or ``None`` when retention is disabled
-        (``session_retention_seconds`` is null or 0). Defaults to
-        :data:`DEFAULT_SESSION_RETENTION_SECONDS` when the key is absent.
-    :raises ValueError: When the section or the value is malformed.
+    :raises ValueError: When the section or a value is malformed.
     """
     if raw is None:
-        return DEFAULT_SESSION_RETENTION_SECONDS
+        return ScheduledTasksConfig()
     if not isinstance(raw, dict):
         raise ValueError("server config 'scheduled_tasks' must be a mapping")
-    if "session_retention_seconds" not in raw:
-        return DEFAULT_SESSION_RETENTION_SECONDS
-    value = raw["session_retention_seconds"]
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    retention: int | None = DEFAULT_SESSION_RETENTION_SECONDS
+    if "session_retention_seconds" in raw:
+        value = raw["session_retention_seconds"]
+        if value is None:
+            retention = None
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                "scheduled_tasks.session_retention_seconds must be a non-negative integer or null"
+            )
+        else:
+            retention = value or None
+    interval = raw.get("retention_sweep_interval_seconds", DEFAULT_SWEEP_INTERVAL_SECONDS)
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
         raise ValueError(
-            "scheduled_tasks.session_retention_seconds must be a non-negative integer or null"
+            "scheduled_tasks.retention_sweep_interval_seconds must be a positive integer"
         )
-    return value or None
+    return ScheduledTasksConfig(retention, interval)
 
 
 class ScheduledSessionRetention:
@@ -134,9 +159,7 @@ class ScheduledSessionRetention:
             if len(page) < _SWEEP_PAGE_SIZE:
                 return deleted
             last = page[-1][1]
-            if last.finished_at is None:
-                return deleted
-            cursor = (last.finished_at, last.id)
+            cursor = (_finish_time(last), last.id)
 
     async def _run(self) -> None:
         while True:
@@ -156,38 +179,21 @@ class ScheduledSessionRetention:
         :returns: ``True`` if a session was deleted.
         """
         session_id = run.conversation_id
-        if session_id is None or run.finished_at is None:
+        if session_id is None:
             return False
+        finished_at = _finish_time(run)
         conv = await asyncio.to_thread(self._conversation_store.get_conversation, session_id)
-        deleted = False
+        outcome: Literal["deleted", "engaged", "missing"] = "missing"
         if conv is not None:
-            if await self._is_engaged(conv, run.finished_at):
+            outcome = await self._delete_session(session_id, conv, finished_at)
+            if outcome == "engaged":
                 return False
-            deleted = await self._delete_session(session_id, conv)
         await asyncio.to_thread(self._store.clear_run_conversation, run.id)
-        await asyncio.to_thread(self._clear_task_pointer, run.scheduled_task_id, session_id)
-        return deleted
+        return outcome == "deleted"
 
-    def _clear_task_pointer(self, task_id: str, session_id: str) -> None:
-        task = self._store.get(task_id)
-        if task is not None and task.last_run_conversation_id == session_id:
-            self._store.update(task_id, last_run_conversation_id=None)
 
-    async def _is_engaged(self, conv: Conversation, finished_at: int) -> bool:
-        """Whether the session is pinned or has a user message after the run finished."""
-        if any(
-            key == PINNED_LABEL_KEY or key.startswith(f"{PINNED_LABEL_KEY}.")
-            for key in conv.labels
-        ):
-            return True
-        page = await asyncio.to_thread(
-            self._conversation_store.list_items,
-            conv.id,
-            limit=_RECENT_MESSAGE_SCAN_LIMIT,
-            order="desc",
-            type="message",
-        )
-        return any(
-            getattr(item.data, "role", None) == "user" and item.created_at > finished_at
-            for item in page.data
-        )
+def _finish_time(run: ScheduledTaskRun) -> int:
+    """The run's finish time, falling back to ``fired_at`` then ``scheduled_at``."""
+    if run.finished_at is not None:
+        return run.finished_at
+    return run.fired_at if run.fired_at is not None else run.scheduled_at

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import Request
@@ -19,6 +19,7 @@ from omnigent.server.routes._sessions.common import (
     _session_sandbox_status_cache,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _collect_descendant_conversation_ids,
     _get_runner_client_for_resource_access,
     _prune_session_read_state,
     _remove_session_worktree_best_effort,
@@ -37,11 +38,13 @@ async def purge_session(
     app_state: Any,
     request: Request | None = None,
     delete_branch: bool = False,
-) -> bool:
+    unengaged_since: int | None = None,
+) -> Literal["deleted", "engaged", "missing"]:
     """Stop a session, release its runner, sandbox and files, and delete its rows.
 
     Runner-side cleanup is best-effort. Must run inside the session's workspace
-    scope.
+    scope. With ``unengaged_since`` the guarded row delete runs first and the
+    teardown follows only when it deleted.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: The session's conversation row.
@@ -53,17 +56,33 @@ async def purge_session(
         sandbox config.
     :param request: Request for host access; required for ``delete_branch``.
     :param delete_branch: Remove the session's git worktree and branch.
-    :returns: ``False`` if the conversation row was already gone.
+    :param unengaged_since: Epoch seconds; when set, the session is kept if its
+        subtree is pinned or has a user message created after it.
+    :returns: ``"deleted"``, ``"engaged"`` (kept, nothing torn down) or
+        ``"missing"`` (the conversation row was already gone).
     """
-    await _best_effort_stop(session_id, conversation_store, runner_router)
+    descendant_ids: list[str] | None = None
+    if unengaged_since is not None:
+        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        outcome = await conversation_store.delete_conversation_if_unengaged(
+            session_id, unengaged_since
+        )
+        if outcome != "deleted":
+            return outcome
+    await _best_effort_stop(
+        session_id, conversation_store, runner_router, descendant_ids=descendant_ids
+    )
     # Runner-side resource cleanup is best-effort: if the bound
     # runner is offline or unbound, the session must still be
     # deletable. Server-owned records (files and conversation row
     # below) live independently of the runner, and runner-side
     # resources are gone with the runner anyway.
+    # The guarded path has already removed the row, so routing uses the loaded one.
     runner_client: httpx.AsyncClient | None = None
     try:
-        runner_client = await _get_runner_client_for_resource_access(session_id)
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id, **({} if unengaged_since is None else {"conversation": conv})
+        )
     except OmnigentError as exc:
         _logger.info(
             "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",
@@ -125,9 +144,10 @@ async def purge_session(
             await asyncio.to_thread(artifact_store.delete, blob_key)
     _interrupt_fenced_sessions.discard(session_id)
     _intentional_stop_sessions.discard(session_id)
-    deleted = await conversation_store.delete_conversation(session_id)
-    if not deleted:
-        return False
+    if unengaged_since is None:
+        deleted = await conversation_store.delete_conversation(session_id)
+        if not deleted:
+            return "missing"
     # The session is gone, so is its launch-progress state. Failed
     # launches are retained in the cache for reload visibility while
     # the session exists; without this eviction every deleted
@@ -175,4 +195,4 @@ async def purge_session(
                 # still deletes the row and revokes the token.
                 getattr(app_state, "sandbox_config", None),
             )
-    return True
+    return "deleted"

@@ -2927,7 +2927,7 @@ def register_events_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
-        purged = await purge_session(
+        outcome = await purge_session(
             session_id,
             conv,
             conversation_store=conversation_store,
@@ -2938,7 +2938,7 @@ def register_events_routes(
             request=request,
             delete_branch=delete_branch,
         )
-        if not purged:
+        if outcome == "missing":
             raise _session_not_found()
         try:
             import time as _time
