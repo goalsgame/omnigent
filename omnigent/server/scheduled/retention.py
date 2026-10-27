@@ -28,9 +28,10 @@ _SWEEP_PAGE_SIZE = 100
 
 # ``delete_session(session_id, conversation, finished_at)`` deletes the session
 # unless it is engaged (pinned, or a user message at or after ``finished_at`` in its
-# subtree) and returns ``"deleted"``, ``"engaged"`` or ``"missing"``.
+# subtree) and returns ``"deleted"``, ``"engaged"`` or ``"missing"``, or
+# ``"other_replica"`` when a runner lives on another replica (skipped this pass).
 DeleteSession = Callable[
-    [str, Conversation, int], Awaitable[Literal["deleted", "engaged", "missing"]]
+    [str, Conversation, int], Awaitable[Literal["deleted", "engaged", "missing", "other_replica"]]
 ]
 
 
@@ -183,10 +184,10 @@ class ScheduledSessionRetention:
             return False
         finished_at = _finish_time(run)
         conv = await asyncio.to_thread(self._conversation_store.get_conversation, session_id)
-        outcome: Literal["deleted", "engaged", "missing"] = "missing"
+        outcome: Literal["deleted", "engaged", "missing", "other_replica"] = "missing"
         if conv is not None:
             outcome = await self._delete_session(session_id, conv, finished_at)
-            if outcome == "engaged":
+            if outcome in ("engaged", "other_replica"):
                 return False
         await asyncio.to_thread(self._store.clear_run_conversation, run.id)
         return outcome == "deleted"

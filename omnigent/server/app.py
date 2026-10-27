@@ -1775,7 +1775,7 @@ def create_app(
 
             async def _delete_scheduled_session(
                 session_id: str, conv: Conversation, finished_at: int
-            ) -> Literal["deleted", "engaged", "missing"]:
+            ) -> Literal["deleted", "engaged", "missing", "other_replica"]:
                 return await purge_session(
                     session_id,
                     conv,

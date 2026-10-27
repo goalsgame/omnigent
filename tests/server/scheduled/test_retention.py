@@ -77,7 +77,7 @@ class _Harness:
 
     async def _delete(
         self, session_id: str, conv: Conversation, finished_at: int
-    ) -> Literal["deleted", "engaged", "missing"]:
+    ) -> Literal["deleted", "engaged", "missing", "other_replica"]:
         outcome = await self.conversation_store.delete_conversation_if_unengaged(
             session_id, finished_at
         )
@@ -260,7 +260,7 @@ async def test_failed_delete_keeps_run_link_and_continues(harness: _Harness) -> 
 
     async def flaky_delete(
         session_id: str, conv: Conversation, finished_at: int
-    ) -> Literal["deleted", "engaged", "missing"]:
+    ) -> Literal["deleted", "engaged", "missing", "other_replica"]:
         if session_id == bad_conv:
             raise RuntimeError("runner exploded")
         return await harness._delete(session_id, conv, finished_at)
@@ -312,7 +312,7 @@ async def test_message_arriving_during_delete_keeps_session(harness: _Harness) -
 
     async def delete_after_user_message(
         session_id: str, conv: Conversation, finished_at: int
-    ) -> Literal["deleted", "engaged", "missing"]:
+    ) -> Literal["deleted", "engaged", "missing", "other_replica"]:
         harness.conversation_store.append(conv_id, [harness._message("user")])
         return await real_delete(session_id, conv, finished_at)
 
@@ -432,3 +432,19 @@ def test_parse_sweep_interval() -> None:
 def test_parse_scheduled_tasks_config_rejects_malformed(raw: object) -> None:
     with pytest.raises(ValueError, match="scheduled_tasks"):
         parse_scheduled_tasks_config(raw)
+
+
+async def test_session_on_another_replica_is_skipped_and_stays_linked(harness: _Harness) -> None:
+    run_id, conv_id = harness.add_run("remote")
+
+    async def other_replica(
+        session_id: str, conv: Conversation, finished_at: int
+    ) -> Literal["deleted", "engaged", "missing", "other_replica"]:
+        return "other_replica"
+
+    harness.sweeper._delete_session = other_replica
+
+    assert await harness.sweeper.sweep_once() == 0
+
+    assert harness.conversation_store.get_conversation(conv_id) is not None
+    assert harness.run_conversation_id(run_id) == conv_id

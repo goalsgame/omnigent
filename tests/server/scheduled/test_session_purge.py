@@ -96,3 +96,81 @@ async def test_guarded_purge_keeps_engaged_session_untouched(db_uri: str) -> Non
     assert outcome == "engaged"
     assert store.get_conversation(root.id) is not None
     stop.assert_not_called()
+
+
+def _app_state(*, local_hosts: set[str]) -> SimpleNamespace:
+    return SimpleNamespace(
+        host_registry=SimpleNamespace(
+            get=lambda host_id: host_id if host_id in local_hosts else None
+        ),
+        host_store=SimpleNamespace(
+            get_host=lambda host_id: SimpleNamespace(id=host_id, sandbox_provider=None)
+        ),
+    )
+
+
+async def _purge(store: SqlAlchemyConversationStore, conv_id: str, app_state: Any) -> str:
+    row = store.get_conversation(conv_id)
+    assert row is not None
+    with (
+        patch("omnigent.server.routes.sessions.routes_events.host_is_live", return_value=True),
+        patch.object(sessions_orchestration, "_stop_session_via_runner", AsyncMock()),
+        patch(
+            "omnigent.server.routes._sessions.session_purge._get_runner_client_for_resource_access",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        return await purge_session(
+            conv_id,
+            row,
+            conversation_store=store,
+            runner_router=None,
+            file_store=None,
+            artifact_store=None,
+            app_state=app_state,
+            unengaged_since=1,
+        )
+
+
+async def test_guarded_purge_skips_session_whose_runner_is_on_another_replica(
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation(host_id="b" * 32, workspace="/w", runner_id="runner_remote")
+
+    outcome = await _purge(store, root.id, _app_state(local_hosts=set()))
+
+    assert outcome == "other_replica"
+    assert store.get_conversation(root.id) is not None
+
+
+async def test_guarded_purge_skips_when_only_a_descendant_runner_is_remote(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation(host_id="a" * 32, workspace="/w", runner_id="runner_local")
+    child = store.create_conversation(
+        parent_conversation_id=root.id, host_id="b" * 32, workspace="/w", runner_id="runner_remote"
+    )
+
+    outcome = await _purge(store, root.id, _app_state(local_hosts={"a" * 32}))
+
+    assert outcome == "other_replica"
+    assert store.get_conversation(child.id) is not None
+
+
+async def test_guarded_purge_proceeds_when_runner_is_on_this_replica(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation(host_id="a" * 32, workspace="/w", runner_id="runner_local")
+
+    outcome = await _purge(store, root.id, _app_state(local_hosts={"a" * 32}))
+
+    assert outcome == "deleted"
+    assert store.get_conversation(root.id) is None
+
+
+async def test_guarded_purge_proceeds_without_a_runner_binding(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+
+    outcome = await _purge(store, root.id, _app_state(local_hosts=set()))
+
+    assert outcome == "deleted"

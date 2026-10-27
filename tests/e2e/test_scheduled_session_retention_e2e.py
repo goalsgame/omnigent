@@ -31,6 +31,8 @@ from tests._helpers.compat import apply_server_env, compat_server_cwd, server_ex
 from tests.e2e.conftest import _REPO_ROOT, find_free_port
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
 
+pytestmark = pytest.mark.min_server_version("0.17.0")
+
 _RETENTION_SECONDS = 2
 _SWEEP_INTERVAL_SECONDS = 1
 _DELETE_TIMEOUT_SECONDS = 60

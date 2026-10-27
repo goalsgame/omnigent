@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from typing import Any, Literal
 
 import httpx
 from fastapi import Request
 
 from omnigent.entities import Conversation
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._sessions.common import (
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
@@ -45,6 +46,24 @@ def _bridge_cleanup_labels(conv: Conversation) -> dict[str, str]:
     return {key: conv.labels[key] for key in keys if key in conv.labels}
 
 
+async def _runner_on_another_replica(
+    conversations: Iterable[Conversation],
+    conversation_store: Any,
+    app_state: Any,
+) -> bool:
+    """Whether any conversation's runner host is live on a different replica."""
+    from omnigent.server.routes.sessions.routes_events import _raise_if_runner_on_another_replica
+
+    for candidate in conversations:
+        try:
+            await _raise_if_runner_on_another_replica(candidate, app_state, conversation_store)
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                return True
+            raise
+    return False
+
+
 async def purge_session(
     session_id: str,
     conv: Conversation,
@@ -57,7 +76,7 @@ async def purge_session(
     request: Request | None = None,
     delete_branch: bool = False,
     unengaged_since: int | None = None,
-) -> Literal["deleted", "engaged", "missing"]:
+) -> Literal["deleted", "engaged", "missing", "other_replica"]:
     """Stop a session, release its runner, sandbox and files, and delete its rows.
 
     Runner-side cleanup is best-effort. Must run inside the session's workspace
@@ -76,8 +95,10 @@ async def purge_session(
     :param delete_branch: Remove the session's git worktree and branch.
     :param unengaged_since: Epoch seconds; when set, the session is kept if its
         subtree is pinned or has a user message created at or after it.
-    :returns: ``"deleted"``, ``"engaged"`` (kept, nothing torn down) or
-        ``"missing"`` (the conversation row was already gone).
+    :returns: ``"deleted"``, ``"engaged"`` (kept, nothing torn down),
+        ``"missing"`` (the conversation row was already gone) or
+        ``"other_replica"`` (a runner is held by another replica, which must
+        expire the session; only returned with ``unengaged_since``).
     """
     descendant_ids: list[str] | None = None
     snapshot: dict[str, Conversation] | None = None
@@ -90,6 +111,8 @@ async def purge_session(
             await asyncio.to_thread(conversation_store.get_conversations, descendant_ids)
         )
         cleanup_labels = _bridge_cleanup_labels(conv)
+        if await _runner_on_another_replica(snapshot.values(), conversation_store, app_state):
+            return "other_replica"
         outcome = await conversation_store.delete_conversation_if_unengaged(
             session_id, unengaged_since
         )
