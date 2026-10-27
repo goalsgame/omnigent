@@ -332,6 +332,29 @@ describe("PermissionsModal", () => {
     await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
   });
 
+  it("warns about legacy elevated internal grants instead of claiming read-only", async () => {
+    listMock.mockResolvedValue([
+      {
+        user_id: "oidc-group:encoded",
+        conversation_id: "conv_abc",
+        level: 3,
+        principal_type: "group",
+        group_name: "employees",
+      },
+    ]);
+    render(<PermissionsModal sessionId="conv_abc" open onOpenChange={vi.fn()} />, {
+      wrapper: createInfoWrapper({
+        group_sharing_enabled: true,
+        internal_sharing_group: "employees",
+        public_sharing_enabled: false,
+      }),
+    });
+    expect(
+      await screen.findByText(/An older group grant allows editing or management/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Share internally" })).toBeChecked();
+  });
+
   it("does not offer an internal audience without verified group support", async () => {
     listMock.mockResolvedValue([]);
     render(<PermissionsModal sessionId="conv_abc" open onOpenChange={vi.fn()} />, {
