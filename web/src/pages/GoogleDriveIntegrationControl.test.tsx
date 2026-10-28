@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { GoogleDriveIntegrationControl } from "./GoogleDriveIntegrationControl";
 import { authenticatedFetch } from "@/lib/identity";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/nativeBridge", () => ({ isElectronShell: () => true }));
 const fetchMock = vi.mocked(authenticatedFetch);
 const response = (body: unknown, ok = true) => ({ ok, json: async () => body }) as Response;
 beforeEach(() => {
@@ -38,4 +39,22 @@ it("displays OAuth errors and removes the callback marker", async () => {
   render(<GoogleDriveIntegrationControl />);
   expect(await screen.findByRole("alert")).toHaveTextContent("Could not connect Google Drive");
   expect(window.location.search).toBe("");
+});
+
+it("clears a failed connection's error when a retry in the sign-in window succeeds", async () => {
+  window.history.replaceState({}, "", "/settings?google_drive=error");
+  fetchMock.mockResolvedValue(response({ connected: false, email: null }));
+  render(<GoogleDriveIntegrationControl />);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Could not connect Google Drive");
+  fetchMock.mockResolvedValue(response({ connected: true, email: "user@example.com" }));
+  act(() => {
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: window.location.origin,
+        data: { type: "omnigent:connection", provider: "google_drive", outcome: "connected" },
+      }),
+    );
+  });
+  expect(await screen.findByRole("status")).toHaveTextContent("Google Drive connected.");
+  expect(screen.queryByRole("alert")).toBeNull();
 });

@@ -111,6 +111,7 @@ import {
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
+import { finishConnectionWindow, useConnectionWindow } from "@/lib/connectionFlow";
 import {
   beginDatabricksConnect,
   disconnectDatabricks,
@@ -1178,8 +1179,8 @@ function IntegrationsSection() {
  * Connect / disconnect a GitHub account. Once connected, a managed
  * sandbox launched by this user authenticates ``gh`` / git as them and
  * receives their public SSH keys (so they can SSH into their own box).
- * The connect action is a full-page redirect to GitHub; on return the
- * callback lands back here with ``?github=connected|error``.
+ * The connect action goes to GitHub (in a sign-in window from the desktop
+ * app); on return the callback lands back here with ``?github=connected|error``.
  */
 function GithubIntegrationControl() {
   const [status, setStatus] = useState<GithubConnectionStatus | null | "loading">("loading");
@@ -1194,12 +1195,20 @@ function GithubIntegrationControl() {
     }
   }, []);
 
+  useConnectionWindow("github", setNotice, refresh);
+
   useEffect(() => {
-    void refresh();
     // Surface the callback outcome carried back in the URL, then strip it
     // so a reload doesn't re-show the banner.
     const params = new URLSearchParams(window.location.search);
     const outcome = params.get("github");
+    if (
+      (outcome === "connected" || outcome === "error") &&
+      finishConnectionWindow("github", outcome)
+    ) {
+      return;
+    }
+    void refresh();
     if (outcome === "connected" || outcome === "error") {
       setNotice(outcome);
       params.delete("github");

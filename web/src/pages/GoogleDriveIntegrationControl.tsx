@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { withBasePath } from "@/lib/basePath";
+import {
+  beginConnection,
+  type ConnectionOutcome,
+  finishConnectionWindow,
+  useConnectionWindow,
+} from "@/lib/connectionFlow";
 import { authenticatedFetch } from "@/lib/identity";
 
 interface ConnectionStatus {
   connected: boolean;
   email: string | null;
 }
+
+const STATUS_ERROR = "Google Drive connection status is unavailable. Please retry.";
 
 export function GoogleDriveIntegrationControl() {
   const [status, setStatus] = useState<ConnectionStatus | null>(null);
@@ -21,26 +28,40 @@ export function GoogleDriveIntegrationControl() {
       const response = await authenticatedFetch("/v1/connections/google_drive/status");
       if (!response.ok) throw new Error("status unavailable");
       setStatus((await response.json()) as ConnectionStatus);
+      setError((current) => (current === STATUS_ERROR ? null : current));
     } catch {
       setStatus(null);
-      setError("Google Drive connection status is unavailable. Please retry.");
+      setError(STATUS_ERROR);
     } finally {
       setLoading(false);
     }
   }, []);
 
+  const showOutcome = useCallback((outcome: ConnectionOutcome) => {
+    setConnectedNotice(outcome === "connected");
+    if (outcome === "connected") setError(null);
+    if (outcome === "error")
+      setError("Could not connect Google Drive. Try again and grant the requested permissions.");
+  }, []);
+
+  useConnectionWindow("google_drive", showOutcome, refresh);
+
   useEffect(() => {
-    void refresh();
     const url = new URL(window.location.href);
     const outcome = url.searchParams.get("google_drive");
+    if (
+      (outcome === "connected" || outcome === "error") &&
+      finishConnectionWindow("google_drive", outcome)
+    ) {
+      return;
+    }
+    void refresh();
     if (outcome === "connected" || outcome === "error") {
-      setConnectedNotice(outcome === "connected");
-      if (outcome === "error")
-        setError("Could not connect Google Drive. Try again and grant the requested permissions.");
+      showOutcome(outcome);
       url.searchParams.delete("google_drive");
       window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
     }
-  }, [refresh]);
+  }, [refresh, showOutcome]);
 
   async function disconnect() {
     setBusy(true);
@@ -61,7 +82,7 @@ export function GoogleDriveIntegrationControl() {
 
   function connect() {
     const returnTo = `${window.location.pathname}${window.location.search}`;
-    window.location.href = withBasePath(
+    beginConnection(
       `/v1/connections/google_drive/connect?return_to=${encodeURIComponent(returnTo)}`,
     );
   }
