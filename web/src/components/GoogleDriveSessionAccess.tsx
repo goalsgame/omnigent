@@ -143,7 +143,7 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
     };
   }, [refresh, open]);
 
-  const mutate = async (path: string, init: RequestInit): Promise<boolean> => {
+  const mutate = async (path: string, init: RequestInit, request?: Pending): Promise<boolean> => {
     revision.current += 1;
     setBusy(true);
     setError(null);
@@ -151,8 +151,8 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
       const response = await authenticatedFetch(`${endpoint}${path}`, init);
       if (response.status === 409) {
         const detail = await errorDetail(response);
-        if (detail.audience && pending) {
-          setPending({ ...pending, audience: detail.audience });
+        if (detail.audience && request) {
+          setPending({ ...request, audience: detail.audience });
           setError("Sharing changed. Review who can use this access before confirming.");
           return false;
         }
@@ -176,22 +176,30 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
     const audience = audienceMap(request.audience);
     const ok =
       request.kind === "confirm"
-        ? await mutate(`/grants/${encodeURIComponent(request.grantId ?? "")}/confirm`, {
-            method: "POST",
-            headers: json,
-            body: JSON.stringify({ audience }),
-          })
-        : await mutate("/grants", {
-            method: "POST",
-            headers: json,
-            body: JSON.stringify({
-              kind: request.kind,
-              file: request.file,
-              access: request.access,
-              generation: snapshot?.viewer.generation,
-              audience,
-            }),
-          });
+        ? await mutate(
+            `/grants/${encodeURIComponent(request.grantId ?? "")}/confirm`,
+            {
+              method: "POST",
+              headers: json,
+              body: JSON.stringify({ audience }),
+            },
+            request,
+          )
+        : await mutate(
+            "/grants",
+            {
+              method: "POST",
+              headers: json,
+              body: JSON.stringify({
+                kind: request.kind,
+                file: request.file,
+                access: request.access,
+                generation: snapshot?.viewer.generation,
+                audience,
+              }),
+            },
+            request,
+          );
     if (ok) {
       setPending(null);
       setLink("");

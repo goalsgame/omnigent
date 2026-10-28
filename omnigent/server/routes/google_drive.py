@@ -539,11 +539,10 @@ def create_google_drive_router(
                 "Creating files needs a participant to allow Drive access with editing for "
                 "this session.",
             )
-        if len(writable) > 1:
+        accounts = sorted({(info["email"] or "").lower() for info in writable})
+        if len(accounts) > 1:
             raise HTTPException(
-                409,
-                "Several Drives allow editing; pass account as one of: "
-                + ", ".join(sorted(info["email"] or "" for info in writable)),
+                409, "Several Drives allow editing; pass account as one of: " + ", ".join(accounts)
             )
         info = writable[0]
         token = await token_for(info)

@@ -108,7 +108,8 @@ class GoogleSheetsUpdateTool(_DriveTool):
     TOOL_NAME = "google_sheets_update"
     HELP = (
         "Write rows of cell values into a Google Sheet granted to this session with editing. "
-        "Values are entered as if typed, so formulas such as '=SUM(A1:A3)' are evaluated."
+        "Each cell is text entered as if typed: numbers, TRUE/FALSE and formulas such as "
+        "'=SUM(A1:A3)' are interpreted, and an empty string clears the cell."
     )
     PROPERTIES = {
         "file_id": _FILE_ID,
@@ -119,7 +120,7 @@ class GoogleSheetsUpdateTool(_DriveTool):
             "items": {
                 "type": "array",
                 "maxItems": 1000,
-                "items": {"type": ["string", "number", "boolean", "null"]},
+                "items": {"type": "string"},
             },
         },
     }

@@ -204,3 +204,20 @@ it("describes a paused whole-Drive grant as covering the whole Drive", async () 
   fireEvent.click(screen.getByRole("button", { name: "Review and resume" }));
   expect(screen.getByText(/anything in your Drive/)).toBeTruthy();
 });
+
+it("opens participant review when a private session became shared", async () => {
+  fetchMock
+    .mockResolvedValueOnce(response(snapshot()))
+    .mockResolvedValueOnce(response({ detail: { message: "changed", audience: [bob] } }, 409))
+    .mockResolvedValueOnce(response(snapshot({ audience: [bob], grants: [grant()] })));
+  render(<GoogleDriveSessionAccess sessionId="s1" />);
+  await open("Google Drive access: off");
+  fireEvent.click(screen.getByRole("button", { name: "Allow view-only" }));
+  expect(await screen.findByText("Share Google Drive access?")).toBeTruthy();
+  expect(screen.getByText("bob@example.com")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Share with everyone" }));
+  await screen.findByText("Active");
+  expect(JSON.parse(fetchMock.mock.calls[2][1]?.body as string).audience).toEqual({
+    "bob@example.com": 2,
+  });
+});

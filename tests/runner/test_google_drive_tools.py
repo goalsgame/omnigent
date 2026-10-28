@@ -84,3 +84,20 @@ async def test_requests_are_bound_to_the_session_and_report_errors():
 async def test_requires_a_server_session():
     result = json.loads(await execute_google_drive_tool("google_drive_list", {}, None, None))
     assert "error" in result
+
+
+def test_schemas_use_single_types_for_gemini():
+    from omnigent.tools.builtins.google_drive import GOOGLE_DRIVE_TOOL_TYPES
+
+    def types(node):
+        if isinstance(node, dict):
+            if "type" in node:
+                yield node["type"]
+            for value in node.values():
+                yield from types(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from types(value)
+
+    for tool in GOOGLE_DRIVE_TOOL_TYPES:
+        assert all(isinstance(t, str) for t in types(tool().get_schema())), tool.name()

@@ -590,3 +590,21 @@ def test_grant_evaluation_reads_sharing_once_per_request(env, monkeypatch):
     calls.clear()
     assert agent(env, "get", f"/{DOC}").status_code == 200
     assert len(calls) == 1
+
+
+def test_participants_sharing_one_google_account_are_one_drive(env):
+    env.permissions.grant(BOB, env.session, 2)
+    env.connections.upsert(
+        BOB,
+        tokens={
+            "access_token": "token-owner",
+            "refresh_token": "r",
+            "expires_at": time.time() + 3600,
+            "scope": SCOPES,
+        },
+        identity={"subject": OWNER, "email": OWNER.upper()},
+    )
+    grant(env, kind="drive", access="write", audience={BOB: 2})
+    grant(env, user=BOB, kind="drive", access="write", audience={OWNER: 4})
+    response = agent(env, "post", json={"title": "Notes", "kind": "document"})
+    assert response.status_code == 200, response.text
