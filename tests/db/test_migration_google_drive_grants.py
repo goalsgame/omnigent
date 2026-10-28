@@ -25,9 +25,12 @@ def test_google_drive_grant_migration_and_orm_schema_agree(db_uri):
                 assert set(columns) == {c.name for c in table.columns}
                 assert columns["file_id"]["nullable"]
                 assert not columns["audience"]["nullable"]
-                assert [i["name"] for i in sa.inspect(connection).get_indexes(table.name)] == [
-                    "ix_google_drive_grants_session"
-                ]
+                indexes = {i["name"]: i for i in sa.inspect(connection).get_indexes(table.name)}
+                assert set(indexes) == {
+                    "ix_google_drive_grants_session",
+                    "ux_google_drive_grants_scope",
+                }
+                assert indexes["ux_google_drive_grants_scope"]["unique"]
                 migration.downgrade()
                 assert table.name not in sa.inspect(connection).get_table_names()
             table.create(connection)

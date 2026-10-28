@@ -363,7 +363,9 @@ Use `tests/server/test_google_drive.py` for per-file and whole-Drive grants,
 shared-session acknowledgement, pausing after sharing changes, revocation,
 reconnect and sub-agent behavior; `tests/server/test_google_drive_client.py`
 for Drive, Docs and Sheets requests; and `tests/runner/test_google_drive_tools.py`
-for tool registration and session binding. Component coverage is
+for tool registration and session binding. `tests/e2e/test_google_drive_connection.py`
+runs OAuth, a grant and a runner tool call against fake Google replies and checks no
+Google token reaches the agent. Component coverage is
 `web/src/components/GoogleDriveSessionAccess.test.tsx`. Live checks need a
 configured OAuth client: connect Drive in Settings, add a file in a private
 session and ask the agent to read it, then share the session and confirm the

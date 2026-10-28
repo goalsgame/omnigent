@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from types import SimpleNamespace
 
@@ -12,8 +13,12 @@ from fastapi.testclient import TestClient
 
 from omnigent.connections.google_drive import GoogleDriveConnectionStore
 from omnigent.db.account_authority import account_authority_scope
-from omnigent.db.db_models import workspace_scope
-from omnigent.db.group_authority import group_authority_scope
+from omnigent.db.db_models import SqlGoogleDriveGrant, workspace_scope
+from omnigent.db.group_authority import (
+    bind_group_authority,
+    group_authority_scope,
+    group_principal,
+)
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.google_drive import (
@@ -46,7 +51,12 @@ FOLDER_ID = "folder_dddddddd"
 
 class _Auth(AuthProvider):
     def get_user_id(self, request):
-        return request.headers.get("x-user")
+        user = request.headers.get("x-user")
+        if user:
+            bind_group_authority(
+                user, json.loads(request.headers.get("x-groups", "[]")), int(time.time()) + 60
+            )
+        return user
 
     def get_credential_user_id(self, request):
         if request.headers.get("x-delegated"):
@@ -68,6 +78,7 @@ class FakeDrive:
             "token-bob": {SHEET: {"name": "Budget", "mime_type": SPREADSHEET, "can_edit": True}},
         }
         self.calls: list[tuple] = []
+        self.on_create = None
 
     def _meta(self, token, file_id):
         try:
@@ -93,6 +104,8 @@ class FakeDrive:
 
     async def create(self, token, title, kind, content):
         self.calls.append(("create", token, title, kind, content))
+        if self.on_create:
+            self.on_create()
         file_id = "created_eeeeeeee"
         self.files[token][file_id] = {"name": title, "mime_type": DOCUMENT, "can_edit": True}
         return self._meta(token, file_id)
@@ -163,6 +176,7 @@ def env(db_uri):
         drive=drive,
         permissions=permissions,
         connections=connections,
+        grants=grants,
         connect=connect,
         session=session,
         other=other,
@@ -185,10 +199,10 @@ def grant(env, user=OWNER, session=None, audience=None, **body):
     )
 
 
-def agent(env, method, path="", session=None, user=OWNER, **kwargs):
+def agent(env, method, path="", session=None, user=OWNER, headers=None, **kwargs):
     return getattr(env.client, method)(
         f"/v1/sessions/{session or env.session}/google-drive/agent/files{path}",
-        headers={"x-user": user},
+        headers={"x-user": user, **(headers or {})},
         **kwargs,
     )
 
@@ -446,3 +460,83 @@ async def test_connect_requires_drive_scope(db_uri):
     tokens["scope"] = SCOPES
     await hooks.complete(OWNER, "code", {"nonce": "n"})
     assert connections.get(OWNER).metadata["email"] == OWNER
+
+
+def test_revoking_during_create_does_not_add_the_new_file(env):
+    grant(env, kind="drive", access="write")
+    [item] = snapshot(env)["grants"]
+    env.drive.on_create = lambda: env.grants.delete(env.session, item["id"])
+    response = agent(env, "post", json={"title": "Notes", "kind": "document"})
+    assert response.status_code == 200
+    assert "not added" in response.json()["warning"]
+    assert snapshot(env)["grants"] == []
+
+
+def test_replacing_a_grant_keeps_one_row_per_scope(env, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from omnigent.stores import google_drive_grant_store
+
+    grant(env, kind="drive", access="write")
+    real = google_drive_grant_store.run_write_transaction
+    attempts = []
+
+    def flaky(maker, operation, callback):
+        attempts.append(operation)
+        if len(attempts) == 1:
+            raise IntegrityError("insert", {}, Exception("duplicate"))
+        return real(maker, operation, callback)
+
+    monkeypatch.setattr(google_drive_grant_store, "run_write_transaction", flaky)
+    assert grant(env, kind="drive", access="read").status_code == 200
+    assert attempts == ["put", "put"]
+    [item] = snapshot(env)["grants"]
+    assert item["access"] == "read"
+    assert agent(env, "post", f"/{DOC}/append", json={"text": "x"}).status_code == 403
+
+
+def test_scope_uniqueness_is_enforced_by_the_database(env):
+    from sqlalchemy.exc import IntegrityError
+
+    grant(env, kind="drive")
+    [item] = env.grants.list(env.session)
+
+    def duplicate(session):
+        session.add(
+            SqlGoogleDriveGrant(
+                workspace_id=0,
+                id="f" * 32,
+                session_id=env.session,
+                user_id=OWNER,
+                scope_key="*",
+                connection_generation=item.connection_generation,
+                kind="drive",
+                access="write",
+                audience="{}",
+                created_at=1,
+            )
+        )
+        session.flush()
+
+    with pytest.raises(IntegrityError):
+        env.grants._write_unique("duplicate", duplicate)
+
+
+def test_group_only_members_can_use_but_not_grant(env):
+    team = group_principal("team")
+    env.permissions.grant(team, env.session, 2, is_group=True)
+    grant(env, kind="file", file=DOC, audience={team: 2})
+    groups = {"x-groups": json.dumps(["team"])}
+    assert agent(env, "get", f"/{DOC}", user=BOB, headers=groups).status_code == 200
+    denied = env.client.post(
+        f"/v1/sessions/{env.session}/google-drive/grants",
+        json={"kind": "drive", "access": "read", "generation": _generation(env, BOB)},
+        headers={"x-user": BOB, **groups},
+    )
+    assert denied.status_code == 403
+    assert "group" in denied.json()["detail"]
+    view = env.client.get(
+        f"/v1/sessions/{env.session}/google-drive", headers={"x-user": BOB, **groups}
+    ).json()
+    assert view["viewer"]["can_grant"] is False
+    assert view["grants"][0]["state"] == "active"

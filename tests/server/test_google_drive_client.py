@@ -18,10 +18,9 @@ from omnigent.server.google_drive import (
 
 
 @pytest.fixture
-def drive(monkeypatch):
+def drive():
     requests: list[httpx.Request] = []
     replies: dict[str, httpx.Response] = {}
-    real = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -30,12 +29,9 @@ def drive(monkeypatch):
                 return reply
         return httpx.Response(404, json={"error": {"message": "missing"}})
 
-    monkeypatch.setattr(
-        google_drive.httpx,
-        "AsyncClient",
-        lambda **kwargs: real(transport=httpx.MockTransport(handler), **kwargs),
+    client = GoogleDriveClient(
+        GoogleDriveConfig("id", "secret", "https://app/cb"), httpx.MockTransport(handler)
     )
-    client = GoogleDriveClient(GoogleDriveConfig("id", "secret", "https://app/cb"))
     return client, requests, replies
 
 

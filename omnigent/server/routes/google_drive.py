@@ -152,6 +152,15 @@ def create_google_drive_router(
                 return level
         return 0
 
+    def grantor_level(user: str, root: str) -> int:
+        """Session level from the person's own invitation, which holds for any caller."""
+        if permissions is None:
+            return LEVEL_MANAGE + 1
+        if permissions.is_admin(user):
+            return LEVEL_MANAGE + 1
+        members = audience(root, "")
+        return max(members.get(user, 0), members.get(RESERVED_USER_PUBLIC, 0))
+
     def describe(members: dict[str, int]) -> list[dict[str, Any]]:
         return [
             {
@@ -175,7 +184,7 @@ def create_google_drive_router(
             grant.connection_generation
         ):
             state = "disconnected"
-        elif level_of(grant.user_id, root) < LEVEL_EDIT:
+        elif grantor_level(grant.user_id, root) < LEVEL_EDIT:
             state = "inactive"
         elif new:
             state = "suspended"
@@ -197,7 +206,8 @@ def create_google_drive_router(
                 "connected": connection is not None,
                 "email": connection.metadata.get("email") if connection else None,
                 "generation": connection.metadata.get("generation") if connection else None,
-                "can_grant": credential is not None and level >= LEVEL_EDIT,
+                "can_grant": credential is not None
+                and grantor_level(credential, root) >= LEVEL_EDIT,
                 "can_manage": level >= LEVEL_MANAGE,
             },
             "grants": [],
@@ -242,8 +252,12 @@ def create_google_drive_router(
         """Grant the session's agents one of the caller's files or their whole Drive."""
         user = credential_user(request, auth)
         _, root = await authorize(request, session_id, LEVEL_EDIT)
-        if await asyncio.to_thread(level_of, user, root) < LEVEL_EDIT:
-            raise HTTPException(403, "Edit access to the session is required")
+        if await asyncio.to_thread(grantor_level, user, root) < LEVEL_EDIT:
+            raise HTTPException(
+                403,
+                "Sharing Google Drive needs edit access from your own invitation to this "
+                "session; access through a group is not enough",
+            )
         connection = await asyncio.to_thread(connections.get, user)
         if connection is None or connection.metadata.get("generation") != body.generation:
             raise HTTPException(409, "Google Drive connection changed; refresh and retry")
@@ -528,11 +542,12 @@ def create_google_drive_router(
             meta = await client.create(token, body.title, body.kind, body.content)
         except GoogleDriveError as exc:
             raise HTTPException(exc.status, str(exc)) from None
-        grant = info["grant"]
-        await asyncio.to_thread(
-            grants.put,
+        source = info["grant"]
+        derived = await asyncio.to_thread(
+            grants.derive,
+            source,
             replace(
-                grant,
+                source,
                 id=uuid.uuid4().hex,
                 kind="file",
                 file_id=meta["id"],
@@ -542,7 +557,13 @@ def create_google_drive_router(
             ),
         )
         audit(root, info, "create", meta["id"])
-        return {"file": file_view(meta, info)}
+        result: dict[str, Any] = {"file": file_view(meta, info)}
+        if derived is None:
+            result["warning"] = (
+                "Drive access changed while the file was being created, so it was not added "
+                "to this session"
+            )
+        return result
 
     @router.post("/sessions/{session_id}/google-drive/agent/files/{file_id}/append")
     async def agent_append(

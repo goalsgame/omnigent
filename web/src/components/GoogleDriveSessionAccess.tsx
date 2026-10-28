@@ -57,6 +57,7 @@ interface DriveFile {
 
 interface Pending {
   kind: "file" | "drive" | "confirm";
+  scope: "file" | "drive";
   access: Access;
   file?: string;
   label: string;
@@ -197,9 +198,13 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
     }
   };
 
-  const request = (next: Omit<Pending, "audience">) => {
+  const request = (next: Omit<Pending, "audience" | "scope">) => {
     const audience = snapshot?.audience ?? [];
-    const pendingRequest = { ...next, audience };
+    const pendingRequest: Pending = {
+      ...next,
+      scope: next.kind === "drive" ? "drive" : "file",
+      audience,
+    };
     if (audience.length > 0) setPending(pendingRequest);
     else void submit(pendingRequest);
   };
@@ -254,7 +259,7 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
           )}
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
             {pending ? "Share Google Drive access?" : "Google Drive access"}
@@ -285,9 +290,9 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
               <p>
                 People who can use the agent can make it read
                 {pending.access === "write" ? " and change" : ""}{" "}
-                {pending.kind === "drive" ? "anything in your Drive" : "this file"} with your Google
-                permissions. Anyone who can read the session can see what the agent reads. People
-                added to the session later pause this access until you confirm again.
+                {pending.scope === "drive" ? "anything in your Drive" : "this file"} with your
+                Google permissions. Anyone who can read the session can see what the agent reads.
+                People added to the session later pause this access until you confirm again.
               </p>
             </>
           ) : (
@@ -322,6 +327,7 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
                             onClick={() =>
                               setPending({
                                 kind: "confirm",
+                                scope: grant.kind,
                                 access: grant.access,
                                 label: grantTitle(grant),
                                 grantId: grant.id,
@@ -426,24 +432,28 @@ export function GoogleDriveSessionAccess({ sessionId }: { sessionId: string }) {
                       ))}
                     </ul>
                   )}
-                  <form
-                    className="flex gap-2"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      if (link.trim())
-                        request({ kind: "file", access: "read", file: link, label: "This file" });
-                    }}
-                  >
+                  <div className="flex flex-wrap gap-2">
                     <Input
+                      className="min-w-0 flex-1 basis-56"
                       value={link}
                       onChange={(event) => setLink(event.target.value)}
                       placeholder="Or paste a Docs, Sheets or Drive link"
                       aria-label="Google Drive link"
                     />
-                    <Button type="submit" size="sm" variant="outline" disabled={busy}>
-                      Add
-                    </Button>
-                  </form>
+                    {(["read", "write"] as const).map((access) => (
+                      <Button
+                        key={access}
+                        size="sm"
+                        variant="outline"
+                        disabled={busy || !link.trim()}
+                        onClick={() =>
+                          request({ kind: "file", access, file: link, label: "This file" })
+                        }
+                      >
+                        {access === "write" ? "Add with editing" : "Add view-only"}
+                      </Button>
+                    ))}
+                  </div>
                   <div className="space-y-2 border-t pt-3">
                     <p className="font-medium">Whole Drive</p>
                     <p className="text-muted-foreground">

@@ -117,10 +117,13 @@ class _Reply:
 class GoogleDriveClient(GoogleCloudClient):
     """OAuth token exchange plus the Drive, Docs and Sheets calls agents may make."""
 
-    def __init__(self, config: GoogleDriveConfig) -> None:
+    def __init__(
+        self, config: GoogleDriveConfig, transport: httpx.AsyncBaseTransport | None = None
+    ) -> None:
         super().__init__(
             GoogleCloudConfig(config.client_id, config.client_secret, config.redirect_uri)
         )
+        self._transport = transport
 
     async def token(self, fields: dict[str, str]) -> dict[str, Any]:
         try:
@@ -151,7 +154,9 @@ class GoogleDriveClient(GoogleCloudClient):
         body = bytearray()
         try:
             async with (
-                httpx.AsyncClient(timeout=30, trust_env=False) as client,
+                httpx.AsyncClient(
+                    timeout=30, trust_env=False, transport=self._transport
+                ) as client,
                 client.stream(
                     method,
                     url,

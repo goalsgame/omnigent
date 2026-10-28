@@ -25,6 +25,7 @@ def upgrade() -> None:
         sa.Column("id", Uuid16(), primary_key=True),
         sa.Column("session_id", Uuid16(), nullable=False),
         sa.Column("user_id", sa.String(128), nullable=False),
+        sa.Column("scope_key", sa.String(256), nullable=False),
         sa.Column("connection_generation", sa.String(64), nullable=False),
         sa.Column("kind", sa.String(8), nullable=False),
         sa.Column("file_id", sa.String(256), nullable=True),
@@ -36,6 +37,12 @@ def upgrade() -> None:
     )
     op.create_index(
         "ix_google_drive_grants_session", "google_drive_grants", ["workspace_id", "session_id"]
+    )
+    op.create_index(
+        "ux_google_drive_grants_scope",
+        "google_drive_grants",
+        ["workspace_id", "session_id", "user_id", "scope_key"],
+        unique=True,
     )
 
 

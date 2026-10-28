@@ -423,7 +423,8 @@ Google token: each tool calls the server, which checks the session's grants and
 calls Google with the granting person's credentials.
 
 Connecting shares nothing. In a session, the Drive icon in the title bar shows
-every grant to anyone who can read the session. People with edit access can add
+every grant to anyone who can read the session. People invited to the session
+with edit access (access only through a group is not enough) can add
 their own files (by searching their Drive or pasting a link) with view-only or
 view-and-edit access, or allow their whole Drive, view-only or with editing.
 Whole-Drive grants let agents search that Drive and create Docs and Sheets in

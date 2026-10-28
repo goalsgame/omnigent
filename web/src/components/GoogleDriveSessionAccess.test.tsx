@@ -175,3 +175,32 @@ it("warns in the share dialog when Drive access exists", async () => {
   expect(await screen.findByText("This session can use Google Drive")).toBeTruthy();
   expect(screen.getByText(/me@example.com applies to everyone/)).toBeTruthy();
 });
+
+it("adds a pasted link with editing", async () => {
+  fetchMock
+    .mockResolvedValueOnce(response(snapshot()))
+    .mockResolvedValueOnce(response(snapshot({ grants: [grant({ kind: "file", name: "Doc" })] })));
+  render(<GoogleDriveSessionAccess sessionId="s1" />);
+  await open("Google Drive access: off");
+  const link = "https://docs.google.com/document/d/abcdefghijk/edit";
+  fireEvent.change(screen.getByLabelText("Google Drive link"), { target: { value: link } });
+  fireEvent.click(screen.getByRole("button", { name: "Add with editing" }));
+  await screen.findByText("Doc");
+  expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string)).toMatchObject({
+    kind: "file",
+    file: link,
+    access: "write",
+  });
+});
+
+it("describes a paused whole-Drive grant as covering the whole Drive", async () => {
+  fetchMock.mockResolvedValue(
+    response(
+      snapshot({ audience: [bob], grants: [grant({ state: "suspended", new_audience: [bob] })] }),
+    ),
+  );
+  render(<GoogleDriveSessionAccess sessionId="s1" />);
+  await open("Google Drive access: needs confirmation");
+  fireEvent.click(screen.getByRole("button", { name: "Review and resume" }));
+  expect(screen.getByText(/anything in your Drive/)).toBeTruthy();
+});
