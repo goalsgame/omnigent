@@ -441,10 +441,19 @@ def create_google_drive_router(
             return info, token, meta
         raise unavailable(inactive, write=write)
 
-    def audit(root: str, info: dict[str, Any], operation: str, file_id: str | None) -> None:
+    def audit(
+        caller: str,
+        session_id: str,
+        root: str,
+        info: dict[str, Any],
+        operation: str,
+        file_id: str | None,
+    ) -> None:
         _logger.info(
-            "Google Drive %s on session %s via grant %s of %s: %s",
+            "Google Drive %s by %s in session %s (root %s) via grant %s of %s: %s",
             operation,
+            caller,
+            session_id,
             root,
             info["grant"].id,
             info["grant"].user_id,
@@ -462,7 +471,7 @@ def create_google_drive_router(
         limit: int = Query(default=20, ge=1, le=50),
     ) -> dict[str, Any]:
         """List the files granted to the session and search Drives granted in full."""
-        _, root = await authorize(request, session_id, LEVEL_EDIT)
+        caller, root = await authorize(request, session_id, LEVEL_EDIT)
         usable, inactive = await active(root)
         files = [
             {
@@ -486,7 +495,7 @@ def create_google_drive_router(
                 found = await client.search(token, query, limit)
             except GoogleDriveError as exc:
                 raise HTTPException(exc.status, str(exc)) from None
-            audit(root, info, "search", None)
+            audit(caller, session_id, root, info, "search", None)
             results.extend(file_view(meta, info) for meta in found)
         result: dict[str, Any] = {
             "granted_files": files,
@@ -512,19 +521,19 @@ def create_google_drive_router(
         sheet_range: str | None = Query(default=None, alias="range", max_length=256),
     ) -> dict[str, Any]:
         """Read a granted file as text, or spreadsheet values."""
-        _, root = await authorize(request, session_id, LEVEL_EDIT)
+        caller, root = await authorize(request, session_id, LEVEL_EDIT)
         info, token, meta = await resolve(root, file_id, write=False)
         try:
             content = await client.read(token, meta, sheet_range)
         except GoogleDriveError as exc:
             raise HTTPException(exc.status, str(exc)) from None
-        audit(root, info, "read", file_id)
+        audit(caller, session_id, root, info, "read", file_id)
         return {"file": file_view(meta, info), **content}
 
     @router.post("/sessions/{session_id}/google-drive/agent/files")
     async def agent_create(session_id: str, body: CreateFile, request: Request) -> dict[str, Any]:
         """Create a Doc or Sheet in a Drive granted in full with edit access."""
-        _, root = await authorize(request, session_id, LEVEL_EDIT)
+        caller, root = await authorize(request, session_id, LEVEL_EDIT)
         usable, inactive = await active(root)
         writable = [
             info
@@ -566,7 +575,7 @@ def create_google_drive_router(
                 created_at=int(time.time()),
             ),
         )
-        audit(root, info, "create", meta["id"])
+        audit(caller, session_id, root, info, "create", meta["id"])
         result: dict[str, Any] = {"file": file_view(meta, info)}
         if derived is None:
             result["warning"] = (
@@ -580,7 +589,7 @@ def create_google_drive_router(
         session_id: str, file_id: str, body: AppendText, request: Request
     ) -> dict[str, Any]:
         """Append text to the end of a granted Google Doc."""
-        _, root = await authorize(request, session_id, LEVEL_EDIT)
+        caller, root = await authorize(request, session_id, LEVEL_EDIT)
         info, token, meta = await resolve(root, file_id, write=True)
         if meta["mime_type"] != DOCUMENT:
             raise HTTPException(415, "Text can only be appended to a Google Doc")
@@ -588,7 +597,7 @@ def create_google_drive_router(
             await client.append(token, file_id, body.text)
         except GoogleDriveError as exc:
             raise HTTPException(exc.status, str(exc)) from None
-        audit(root, info, "append", file_id)
+        audit(caller, session_id, root, info, "append", file_id)
         return {"file": file_view(meta, info), "appended_characters": len(body.text)}
 
     @router.put("/sessions/{session_id}/google-drive/agent/files/{file_id}/values")
@@ -596,7 +605,7 @@ def create_google_drive_router(
         session_id: str, file_id: str, body: UpdateValues, request: Request
     ) -> dict[str, Any]:
         """Write cell values into a granted Google Sheet."""
-        _, root = await authorize(request, session_id, LEVEL_EDIT)
+        caller, root = await authorize(request, session_id, LEVEL_EDIT)
         if any(len(row) > 1000 for row in body.values):
             raise HTTPException(422, "Rows can have at most 1000 cells")
         info, token, meta = await resolve(root, file_id, write=True)
@@ -606,7 +615,7 @@ def create_google_drive_router(
             result = await client.update_values(token, file_id, body.range, body.values)
         except GoogleDriveError as exc:
             raise HTTPException(exc.status, str(exc)) from None
-        audit(root, info, "update_values", file_id)
+        audit(caller, session_id, root, info, "update_values", file_id)
         return {"file": file_view(meta, info), **result}
 
     return router

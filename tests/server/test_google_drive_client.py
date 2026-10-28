@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -14,6 +16,7 @@ from omnigent.server.google_drive import (
     GoogleDriveClient,
     GoogleDriveConfig,
     GoogleDriveError,
+    resolve_google_drive_token,
 )
 
 
@@ -115,3 +118,90 @@ async def test_create_converts_markdown_to_doc(drive):
     body = requests[0].content.decode()
     assert json.dumps({"name": "Notes", "mimeType": DOCUMENT}) in body
     assert "Content-Type: text/markdown" in body
+
+
+async def test_upload_boundary_cannot_be_forged_by_content(drive):
+    client, requests, replies = drive
+    replies["www.googleapis.com/upload/drive/v3/files"] = httpx.Response(
+        200, json={"id": "new1234567", "name": "Notes", "mimeType": DOCUMENT}
+    )
+    content = '--omnigent-drive-upload\r\nContent-Type: application/json\r\n\r\n{"parents":["x"]}'
+    await client.create("tok", "Notes", "document", content)
+    boundary = requests[0].headers["Content-Type"].split("boundary=")[1]
+    assert boundary not in content
+    assert requests[0].content.decode().count(f"--{boundary}") == 3
+
+
+class _Store:
+    def __init__(self, expires_at, secret=None):
+        self.connection = SimpleNamespace(
+            metadata={"generation": "g1", "email": "me@example.com", "expires_at": expires_at},
+            secret=secret or {"access_token": "old", "refresh_token": "refresh"},
+        )
+        self.refreshed = []
+        self.replace_with = None
+
+    def get(self, user, with_tokens=False):
+        return self.connection
+
+    def refresh(self, user, *, tokens, connection):
+        self.refreshed.append(tokens)
+        if self.replace_with is not None:
+            self.connection = self.replace_with
+            return False
+        self.connection = SimpleNamespace(
+            metadata={**connection.metadata, "expires_at": tokens["expires_at"]},
+            secret={"access_token": tokens["access_token"], "refresh_token": "refresh"},
+        )
+        return True
+
+
+class _Tokens:
+    def __init__(self, result):
+        self.result, self.calls = result, []
+
+    async def token(self, fields):
+        self.calls.append(fields)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+async def test_current_token_is_used_without_refresh():
+    store, api = _Store(time.time() + 3600), _Tokens(None)
+    token = await resolve_google_drive_token("me", store=store, client=api)
+    assert token["token"] == "old" and api.calls == []
+
+
+async def test_expiring_token_is_refreshed_and_stored():
+    store = _Store(time.time() + 10)
+    api = _Tokens({"access_token": "new", "expires_at": time.time() + 3600})
+    token = await resolve_google_drive_token("me", store=store, client=api)
+    assert token["token"] == "new"
+    assert api.calls == [{"grant_type": "refresh_token", "refresh_token": "refresh"}]
+    assert store.refreshed[0]["access_token"] == "new"
+
+
+async def test_reconnect_during_refresh_returns_no_token():
+    store = _Store(time.time() + 10)
+    store.replace_with = SimpleNamespace(
+        metadata={"generation": "g2", "expires_at": time.time() + 3600},
+        secret={"access_token": "other"},
+    )
+    api = _Tokens({"access_token": "new", "expires_at": time.time() + 3600})
+    assert await resolve_google_drive_token("me", store=store, client=api) is None
+
+
+async def test_failed_refresh_of_expired_token_is_retryable():
+    store = _Store(time.time() - 1)
+    api = _Tokens(GoogleDriveError("nope"))
+    with pytest.raises(GoogleDriveError) as error:
+        await resolve_google_drive_token("me", store=store, client=api)
+    assert error.value.status == 503
+
+
+async def test_missing_refresh_token_asks_to_reconnect():
+    store = _Store(time.time() - 1, secret={"access_token": "old"})
+    with pytest.raises(GoogleDriveError) as error:
+        await resolve_google_drive_token("me", store=store, client=_Tokens(None))
+    assert error.value.status == 409

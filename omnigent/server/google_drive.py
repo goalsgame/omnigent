@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -300,7 +301,9 @@ class GoogleDriveClient(GoogleCloudClient):
         target, source = (
             (DOCUMENT, "text/markdown") if kind == "document" else (SPREADSHEET, "text/csv")
         )
-        boundary = "omnigent-drive-upload"
+        boundary = f"omnigent-{secrets.token_hex(16)}"
+        while boundary in content or boundary in title:
+            boundary = f"omnigent-{secrets.token_hex(16)}"
         body = (
             f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
             + json.dumps({"name": title, "mimeType": target})

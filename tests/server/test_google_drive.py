@@ -608,3 +608,12 @@ def test_participants_sharing_one_google_account_are_one_drive(env):
     grant(env, user=BOB, kind="drive", access="write", audience={OWNER: 4})
     response = agent(env, "post", json={"title": "Notes", "kind": "document"})
     assert response.status_code == 200, response.text
+
+
+def test_agent_operations_are_audited_with_the_caller(env, caplog):
+    grant(env, kind="file", file=DOC)
+    with caplog.at_level("INFO", logger="omnigent.server.routes.google_drive"):
+        assert agent(env, "get", f"/{DOC}", session=env.child).status_code == 200
+    [line] = [r.getMessage() for r in caplog.records if "Google Drive read" in r.getMessage()]
+    assert f"by {OWNER} in session {env.child} (root {env.session})" in line
+    assert DOC in line
