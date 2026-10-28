@@ -43,6 +43,7 @@ import {
   useState,
 } from "react";
 import { GoogleCloudIntegrationControl } from "./GoogleCloudIntegrationControl";
+import { GoogleDriveIntegrationControl } from "./GoogleDriveIntegrationControl";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
@@ -1141,6 +1142,7 @@ function GithubMark({ className }: { className?: string }) {
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   google_cloud: GoogleCloudIntegrationControl,
+  google_drive: GoogleDriveIntegrationControl,
   github: GithubIntegrationControl,
   databricks: DatabricksIntegrationControl,
 };

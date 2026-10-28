@@ -1,5 +1,6 @@
 import { PeerNotificationSettings } from "@/components/PeerNotificationSettings";
 import { RootGoogleCloudSessionAccess } from "@/components/RootGoogleCloudSessionAccess";
+import { GoogleDriveSessionAccess } from "@/components/GoogleDriveSessionAccess";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import {
   type CSSProperties,
@@ -2472,6 +2473,13 @@ export function AppShell() {
                             key={`peer-${serverConversationId}`}
                             sessionId={serverConversationId}
                           />
+                          {serverInfo !== "loading" &&
+                          serverInfo.enabled_connections.includes("google_drive") ? (
+                            <GoogleDriveSessionAccess
+                              key={`drive-${serverConversationId}`}
+                              sessionId={serverConversationId}
+                            />
+                          ) : null}
                           {serverInfo !== "loading" && hasGoogleCloudSessionAccess(serverInfo) ? (
                             <RootGoogleCloudSessionAccess
                               key={serverConversationId}

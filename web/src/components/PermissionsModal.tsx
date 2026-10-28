@@ -45,6 +45,7 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { GoogleDriveSharingNotice } from "@/components/GoogleDriveSessionAccess";
 import { withBasePath } from "@/lib/basePath";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
@@ -224,6 +225,9 @@ export function PermissionsModal({
           </DialogDescription>
         </DialogHeader>
 
+        {info !== "loading" && info.enabled_connections.includes("google_drive") && (
+          <GoogleDriveSharingNotice sessionId={sessionId} />
+        )}
         {internalGroup && (
           <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
             <div className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">

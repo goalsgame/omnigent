@@ -4591,6 +4591,13 @@ def server(
             raise click.ClickException("Google Cloud connections require credential encryption")
         google_cloud_store = GoogleCloudConnectionStore(db_uri, google_cipher)
 
+    from omnigent.server.google_drive import build_google_drive_connection
+
+    try:
+        google_drive_config, google_drive_store = build_google_drive_connection(db_uri)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     # Databricks Connect (per-user OAuth U2M). Shares the credential store's
     # cipher; inert unless OMNIGENT_DATABRICKS_CLIENT_ID/_SECRET are set.
     from omnigent.server.databricks_app import DatabricksConfig
@@ -4684,6 +4691,8 @@ def server(
         sandbox_config=sandbox_config,
         google_cloud_config=google_cloud_config,
         google_cloud_store=google_cloud_store,
+        google_drive_config=google_drive_config,
+        google_drive_store=google_drive_store,
         github_config=github_config,
         github_store=github_store,
         databricks_config=databricks_config,

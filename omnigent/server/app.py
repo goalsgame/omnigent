@@ -1352,6 +1352,8 @@ def create_app(
     sandbox_config: ManagedSandboxDeployment | None = None,
     google_cloud_config: Any | None = None,
     google_cloud_store: Any | None = None,
+    google_drive_config: Any | None = None,
+    google_drive_store: Any | None = None,
     github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
@@ -2172,6 +2174,7 @@ def create_app(
 
     _connection_inputs = {
         "google_cloud": (google_cloud_config, google_cloud_store),
+        "google_drive": (google_drive_config, google_drive_store),
         "github": (github_config, github_store),
         "databricks": (databricks_config, databricks_store),
     }
@@ -3312,7 +3315,7 @@ def create_app(
         # and its connection store are present.
         enabled_connections = [
             provider
-            for provider in ("github", "databricks", "google_cloud")
+            for provider in ("github", "databricks", "google_cloud", "google_drive")
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
@@ -3502,6 +3505,23 @@ def create_app(
                 notifier=peer_notifier,
             ),
             prefix="/v1",
+        )
+
+    if isinstance(publication_uri, str) and app.state.google_drive_store is not None:
+        from omnigent.server.routes.google_drive import create_google_drive_router
+        from omnigent.stores.google_drive_grant_store import GoogleDriveGrantStore
+
+        app.include_router(
+            create_google_drive_router(
+                app.state.google_drive_store,
+                app.state.google_drive_client,
+                GoogleDriveGrantStore(publication_uri),
+                conversation_store,
+                permission_store,
+                auth_provider,
+            ),
+            prefix="/v1",
+            tags=["integrations"],
         )
 
     if publication_store is not None:

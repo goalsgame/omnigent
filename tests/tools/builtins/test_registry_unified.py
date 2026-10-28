@@ -156,6 +156,13 @@ def test_builtin_names_size_matches_registry() -> None:
                 "browser_click",
                 "browser_type",
                 "browser_screenshot",
+                # Google Drive tools: registered when the deployment enables
+                # the Drive connection; runner-dispatched to the server.
+                "google_drive_list",
+                "google_drive_read",
+                "google_drive_create",
+                "google_docs_append",
+                "google_sheets_update",
             }
         )
         == BUILTIN_NAMES

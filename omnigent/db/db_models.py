@@ -325,6 +325,40 @@ class SqlAgent(OmnigentBase):
     )
 
 
+class SqlGoogleDriveGrant(OmnigentBase):
+    """A person's per-session approval for agents to use one Drive file or their whole Drive."""
+
+    __tablename__ = "google_drive_grants"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16())
+    user_id: Mapped[str] = mapped_column(String(128))
+    # The file id, or "*" for a whole-Drive grant; one grant per person and scope.
+    scope_key: Mapped[str] = mapped_column(String(256))
+    connection_generation: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(8))
+    file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    access: Mapped[str] = mapped_column(String(8))
+    # JSON object of principal -> permission level the grantor acknowledged.
+    audience: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    __table_args__ = (
+        Index("ix_google_drive_grants_session", "workspace_id", "session_id"),
+        Index(
+            "ux_google_drive_grants_scope",
+            "workspace_id",
+            "session_id",
+            "user_id",
+            "scope_key",
+            unique=True,
+        ),
+    )
+
+
 class SqlPeerMessage(OmnigentBase):
     """Session-addressed coordination messages with immutable sender attribution."""
 
