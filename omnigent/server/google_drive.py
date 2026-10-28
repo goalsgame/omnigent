@@ -378,8 +378,11 @@ async def resolve_google_drive_token(
         ):
             raise GoogleDriveError("Google Drive refresh temporarily unavailable; retry", 503)
         connection = current
+    token = (connection.secret or {}).get("access_token")
+    if not isinstance(token, str) or not token:
+        raise GoogleDriveError("Reconnect your Google Drive account", 409)
     return {
-        "token": (connection.secret or {})["access_token"],
+        "token": token,
         "email": connection.metadata.get("email"),
         "generation": connection.metadata.get("generation"),
     }

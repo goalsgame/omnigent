@@ -8861,3 +8861,16 @@ async def test_cancelled_grant_preparation_removes_late_written_file(tmp_path, m
         ):
             await asyncio.sleep(0.01)
     assert not host._runners
+
+
+def test_build_runner_env_forwards_google_drive_flag() -> None:
+    env = _build_runner_env(
+        {"OMNIGENT_GOOGLE_DRIVE_AUTH": "1"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert env["OMNIGENT_GOOGLE_DRIVE_AUTH"] == "1"

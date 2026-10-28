@@ -10,7 +10,7 @@ import secrets
 from typing import Any
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from omnigent.connections.google_drive import GoogleDriveConnectionStore
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -149,8 +149,15 @@ def create_connections_google_drive_router(
             except GoogleDriveError as exc:
                 raise HTTPException(exc.status, str(exc)) from None
 
-    return create_connection_router(
-        GoogleDriveConnectionHooks(config, store, api),
-        auth_provider=auth_provider,
-        extra_routes=extra_routes,
+    def direct_human(request: Request) -> None:
+        credential_user(request, auth_provider)
+
+    router = APIRouter(dependencies=[Depends(direct_human)])
+    router.include_router(
+        create_connection_router(
+            GoogleDriveConnectionHooks(config, store, api),
+            auth_provider=auth_provider,
+            extra_routes=extra_routes,
+        )
     )
+    return router

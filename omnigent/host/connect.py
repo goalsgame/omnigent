@@ -533,6 +533,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Deployment default for Codex's own command sandbox, for hosts whose
         # container already isolates the session and cannot nest bubblewrap.
         "OMNIGENT_CODEX_SANDBOX_MODE",
+        # Non-secret deployment flag that offers the server-mediated Drive tools.
+        "OMNIGENT_GOOGLE_DRIVE_AUTH",
         # Databricks config selectors are not bearer secrets. They must
         # reach host-spawned runners so native harnesses resolve the same
         # profile/config file the host resolved (e.g. a spec-declared

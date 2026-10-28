@@ -152,13 +152,12 @@ def create_google_drive_router(
                 return level
         return 0
 
-    def grantor_level(user: str, root: str) -> int:
+    def grantor_level(user: str, root: str, members: dict[str, int] | None = None) -> int:
         """Session level from the person's own invitation, which holds for any caller."""
-        if permissions is None:
+        if permissions is None or permissions.is_admin(user):
             return LEVEL_MANAGE + 1
-        if permissions.is_admin(user):
-            return LEVEL_MANAGE + 1
-        members = audience(root, "")
+        if members is None:
+            members = audience(root, "")
         return max(members.get(user, 0), members.get(RESERVED_USER_PUBLIC, 0))
 
     def describe(members: dict[str, int]) -> list[dict[str, Any]]:
@@ -172,33 +171,46 @@ def create_google_drive_router(
             for principal, level in sorted(members.items())
         ]
 
-    def evaluate(root: str, grant: GoogleDriveGrant) -> dict[str, Any]:
-        """Return the grant's state against current sharing and the grantor's connection."""
-        connection = connections.get(grant.user_id)
-        new = {
-            principal: level
-            for principal, level in audience(root, grant.user_id).items()
-            if grant.audience.get(principal, 0) < level
-        }
-        if connection is None or connection.metadata.get("generation") != (
-            grant.connection_generation
-        ):
-            state = "disconnected"
-        elif grantor_level(grant.user_id, root) < LEVEL_EDIT:
-            state = "inactive"
-        elif new:
-            state = "suspended"
-        else:
-            state = "active"
-        return {
-            "grant": grant,
-            "state": state,
-            "email": connection.metadata.get("email") if connection else None,
-            "new_audience": new,
-        }
+    def evaluate_all(root: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Return each grant's state, reading sharing and each owner's connection once."""
+        members = audience(root, "")
+        owners: dict[str, tuple[Any, int]] = {}
+        evaluated = []
+        for grant in grants.list(root):
+            if grant.user_id not in owners:
+                owners[grant.user_id] = (
+                    connections.get(grant.user_id),
+                    grantor_level(grant.user_id, root, members),
+                )
+            connection, owner_level = owners[grant.user_id]
+            new = {
+                principal: level
+                for principal, level in members.items()
+                if principal != grant.user_id and grant.audience.get(principal, 0) < level
+            }
+            if connection is None or connection.metadata.get("generation") != (
+                grant.connection_generation
+            ):
+                state = "disconnected"
+            elif owner_level < LEVEL_EDIT:
+                state = "inactive"
+            elif new:
+                state = "suspended"
+            else:
+                state = "active"
+            evaluated.append(
+                {
+                    "grant": grant,
+                    "state": state,
+                    "email": connection.metadata.get("email") if connection else None,
+                    "new_audience": new,
+                }
+            )
+        return evaluated, members
 
     def snapshot(root: str, viewer: str, credential: str | None) -> dict[str, Any]:
         level = level_of(viewer, root)
+        evaluated, members = evaluate_all(root)
         connection = connections.get(credential) if credential else None
         result: dict[str, Any] = {
             "session_id": root,
@@ -207,15 +219,16 @@ def create_google_drive_router(
                 "email": connection.metadata.get("email") if connection else None,
                 "generation": connection.metadata.get("generation") if connection else None,
                 "can_grant": credential is not None
-                and grantor_level(credential, root) >= LEVEL_EDIT,
+                and grantor_level(credential, root, members) >= LEVEL_EDIT,
                 "can_manage": level >= LEVEL_MANAGE,
             },
             "grants": [],
         }
         if level >= LEVEL_EDIT:
-            result["audience"] = describe(audience(root, credential or viewer))
-        for grant in grants.list(root):
-            info = evaluate(root, grant)
+            exclude = credential or viewer
+            result["audience"] = describe({k: v for k, v in members.items() if k != exclude})
+        for info in evaluated:
+            grant = info["grant"]
             result["grants"].append(
                 {
                     "id": grant.id,
@@ -362,9 +375,7 @@ def create_google_drive_router(
         return await asyncio.to_thread(snapshot, root, user, credential)
 
     async def active(root: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        evaluated = await asyncio.to_thread(
-            lambda: [evaluate(root, grant) for grant in grants.list(root)]
-        )
+        evaluated, _ = await asyncio.to_thread(evaluate_all, root)
         return (
             [info for info in evaluated if info["state"] == "active"],
             [info for info in evaluated if info["state"] != "active"],

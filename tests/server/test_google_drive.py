@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -540,3 +541,52 @@ def test_group_only_members_can_use_but_not_grant(env):
     ).json()
     assert view["viewer"]["can_grant"] is False
     assert view["grants"][0]["state"] == "active"
+
+
+def test_runner_tokens_cannot_manage_the_drive_connection(env):
+    delegated = {"x-user": OWNER, "x-delegated": "1"}
+    for method, path in (
+        ("post", "/disconnect"),
+        ("get", "/connect"),
+        ("get", "/status"),
+        ("get", "/files"),
+    ):
+        response = getattr(env.client, method)(
+            f"/v1/connections/google_drive{path}", headers=delegated, follow_redirects=False
+        )
+        assert response.status_code == 403, path
+    assert env.connections.get(OWNER) is not None
+
+
+def test_undecryptable_token_asks_to_reconnect(env, monkeypatch):
+    grant(env, kind="file", file=DOC)
+    real = env.connections.get
+
+    def without_secret(user, with_tokens=False):
+        connection = real(user, with_tokens=with_tokens)
+        if with_tokens and connection is not None:
+            return replace(connection, secret=None)
+        return connection
+
+    monkeypatch.setattr(env.connections, "get", without_secret)
+    picker = env.client.get("/v1/connections/google_drive/files", headers={"x-user": OWNER})
+    assert picker.status_code == 409
+    assert agent(env, "get", f"/{DOC}").status_code == 403
+
+
+def test_grant_evaluation_reads_sharing_once_per_request(env, monkeypatch):
+    for file_id in (DOC, PRIVATE, SHEET):
+        grant(env, kind="file", file=file_id)
+    calls = []
+    real = env.permissions.list_for_session
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(env.permissions, "list_for_session", counted)
+    assert len(snapshot(env)["grants"]) == 3
+    assert len(calls) == 1
+    calls.clear()
+    assert agent(env, "get", f"/{DOC}").status_code == 200
+    assert len(calls) == 1
