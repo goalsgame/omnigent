@@ -12,11 +12,19 @@ from omnigent.server.oidc_machine_auth import MACHINE_PRINCIPAL_PREFIX
 
 
 @dataclass(frozen=True)
+class GitCommitAuthor:
+    name: str
+    email: str
+
+
+@dataclass(frozen=True)
 class GitHubMachineBinding:
     installation_id: int
     repository_ids: tuple[int, ...]
     access: str
     ci_read: bool = False
+    issues_access: str = "none"
+    commit_author: GitCommitAuthor | None = None
 
     @property
     def permissions(self) -> dict[str, str]:
@@ -25,6 +33,8 @@ class GitHubMachineBinding:
             "pull_requests": self.access,
             "metadata": "read",
         }
+        if self.issues_access != "none":
+            permissions["issues"] = self.issues_access
         if self.ci_read:
             permissions.update({"checks": "read", "actions": "read", "statuses": "read"})
         return permissions
@@ -54,11 +64,11 @@ def parse_machine_bindings(
         if (
             not isinstance(raw, dict)
             or not required <= set(raw)
-            or set(raw) - required - {"ci_read"}
+            or set(raw) - required - {"ci_read", "issues_access", "commit_author"}
         ):
             raise RuntimeError(
                 "GitHub machine bindings require installation_id, repository_ids, access "
-                "and optionally ci_read"
+                "and optionally ci_read, issues_access, commit_author"
             )
         installation = raw["installation_id"]
         repos = raw["repository_ids"]
@@ -79,8 +89,34 @@ def parse_machine_bindings(
             raise RuntimeError("GitHub machine access must be read or write")
         if type(ci_read) is not bool:
             raise RuntimeError("GitHub machine ci_read must be a boolean")
+        issues_access = raw.get("issues_access", "none")
+        if issues_access not in ("none", "read", "write"):
+            raise RuntimeError("GitHub machine issues_access must be none, read or write")
+        commit_author = None
+        if "commit_author" in raw:
+            author = raw["commit_author"]
+            if (
+                not isinstance(author, dict)
+                or set(author) != {"name", "email"}
+                or any(
+                    not isinstance(value, str)
+                    or not value.strip()
+                    or value != value.strip()
+                    or any(ord(char) < 32 or ord(char) == 127 or char in "<>" for char in value)
+                    for value in author.values()
+                )
+            ):
+                raise RuntimeError("GitHub machine commit_author requires a valid name and email")
+            email = author["email"]
+            if (
+                email.count("@") != 1
+                or not all(email.split("@"))
+                or any(char.isspace() for char in email)
+            ):
+                raise RuntimeError("GitHub machine commit_author requires a valid email")
+            commit_author = GitCommitAuthor(author["name"], email)
         result[principal] = GitHubMachineBinding(
-            installation, tuple(sorted(repos)), access, ci_read
+            installation, tuple(sorted(repos)), access, ci_read, issues_access, commit_author
         )
     return result
 
@@ -119,9 +155,15 @@ class GitHubMachineBroker:
                     return None
                 cached = (token, expiry)
                 self._tokens[principal] = cached
-        return {
+        credential: dict[str, object] = {
             "username": "x-access-token",
             "token": cached[0],
             "expires_at": cached[1],
             "login": self._client.bot_login,
         }
+        if binding.commit_author is not None:
+            credential["commit_author"] = {
+                "name": binding.commit_author.name,
+                "email": binding.commit_author.email,
+            }
+        return credential

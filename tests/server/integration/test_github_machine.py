@@ -36,6 +36,7 @@ __all__ = ["machine_config", "oidc", "signing_key", "verifier"]
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_user_store", [False, True])
+@pytest.mark.parametrize("configure_machine_options", [False, True])
 async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
     runtime_init,
     db_uri,
@@ -44,7 +45,12 @@ async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
     verifier,
     monkeypatch,
     with_user_store,
+    configure_machine_options,
 ):
+    author = {"name": "Ticket Bot", "email": "ticket-bot@example.com"}
+    machine_options = (
+        {"issues_access": "write", "commit_author": author} if configure_machine_options else {}
+    )
     artifact = LocalArtifactStore(str(tmp_path / "artifacts"))
     hosts = HostStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
@@ -64,7 +70,12 @@ async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
         ),
         server_config={
             "github_machine_auth": {
-                PRINCIPAL: {"installation_id": 123, "repository_ids": [456], "access": "write"}
+                PRINCIPAL: {
+                    "installation_id": 123,
+                    "repository_ids": [456],
+                    "access": "write",
+                    **machine_options,
+                }
             }
         },
     )
@@ -101,10 +112,17 @@ async def test_app_vends_scoped_bot_token_and_rechecks_admin_exclusion(
         assert response.status_code == 200, response.text
         assert response.json()["token"] == "ghs_bot"
         assert response.json()["owner"] == PRINCIPAL
+        if configure_machine_options:
+            assert response.json()["commit_author"] == author
+        else:
+            assert "commit_author" not in response.json()
+        expected_permissions = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+        if configure_machine_options:
+            expected_permissions["issues"] = "write"
         assert calls == [
             {
                 "repository_ids": [456],
-                "permissions": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+                "permissions": expected_permissions,
             }
         ]
         permissions.set_admin(PRINCIPAL, True)
