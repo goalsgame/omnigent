@@ -4,62 +4,125 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const shell = vi.hoisted(() => ({ electron: false }));
 vi.mock("./nativeBridge", () => ({ isElectronShell: () => shell.electron }));
 
-import { beginConnection, useRefreshOnFocus } from "./connectionFlow";
+import {
+  beginConnection,
+  CONNECTION_WINDOW,
+  finishConnectionWindow,
+  useConnectionWindow,
+} from "./connectionFlow";
+
+const origin = window.location.origin;
+
+const setOpener = (value: unknown) =>
+  Object.defineProperty(window, "opener", { configurable: true, writable: true, value });
+
+afterEach(() => {
+  shell.electron = false;
+  window.name = "";
+  setOpener(null);
+  vi.restoreAllMocks();
+});
 
 describe("beginConnection", () => {
   const path = "/v1/connections/google_drive/connect?return_to=%2Fsettings";
-  let open: ReturnType<typeof vi.spyOn>;
   let location: Location;
 
   beforeEach(() => {
-    open = vi.spyOn(window, "open").mockReturnValue(null);
     location = window.location;
     Object.defineProperty(window, "location", {
       configurable: true,
-      value: { ...location, href: "https://omnigent.example/settings" },
+      value: { ...location, href: `${origin}/settings` },
     });
   });
 
   afterEach(() => {
-    open.mockRestore();
     Object.defineProperty(window, "location", { configurable: true, value: location });
-    shell.electron = false;
   });
 
-  it("opens the flow in the system browser from the desktop app", () => {
+  it("opens the flow in a sized sign-in window from the desktop app", () => {
     shell.electron = true;
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
     beginConnection(path);
-    expect(open).toHaveBeenCalledWith(`https://omnigent.example${path}`, "_blank", "noopener");
-    expect(window.location.href).toBe("https://omnigent.example/settings");
+    expect(open).toHaveBeenCalledWith(
+      `${origin}${path}`,
+      CONNECTION_WINDOW,
+      expect.stringMatching(/width=/),
+    );
+    expect(window.location.href).toBe(`${origin}/settings`);
   });
 
   it("navigates the page in a browser", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
     beginConnection(path);
     expect(open).not.toHaveBeenCalled();
     expect(window.location.href).toBe(path);
   });
 });
 
-describe("useRefreshOnFocus", () => {
-  afterEach(() => {
-    shell.electron = false;
+describe("finishConnectionWindow", () => {
+  it("hands the outcome to the app window and closes the sign-in window", () => {
+    const postMessage = vi.fn();
+    setOpener({ postMessage });
+    const close = vi.spyOn(window, "close").mockImplementation(() => {});
+    window.name = CONNECTION_WINDOW;
+    expect(finishConnectionWindow("google_drive", "connected")).toBe(true);
+    expect(postMessage).toHaveBeenCalledWith(
+      { type: "omnigent:connection", provider: "google_drive", outcome: "connected" },
+      origin,
+    );
+    expect(close).toHaveBeenCalled();
   });
 
-  it("refreshes on focus in the desktop app", () => {
+  it("does nothing outside the sign-in window", () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => {});
+    expect(finishConnectionWindow("google_drive", "connected")).toBe(false);
+    window.name = "other";
+    setOpener({ postMessage: vi.fn() });
+    expect(finishConnectionWindow("google_drive", "connected")).toBe(false);
+    expect(close).not.toHaveBeenCalled();
+  });
+});
+
+describe("useConnectionWindow", () => {
+  const message = (data: unknown, from = origin) =>
+    act(() => void window.dispatchEvent(new MessageEvent("message", { data, origin: from })));
+
+  it("reports the provider's outcome and refreshes in the desktop app", () => {
     shell.electron = true;
+    const onOutcome = vi.fn();
     const refresh = vi.fn();
-    const { unmount } = renderHook(() => useRefreshOnFocus(refresh));
+    const { unmount } = renderHook(() => useConnectionWindow("google_drive", onOutcome, refresh));
+    message({ type: "omnigent:connection", provider: "google_drive", outcome: "connected" });
+    expect(onOutcome).toHaveBeenCalledWith("connected");
+    expect(refresh).toHaveBeenCalledTimes(1);
     act(() => void window.dispatchEvent(new Event("focus")));
-    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(2);
     unmount();
-    window.dispatchEvent(new Event("focus"));
-    expect(refresh).toHaveBeenCalledTimes(1);
+    act(() => void window.dispatchEvent(new Event("focus")));
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores other providers, other origins and malformed messages", () => {
+    shell.electron = true;
+    const onOutcome = vi.fn();
+    renderHook(() => useConnectionWindow("google_drive", onOutcome, vi.fn()));
+    message({ type: "omnigent:connection", provider: "github", outcome: "connected" });
+    message(
+      { type: "omnigent:connection", provider: "google_drive", outcome: "connected" },
+      "https://evil.example",
+    );
+    message({ type: "omnigent:connection", provider: "google_drive", outcome: "nope" });
+    message("connected");
+    expect(onOutcome).not.toHaveBeenCalled();
   });
 
   it("does nothing in a browser", () => {
+    const onOutcome = vi.fn();
     const refresh = vi.fn();
-    renderHook(() => useRefreshOnFocus(refresh));
-    window.dispatchEvent(new Event("focus"));
+    renderHook(() => useConnectionWindow("google_drive", onOutcome, refresh));
+    message({ type: "omnigent:connection", provider: "google_drive", outcome: "connected" });
+    act(() => void window.dispatchEvent(new Event("focus")));
+    expect(onOutcome).not.toHaveBeenCalled();
     expect(refresh).not.toHaveBeenCalled();
   });
 });
