@@ -34,6 +34,21 @@ def bindings(raw=POLICY):
         {**POLICY, "installation_id": 0},
         {**POLICY, "access": "admin"},
         {**POLICY, "ci_read": "true"},
+        {**POLICY, "issues_access": "admin"},
+        {**POLICY, "issues_access": True},
+        {**POLICY, "issues_access": None},
+        {**POLICY, "issues_access": []},
+        {**POLICY, "commit_author": None},
+        {**POLICY, "commit_author": {}},
+        {**POLICY, "commit_author": {"name": "Bot"}},
+        {**POLICY, "commit_author": {"name": "", "email": "bot@example.com"}},
+        {**POLICY, "commit_author": {"name": "Bot\nOther", "email": "bot@example.com"}},
+        {**POLICY, "commit_author": {"name": "Bot", "email": "not-an-email"}},
+        {**POLICY, "commit_author": {"name": "Bot", "email": "bot@example.com\n"}},
+        {**POLICY, "commit_author": {"name": 123, "email": "bot@example.com"}},
+        {**POLICY, "commit_author": {"name": "Bot <other>", "email": "bot@example.com"}},
+        {**POLICY, "commit_author": {"name": "Bot", "email": "bot @example.com"}},
+        {**POLICY, "commit_author": {"name": "Bot", "email": "bot@example.com", "extra": 1}},
         {**POLICY, "extra": "ignored"},
     ],
 )
@@ -110,6 +125,54 @@ async def test_ci_read_requests_only_read_permissions(monkeypatch):
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("issues_access", ["none", "read", "write"])
+async def test_issues_permission_is_independent_and_opt_in(monkeypatch, issues_access):
+    requests = []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(201, json=payload())
+
+    broker = GitHubMachineBroker(
+        bindings({**POLICY, "access": "read", "issues_access": issues_access}),
+        client(handle, monkeypatch),
+        lambda p: True,
+    )
+    await broker.resolve(PRINCIPAL)
+    permissions = {"contents": "read", "pull_requests": "read", "metadata": "read"}
+    if issues_access != "none":
+        permissions["issues"] = issues_access
+    assert requests == [{"repository_ids": [456], "permissions": permissions}]
+
+
+@pytest.mark.asyncio
+async def test_configured_commit_author_is_vended_without_changing_token_scope(monkeypatch):
+    author = {"name": "Ticket Bot", "email": "ticket-bot@example.com"}
+    requests = []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(201, json=payload())
+
+    broker = GitHubMachineBroker(
+        bindings({**POLICY, "commit_author": author}), client(handle, monkeypatch), lambda p: True
+    )
+    first = await broker.resolve(PRINCIPAL)
+    assert first["commit_author"] == author
+    # A caller cannot mutate the configured identity through a previous response.
+    first["commit_author"]["name"] = "Changed"
+    assert (await broker.resolve(PRINCIPAL))["commit_author"] == author
+    assert requests == [
+        {
+            "repository_ids": [456],
+            "permissions": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+        }
+    ]
+    default_broker = GitHubMachineBroker(bindings(), client(handle, monkeypatch), lambda p: True)
+    assert "commit_author" not in await default_broker.resolve(PRINCIPAL)
 
 
 @pytest.mark.asyncio

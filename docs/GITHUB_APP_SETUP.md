@@ -105,6 +105,7 @@ Under **Repository permissions**, set only what sandboxes need:
 | **Contents** | **Read and write** | Clone repos, and push branches for PRs. Use **Read-only** if sandboxes should only clone. |
 | **Metadata** | **Read-only** (mandatory) | Auto-selected; required by GitHub. |
 | **Pull requests** | **Read and write** | Open PRs from the sandbox and surface "PRs opened this session". **Read-only** if you never create PRs. |
+| **Issues** | **Read-only** or **Read and write** (optional) | Read issues, or create/update them. Machine tokens must also opt in through `issues_access`. |
 | **Checks** | **Read-only** (optional) | Show CI checks in the PR panel. |
 | **Actions** | **Read-only** (optional) | Read the workflow runs behind GitHub Actions checks. |
 | **Commit statuses** | **Read-only** (optional) | Show status-context CI in the PR panel. |
@@ -258,6 +259,10 @@ github_machine_auth:
     repository_ids: [987654321]
     access: write
     ci_read: true
+    issues_access: write
+    commit_author:
+      name: Ticket Bot
+      email: ticket-bot@example.com
 ```
 
 Each principal must already be bound by `oidc_machine_auth`. Installation and
@@ -271,6 +276,32 @@ Set `ci_read: true` to include read-only access to Checks, Actions, and Commit
 statuses for PR status in machine-owned sessions. The App installation must
 grant all three; without `ci_read`, machine tokens retain the smaller permission
 set.
+
+`issues_access` independently controls Issues permission: `none` (the default)
+requests no Issues access, `read` permits reading issues, and `write` permits
+creating/updating them. Grant the corresponding permission to the App installation
+as well. Having Issues permission on the App alone is insufficient: machine tokens
+explicitly request only the configured subset. Enabling Issues does not widen
+Contents, Pull requests, CI permissions or the repository allowlist.
+
+`commit_author` optionally supplies both `name` and `email` for local Git commits
+in that machine's managed sandboxes. Use the intended automation identity (for
+GitHub attribution, an email associated with that identity); no human sign-in or
+`GET /user` call is needed. Both values must be nonempty, have no surrounding
+whitespace, control characters or angle brackets, and the email must have one `@`
+with nonempty parts and no whitespace. The broker returns these non-secret
+metadata fields alongside the credential; they are not sent to GitHub when minting
+tokens and do not grant access. Without this setting, machine Git identity is left
+unchanged. Human commit attribution continues to use the connected owner's email
+and GitHub login. Repository-local Git configuration can still override these
+sandbox-global defaults.
+
+After an authorized configuration rollout, new tokens use `issues_access` and
+new or restarted managed hosts apply `commit_author`. Changing the author setup
+requires an updated runner as well as the server; already-running hosts do not
+reconfigure Git automatically. Existing tokens retain their original permissions
+until expiry. Do not use `gh api user` to verify a machine installation token;
+that endpoint requires a user identity.
 
 Configure the App client ID, client secret and callback, plus `OMNIGENT_GITHUB_APP_ID`
 and `OMNIGENT_GITHUB_APP_PRIVATE_KEY` (or `_PRIVATE_KEY_PATH`). Human GitHub
@@ -297,6 +328,11 @@ To verify, connect GitHub as a human and create a managed session with a private
 HTTPS repository workspace. Confirm clone, branch push and PR creation use that
 user. Then create a machine-owned session through the authenticated session API
 and confirm it uses the App bot, can access its allowed repository, and cannot
-access a private repository excluded from the token policy. A machine with no
+access a private repository excluded from the token policy. With `issues_access:
+read` or `write`, verify `gh api repos/OWNER/REPO/issues/NUMBER` against an existing
+issue; with `none`, verify Issues access is denied. With a configured
+`commit_author`, create a disposable local repository, run `git commit --allow-empty
+-m 'test: verify machine author'`, and check `git log -1 --format=fuller` shows the
+configured author and committer. This needs no push or issue creation. A machine with no
 GitHub binding must receive no GitHub credential, even if a user connection was
 previously stored under that subject.

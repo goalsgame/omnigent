@@ -90,6 +90,88 @@ def test_configure_host_git_resets_then_adds_broker_helper(
     assert any("user.name octo" in c for c in flat)
 
 
+def test_configure_host_git_sets_configured_machine_author(monkeypatch, tmp_path) -> None:
+    import subprocess
+
+    author = {"name": "Ticket Bot", "email": "ticket-bot@example.com"}
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        h,
+        "_fetch",
+        lambda *a, **k: {
+            "connected": True,
+            "owner": "oidc-machine:ticket-bot",
+            "login": "app[bot]",
+            "commit_author": author,
+        },
+    )
+    h.configure_host_git("http://srv", "host1")
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--allow-empty", "-m", "test machine author"],
+        check=True,
+        capture_output=True,
+    )
+    result = subprocess.run(
+        ["git", "-C", str(repo), "log", "-1", "--format=%an <%ae>|%cn <%ce>"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        result.stdout.strip()
+        == "Ticket Bot <ticket-bot@example.com>|Ticket Bot <ticket-bot@example.com>"
+    )
+
+
+@pytest.mark.parametrize("author", [None, {}])
+def test_configure_host_git_machine_without_author_leaves_identity_unset(monkeypatch, author):
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls = []
+    monkeypatch.setattr(h, "_git_config", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        h,
+        "_fetch",
+        lambda *a, **k: {
+            "connected": True,
+            "owner": "oidc-machine:ticket-bot",
+            "login": "app[bot]",
+            "commit_author": author,
+        },
+    )
+    h.configure_host_git("http://srv", "host1")
+    assert not any(call[0] in ("user.name", "user.email") for call in calls)
+
+
+def test_configure_host_git_human_ignores_machine_author(monkeypatch):
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls = []
+    monkeypatch.setattr(h, "_git_config", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        h,
+        "_fetch",
+        lambda *a, **k: {
+            "connected": True,
+            "owner": "alice@example.com",
+            "login": "alice",
+            "commit_author": {"name": "Bot", "email": "bot@example.com"},
+        },
+    )
+    h.configure_host_git("http://srv", "host1")
+    assert ("user.name", "alice") in calls
+    assert ("user.email", "alice@example.com") in calls
+
+
 def test_configure_host_git_noop_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
     calls: list[object] = []
