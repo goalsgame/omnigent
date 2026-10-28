@@ -4,7 +4,9 @@
  * In the desktop app the flow runs in the shell's sign-in window, which shares
  * the app's session, so the provider's sign-in never replaces the app window.
  * When the provider sends the user back, that window hands the outcome to the
- * app and closes. Elsewhere the page navigates to the flow.
+ * app and closes. Elsewhere, including desktop connections to plain-HTTP
+ * servers (which the shell keeps out of its sign-in window), the page
+ * navigates to the flow.
  */
 
 import { useEffect, useRef } from "react";
@@ -20,7 +22,7 @@ export type ConnectionOutcome = "connected" | "error";
 /** Begin the connect flow at ``path`` (relative to the server's base path). */
 export function beginConnection(path: string): void {
   const url = withBasePath(path);
-  if (isElectronShell()) {
+  if (isElectronShell() && window.location.protocol === "https:") {
     window.open(
       new URL(url, window.location.href).href,
       CONNECTION_WINDOW,

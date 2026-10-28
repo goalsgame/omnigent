@@ -39,6 +39,7 @@ export function GoogleCloudIntegrationControl() {
 
   const showOutcome = useCallback((outcome: ConnectionOutcome) => {
     setConnectedNotice(outcome === "connected");
+    if (outcome === "connected") setError(null);
     if (outcome === "error")
       setError("Could not connect Google Cloud. Try again and grant the requested permissions.");
   }, []);

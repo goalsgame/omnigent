@@ -34,7 +34,10 @@ vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas page</div> 
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
-    SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
+    SettingsPage: () => {
+      const location = useLocation();
+      return <div data-testid="settings-location">{location.pathname + location.search}</div>;
+    },
   };
 });
 vi.mock("@/extensions/ExtensionPageHost", () => ({
@@ -270,6 +273,22 @@ describe("Settings routes", () => {
     renderRoute("/settings");
 
     expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
+  });
+
+  it("sends a connection callback's outcome to Integrations with its query", async () => {
+    renderRoute("/settings?google_drive=error");
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent(
+      "/settings/integrations?google_drive=error",
+    );
+  });
+
+  it("drops unrelated queries on the General redirect", async () => {
+    renderRoute("/settings?tab=x");
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent(
+      /^\/settings\/general$/,
+    );
   });
 
   it("preserves an explicit settings section", async () => {

@@ -27,12 +27,15 @@ describe("beginConnection", () => {
   const path = "/v1/connections/google_drive/connect?return_to=%2Fsettings";
   let location: Location;
 
-  beforeEach(() => {
-    location = window.location;
+  const at = (href: string) =>
     Object.defineProperty(window, "location", {
       configurable: true,
-      value: { ...location, href: `${origin}/settings` },
+      value: { ...location, href, protocol: new URL(href).protocol },
     });
+
+  beforeEach(() => {
+    location = window.location;
+    at("https://omnigent.example/settings");
   });
 
   afterEach(() => {
@@ -44,11 +47,20 @@ describe("beginConnection", () => {
     const open = vi.spyOn(window, "open").mockReturnValue(null);
     beginConnection(path);
     expect(open).toHaveBeenCalledWith(
-      `${origin}${path}`,
+      `https://omnigent.example${path}`,
       CONNECTION_WINDOW,
       expect.stringMatching(/width=/),
     );
-    expect(window.location.href).toBe(`${origin}/settings`);
+    expect(window.location.href).toBe("https://omnigent.example/settings");
+  });
+
+  it("navigates the page for a plain-HTTP server in the desktop app", () => {
+    shell.electron = true;
+    at("http://localhost:8000/settings");
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    beginConnection(path);
+    expect(open).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(path);
   });
 
   it("navigates the page in a browser", () => {

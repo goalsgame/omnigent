@@ -1,6 +1,7 @@
 import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
 import { matchPath, Navigate, Route, Routes } from "react-router-dom";
 import { Outlet, useLocation } from "@/lib/routing";
+import { SettingsIndexRedirect } from "@/pages/SettingsIndexRedirect";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
@@ -203,10 +204,7 @@ function AppRoutes({ basename }: AppProps) {
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
               redirects to the canonical General section. */}
-          <Route
-            path={`${prefix}/settings`}
-            element={<Navigate to={`${prefix}/settings/general`} replace />}
-          />
+          <Route path={`${prefix}/settings`} element={<SettingsIndexRedirect prefix={prefix} />} />
           <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories

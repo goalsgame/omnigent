@@ -39,6 +39,7 @@ export function GoogleDriveIntegrationControl() {
 
   const showOutcome = useCallback((outcome: ConnectionOutcome) => {
     setConnectedNotice(outcome === "connected");
+    if (outcome === "connected") setError(null);
     if (outcome === "error")
       setError("Could not connect Google Drive. Try again and grant the requested permissions.");
   }, []);
