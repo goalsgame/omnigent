@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { withBasePath } from "@/lib/basePath";
+import { beginConnection, useRefreshOnFocus } from "@/lib/connectionFlow";
 import { authenticatedFetch } from "@/lib/identity";
 
 interface ConnectionStatus {
@@ -28,6 +28,8 @@ export function GoogleCloudIntegrationControl() {
       setLoading(false);
     }
   }, []);
+
+  useRefreshOnFocus(refresh);
 
   useEffect(() => {
     void refresh();
@@ -61,7 +63,7 @@ export function GoogleCloudIntegrationControl() {
 
   function connect() {
     const returnTo = `${window.location.pathname}${window.location.search}`;
-    window.location.href = withBasePath(
+    beginConnection(
       `/v1/connections/google_cloud/connect?return_to=${encodeURIComponent(returnTo)}`,
     );
   }

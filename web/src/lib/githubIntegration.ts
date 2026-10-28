@@ -4,11 +4,11 @@
  *
  * Lets a signed-in user connect their GitHub account so their managed
  * sandboxes authenticate ``gh`` / git as them and receive their public
- * SSH keys. The connect flow is a full-page redirect to GitHub (the
- * server owns the OAuth handshake); status and disconnect are JSON.
+ * SSH keys. The connect flow goes to GitHub through the server, which owns
+ * the OAuth handshake (see ``beginConnection``); status and disconnect are JSON.
  */
 
-import { withBasePath } from "./basePath";
+import { beginConnection } from "./connectionFlow";
 import { authenticatedFetch } from "./identity";
 
 /** Shape of ``GET /v1/connections/github/status``. */
@@ -42,8 +42,7 @@ export async function fetchGithubStatus(): Promise<GithubConnectionStatus> {
  * callback lands afterwards (defaults to the current settings path).
  */
 export function beginGithubConnect(returnTo: string): void {
-  const url = `/v1/connections/github/connect?return_to=${encodeURIComponent(returnTo)}`;
-  window.location.href = withBasePath(url);
+  beginConnection(`/v1/connections/github/connect?return_to=${encodeURIComponent(returnTo)}`);
 }
 
 /** A repo the connected user can access, from ``GET .../github/repos``. */

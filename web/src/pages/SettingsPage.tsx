@@ -111,6 +111,7 @@ import {
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
+import { useRefreshOnFocus } from "@/lib/connectionFlow";
 import {
   beginDatabricksConnect,
   disconnectDatabricks,
@@ -1178,8 +1179,8 @@ function IntegrationsSection() {
  * Connect / disconnect a GitHub account. Once connected, a managed
  * sandbox launched by this user authenticates ``gh`` / git as them and
  * receives their public SSH keys (so they can SSH into their own box).
- * The connect action is a full-page redirect to GitHub; on return the
- * callback lands back here with ``?github=connected|error``.
+ * The connect action goes to GitHub (in the system browser from the desktop
+ * app); on return the callback lands back here with ``?github=connected|error``.
  */
 function GithubIntegrationControl() {
   const [status, setStatus] = useState<GithubConnectionStatus | null | "loading">("loading");
@@ -1193,6 +1194,8 @@ function GithubIntegrationControl() {
       setStatus(null);
     }
   }, []);
+
+  useRefreshOnFocus(refresh);
 
   useEffect(() => {
     void refresh();
