@@ -66,6 +66,10 @@ the header menu), and each place is a separate entry point.
   recognized Google Cloud CLI command produces a normal approval card on the root
   session. Approve as the owner through the web/mobile UI, REPL or standard
   approval API; the held command then continues.
+- **Google Drive access:** after connecting Google Drive in Settings → Sandbox
+  Integrations, select the Drive icon in a session's title bar to add files or
+  allow your whole Drive for that session, resume paused grants, or revoke them.
+  Shared sessions ask you to confirm everyone who will be able to use the access.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
@@ -352,6 +356,18 @@ Component coverage for the control and
 prompt is `web/src/components/GoogleCloudSessionAccess.test.tsx`.
 Live Google consent requires a configured OAuth client; these tests use fake
 provider replies and do not issue real Google tokens.
+
+### Google Drive grant checks
+
+Use `tests/server/test_google_drive.py` for per-file and whole-Drive grants,
+shared-session acknowledgement, pausing after sharing changes, revocation,
+reconnect and sub-agent behavior; `tests/server/test_google_drive_client.py`
+for Drive, Docs and Sheets requests; and `tests/runner/test_google_drive_tools.py`
+for tool registration and session binding. Component coverage is
+`web/src/components/GoogleDriveSessionAccess.test.tsx`. Live checks need a
+configured OAuth client: connect Drive in Settings, add a file in a private
+session and ask the agent to read it, then share the session and confirm the
+grant pauses until it is resumed.
 
 ## Gotchas
 

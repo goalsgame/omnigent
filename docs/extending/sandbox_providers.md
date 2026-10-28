@@ -400,6 +400,48 @@ already issued access tokens can remain usable until their Google expiration.
 A session approval grants cloud access to code throughout its sandbox. Use an
 account whose permissions are appropriate for that code. Machine identities cannot use this human connection.
 
+## Human Google Drive connections
+
+Operators can enable a Google Drive connection in Sandbox Integrations. It is
+separate from the Google Cloud connection, so Drive access is never part of the
+cloud credentials delivered to sandboxes. Create an OAuth Web application client
+(an existing Google Cloud client can be reused) with the callback
+`https://<server>/v1/connections/google_drive/callback`, enable the Google Drive,
+Docs and Sheets APIs in its project, and configure the server with
+`OMNIGENT_GOOGLE_DRIVE_CLIENT_ID`, `OMNIGENT_GOOGLE_DRIVE_CLIENT_SECRET`,
+`OMNIGENT_GOOGLE_DRIVE_REDIRECT_URI` and `OMNIGENT_GOOGLE_DRIVE_AUTH=1`. A
+configured credential cipher is required. Consent requests `openid`, `email` and
+`https://www.googleapis.com/auth/drive` with offline access. Drive is a
+restricted scope: use an Internal OAuth audience to limit it to your Workspace
+organization and avoid Google's verification process.
+
+Set `OMNIGENT_GOOGLE_DRIVE_AUTH=1` in managed sandbox hosts as well (for
+Kubernetes, include it in `sandbox.kubernetes.env`). Runners use it to offer the
+`google_drive_list`, `google_drive_read`, `google_drive_create`,
+`google_docs_append` and `google_sheets_update` tools. Agents never receive a
+Google token: each tool calls the server, which checks the session's grants and
+calls Google with the granting person's credentials.
+
+Connecting shares nothing. In a session, the Drive icon in the title bar shows
+every grant to anyone who can read the session. People with edit access can add
+their own files (by searching their Drive or pasting a link) with view-only or
+view-and-edit access, or allow their whole Drive, view-only or with editing.
+Whole-Drive grants let agents search that Drive and create Docs and Sheets in
+it; created files are added to the session. Grants belong to the root session,
+apply to its sub-agents, and are not copied to forks or new sessions.
+
+In a shared session, everyone who can use the agent can use a grant, and
+everyone who can read the session can see what the agent reads. Granting in a
+shared session requires confirming the current participants. If people are
+added later, or a reader is given edit access, the grant pauses until its owner
+reviews the new participants and resumes it; the share dialog warns about this.
+Grants also stop when their owner disconnects or reconnects Google Drive or
+loses edit access to the session. The owner or a session manager can revoke a
+grant. The grant API is `GET /v1/sessions/{session_id}/google-drive`,
+`POST .../google-drive/grants`, `POST .../grants/{id}/confirm` and
+`DELETE .../grants/{id}`. The server logs each agent operation with its session,
+grant and file.
+
 ## Machine Google Cloud access
 
 Machine sessions use operator-configured service accounts rather than human OAuth

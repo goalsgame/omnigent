@@ -510,6 +510,15 @@ class ToolManager:
         for tool_type in PEER_TOOL_TYPES:
             self._tools[tool_type.name()] = tool_type()
 
+        from omnigent.tools.builtins.google_drive import (
+            GOOGLE_DRIVE_TOOL_TYPES,
+            google_drive_tools_enabled,
+        )
+
+        if google_drive_tools_enabled():
+            for tool_type in GOOGLE_DRIVE_TOOL_TYPES:
+                self._tools[tool_type.name()] = tool_type()
+
         self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
 
     def _register_agent_mgmt_tools(self) -> None:

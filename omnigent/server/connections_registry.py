@@ -48,6 +48,7 @@ def connection_providers() -> list[ConnectionProvider]:
     from omnigent.server.github_app_client import GitHubAppClient
     from omnigent.server.github_identity import resolve_github_credential
     from omnigent.server.google_cloud import GoogleCloudClient, resolve_google_cloud_credential
+    from omnigent.server.google_drive import GoogleDriveClient
     from omnigent.server.routes.connections_databricks import (
         create_connections_databricks_router,
     )
@@ -57,6 +58,9 @@ def connection_providers() -> list[ConnectionProvider]:
     from omnigent.server.routes.connections_google_cloud import (
         create_connections_google_cloud_router,
     )
+    from omnigent.server.routes.connections_google_drive import (
+        create_connections_google_drive_router,
+    )
 
     return [
         ConnectionProvider(
@@ -64,6 +68,11 @@ def connection_providers() -> list[ConnectionProvider]:
             client_factory=GoogleCloudClient,
             router_factory=create_connections_google_cloud_router,
             credential_resolver=resolve_google_cloud_credential,
+        ),
+        ConnectionProvider(
+            name="google_drive",
+            client_factory=GoogleDriveClient,
+            router_factory=create_connections_google_drive_router,
         ),
         ConnectionProvider(
             name="github",
