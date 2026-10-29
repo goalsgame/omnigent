@@ -1094,6 +1094,9 @@ class SqlConversation(ConversationBase):
     )
 
 
+CONVERSATION_ITEMS_SEARCH_INDEX = "ix_conversation_items_search_tsv"
+
+
 class SqlConversationItem(ConversationBase):
     """
     SQLAlchemy model for the ``conversation_items`` table.
@@ -1192,6 +1195,14 @@ class SqlConversationItem(ConversationBase):
             "type",
             text("position DESC"),
         ),
+        # Must stay identical to session_search.tsvector_expression and its
+        # searched item types (message, compaction) or the planner ignores it.
+        Index(
+            CONVERSATION_ITEMS_SEARCH_INDEX,
+            text("to_tsvector('english', left(search_text, 100000))"),
+            postgresql_using="gin",
+            postgresql_where=text("type IN (1, 6)"),
+        ).ddl_if(dialect="postgresql"),
         CheckConstraint(
             "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
             name="ck_conversation_items_type",

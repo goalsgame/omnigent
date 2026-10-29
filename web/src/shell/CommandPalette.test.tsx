@@ -14,6 +14,11 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
 }));
 
+const useSessionSearch = vi.fn();
+vi.mock("@/hooks/useSessionSearch", () => ({
+  useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
+}));
+
 function conv(
   id: string,
   title: string | null,
@@ -49,6 +54,8 @@ beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   setSessions([]);
+  useSessionSearch.mockReset();
+  useSessionSearch.mockReturnValue({ data: undefined });
 });
 afterEach(cleanup);
 
@@ -339,6 +346,50 @@ describe("CommandPalette — match preview", () => {
     expect(screen.getByText(/deploy/)).toBeTruthy();
     // No second line: only the single title row is present.
     expect(screen.queryByText(/runbook.*\n/)).toBeNull();
+  });
+});
+
+describe("CommandPalette — best matches", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("lists ranked message matches first without repeating them under Sessions", () => {
+    setSessions([conv("c1", "Rollout"), conv("c2", "Other")]);
+    useSessionSearch.mockReturnValue({
+      data: [
+        {
+          session_id: "c1",
+          title: "Rollout",
+          created_at: 1,
+          updated_at: 2,
+          score: 1,
+          title_match: false,
+          matches: [
+            { item_id: "i1", conversation_id: "c1", created_at: 1, snippet: "…warm pool drained…" },
+          ],
+        },
+      ],
+    });
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "warm pool" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(useSessionSearch).toHaveBeenLastCalledWith("warm pool", { enabled: true });
+    const headings = screen.getAllByText(/^(Best matches|Sessions)$/).map((el) => el.textContent);
+    expect(headings).toEqual(["Best matches", "Sessions"]);
+    expect(screen.getByText("…warm pool drained…")).toBeTruthy();
+    expect(screen.getAllByText("Rollout")).toHaveLength(1);
+    fireEvent.click(screen.getByText("Rollout"));
+    expect(navigate).toHaveBeenCalledWith("/c/c1");
+  });
+
+  it("does not run message search in the session switcher", () => {
+    renderPalette({ sessionsOnly: true });
+    expect(useSessionSearch).toHaveBeenLastCalledWith("", { enabled: false });
   });
 });
 

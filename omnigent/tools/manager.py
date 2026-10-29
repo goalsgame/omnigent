@@ -519,6 +519,14 @@ class ToolManager:
             for tool_type in GOOGLE_DRIVE_TOOL_TYPES:
                 self._tools[tool_type.name()] = tool_type()
 
+        from omnigent.tools.builtins.session_search import (
+            SearchSessionsTool,
+            session_search_tool_enabled,
+        )
+
+        if session_search_tool_enabled():
+            self._tools[SearchSessionsTool.name()] = SearchSessionsTool()
+
         self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
 
     def _register_agent_mgmt_tools(self) -> None:

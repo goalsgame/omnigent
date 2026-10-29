@@ -163,6 +163,9 @@ def test_builtin_names_size_matches_registry() -> None:
                 "google_drive_create",
                 "google_docs_append",
                 "google_sheets_update",
+                # Session search: registered when the deployment enables it;
+                # runner-dispatched to the server.
+                "search_sessions",
             }
         )
         == BUILTIN_NAMES

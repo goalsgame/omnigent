@@ -71,6 +71,11 @@ the header menu), and each place is a separate entry point.
   allow your whole Drive for that session, resume paused grants, or revoke them.
   Shared sessions ask you to confirm everyone who will be able to use the access.
 
+- **Session search:** type in ⌘K. Best matches ranks the sessions you can read
+  by title and message text; Sessions below keeps the substring list. When the
+  deployment sets `OMNIGENT_SESSION_SEARCH_TOOL=1`, agents get `search_sessions`,
+  which only returns sessions everyone in the current session can read.
+
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
 
@@ -370,6 +375,17 @@ Google token reaches the agent. Component coverage is
 configured OAuth client: connect Drive in Settings, add a file in a private
 session and ask the agent to read it, then share the session and confirm the
 grant pauses until it is resumed.
+
+### Session search checks
+
+Use `tests/stores/test_session_search.py` for permission, group, audience,
+sub-agent and archive filtering and for index use on PostgreSQL;
+`tests/server/test_session_search_routes.py` for the REST routes;
+`tests/runner/test_session_search_tool.py` for tool registration and session
+binding; and `tests/db/test_migration_session_search_index.py` for the index
+migration. Run the store and migration tests with `OMNIGENT_TEST_DB_URI` set to
+a PostgreSQL database to exercise the full-text path. Palette coverage is
+`web/src/shell/CommandPalette.test.tsx`.
 
 ## Gotchas
 

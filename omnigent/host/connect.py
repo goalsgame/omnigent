@@ -535,6 +535,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_CODEX_SANDBOX_MODE",
         # Non-secret deployment flag that offers the server-mediated Drive tools.
         "OMNIGENT_GOOGLE_DRIVE_AUTH",
+        # Non-secret deployment flag that offers the server-mediated session search tool.
+        "OMNIGENT_SESSION_SEARCH_TOOL",
         # Databricks config selectors are not bearer secrets. They must
         # reach host-spawned runners so native harnesses resolve the same
         # profile/config file the host resolved (e.g. a spec-declared

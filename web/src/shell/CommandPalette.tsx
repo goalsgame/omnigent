@@ -1,5 +1,7 @@
-// Global command palette (⌘K). Two command groups, Sessions first:
+// Global command palette (⌘K). Command groups, Sessions first:
 //
+//   • Best matches — relevance-ranked message search (`useSessionSearch` →
+//     `GET /v1/sessions/search`), shown above Sessions once the query is typed.
 //   • Sessions — fuzzy session switching from the SAME server-search source the
 //     sidebar uses (`useConversations(query)` → `GET /v1/sessions?search_query=`),
 //     debounced. Not a static first page: a user with hundreds of sessions must
@@ -31,6 +33,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
+import { useSessionSearch } from "@/hooks/useSessionSearch";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -254,7 +257,13 @@ export function CommandPalette({
     }
     return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
   }, [data, debouncedQuery, query, sessionsOnly]);
-  const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
+  const ranked = useSessionSearch(debouncedQuery, { enabled: open && !sessionsOnly });
+  const bestMatches = debouncedQuery.trim() && !sessionsOnly ? (ranked.data ?? []) : [];
+  const rankedIds = new Set(bestMatches.map((hit) => hit.session_id));
+  const listedSessions = sessions.filter((session) => !rankedIds.has(session.id));
+  const visibleSessions = sessionsOnly
+    ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT)
+    : listedSessions;
   const loadError = isError || isFetchNextPageError;
 
   const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
@@ -364,7 +373,33 @@ export function CommandPalette({
                 {isFetching && debouncedQuery ? "Searching…" : "No results found"}
               </CommandEmpty>
             )}
-            {sessions.length > 0 && (
+            {bestMatches.length > 0 && (
+              <CommandGroup heading="Best matches">
+                {bestMatches.map((hit) => (
+                  <CommandItem
+                    key={`ranked:${hit.session_id}`}
+                    value={`ranked:${hit.session_id}`}
+                    onSelect={() => goToSession(hit.session_id)}
+                    className="items-start pl-6"
+                  >
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="truncate text-left">
+                        <HighlightedText
+                          text={hit.title || "Untitled session"}
+                          query={debouncedQuery}
+                        />
+                      </span>
+                      {hit.matches[0] && (
+                        <span className="truncate text-left text-muted-foreground text-sm">
+                          {hit.matches[0].snippet}
+                        </span>
+                      )}
+                    </div>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
+            {visibleSessions.length > 0 && (
               <CommandGroup heading="Sessions">
                 {visibleSessions.map((s) => (
                   // pl-6 indents the label to line up with the icon-prefixed

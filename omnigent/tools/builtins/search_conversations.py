@@ -13,12 +13,11 @@ _MAX_SEARCH_RESULTS = 100
 
 class SearchConversationsTool(Tool):
     """
-    Full-text search across all conversations.
+    Full-text search within the calling session.
 
-    Uses the FTS index to find past messages, tool calls, and
-    results that match a query. Returns matching items with
-    surrounding context so the agent can recall information
-    from prior interactions.
+    Uses the FTS index to find earlier messages, tool calls and
+    results that match a query, so the agent can recall
+    information from earlier in the session.
     """
 
     @classmethod
@@ -34,11 +33,11 @@ class SearchConversationsTool(Tool):
         :returns: Human-readable description of the tool.
         """
         return (
-            "Search past conversations for relevant information. "
-            "Use this to recall details from prior interactions — "
-            "e.g. decisions made, code reviewed, files created, "
-            "or facts discussed. Returns matching messages ranked "
-            "by relevance with surrounding context."
+            "Search this session's earlier messages, tool calls and "
+            "results for relevant information. Use this to recall "
+            "details from earlier in the session — e.g. decisions "
+            "made, code reviewed, files created, or facts discussed. "
+            "Returns matching items ranked by relevance."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -51,13 +50,7 @@ class SearchConversationsTool(Tool):
             "type": "function",
             "function": {
                 "name": "search_conversations",
-                "description": (
-                    "Search past conversations for relevant information. "
-                    "Use this to recall details from prior interactions — "
-                    "e.g. decisions made, code reviewed, files created, "
-                    "or facts discussed. Returns matching messages ranked "
-                    "by relevance with surrounding context."
-                ),
+                "description": self.description(),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -86,7 +79,8 @@ class SearchConversationsTool(Tool):
         :param arguments: JSON with ``"query"`` and optional
             ``"limit"`` keys, e.g.
             ``'{"query": "database config", "limit": 5}'``.
-        :param ctx: Server-side execution context (unused).
+        :param ctx: Server-side execution context; its
+            ``conversation_id`` bounds the search.
         :returns: JSON string with search results.
         """
         args, error = parse_json_object_arguments(arguments)
@@ -104,18 +98,21 @@ class SearchConversationsTool(Tool):
 
         from omnigent.runtime import get_conversation_store
 
+        if ctx.conversation_id is None:
+            return json.dumps({"error": "search_conversations requires a session"})
         conv_store = get_conversation_store()
-        items = conv_store.search(query, limit=limit)
+        items = conv_store.search(query, conversation_id=ctx.conversation_id, limit=limit)
 
         if not items:
             return json.dumps({"results": [], "message": "No matching conversations found."})
 
-        results = _format_results(items)
+        results = _format_results(items, ctx.conversation_id)
         return json.dumps({"results": results})
 
 
 def _format_results(
     items: list[Any],
+    conversation_id: str,
 ) -> list[dict[str, Any]]:
     """
     Format conversation items into search result dicts.
@@ -124,13 +121,14 @@ def _format_results(
     timestamp, and extracted text content.
 
     :param items: ConversationItem objects from the store search.
+    :param conversation_id: The session that was searched.
     :returns: List of result dicts with ``conversation_id``,
         ``created_at``, ``type``, ``role``, and ``text`` fields.
     """
     results: list[dict[str, Any]] = []
     for item in items:
         result: dict[str, Any] = {
-            "conversation_id": item.response_id,
+            "conversation_id": conversation_id,
             "item_id": item.id,
             "created_at": item.created_at,
             "type": item.type,
