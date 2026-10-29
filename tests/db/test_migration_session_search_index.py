@@ -90,6 +90,7 @@ def test_index_is_built_per_partition_on_a_partitioned_table(db_uri: str) -> Non
         pytest.skip("PostgreSQL full-text index")
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.execute(sa.text("DROP SCHEMA IF EXISTS search_partitions CASCADE"))
+        connection.execute(sa.text("DROP SCHEMA IF EXISTS search_archive CASCADE"))
         connection.execute(sa.text("CREATE SCHEMA search_partitions"))
         try:
             connection.execute(sa.text("SET search_path TO search_partitions"))
@@ -112,6 +113,21 @@ def test_index_is_built_per_partition_on_a_partitioned_table(db_uri: str) -> Non
                     "FOR VALUES FROM (2000) TO (3000)"
                 )
             )
+            connection.execute(sa.text("CREATE SCHEMA search_archive"))
+            connection.execute(
+                sa.text(
+                    "CREATE TABLE search_archive.items_archived (type smallint, "
+                    "search_text text, created_at integer)"
+                )
+            )
+            connection.execute(
+                sa.text(
+                    "ALTER TABLE conversation_items ATTACH PARTITION "
+                    "search_archive.items_archived FOR VALUES FROM (3000) TO (4000)"
+                )
+            )
+            connection.execute(sa.text(f"DROP INDEX {CONVERSATION_ITEMS_SEARCH_INDEX}"))
+            ensure_session_search_index(connection)
             ensure_session_search_index(connection)
 
             valid = connection.execute(
@@ -127,6 +143,13 @@ def test_index_is_built_per_partition_on_a_partitioned_table(db_uri: str) -> Non
             ).scalar_one()
             assert valid
             assert leaves == 4
+            archived = connection.execute(
+                sa.text(
+                    "SELECT count(*) FROM pg_indexes WHERE schemaname = 'search_archive' "
+                    "AND indexdef LIKE '%to_tsvector%'"
+                )
+            ).scalar_one()
+            assert archived == 1
 
             drop_session_search_index(connection)
             assert (
@@ -138,3 +161,4 @@ def test_index_is_built_per_partition_on_a_partitioned_table(db_uri: str) -> Non
         finally:
             connection.execute(sa.text("SET search_path TO public"))
             connection.execute(sa.text("DROP SCHEMA search_partitions CASCADE"))
+            connection.execute(sa.text("DROP SCHEMA IF EXISTS search_archive CASCADE"))

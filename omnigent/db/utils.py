@@ -572,14 +572,19 @@ def _ensure_partition_search_indexes(connection: Connection, table: str, index: 
             if kind == "p":
                 _ensure_partition_search_indexes(connection, partition, child)
             continue
-        oid = connection.execute(
-            text("SELECT to_regclass(:name)::oid"), {"name": partition}
-        ).scalar_one()
-        child = f"ix_conversation_items_search_tsv_{oid}"
+        oid, schema = connection.execute(
+            text(
+                "SELECT c.oid, quote_ident(n.nspname) FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass(:name)"
+            ),
+            {"name": partition},
+        ).one()
+        name = f"ix_conversation_items_search_tsv_{oid}"
+        child = f"{schema}.{name}"
         if kind == "p":
             connection.execute(
                 text(
-                    f"CREATE INDEX IF NOT EXISTS {child} ON ONLY {partition} "
+                    f"CREATE INDEX IF NOT EXISTS {name} ON ONLY {partition} "
                     f"{_SESSION_SEARCH_INDEX_BODY}"
                 )
             )
@@ -589,7 +594,7 @@ def _ensure_partition_search_indexes(connection: Connection, table: str, index: 
                 connection.execute(text(f"DROP INDEX CONCURRENTLY {child}"))
             connection.execute(
                 text(
-                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {child} ON {partition} "
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {partition} "
                     f"{_SESSION_SEARCH_INDEX_BODY}"
                 )
             )
