@@ -21,7 +21,11 @@ from omnigent.db.db_models import (
 from omnigent.db.enum_codecs import ITEM_TYPE
 from omnigent.db.group_authority import permission_principal_filter
 from omnigent.db.utils import build_search_snippet, is_postgresql_family
-from omnigent.stores.conversation_store.session_memory import embedding_column, query_vector
+from omnigent.stores.conversation_store.session_memory import (
+    allow_iterative_index_scan,
+    embedding_column,
+    query_vector,
+)
 
 SEARCHED_ITEM_TYPES = ("message", "compaction")
 TEXT_SEARCH_CONFIG = "english"
@@ -264,6 +268,7 @@ class SessionSearch:
         rows: dict[str, Any] = {}
         similarities: dict[str, float] = {}
         if query_embedding is not None:
+            allow_iterative_index_scan(session)
             distance = embedding_column().op("<=>", return_type=Float())(
                 query_vector(query_embedding)
             )
@@ -273,12 +278,13 @@ class SessionSearch:
                 .order_by(distance)
                 .limit(_MEMORY_CANDIDATES)
             ).all()
-            for position, row in enumerate(nearest):
-                score = 1.0 - float(row.distance)
-                if score < min_similarity:
-                    break
+            close = sorted(
+                (row for row in nearest if 1.0 - float(row.distance) >= min_similarity),
+                key=lambda row: float(row.distance),
+            )
+            for position, row in enumerate(close):
                 rows[row.id] = row
-                similarities[row.id] = score
+                similarities[row.id] = 1.0 - float(row.distance)
                 scores[row.id] = 1.0 / (_RRF_K + position)
         if terms:
             if tsquery is not None:

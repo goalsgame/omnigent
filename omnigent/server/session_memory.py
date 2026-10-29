@@ -242,6 +242,8 @@ def build_digest(
                 if item.role != "summary" and item.message_id:
                     message_ids.append(item.message_id)
                 created_at = max(created_at, item.created_at)
+        if not item_ids:
+            continue
         entry: dict[str, Any] = {
             "kind": value["kind"],
             "title": title,
@@ -459,7 +461,9 @@ class SessionMemory:
     async def embed_backlog(self) -> int:
         """Embed entries that have no embedding yet; returns how many were stored."""
         store = self.store
-        pending = await asyncio.to_thread(store.unembedded, _EMBED_BATCH)
+        pending = await asyncio.to_thread(
+            store.claim_unembedded, int(self._clock()), LEASE_SECONDS, _EMBED_BATCH
+        )
         done = 0
         for workspace, entry_id, text in pending:
             try:

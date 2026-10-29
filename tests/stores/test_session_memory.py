@@ -344,3 +344,58 @@ def test_simultaneous_first_claims_lease_the_session_once(stores) -> None:
     with ThreadPoolExecutor(8) as pool:
         claims = list(pool.map(claim, range(8)))
     assert sum(record is not None for record in claims) == 1
+
+
+def test_long_transcripts_are_read_in_pages_within_the_budget(stores) -> None:
+    store, _ = stores
+    memory = store.session_memory()
+    session = _session(store, "Long", *(f"message {index:03d}" for index in range(250)))
+
+    items, more = memory.transcript(session, -1, 10_000_000)
+    assert [item.text for item in items] == [f"message {index:03d}" for index in range(250)]
+    assert not more
+    first, more = memory.transcript(session, -1, 11 * 120)
+    assert len(first) == 120 and more
+    rest, more = memory.transcript(session, first[-1].position, 10_000_000)
+    assert len(rest) == 130 and not more
+
+
+def test_postgres_embedding_leases_split_work_between_workers(stores) -> None:
+    store, _ = stores
+    if store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL with pgvector")
+    store.ensure_session_memory_vectors(DIMENSIONS, MODEL)
+    session = _session(store, "Leases", "notes")
+    _remember(store, session, *(MemoryEntry("decision", f"entry {index}") for index in range(5)))
+    memory = store.session_memory()
+    now = _later()
+
+    first = memory.claim_unembedded(now, 600, 3)
+    second = memory.claim_unembedded(now, 600, 3)
+    assert len(first) == 3 and len(second) == 2
+    assert not {entry_id for _, entry_id, _ in first} & {entry_id for _, entry_id, _ in second}
+    assert memory.claim_unembedded(now, 600, 3) == []
+    assert len(memory.claim_unembedded(now + 601, 600, 10)) == 5
+
+
+def test_postgres_semantic_matches_survive_nearer_hidden_entries(stores) -> None:
+    store, perms = stores
+    if store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL with pgvector")
+    store.ensure_session_memory_vectors(DIMENSIONS, MODEL)
+    readable = _session(store, "Readable", "notes")
+    hidden = _session(store, "Hidden", "notes")
+    perms.grant(ALICE, readable, 4)
+    perms.grant(BOB, hidden, 4)
+    _remember(store, readable, MemoryEntry("decision", "readable entry"))
+    _remember(store, hidden, *(MemoryEntry("decision", f"hidden {index}") for index in range(150)))
+    memory = store.session_memory()
+    for workspace, entry_id, body in memory.unembedded(200):
+        vector = [1.0, 0.0, 0.0] if body.startswith("hidden") else [0.9, 0.3, 0.0]
+        memory.set_embedding(workspace, entry_id, vector)
+
+    hits = store.search_sessions(
+        "readable", (ALICE,), query_embedding=[1.0, 0.0, 0.0], min_similarity=0.5, memory=True
+    )
+    assert [hit.session_id for hit in hits] == [readable]
+    assert hits[0].memories[0].similarity is not None

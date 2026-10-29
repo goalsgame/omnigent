@@ -1328,8 +1328,8 @@ class SqlSessionMemoryEntry(ConversationBase):
     :param ordinal: Position within the digest.
     :param text: Searchable text of the entry.
     :param item_ids: JSON list of ``[conversation_id, item_id]`` source messages.
-    :param created_at: ``created_at`` of the newest cited message, or of the
-        digest when the entry cites none.
+    :param created_at: ``created_at`` of the newest cited message.
+    :param lease_until: Epoch second until which one worker is embedding the entry.
     """
 
     __tablename__ = "session_memory_entries"
@@ -1348,6 +1348,7 @@ class SqlSessionMemoryEntry(ConversationBase):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     item_ids: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     created_at: Mapped[int] = mapped_column(Integer)
+    lease_until: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     __table_args__ = (
         Index(

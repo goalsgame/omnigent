@@ -20,6 +20,7 @@ from omnigent.errors import OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes.session_search import create_session_search_router
 from omnigent.server.session_memory import (
+    LEASE_SECONDS,
     SessionMemory,
     SessionMemoryConfig,
     build_digest,
@@ -205,6 +206,7 @@ def test_digest_cites_messages_and_carries_previous_entries_forward() -> None:
                     "from": ["p1", "p7"],
                 },
                 {"kind": "open_question", "title": "Spot", "text": "Spot nodes?", "refs": [3]},
+                {"kind": "decision", "title": "Unsourced", "text": "No source", "refs": [999]},
                 {"kind": "gossip", "title": "x", "text": "y", "refs": []},
                 {"kind": "tangent", "title": "", "text": "", "refs": []},
             ],
@@ -299,6 +301,9 @@ async def test_worker_embeds_entries_on_postgres(db_uri) -> None:
     await memory.tick()
     assert len(store.session_memory().unembedded(10)) == 2
     vertex.embed_status = 200
+    await memory.tick()
+    assert len(store.session_memory().unembedded(10)) == 2
+    memory._clock = lambda: time.time() + 3600 + LEASE_SECONDS
     await memory.tick()
     assert store.session_memory().unembedded(10) == []
     assert {task for task, _ in vertex.embedded} == {"RETRIEVAL_DOCUMENT"}

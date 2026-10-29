@@ -50,6 +50,7 @@ def upgrade() -> None:
             sa.Column("text", sa.Text(), nullable=False),
             sa.Column("item_ids", sa.Text(), nullable=False),
             sa.Column("created_at", sa.Integer(), nullable=True),
+            sa.Column("lease_until", sa.Integer(), nullable=False, server_default="0"),
         )
         op.create_index(
             "ix_session_memory_entries_conversation",

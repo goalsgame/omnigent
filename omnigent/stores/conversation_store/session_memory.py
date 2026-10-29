@@ -9,11 +9,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     String,
+    Text,
     and_,
     bindparam,
     cast,
     delete,
+    func,
     literal_column,
     or_,
     select,
@@ -38,6 +41,7 @@ from omnigent.db.utils import run_write_transaction
 ENTRY_KINDS = ("summary", "decision", "discussion", "open_question", "tangent")
 TRANSCRIPT_ITEM_TYPES = ("message", "compaction")
 MAX_ITEM_CHARS = 8_000
+TRANSCRIPT_PAGE = 100
 
 
 class Vector(UserDefinedType[list[float]]):
@@ -60,6 +64,27 @@ def embedding_column() -> Any:
 
 def query_vector(values: Sequence[float]) -> Any:
     return cast(bindparam("query_embedding", vector_literal(values), type_=String()), Vector())
+
+
+_ITERATIVE_SCAN: dict[str, bool] = {}
+
+
+def allow_iterative_index_scan(session: Session) -> None:
+    """
+    Let a filtered HNSW scan keep searching until enough rows pass its filters.
+
+    Needs pgvector 0.8 or later; older versions keep their fixed candidate list.
+    """
+    bind = session.get_bind()
+    key = str(bind.engine.url)
+    if key not in _ITERATIVE_SCAN:
+        version = session.execute(
+            text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+        ).scalar()
+        parts = tuple(int(part) for part in (version or "0").split(".")[:2] if part.isdigit())
+        _ITERATIVE_SCAN[key] = parts >= (0, 8)
+    if _ITERATIVE_SCAN[key]:
+        session.execute(text("SET LOCAL hnsw.iterative_scan = relaxed_order"))
 
 
 @dataclass(frozen=True)
@@ -233,46 +258,52 @@ class SessionMemoryStore:
         """
         items: list[TranscriptItem] = []
         used = 0
+        cursor = after_position
         with self._store._conv_session("session_memory_transcript") as session:
-            rows = session.execute(
-                select(
-                    SqlConversationItem.id,
-                    SqlConversationItem.position,
-                    SqlConversationItem.created_at,
-                    SqlConversationItem.type,
-                    SqlConversationItem.data,
-                    SqlConversationItem.search_text,
-                    SqlConversationItem.response_id,
-                )
-                .where(
-                    SqlConversationItem.workspace_id == current_workspace_id(),
-                    SqlConversationItem.conversation_id == session_id,
-                    SqlConversationItem.position > after_position,
-                    SqlConversationItem.type.in_(
-                        [ITEM_TYPE[name] for name in TRANSCRIPT_ITEM_TYPES]
-                    ),
-                )
-                .order_by(SqlConversationItem.position)
-            )
-            for item_id, position, created_at, item_type, data, body, response_id in rows:
-                content = " ".join((body or "").split())
-                if not content:
-                    continue
-                if len(content) > MAX_ITEM_CHARS:
-                    content = content[:MAX_ITEM_CHARS] + "…"
-                if items and used + len(content) > max_chars:
-                    return items, True
-                used += len(content)
-                items.append(
-                    TranscriptItem(
-                        item_id=item_id,
-                        position=position,
-                        created_at=created_at,
-                        role=_role(item_type, data),
-                        text=content,
-                        response_id=response_id,
+            while True:
+                rows = session.execute(
+                    select(
+                        SqlConversationItem.id,
+                        SqlConversationItem.position,
+                        SqlConversationItem.created_at,
+                        SqlConversationItem.type,
+                        SqlConversationItem.data,
+                        func.substr(SqlConversationItem.search_text, 1, 2 * MAX_ITEM_CHARS),
+                        SqlConversationItem.response_id,
                     )
-                )
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == session_id,
+                        SqlConversationItem.position > cursor,
+                        SqlConversationItem.type.in_(
+                            [ITEM_TYPE[name] for name in TRANSCRIPT_ITEM_TYPES]
+                        ),
+                    )
+                    .order_by(SqlConversationItem.position)
+                    .limit(TRANSCRIPT_PAGE)
+                ).all()
+                for item_id, position, created_at, item_type, data, body, response_id in rows:
+                    cursor = position
+                    content = " ".join((body or "").split())
+                    if not content:
+                        continue
+                    if len(content) > MAX_ITEM_CHARS:
+                        content = content[:MAX_ITEM_CHARS] + "…"
+                    if items and used + len(content) > max_chars:
+                        return items, True
+                    used += len(content)
+                    items.append(
+                        TranscriptItem(
+                            item_id=item_id,
+                            position=position,
+                            created_at=created_at,
+                            role=_role(item_type, data),
+                            text=content,
+                            response_id=response_id,
+                        )
+                    )
+                if len(rows) < TRANSCRIPT_PAGE:
+                    break
         return items, False
 
     def save(
@@ -388,6 +419,29 @@ class SessionMemoryStore:
                 .limit(limit)
             ).all()
         return [(int(workspace), str(entry_id), str(body)) for workspace, entry_id, body in rows]
+
+    def claim_unembedded(
+        self, now: int, lease_seconds: int, limit: int
+    ) -> list[tuple[int, str, str]]:
+        """Lease up to *limit* entries in any workspace that still need an embedding."""
+
+        def claim(session: Session) -> list[tuple[int, str, str]]:
+            rows = session.execute(
+                text(
+                    "UPDATE session_memory_entries AS e SET lease_until = :until "
+                    "FROM (SELECT workspace_id, id FROM session_memory_entries "
+                    "WHERE embedding IS NULL AND lease_until <= :now "
+                    "LIMIT :limit FOR UPDATE SKIP LOCKED) AS c "
+                    "WHERE e.workspace_id = c.workspace_id AND e.id = c.id "
+                    "RETURNING e.workspace_id, e.id, e.text"
+                ).columns(workspace_id=BigInteger(), id=Uuid16(), text=Text()),
+                {"until": now + lease_seconds, "now": now, "limit": limit},
+            ).all()
+            return [
+                (int(workspace), str(entry_id), str(body)) for workspace, entry_id, body in rows
+            ]
+
+        return self._write("session_memory_claim_unembedded", claim)
 
     def set_embedding(self, workspace: int, entry_id: str, values: Sequence[float]) -> None:
         """Store the embedding for one entry."""
