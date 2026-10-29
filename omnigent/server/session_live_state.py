@@ -204,6 +204,7 @@ def persist_scheduled_run_completion(
     *,
     error_code: str | None = None,
     error: str | None = None,
+    turn_seen: bool = True,
 ) -> None:
     """Transition a scheduled-task run to terminal when its turn ends.
 
@@ -237,6 +238,9 @@ def persist_scheduled_run_completion(
     :param error_code: Short failure classification when ``run_status`` is
         ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
     :param error: Optional human-readable failure detail for ``"failed"``.
+    :param turn_seen: Whether a ``running`` or ``waiting`` edge preceded this
+        one in this process. Without it, a ``"succeeded"`` edge counts only
+        when the prompt was stored in an earlier second than the edge.
     """
     store = _scheduled_task_store
     if store is None:
@@ -249,7 +253,8 @@ def persist_scheduled_run_completion(
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
-        if run_status == "succeeded" and not _has_user_message(conversation_id, edge_at):
+        prompt_by = edge_at if turn_seen else edge_at - 1
+        if run_status == "succeeded" and not _has_user_message(conversation_id, prompt_by):
             # A native session reports idle when its terminal starts, before
             # the scheduled prompt reaches it; that is not a finished turn.
             return

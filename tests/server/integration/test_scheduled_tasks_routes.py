@@ -1444,6 +1444,7 @@ async def test_publish_status_idle_after_cache_loss_completes_run(
     db_uri: str,
 ) -> None:
     """Run completion still works after a restart loses cached session status."""
+    import time
 
     from omnigent.server import session_live_state
     from omnigent.server.routes.sessions import _publish_status, _session_status_cache
@@ -1459,6 +1460,7 @@ async def test_publish_status_idle_after_cache_loss_completes_run(
     )
     try:
         _session_status_cache.pop(conv_id, None)
+        time.sleep(1.1)
         _publish_status(conv_id, "idle")
         run = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
     finally:
@@ -1536,7 +1538,6 @@ async def test_publish_status_idle_handled_after_the_prompt_arrived_does_not_com
 ) -> None:
     """A startup idle the worker only reaches after the prompt was stored still does not count."""
     import threading
-    import time
 
     from omnigent.server import session_live_state
     from omnigent.server.routes.sessions import _publish_status, _session_status_cache
@@ -1554,7 +1555,6 @@ async def test_publish_status_idle_handled_after_the_prompt_arrived_does_not_com
     try:
         session_live_state.submit("hold", gate.wait, 10)
         _publish_status(conv_id, "idle")
-        time.sleep(1.1)
         _append_prompt(db_uri, conv_id)
         gate.set()
         session_live_state.submit("barrier", lambda: None).result(timeout=10)
