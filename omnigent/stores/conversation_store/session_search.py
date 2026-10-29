@@ -75,6 +75,12 @@ def tsvector_expression(column: Any) -> ColumnElement[Any]:
     )
 
 
+def _contains(term: str) -> str:
+    """A LIKE pattern matching *term* literally anywhere, escaped with a backslash."""
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _item_type_codes() -> list[Any]:
     return [literal_column(str(ITEM_TYPE[name])) for name in SEARCHED_ITEM_TYPES]
 
@@ -223,10 +229,15 @@ class SessionSearch:
                 title_rank: ColumnElement[Any] = func.ts_rank_cd(title_vector, tsquery)
             else:
                 item_match = and_(
-                    *(SqlConversationItem.search_text.ilike(f"%{term}%") for term in terms)
+                    *(
+                        SqlConversationItem.search_text.ilike(_contains(term), escape="\\")
+                        for term in terms
+                    )
                 )
                 item_rank = cast(ColumnElement[Any], SqlConversationItem.created_at)
-                title_match = and_(*(root.title.ilike(f"%{term}%") for term in terms))
+                title_match = and_(
+                    *(root.title.ilike(_contains(term), escape="\\") for term in terms)
+                )
                 title_rank = cast(ColumnElement[Any], root.updated_at)
 
             matched = (

@@ -13,6 +13,8 @@ from omnigent.db.utils import (
     _build_alembic_config,
     _ensure_conversation_tables,
     clear_engine_cache,
+    drop_session_search_index,
+    ensure_session_search_index,
     get_or_create_engine,
 )
 
@@ -80,3 +82,53 @@ def test_conversation_bootstrap_adds_the_index_to_an_existing_postgres_table(db_
     _ensure_conversation_tables(engine)
 
     assert CONVERSATION_ITEMS_SEARCH_INDEX in _indexes(engine)
+
+
+def test_index_is_built_per_partition_on_a_partitioned_table(db_uri: str) -> None:
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL full-text index")
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(sa.text("DROP SCHEMA IF EXISTS search_partitions CASCADE"))
+        connection.execute(sa.text("CREATE SCHEMA search_partitions"))
+        try:
+            connection.execute(sa.text("SET search_path TO search_partitions"))
+            for statement in (
+                "CREATE TABLE conversation_items (type smallint, search_text text, "
+                "created_at integer) PARTITION BY RANGE (created_at)",
+                "CREATE TABLE items_old PARTITION OF conversation_items "
+                "FOR VALUES FROM (0) TO (1000)",
+                "CREATE TABLE items_new PARTITION OF conversation_items "
+                "FOR VALUES FROM (1000) TO (2000) PARTITION BY RANGE (created_at)",
+                "CREATE TABLE items_new_a PARTITION OF items_new FOR VALUES FROM (1000) TO (1500)",
+                "CREATE TABLE items_new_b PARTITION OF items_new FOR VALUES FROM (1500) TO (2000)",
+            ):
+                connection.execute(sa.text(statement))
+
+            for _ in range(2):
+                ensure_session_search_index(connection)
+
+            valid = connection.execute(
+                sa.text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"),
+                {"name": CONVERSATION_ITEMS_SEARCH_INDEX},
+            ).scalar_one()
+            leaves = connection.execute(
+                sa.text(
+                    "SELECT count(*) FROM pg_indexes WHERE schemaname = 'search_partitions' "
+                    "AND tablename IN ('items_old', 'items_new_a', 'items_new_b') "
+                    "AND indexdef LIKE '%to_tsvector%'"
+                )
+            ).scalar_one()
+            assert valid
+            assert leaves == 3
+
+            drop_session_search_index(connection)
+            assert (
+                connection.execute(
+                    sa.text("SELECT to_regclass(:name)"), {"name": CONVERSATION_ITEMS_SEARCH_INDEX}
+                ).scalar()
+                is None
+            )
+        finally:
+            connection.execute(sa.text("SET search_path TO public"))
+            connection.execute(sa.text("DROP SCHEMA search_partitions CASCADE"))

@@ -11,8 +11,7 @@ from __future__ import annotations
 
 from alembic import op
 
-from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX
-from omnigent.db.utils import ensure_session_search_index
+from omnigent.db.utils import drop_session_search_index, ensure_session_search_index
 
 revision = "of1b2c3d4e5f"
 down_revision = "oe1b2c3d4e5f"
@@ -37,4 +36,4 @@ def downgrade() -> None:
     if not _is_postgres():
         return
     with op.get_context().autocommit_block():
-        op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {CONVERSATION_ITEMS_SEARCH_INDEX}")
+        drop_session_search_index(op.get_bind())

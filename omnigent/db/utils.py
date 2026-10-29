@@ -532,35 +532,107 @@ def _ensure_conversation_tables(engine: Engine) -> None:
                 ensure_session_search_index(connection)
 
 
+_SESSION_SEARCH_INDEX_BODY = (
+    "USING gin (to_tsvector('english', left(search_text, 100000))) WHERE type IN (1, 6)"
+)
+
+
+def _relkind(connection: Connection, name: str) -> str | None:
+    return connection.execute(
+        text("SELECT relkind FROM pg_class WHERE oid = to_regclass(:name)"), {"name": name}
+    ).scalar()
+
+
+def _index_valid(connection: Connection, name: str) -> bool | None:
+    return connection.execute(
+        text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"),
+        {"name": name},
+    ).scalar()
+
+
+def _ensure_partition_search_indexes(connection: Connection, table: str, index: str) -> None:
+    """Index each partition of *table* concurrently and attach it to *index*."""
+    partitions = connection.execute(
+        text(
+            "SELECT c.oid::regclass::text, c.relkind FROM pg_inherits i "
+            "JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass(:table)"
+        ),
+        {"table": table},
+    ).all()
+    for partition, kind in partitions:
+        oid = connection.execute(
+            text("SELECT to_regclass(:name)::oid"), {"name": partition}
+        ).scalar_one()
+        child = f"ix_conversation_items_search_tsv_{oid}"
+        if kind == "p":
+            connection.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {child} ON ONLY {partition} "
+                    f"{_SESSION_SEARCH_INDEX_BODY}"
+                )
+            )
+            _ensure_partition_search_indexes(connection, partition, child)
+        else:
+            if _index_valid(connection, child) is False:
+                connection.execute(text(f"DROP INDEX CONCURRENTLY {child}"))
+            connection.execute(
+                text(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {child} ON {partition} "
+                    f"{_SESSION_SEARCH_INDEX_BODY}"
+                )
+            )
+        attached = connection.execute(
+            text(
+                "SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass(:child) "
+                "AND inhparent = to_regclass(:index)"
+            ),
+            {"child": child, "index": index},
+        ).scalar()
+        if not attached:
+            connection.execute(text(f"ALTER INDEX {index} ATTACH PARTITION {child}"))
+
+
 def ensure_session_search_index(connection: Connection) -> None:
     """
     Build the PostgreSQL session-search index if it is missing or invalid.
 
     ``create_all`` skips indexes on tables that already exist, so databases
-    bootstrapped outside Alembic need this too.
+    bootstrapped outside Alembic need this too. A partitioned
+    ``conversation_items`` gets a parent index on the table alone and a
+    concurrently built index attached for each partition.
 
     :param connection: An autocommit PostgreSQL connection, since the index is
         built ``CONCURRENTLY``.
     """
-    from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX
+    from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX as index
 
-    invalid = connection.execute(
-        text(
-            "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-            "WHERE c.relname = :name AND NOT i.indisvalid"
-        ),
-        {"name": CONVERSATION_ITEMS_SEARCH_INDEX},
-    ).scalar()
-    if invalid:
-        connection.execute(text(f"DROP INDEX CONCURRENTLY {CONVERSATION_ITEMS_SEARCH_INDEX}"))
+    if _relkind(connection, "conversation_items") == "p":
+        connection.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS {index} ON ONLY conversation_items "
+                f"{_SESSION_SEARCH_INDEX_BODY}"
+            )
+        )
+        _ensure_partition_search_indexes(connection, "conversation_items", index)
+        return
+    if _index_valid(connection, index) is False:
+        connection.execute(text(f"DROP INDEX CONCURRENTLY {index}"))
     connection.execute(
         text(
-            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {CONVERSATION_ITEMS_SEARCH_INDEX} "
-            "ON conversation_items USING gin "
-            "(to_tsvector('english', left(search_text, 100000))) "
-            "WHERE type IN (1, 6)"
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index} ON conversation_items "
+            f"{_SESSION_SEARCH_INDEX_BODY}"
         )
     )
+
+
+def drop_session_search_index(connection: Connection) -> None:
+    """Drop the session-search index, with its partition indexes when partitioned."""
+    from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX as index
+
+    if _relkind(connection, index) == "I":
+        connection.execute(text(f"DROP INDEX IF EXISTS {index}"))
+    else:
+        connection.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index}"))
 
 
 def _set_alembic_database_url(config: Config, db_uri: str) -> None:

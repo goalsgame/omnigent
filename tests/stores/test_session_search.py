@@ -201,3 +201,38 @@ def test_a_long_session_does_not_crowd_out_other_matches(stores) -> None:
     hits = store.search_sessions("pool", (ALICE,), limit=8)
     assert set(_ids(hits)) == {long, short}
     assert all(len(hit.matches) <= 3 for hit in hits)
+
+
+def test_single_conversation_search_ignores_other_sessions_with_the_same_item_id(
+    conversation_store,
+) -> None:
+    def add(text: str) -> str:
+        conversation = conversation_store.create_conversation()
+        conversation_store.append(
+            conversation.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_1",
+                    stable_id="ab" * 16,
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                )
+            ],
+        )
+        return conversation.id
+
+    mine = add("budget notes I may see")
+    add("budget secrets from a private session")
+
+    [item] = conversation_store.search("budget", conversation_id=mine)
+    assert item.data.content[0]["text"] == "budget notes I may see"
+
+
+def test_underscores_match_literally(stores) -> None:
+    store, perms = stores
+    exact = _session(store, "Exact", "rotate the server_key tonight")
+    other = _session(store, "Other", "rotate the serverXkey tonight")
+    perms.grant(ALICE, exact, 4)
+    perms.grant(ALICE, other, 4)
+
+    assert _ids(store.search_sessions("server_key", (ALICE,))) == [exact]

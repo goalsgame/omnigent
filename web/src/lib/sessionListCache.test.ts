@@ -10,6 +10,7 @@ import {
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
+  overlayTitleIntoCaches,
   removeIdsFromPages,
 } from "./sessionListCache";
 
@@ -521,5 +522,25 @@ describe("insertNewRowsIntoPages", () => {
       (id) => id === "gone",
     );
     expect(inserted).toHaveLength(0);
+  });
+});
+
+describe("overlayTitleIntoCaches ranked search", () => {
+  it("renames the session in cached ranked search results", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(
+      ["session-search", "pool"],
+      [
+        { session_id: "a", title: "Old" },
+        { session_id: "b", title: "Other" },
+      ],
+    );
+
+    overlayTitleIntoCaches(queryClient, "a", "New");
+
+    expect(queryClient.getQueryData(["session-search", "pool"])).toEqual([
+      { session_id: "a", title: "New" },
+      { session_id: "b", title: "Other" },
+    ]);
   });
 });

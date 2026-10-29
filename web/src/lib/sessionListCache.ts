@@ -519,6 +519,15 @@ export function overlayTitleIntoCaches(
     old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
   );
   queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
+  for (const [key, hits] of queryClient.getQueriesData<{ session_id: string; title: string }[]>({
+    queryKey: SESSION_SEARCH_KEY,
+  })) {
+    if (!hits?.some((hit) => hit.session_id === id)) continue;
+    queryClient.setQueryData(
+      key,
+      hits.map((hit) => (hit.session_id === id ? { ...hit, title: title ?? "" } : hit)),
+    );
+  }
 }
 
 /**
