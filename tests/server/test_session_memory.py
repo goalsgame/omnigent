@@ -302,7 +302,7 @@ async def test_worker_embeds_entries_on_postgres(db_uri) -> None:
     assert len(store.session_memory().unembedded(10)) == 2
     vertex.embed_status = 200
     await memory.tick()
-    assert len(store.session_memory().unembedded(10)) == 2
+    assert len(store.session_memory().unembedded(10)) == 1
     memory._clock = lambda: time.time() + 3600 + LEASE_SECONDS
     await memory.tick()
     assert store.session_memory().unembedded(10) == []

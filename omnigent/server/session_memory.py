@@ -461,16 +461,19 @@ class SessionMemory:
     async def embed_backlog(self) -> int:
         """Embed entries that have no embedding yet; returns how many were stored."""
         store = self.store
-        pending = await asyncio.to_thread(
-            store.claim_unembedded, int(self._clock()), LEASE_SECONDS, _EMBED_BATCH
-        )
         done = 0
-        for workspace, entry_id, text in pending:
+        while done < _EMBED_BATCH:
+            claimed = await asyncio.to_thread(
+                store.claim_unembedded, int(self._clock()), LEASE_SECONDS, 1
+            )
+            if not claimed:
+                break
+            [(workspace, entry_id, text)] = claimed
             try:
                 values = await self.embed(text, "RETRIEVAL_DOCUMENT")
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 — retried on the next pass
+            except Exception as exc:  # noqa: BLE001 — retried once the lease expires
                 _logger.warning("Session memory embedding deferred: %s", exc)
                 break
             await asyncio.to_thread(store.set_embedding, workspace, entry_id, values)

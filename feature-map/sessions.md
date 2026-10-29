@@ -399,7 +399,9 @@ Session memory is covered by `tests/stores/test_session_memory.py` (claiming,
 progressive transcripts, backoff, deletion, word and pgvector matching with
 permissions) and `tests/server/test_session_memory.py` (config, digest
 validation and citations, the worker against a fake Vertex AI, the digest route
-and startup). Run both with `OMNIGENT_TEST_DB_URI` pointing at PostgreSQL with
+and startup), and `tests/e2e/test_session_memory.py` runs the worker in a
+started server against a fake Vertex AI through to HTTP search. Run them with
+`OMNIGENT_TEST_DB_URI` pointing at PostgreSQL with
 pgvector. The Memory tab is covered by
 `web/src/shell/SessionMemoryPanel.test.tsx`.
 
