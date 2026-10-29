@@ -2150,6 +2150,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         audience: Any = (),
         exclude_session_id: str | None = None,
         limit: int = 20,
+        query_embedding: Any = None,
+        min_similarity: float = 0.0,
     ) -> list[Any]:
         """Rank readable top-level sessions; see :class:`SessionSearch`."""
         from omnigent.stores.conversation_store.session_search import SessionSearch
@@ -2160,7 +2162,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             audience=audience,
             exclude_session_id=exclude_session_id,
             limit=limit,
+            query_embedding=query_embedding,
+            min_similarity=min_similarity,
         )
+
+    def session_memory(self) -> Any:
+        """Digest and embedding storage; see :class:`SessionMemoryStore`."""
+        from omnigent.stores.conversation_store.session_memory import SessionMemoryStore
+
+        return SessionMemoryStore(self)
+
+    def ensure_session_memory_vectors(self, dimensions: int) -> None:
+        """Prepare pgvector storage for session memory embeddings."""
+        from omnigent.db.utils import ensure_session_memory_vectors
+
+        ensure_session_memory_vectors(self._conv_engine, dimensions)
 
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """
@@ -5374,6 +5390,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ):
                 return "engaged"
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
+            self.session_memory().delete_for(ap_sess, subtree_ids)
             ap_sess.execute(
                 delete(SqlConversationItem).where(
                     SqlConversationItem.workspace_id == current_workspace_id(),

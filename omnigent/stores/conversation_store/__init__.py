@@ -965,15 +965,35 @@ class ConversationStore(ABC):
         audience: Any = (),
         exclude_session_id: str | None = None,
         limit: int = 20,
+        query_embedding: Any = None,
+        min_similarity: float = 0.0,
     ) -> list[Any]:
         """
-        Rank the top-level sessions *principals* may read by title and message text.
+        Rank the top-level sessions *principals* may read by title, message text and digest.
 
         See :meth:`omnigent.stores.conversation_store.session_search.SessionSearch.search`.
 
         :raises NotImplementedError: When the backend has no session search.
         """
         raise NotImplementedError("This conversation store does not support session search")
+
+    def session_memory(self) -> Any:
+        """
+        Digest and embedding storage for session memory.
+
+        See :class:`omnigent.stores.conversation_store.session_memory.SessionMemoryStore`.
+
+        :raises NotImplementedError: When the backend has no session memory.
+        """
+        raise NotImplementedError("This conversation store does not support session memory")
+
+    def ensure_session_memory_vectors(self, dimensions: int) -> None:
+        """
+        Prepare vector storage for session memory embeddings of *dimensions*.
+
+        :raises NotImplementedError: When the backend has no session memory.
+        """
+        raise NotImplementedError("This conversation store does not support session memory")
 
     @abstractmethod
     def update_conversation(

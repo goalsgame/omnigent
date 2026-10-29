@@ -1635,6 +1635,15 @@ def create_app(
     )
     publication_limits = PublicationLimits.parse(resolved_server_config.get("published_artifacts"))
 
+    from omnigent.server.session_memory import SessionMemory, SessionMemoryConfig
+
+    session_memory_config = SessionMemoryConfig.parse(resolved_server_config.get("session_memory"))
+    session_memory = (
+        SessionMemory(session_memory_config, conversation_store)
+        if session_memory_config is not None
+        else None
+    )
+
     @asynccontextmanager
     async def _lifespan(
         app_inst: FastAPI,
@@ -1885,6 +1894,10 @@ def create_app(
             if publication_store is not None
             else None
         )
+        session_memory_task = None
+        if session_memory is not None:
+            await session_memory.prepare()
+            session_memory_task = asyncio.create_task(session_memory.run())
         peer_notifier = getattr(app_inst.state, "peer_notifier", None)
         peer_notifications = (
             asyncio.create_task(peer_notifier.run()) if peer_notifier is not None else None
@@ -1901,6 +1914,12 @@ def create_app(
                 publication_cleanup.cancel()
                 with suppress(asyncio.CancelledError):
                     await publication_cleanup
+            if session_memory_task is not None:
+                session_memory_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await session_memory_task
+            if session_memory is not None:
+                await session_memory.aclose()
             inference_proxy = getattr(app_inst.state, "inference_proxy", None)
             if inference_proxy is not None:
                 await inference_proxy.aclose()
@@ -3540,7 +3559,9 @@ def create_app(
     from omnigent.server.routes.session_search import create_session_search_router
 
     app.include_router(
-        create_session_search_router(conversation_store, permission_store, auth_provider),
+        create_session_search_router(
+            conversation_store, permission_store, auth_provider, session_memory
+        ),
         prefix="/v1",
         tags=["sessions"],
     )

@@ -5,6 +5,7 @@ import {
   FolderTreeIcon,
   FileDiffIcon,
   GitPullRequestIcon,
+  BrainIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
@@ -65,6 +66,7 @@ import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
+import { SessionMemoryPanel } from "./SessionMemoryPanel";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
@@ -653,6 +655,8 @@ interface WorkspacePanelProps {
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
+  /** Whether the Memory tab is available — the server has session memory enabled. */
+  showMemoryTab?: boolean;
   /** Reveal the workspace after a Browser tab is opened by a global shortcut. */
   onBrowserTabOpened?: () => void;
   /** Count of changed files, shown as the Changes tab badge. */
@@ -762,6 +766,7 @@ function WorkspacePanelImpl({
   onRightRailTabChange,
   showFilesPanel,
   showGithubTab,
+  showMemoryTab = false,
   showBrowserTab,
   onBrowserTabOpened,
   changedCount,
@@ -1007,6 +1012,7 @@ function WorkspacePanelImpl({
   const tabOrder = [defaultTab, ...defaultWorkspaceTabs.filter((tab) => tab !== defaultTab)];
   const visiblePermanentTabs: RightRailTab[] = tabOrder.filter((tab) => {
     if (tab === "subagents") return true;
+    if (tab === "memory") return !pending && showMemoryTab;
     if (tab === "github") return pending || showGithubTab;
     return pending || showFilesPanel;
   });
@@ -1039,6 +1045,7 @@ function WorkspacePanelImpl({
   const browserFallbackTab =
     tabOrder.find((tab) => {
       if (tab === "subagents") return true;
+      if (tab === "memory") return showMemoryTab;
       if (tab === "github") return showGithubTab;
       return showFilesPanel;
     }) ?? "subagents";
@@ -1131,6 +1138,20 @@ function WorkspacePanelImpl({
           >
             {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
           </span>
+        </TabsTrigger>
+      </WorkspaceTabTooltip>
+    ),
+    memory: !pending && showMemoryTab && (
+      <WorkspaceTabTooltip key="memory" label="Memory" shortcut={shortcutFor("memory")}>
+        <TabsTrigger
+          value="memory"
+          aria-label="Memory"
+          aria-keyshortcuts={shortcutFor("memory")}
+          data-workspace-tab="memory"
+          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+        >
+          <BrainIcon />
+          <span className="sr-only">Memory</span>
         </TabsTrigger>
       </WorkspaceTabTooltip>
     ),
@@ -1465,6 +1486,8 @@ function WorkspacePanelImpl({
             <PullRequestPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+          ) : rightRailTab === "memory" && showMemoryTab && rootSessionId ? (
+            <SessionMemoryPanel rootSessionId={rootSessionId} />
           ) : (
             showFilesPanel && (
               <FilesPanel

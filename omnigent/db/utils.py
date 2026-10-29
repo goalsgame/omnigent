@@ -644,6 +644,50 @@ def drop_session_search_index(connection: Connection) -> None:
         connection.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index}"))
 
 
+def ensure_session_memory_vectors(engine: Engine, dimensions: int) -> None:
+    """
+    Give session memory entries a pgvector embedding column of *dimensions*.
+
+    Creates the ``vector`` extension, the column and its HNSW cosine index.
+    A column of another dimension is replaced, leaving every entry to be
+    embedded again.
+
+    :param engine: The PostgreSQL engine holding ``session_memory_entries``.
+    :param dimensions: Embedding size, 1 to 2000.
+    :raises ValueError: When *dimensions* is out of range or the database is
+        not PostgreSQL.
+    """
+    from omnigent.db.db_models import SESSION_MEMORY_EMBEDDING_INDEX as index
+
+    if engine.dialect.name != "postgresql":
+        raise ValueError("Session memory embeddings require PostgreSQL with pgvector")
+    if type(dimensions) is not int or not 1 <= dimensions <= 2000:
+        raise ValueError("Session memory embedding dimensions must be between 1 and 2000")
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        current = connection.execute(
+            text(
+                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = to_regclass('session_memory_entries') "
+                "AND attname = 'embedding' AND NOT attisdropped"
+            )
+        ).scalar()
+        wanted = f"vector({dimensions})"
+        if current is not None and current != wanted:
+            connection.execute(text("ALTER TABLE session_memory_entries DROP COLUMN embedding"))
+            current = None
+        if current is None:
+            connection.execute(
+                text(f"ALTER TABLE session_memory_entries ADD COLUMN embedding {wanted}")
+            )
+        connection.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS {index} ON session_memory_entries "
+                "USING hnsw (embedding vector_cosine_ops)"
+            )
+        )
+
+
 def _set_alembic_database_url(config: Config, db_uri: str) -> None:
     """Store a database URL safely in Alembic's ConfigParser-backed config."""
     config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))

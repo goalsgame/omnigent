@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Query, Request
 
@@ -19,6 +19,9 @@ from omnigent.stores.conversation_store.session_search import (
     SessionSearchHit,
 )
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.session_memory import SessionMemory
 
 _SESSION_ID = re.compile(r"^[a-f0-9]{32}$")
 _MAX_QUERY_CHARS = 500
@@ -41,6 +44,16 @@ def _hit(hit: SessionSearchHit) -> dict[str, Any]:
             }
             for match in hit.matches
         ],
+        "memories": [
+            {
+                "kind": memory.kind,
+                "text": memory.text,
+                "item_ids": memory.item_ids,
+                "created_at": memory.created_at,
+                "similarity": memory.similarity,
+            }
+            for memory in hit.memories
+        ],
     }
 
 
@@ -55,9 +68,18 @@ def create_session_search_router(
     conversations: ConversationStore,
     permissions: PermissionStore | None,
     auth: AuthProvider | None,
+    memory: SessionMemory | None = None,
 ) -> APIRouter:
-    """Expose people's session search and the audience-limited agent search."""
+    """Expose session search, the audience-limited agent search and session digests."""
     router = APIRouter()
+
+    async def semantic(query: str) -> dict[str, Any]:
+        if memory is None:
+            return {}
+        return {
+            "query_embedding": await memory.embed_query(query),
+            "min_similarity": memory.config.min_similarity,
+        }
 
     def root_of(session_id: str) -> str:
         current = conversations.get_conversation(session_id)
@@ -95,7 +117,11 @@ def create_session_search_router(
         user = require_user(request, auth)
         query = _query(q)
         hits = await asyncio.to_thread(
-            conversations.search_sessions, query, principals(user), limit=limit
+            conversations.search_sessions,
+            query,
+            principals(user),
+            limit=limit,
+            **await semantic(query),
         )
         return {"object": "list", "data": [_hit(hit) for hit in hits], "has_more": False}
 
@@ -126,7 +152,35 @@ def create_session_search_router(
             audience=members,
             exclude_session_id=root,
             limit=limit,
+            **await semantic(query),
         )
         return {"object": "list", "data": [_hit(hit) for hit in hits], "has_more": False}
+
+    @router.get("/sessions/{session_id}/digest")
+    async def get_session_digest(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        The decisions, discussions, open questions and tangents of a session.
+
+        Sub-agent sessions return their top-level session's digest. Message
+        references in ``item_ids`` belong to the top-level session.
+        """
+        user = require_user(request, auth)
+        if memory is None or not _SESSION_ID.fullmatch(session_id):
+            raise OmnigentError("Session digest not found", code=ErrorCode.NOT_FOUND)
+        await require_access(user, session_id, LEVEL_READ, permissions, conversations)
+        root = await asyncio.to_thread(root_of, session_id)
+        record = await asyncio.to_thread(memory.store.get, root)
+        digest = (record.digest if record is not None else None) or {}
+        return {
+            "object": "session.digest",
+            "session_id": root,
+            "status": record.status if record is not None else "pending",
+            "summary": digest.get("summary", ""),
+            "topics": digest.get("topics", []),
+            "entries": digest.get("entries", []),
+            "model": record.model if record is not None else None,
+            "updated_at": record.updated_at if record is not None else None,
+            "error": record.error if record is not None and record.status == "failed" else None,
+        }
 
     return router

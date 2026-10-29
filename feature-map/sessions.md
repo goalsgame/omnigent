@@ -72,9 +72,17 @@ the header menu), and each place is a separate entry point.
   Shared sessions ask you to confirm everyone who will be able to use the access.
 
 - **Session search:** type in ⌘K. Best matches ranks the sessions you can read
-  by title and message text; Sessions below keeps the substring list. When the
-  deployment sets `OMNIGENT_SESSION_SEARCH_TOOL=1`, agents get `search_sessions`,
-  which only returns sessions everyone in the current session can read.
+  by title, message text and, with session memory, digest entries matched by
+  meaning, so a question like "why did we pick gVisor" finds the decision.
+  Sessions below keeps the substring list. When the deployment sets
+  `OMNIGENT_SESSION_SEARCH_TOOL=1`, agents get `search_sessions`, which only
+  returns sessions everyone in the current session can read.
+
+- **Session memory:** when the operator configures
+  [session memory](../docs/session-memory.md), the workspace rail's Memory tab
+  shows a quiet session's summary, decisions (with why and what was rejected),
+  discussions, open questions and tangents, each linking to the messages it
+  cites.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
@@ -386,6 +394,14 @@ binding; and `tests/db/test_migration_session_search_index.py` for the index
 migration. Run the store and migration tests with `OMNIGENT_TEST_DB_URI` set to
 a PostgreSQL database to exercise the full-text path. Palette coverage is
 `web/src/shell/CommandPalette.test.tsx`.
+
+Session memory is covered by `tests/stores/test_session_memory.py` (claiming,
+progressive transcripts, backoff, deletion, word and pgvector matching with
+permissions) and `tests/server/test_session_memory.py` (config, digest
+validation and citations, the worker against a fake Vertex AI, the digest route
+and startup). Run both with `OMNIGENT_TEST_DB_URI` pointing at PostgreSQL with
+pgvector. The Memory tab is covered by
+`web/src/shell/SessionMemoryPanel.test.tsx`.
 
 ## Gotchas
 
