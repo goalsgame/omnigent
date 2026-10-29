@@ -51,6 +51,9 @@ export const PIN_WRITE_MUTATION_KEY = ["pin-write"] as const;
  */
 export const ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at";
 
+/** Query-key prefix of the ranked message search results (`useSessionSearch`). */
+export const SESSION_SEARCH_KEY = ["session-search"] as const;
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;

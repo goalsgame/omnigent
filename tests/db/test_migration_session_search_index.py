@@ -9,7 +9,12 @@ import sqlalchemy as sa
 from alembic import command
 
 from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX
-from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
+from omnigent.db.utils import (
+    _build_alembic_config,
+    _ensure_conversation_tables,
+    clear_engine_cache,
+    get_or_create_engine,
+)
 
 _REVISION = "of1b2c3d4e5f"
 _PREVIOUS = "oe1b2c3d4e5f"
@@ -60,3 +65,18 @@ def test_migration_builds_a_valid_index_on_postgres(db_uri: str) -> None:
             {"name": CONVERSATION_ITEMS_SEARCH_INDEX},
         ).scalar_one()
     assert valid
+
+
+def test_conversation_bootstrap_adds_the_index_to_an_existing_postgres_table(db_uri: str) -> None:
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL full-text index")
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(
+            sa.text(f"DROP INDEX CONCURRENTLY IF EXISTS {CONVERSATION_ITEMS_SEARCH_INDEX}")
+        )
+    assert CONVERSATION_ITEMS_SEARCH_INDEX not in _indexes(engine)
+
+    _ensure_conversation_tables(engine)
+
+    assert CONVERSATION_ITEMS_SEARCH_INDEX in _indexes(engine)

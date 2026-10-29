@@ -25,7 +25,7 @@ TEXT_SEARCH_CONFIG = "english"
 INDEXED_TEXT_CHARS = 100_000
 MAX_SESSIONS = 50
 MAX_MATCHES_PER_SESSION = 3
-_CANDIDATE_ITEMS = 400
+_CANDIDATE_ITEMS = MAX_SESSIONS * MAX_MATCHES_PER_SESSION
 _STATEMENT_TIMEOUT_MS = 15_000
 _TERM = re.compile(r"\w+", re.UNICODE)
 _OPERATORS = frozenset({"or", "and", "not"})
@@ -229,13 +229,16 @@ class SessionSearch:
                 title_match = and_(*(root.title.ilike(f"%{term}%") for term in terms))
                 title_rank = cast(ColumnElement[Any], root.updated_at)
 
-            items = session.execute(
+            matched = (
                 select(
-                    SqlConversationItem.id,
-                    SqlConversationItem.conversation_id,
-                    SqlConversationItem.created_at,
-                    root.id,
-                    item_rank,
+                    SqlConversationItem.id.label("item_id"),
+                    SqlConversationItem.conversation_id.label("conversation_id"),
+                    SqlConversationItem.created_at.label("created_at"),
+                    root.id.label("root_id"),
+                    item_rank.label("rank"),
+                    func.row_number()
+                    .over(partition_by=root.id, order_by=item_rank.desc())
+                    .label("per_session"),
                 )
                 .join(
                     item_conv,
@@ -257,7 +260,18 @@ class SessionSearch:
                     item_match,
                     *root_filters,
                 )
-                .order_by(item_rank.desc())
+                .subquery()
+            )
+            items = session.execute(
+                select(
+                    matched.c.item_id,
+                    matched.c.conversation_id,
+                    matched.c.created_at,
+                    matched.c.root_id,
+                    matched.c.rank,
+                )
+                .where(matched.c.per_session <= MAX_MATCHES_PER_SESSION)
+                .order_by(matched.c.rank.desc())
                 .limit(_CANDIDATE_ITEMS)
             ).all()
             titles = session.execute(
@@ -275,9 +289,7 @@ class SessionSearch:
             ):
                 weight = 1.0 / (1 + position)
                 scores[root_id] = scores.get(root_id, 0.0) + weight
-                chosen = picked.setdefault(root_id, [])
-                if len(chosen) < MAX_MATCHES_PER_SESSION:
-                    chosen.append((item_id, conversation_id, created_at))
+                picked.setdefault(root_id, []).append((item_id, conversation_id, created_at))
             for position, (root_id, _rank) in enumerate(titles):
                 title_hits.add(root_id)
                 scores[root_id] = scores.get(root_id, 0.0) + 2.0 / (1 + position)

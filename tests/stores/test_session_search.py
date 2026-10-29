@@ -189,3 +189,15 @@ def test_postgres_search_uses_the_partial_text_index(conversation_store, db_uri)
             row[0] for row in connection.exec_driver_sql(f"EXPLAIN {compiled}", compiled.params)
         )
     assert CONVERSATION_ITEMS_SEARCH_INDEX in plan
+
+
+def test_a_long_session_does_not_crowd_out_other_matches(stores) -> None:
+    store, perms = stores
+    long = _session(store, "Long", *(f"pool pool pool reading {n}" for n in range(450)))
+    short = _session(store, "Short", "pool once")
+    perms.grant(ALICE, long, 4)
+    perms.grant(ALICE, short, 4)
+
+    hits = store.search_sessions("pool", (ALICE,), limit=8)
+    assert set(_ids(hits)) == {long, short}
+    assert all(len(hit.matches) <= 3 for hit in hits)

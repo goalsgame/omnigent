@@ -9,10 +9,10 @@ built concurrently so writers are not blocked.
 
 from __future__ import annotations
 
-import sqlalchemy as sa
 from alembic import op
 
 from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX
+from omnigent.db.utils import ensure_session_search_index
 
 revision = "of1b2c3d4e5f"
 down_revision = "oe1b2c3d4e5f"
@@ -29,25 +29,7 @@ def upgrade() -> None:
     if not _is_postgres():
         return
     with op.get_context().autocommit_block():
-        invalid = (
-            op.get_bind()
-            .execute(
-                sa.text(
-                    "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-                    "WHERE c.relname = :name AND NOT i.indisvalid"
-                ),
-                {"name": CONVERSATION_ITEMS_SEARCH_INDEX},
-            )
-            .scalar()
-        )
-        if invalid:
-            op.execute(f"DROP INDEX CONCURRENTLY {CONVERSATION_ITEMS_SEARCH_INDEX}")
-        op.execute(
-            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {CONVERSATION_ITEMS_SEARCH_INDEX} "
-            "ON conversation_items USING gin "
-            "(to_tsvector('english', left(search_text, 100000))) "
-            "WHERE type IN (1, 6)"
-        )
+        ensure_session_search_index(op.get_bind())
 
 
 def downgrade() -> None:

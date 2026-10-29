@@ -1,5 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { isAbortTimeout, isSessionArchiving, isSessionDeleting } from "@/hooks/useConversations";
 import { authenticatedFetch } from "@/lib/identity";
+import { SESSION_SEARCH_KEY } from "@/lib/sessionListCache";
 
 export interface SessionSearchMatch {
   item_id: string;
@@ -25,9 +27,13 @@ const MIN_QUERY_LENGTH = 2;
 export function useSessionSearch(query: string, { enabled = true }: { enabled?: boolean } = {}) {
   const q = query.trim();
   return useQuery({
-    queryKey: ["session-search", q],
+    queryKey: [...SESSION_SEARCH_KEY, q],
     enabled: enabled && q.length >= MIN_QUERY_LENGTH,
-    staleTime: 30_000,
+    retry: (failureCount, error) => !isAbortTimeout(error) && failureCount < 3,
+    select: (hits: SessionSearchHit[]) =>
+      hits.filter(
+        (hit) => !isSessionDeleting(hit.session_id) && !isSessionArchiving(hit.session_id),
+      ),
     queryFn: async () => {
       const params = new URLSearchParams({ q, limit: "8" });
       const response = await authenticatedFetch(`/v1/sessions/search?${params.toString()}`, {

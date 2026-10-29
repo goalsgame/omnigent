@@ -45,6 +45,7 @@ import {
   PROJECT_LABEL_KEY,
   recentlyCreatedSessions,
   removeIdsFromPages,
+  SESSION_SEARCH_KEY,
   unmarkRecentlyCreated,
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -96,7 +97,7 @@ export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
  * (React Query's default), turning one hung spinner into a retry storm. A real
  * server/network error still retries normally.
  */
-function isAbortTimeout(error: unknown): boolean {
+export function isAbortTimeout(error: unknown): boolean {
   return error instanceof DOMException && error.name === "TimeoutError";
 }
 
@@ -939,6 +940,7 @@ async function paintConversationsArchived(
   ]);
   const marked = archived ? markSessionsArchiving(ids) : undefined;
   if (!archived) unmarkSessionsArchiving(ids);
+  queryClient.removeQueries({ queryKey: SESSION_SEARCH_KEY });
   const snapshot = snapshotArchiveLists(queryClient);
   for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
   if (archived) dropFromPinnedCache(queryClient, ids);
@@ -1059,6 +1061,7 @@ async function paintConversationsDeleted(
   ids: readonly string[],
 ): Promise<DeletedListsSnapshot> {
   markSessionsDeleting(ids);
+  queryClient.removeQueries({ queryKey: SESSION_SEARCH_KEY });
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
@@ -1120,6 +1123,7 @@ function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly st
     queryClient.removeQueries({ queryKey: ["session", id] });
   }
   expireSessionsDeleting([...ids]);
+  queryClient.removeQueries({ queryKey: SESSION_SEARCH_KEY });
   // Deleting the last member of a project empties it, so refresh the
   // project list to drop the now-empty folder. Unlike the conversations
   // list, /v1/sessions/projects reads the DB directly (no search-index

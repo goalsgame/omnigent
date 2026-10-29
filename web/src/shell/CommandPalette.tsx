@@ -368,9 +368,24 @@ export function CommandPalette({
                 )}
               </p>
             )}
+            {!sessionsOnly && ranked.isError && debouncedQuery.trim() && (
+              <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
+                Couldn't search messages.
+                <button
+                  type="button"
+                  className="ml-2 underline"
+                  disabled={ranked.isFetching}
+                  onClick={() => void ranked.refetch()}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
             {!loadError && !(sessionsOnly && isFetching) && (
               <CommandEmpty>
-                {isFetching && debouncedQuery ? "Searching…" : "No results found"}
+                {(isFetching || ranked.isFetching) && debouncedQuery
+                  ? "Searching…"
+                  : "No results found"}
               </CommandEmpty>
             )}
             {bestMatches.length > 0 && (

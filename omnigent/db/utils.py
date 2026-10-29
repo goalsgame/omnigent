@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
@@ -527,6 +527,40 @@ def _ensure_conversation_tables(engine: Engine) -> None:
         else:
             ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
         ensure_fts_table(engine)
+        if isinstance(engine, Engine) and engine.dialect.name == "postgresql":
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+                ensure_session_search_index(connection)
+
+
+def ensure_session_search_index(connection: Connection) -> None:
+    """
+    Build the PostgreSQL session-search index if it is missing or invalid.
+
+    ``create_all`` skips indexes on tables that already exist, so databases
+    bootstrapped outside Alembic need this too.
+
+    :param connection: An autocommit PostgreSQL connection, since the index is
+        built ``CONCURRENTLY``.
+    """
+    from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX
+
+    invalid = connection.execute(
+        text(
+            "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = :name AND NOT i.indisvalid"
+        ),
+        {"name": CONVERSATION_ITEMS_SEARCH_INDEX},
+    ).scalar()
+    if invalid:
+        connection.execute(text(f"DROP INDEX CONCURRENTLY {CONVERSATION_ITEMS_SEARCH_INDEX}"))
+    connection.execute(
+        text(
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {CONVERSATION_ITEMS_SEARCH_INDEX} "
+            "ON conversation_items USING gin "
+            "(to_tsvector('english', left(search_text, 100000))) "
+            "WHERE type IN (1, 6)"
+        )
+    )
 
 
 def _set_alembic_database_url(config: Config, db_uri: str) -> None:

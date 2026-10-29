@@ -387,6 +387,31 @@ describe("CommandPalette — best matches", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c1");
   });
 
+  it("reports a running message search and offers retry when it fails", () => {
+    const refetch = vi.fn();
+    useSessionSearch.mockReturnValue({ data: undefined, isFetching: true });
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "pool" } });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    expect(screen.getByText("Searching…")).toBeTruthy();
+
+    useSessionSearch.mockReturnValue({
+      data: undefined,
+      isError: true,
+      isFetching: false,
+      refetch,
+    });
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "pools" } });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    expect(screen.getByText("Couldn't search messages.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalled();
+  });
+
   it("does not run message search in the session switcher", () => {
     renderPalette({ sessionsOnly: true });
     expect(useSessionSearch).toHaveBeenLastCalledWith("", { enabled: false });
