@@ -16,6 +16,7 @@ short polling deadline — the same shape as the host-tunnel route tests'
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -55,6 +56,7 @@ class _RecordingStore:
         self.pending_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
+        self.message_roles: dict[str, list[str]] = {}
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -68,6 +70,10 @@ class _RecordingStore:
 
     def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
         self.clears.append((runner_id, not_after))
+
+    def list_items(self, conversation_id: str, **_: object) -> SimpleNamespace:
+        roles = self.message_roles.get(conversation_id, ["user"])
+        return SimpleNamespace(data=[SimpleNamespace(data=SimpleNamespace(role=r)) for r in roles])
 
 
 @pytest.fixture()
@@ -330,6 +336,21 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
     run_id, status, error, error_code = sched.update_calls[0]
     assert (run_id, status) == ("run_1", "succeeded")
     assert error is None and error_code is None
+
+
+def test_scheduled_run_completion_waits_for_the_prompt() -> None:
+    """An idle edge before the scheduled prompt arrived leaves the run running."""
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    conversations = _RecordingStore()
+    conversations.message_roles["conv_1"] = []
+    session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(sched.lookup_calls))
+        session_live_state.submit("barrier", lambda: None).result(timeout=5)
+    finally:
+        session_live_state.configure(None)
+    assert sched.update_calls == []
 
 
 def test_scheduled_run_completion_failed_carries_error_code() -> None:

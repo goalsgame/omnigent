@@ -1342,6 +1342,34 @@ def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, 
     return task_id, run_id
 
 
+def _conversation_with_prompt(db_uri: str, *, prompt: bool = True) -> str:
+    """Create a conversation, holding the scheduled prompt unless ``prompt`` is false."""
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    if prompt:
+        _append_prompt(db_uri, conv.id)
+    return conv.id
+
+
+def _append_prompt(db_uri: str, conversation_id: str) -> None:
+    """Store the scheduled prompt as the conversation's user message."""
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    SqlAlchemyConversationStore(db_uri).append(
+        conversation_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_0",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "p"}]),
+            )
+        ],
+    )
+
+
 def _wait_for_run_status(
     db_uri: str, task_id: str, run_id: str, want: str, timeout_s: float = 10.0
 ):  # type: ignore[no-untyped-def]
@@ -1384,7 +1412,6 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     is synchronous (the hook write lands on session_live_state's background
     executor, polled below) — no awaits needed.
     """
-    import uuid
 
     from omnigent.server import session_live_state
     from omnigent.server.routes.sessions import _publish_status, _session_status_cache
@@ -1393,7 +1420,7 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
         SqlAlchemyScheduledTaskStore,
     )
 
-    conv_id = uuid.uuid4().hex
+    conv_id = _conversation_with_prompt(db_uri)
     task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
 
     session_live_state.configure(
@@ -1417,7 +1444,6 @@ async def test_publish_status_idle_after_cache_loss_completes_run(
     db_uri: str,
 ) -> None:
     """Run completion still works after a restart loses cached session status."""
-    import uuid
 
     from omnigent.server import session_live_state
     from omnigent.server.routes.sessions import _publish_status, _session_status_cache
@@ -1426,7 +1452,7 @@ async def test_publish_status_idle_after_cache_loss_completes_run(
         SqlAlchemyScheduledTaskStore,
     )
 
-    conv_id = uuid.uuid4().hex
+    conv_id = _conversation_with_prompt(db_uri)
     task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
     session_live_state.configure(
         SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
@@ -1445,7 +1471,6 @@ async def test_publish_status_idle_after_cache_loss_completes_run(
 
 async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> None:
     """An idle that follows ``waiting`` (e.g. Stop while parked) completes the run."""
-    import uuid
 
     from omnigent.server import session_live_state
     from omnigent.server.routes.sessions import _publish_status, _session_status_cache
@@ -1454,7 +1479,7 @@ async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> N
         SqlAlchemyScheduledTaskStore,
     )
 
-    conv_id = uuid.uuid4().hex
+    conv_id = _conversation_with_prompt(db_uri)
     task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
     session_live_state.configure(
         SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
@@ -1469,6 +1494,40 @@ async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> N
 
     assert row is not None
     assert row.status == "succeeded"
+
+
+async def test_publish_status_idle_before_the_prompt_does_not_complete_run(db_uri: str) -> None:
+    """A native session's idle at terminal start, before its prompt, is no finished turn."""
+    import time
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = _conversation_with_prompt(db_uri, prompt=False)
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        _publish_status(conv_id, "idle")
+        session_live_state.submit("barrier", lambda: None).result(timeout=10)
+        early = _wait_for_run_status(db_uri, task_id, run_id, "running", timeout_s=1)
+        assert early is not None and early.status == "running"
+        _append_prompt(db_uri, conv_id)
+        _publish_status(conv_id, "running")
+        _publish_status(conv_id, "idle")
+        done = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert done is not None
+    assert done.status == "succeeded"
+    assert done.finished_at is not None and done.finished_at >= int(time.time()) - 60
 
 
 async def test_patch_pinning_host_on_managed_task_is_rejected(

@@ -248,6 +248,10 @@ def persist_scheduled_run_completion(
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
+        if run_status == "succeeded" and not _has_user_message(conversation_id):
+            # A native session reports idle when its terminal starts, before
+            # the scheduled prompt reaches it; that is not a finished turn.
+            return
         store.update_run(
             run.id,
             status=run_status,
@@ -257,6 +261,15 @@ def persist_scheduled_run_completion(
         )
 
     submit("scheduled_run_completion", _transition)
+
+
+def _has_user_message(conversation_id: str) -> bool:
+    """Whether the conversation holds a user message, such as its scheduled prompt."""
+    conversations = _store
+    if conversations is None:
+        return True
+    page = conversations.list_items(conversation_id, limit=10, type="message")
+    return any(getattr(item.data, "role", None) == "user" for item in page.data)
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:
