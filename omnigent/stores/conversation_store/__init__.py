@@ -967,6 +967,7 @@ class ConversationStore(ABC):
         limit: int = 20,
         query_embedding: Any = None,
         min_similarity: float = 0.0,
+        memory: bool = False,
     ) -> list[Any]:
         """
         Rank the top-level sessions *principals* may read by title, message text and digest.
@@ -987,9 +988,9 @@ class ConversationStore(ABC):
         """
         raise NotImplementedError("This conversation store does not support session memory")
 
-    def ensure_session_memory_vectors(self, dimensions: int) -> None:
+    def ensure_session_memory_vectors(self, dimensions: int, model: str) -> None:
         """
-        Prepare vector storage for session memory embeddings of *dimensions*.
+        Prepare vector storage for session memory embeddings of *dimensions* from *model*.
 
         :raises NotImplementedError: When the backend has no session memory.
         """

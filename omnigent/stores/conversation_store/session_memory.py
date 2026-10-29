@@ -277,10 +277,13 @@ class SessionMemoryStore:
         model: str,
         now: int,
     ) -> None:
-        """Replace the digest and its entries and release the lease."""
+        """Replace the digest and its entries and release the lease, unless the session is gone."""
 
         def save(session: Session) -> None:
             workspace = current_workspace_id()
+            claimed = session.get(SqlSessionDigest, (workspace, session_id), with_for_update=True)
+            if claimed is None or session.get(SqlConversation, (workspace, session_id)) is None:
+                return
             session.execute(
                 delete(SqlSessionMemoryEntry).where(
                     SqlSessionMemoryEntry.workspace_id == workspace,
@@ -396,17 +399,21 @@ class SessionMemoryStore:
         self._write("session_memory_set_embedding", store)
 
     def delete_for(self, session: Session, session_ids: Sequence[str]) -> None:
-        """Delete digests and entries for *session_ids* inside the caller's transaction."""
+        """
+        Delete digests and entries for *session_ids* inside the caller's transaction.
+
+        Digests must be deleted before entries; an in-flight :meth:`save` holds the digest row.
+        """
         workspace = current_workspace_id()
-        session.execute(
-            delete(SqlSessionMemoryEntry).where(
-                SqlSessionMemoryEntry.workspace_id == workspace,
-                SqlSessionMemoryEntry.conversation_id.in_(session_ids),
-            )
-        )
         session.execute(
             delete(SqlSessionDigest).where(
                 SqlSessionDigest.workspace_id == workspace,
                 SqlSessionDigest.conversation_id.in_(session_ids),
+            )
+        )
+        session.execute(
+            delete(SqlSessionMemoryEntry).where(
+                SqlSessionMemoryEntry.workspace_id == workspace,
+                SqlSessionMemoryEntry.conversation_id.in_(session_ids),
             )
         )

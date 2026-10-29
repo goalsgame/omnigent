@@ -239,7 +239,8 @@ class SessionSearch:
         root: Any,
         root_filters: Sequence[ColumnElement[bool]],
         terms: Sequence[str],
-        any_term: ColumnElement[Any] | None,
+        tsquery: ColumnElement[Any] | None,
+        require_all: bool,
         query_embedding: Sequence[float] | None,
         min_similarity: float,
     ) -> list[tuple[str, SessionMemoryMatch]]:
@@ -280,12 +281,15 @@ class SessionSearch:
                 similarities[row.id] = score
                 scores[row.id] = 1.0 / (_RRF_K + position)
         if terms:
-            if any_term is not None:
+            if tsquery is not None:
                 vector = func.to_tsvector(literal_column(f"'{TEXT_SEARCH_CONFIG}'"), entry.text)
-                match: ColumnElement[bool] = vector.op("@@")(any_term)
-                rank: ColumnElement[Any] = func.ts_rank_cd(vector, any_term)
+                match: ColumnElement[bool] = vector.op("@@")(tsquery)
+                rank: ColumnElement[Any] = func.ts_rank_cd(vector, tsquery)
             else:
-                match = or_(*(entry.text.ilike(_contains(term), escape="\\") for term in terms))
+                combine = and_ if require_all else or_
+                match = combine(
+                    *(entry.text.ilike(_contains(term), escape="\\") for term in terms)
+                )
                 rank = cast(ColumnElement[Any], entry.created_at)
             matching = session.execute(
                 base.where(match).order_by(rank.desc()).limit(_MEMORY_CANDIDATES)
@@ -330,6 +334,7 @@ class SessionSearch:
         limit: int = 20,
         query_embedding: Sequence[float] | None = None,
         min_similarity: float = 0.0,
+        memory: bool = False,
     ) -> list[SessionSearchHit]:
         """
         Rank top-level sessions whose title, messages or digest match *query*.
@@ -340,8 +345,10 @@ class SessionSearch:
         sessions count toward their top-level session.
 
         A plain-language query that matches too few sessions with every word
-        is widened to messages containing any of its words. Digest entries
-        match by any word and, with *query_embedding*, by meaning.
+        is widened to messages containing any of its words; sessions with a
+        full match still rank first. With *memory*, digest entries match too:
+        by any word and, with *query_embedding*, by meaning for plain-language
+        queries, and by the query's own syntax otherwise.
 
         :param query: Web-search style text, e.g. ``'"warm pool" -staging'``,
             or a question such as ``"why did we pick gVisor"``.
@@ -354,6 +361,7 @@ class SessionSearch:
         :param query_embedding: Embedding of *query* for semantic matching of
             digest entries. PostgreSQL with session memory vectors only.
         :param min_similarity: Lowest cosine similarity a semantic match needs.
+        :param memory: Whether session memory is enabled, so digest entries match.
         :returns: Hits in descending relevance.
         """
         query = query.strip()
@@ -394,15 +402,18 @@ class SessionSearch:
                     text(f"SET LOCAL statement_timeout = {int(_STATEMENT_TIMEOUT_MS)}")
                 )
 
+            natural = is_natural_language(query)
             items: list[Any] = []
+            widened: list[Any] = []
             titles: list[Any] = []
             headline_query: ColumnElement[Any] | None = None
-            any_term: ColumnElement[Any] | None = None
+            memory_query: ColumnElement[Any] | None = None
             if terms and postgres:
                 config = literal_column(f"'{TEXT_SEARCH_CONFIG}'")
                 tsquery = func.websearch_to_tsquery(config, query)
                 any_term = func.to_tsquery(config, " | ".join(terms))
                 headline_query = tsquery
+                memory_query = any_term if natural else tsquery
                 vector = tsvector_expression(SqlConversationItem.search_text)
                 items = self._items(
                     session,
@@ -412,22 +423,19 @@ class SessionSearch:
                     func.ts_rank_cd(vector, tsquery),
                     root_filters,
                 )
-                if (
-                    len(terms) > 1
-                    and is_natural_language(query)
-                    and len({row.root_id for row in items}) < limit
-                ):
+                if len(terms) > 1 and natural and len({row.root_id for row in items}) < limit:
                     seen = {(row.conversation_id, row.item_id) for row in items}
-                    widened = self._items(
-                        session,
-                        root,
-                        item_conv,
-                        vector.op("@@")(any_term),
-                        func.ts_rank_cd(vector, any_term),
-                        root_filters,
-                    )
-                    items += [
-                        row for row in widened if (row.conversation_id, row.item_id) not in seen
+                    widened = [
+                        row
+                        for row in self._items(
+                            session,
+                            root,
+                            item_conv,
+                            vector.op("@@")(any_term),
+                            func.ts_rank_cd(vector, any_term),
+                            root_filters,
+                        )
+                        if (row.conversation_id, row.item_id) not in seen
                     ]
                     headline_query = any_term
                 title_vector = func.to_tsvector(config, root.title)
@@ -462,37 +470,48 @@ class SessionSearch:
                     .order_by(title_order.desc())
                     .limit(MAX_SESSIONS)
                 ).all()
-            memories = self._memories(
-                session,
-                root,
-                root_filters,
-                terms,
-                any_term,
-                query_embedding if postgres else None,
-                min_similarity,
+            memories = (
+                self._memories(
+                    session,
+                    root,
+                    root_filters,
+                    terms,
+                    memory_query,
+                    not natural,
+                    query_embedding if postgres and natural else None,
+                    min_similarity,
+                )
+                if memory
+                else []
             )
 
             scores: dict[str, float] = {}
+            widened_scores: dict[str, float] = {}
             title_hits: set[str] = set()
             picked: dict[str, list[tuple[str, str, int]]] = {}
             per_session: dict[str, int] = {}
-            position = 0
-            for item_id, conversation_id, created_at, root_id, _rank in items:
-                if per_session.get(root_id, 0) >= MAX_MATCHES_PER_SESSION:
-                    continue
-                per_session[root_id] = per_session.get(root_id, 0) + 1
-                scores[root_id] = scores.get(root_id, 0.0) + 1.0 / (1 + position)
-                position += 1
-                picked.setdefault(root_id, []).append((item_id, conversation_id, created_at))
+            for rows, tally in ((items, scores), (widened, widened_scores)):
+                position = 0
+                for item_id, conversation_id, created_at, root_id, _rank in rows:
+                    if per_session.get(root_id, 0) >= MAX_MATCHES_PER_SESSION:
+                        continue
+                    per_session[root_id] = per_session.get(root_id, 0) + 1
+                    tally[root_id] = tally.get(root_id, 0.0) + 1.0 / (1 + position)
+                    position += 1
+                    picked.setdefault(root_id, []).append((item_id, conversation_id, created_at))
             for position, (root_id, _rank) in enumerate(titles):
                 title_hits.add(root_id)
                 scores[root_id] = scores.get(root_id, 0.0) + 2.0 / (1 + position)
             remembered: dict[str, list[SessionMemoryMatch]] = {}
-            for root_id, memory in memories:
+            for root_id, match in memories:
                 if root_id not in remembered:
                     scores[root_id] = scores.get(root_id, 0.0) + 3.0 / (1 + len(remembered))
-                remembered.setdefault(root_id, []).append(memory)
-            ranked = sorted(scores, key=lambda root_id: scores[root_id], reverse=True)[:limit]
+                remembered.setdefault(root_id, []).append(match)
+            ranked = sorted(
+                scores.keys() | widened_scores.keys(),
+                key=lambda root_id: (scores.get(root_id, 0.0), widened_scores.get(root_id, 0.0)),
+                reverse=True,
+            )[:limit]
             if not ranked:
                 return []
 
@@ -551,7 +570,7 @@ class SessionSearch:
                     title=row.title,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
-                    score=round(scores[root_id], 6),
+                    score=round(scores.get(root_id, 0.0) + widened_scores.get(root_id, 0.0), 6),
                     title_match=root_id in title_hits,
                     matches=[
                         SessionSearchMatch(

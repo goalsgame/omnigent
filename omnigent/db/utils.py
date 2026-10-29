@@ -644,16 +644,22 @@ def drop_session_search_index(connection: Connection) -> None:
         connection.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index}"))
 
 
-def ensure_session_memory_vectors(engine: Engine, dimensions: int) -> None:
-    """
-    Give session memory entries a pgvector embedding column of *dimensions*.
+_SESSION_MEMORY_LOCK = 0x6F6D6E69676D656D
 
-    Creates the ``vector`` extension, the column and its HNSW cosine index.
-    A column of another dimension is replaced, leaving every entry to be
-    embedded again.
+
+def ensure_session_memory_vectors(engine: Engine, dimensions: int, model: str) -> None:
+    """
+    Give session memory entries a pgvector embedding column for *model*.
+
+    Creates the ``vector`` extension, a ``vector(dimensions)`` column labelled
+    with *model* and its HNSW cosine index, under an advisory lock so replicas
+    starting together do not race. When the dimensions or model differ from
+    the existing column, the column is replaced and every entry is embedded
+    again.
 
     :param engine: The PostgreSQL engine holding ``session_memory_entries``.
     :param dimensions: Embedding size, 1 to 2000.
+    :param model: Embedding model identity, e.g. ``"gemini-embedding-2"``.
     :raises ValueError: When *dimensions* is out of range or the database is
         not PostgreSQL.
     """
@@ -663,29 +669,43 @@ def ensure_session_memory_vectors(engine: Engine, dimensions: int) -> None:
         raise ValueError("Session memory embeddings require PostgreSQL with pgvector")
     if type(dimensions) is not int or not 1 <= dimensions <= 2000:
         raise ValueError("Session memory embedding dimensions must be between 1 and 2000")
+    wanted = f"vector({dimensions})"
+    label = f"{model}:{dimensions}"
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        current = connection.execute(
-            text(
-                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
-                "WHERE attrelid = to_regclass('session_memory_entries') "
-                "AND attname = 'embedding' AND NOT attisdropped"
-            )
-        ).scalar()
-        wanted = f"vector({dimensions})"
-        if current is not None and current != wanted:
-            connection.execute(text("ALTER TABLE session_memory_entries DROP COLUMN embedding"))
-            current = None
-        if current is None:
+        connection.execute(text("SELECT pg_advisory_lock(:key)"), {"key": _SESSION_MEMORY_LOCK})
+        try:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            current = connection.execute(
+                text(
+                    "SELECT format_type(atttypid, atttypmod), "
+                    "col_description(attrelid, attnum) FROM pg_attribute "
+                    "WHERE attrelid = to_regclass('session_memory_entries') "
+                    "AND attname = 'embedding' AND NOT attisdropped"
+                )
+            ).first()
+            if current is not None and tuple(current) != (wanted, label):
+                connection.execute(
+                    text("ALTER TABLE session_memory_entries DROP COLUMN embedding")
+                )
+                current = None
+            if current is None:
+                connection.execute(
+                    text(f"ALTER TABLE session_memory_entries ADD COLUMN embedding {wanted}")
+                )
+                quoted = label.replace("'", "''")
+                connection.execute(
+                    text(f"COMMENT ON COLUMN session_memory_entries.embedding IS '{quoted}'")
+                )
             connection.execute(
-                text(f"ALTER TABLE session_memory_entries ADD COLUMN embedding {wanted}")
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {index} ON session_memory_entries "
+                    "USING hnsw (embedding vector_cosine_ops)"
+                )
             )
-        connection.execute(
-            text(
-                f"CREATE INDEX IF NOT EXISTS {index} ON session_memory_entries "
-                "USING hnsw (embedding vector_cosine_ops)"
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(:key)"), {"key": _SESSION_MEMORY_LOCK}
             )
-        )
 
 
 def _set_alembic_database_url(config: Config, db_uri: str) -> None:

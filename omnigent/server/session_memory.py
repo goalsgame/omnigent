@@ -178,7 +178,11 @@ def render_transcript(
             "summary": previous.get("summary", ""),
             "topics": previous.get("topics", []),
             "entries": [
-                {key: entry[key] for key in ("kind", "title", "text", "rationale") if key in entry}
+                {
+                    key: entry[key]
+                    for key in ("kind", "title", "text", "rationale", "alternatives")
+                    if key in entry
+                }
                 | {"id": f"p{index}"}
                 for index, entry in enumerate(previous.get("entries", []), start=1)
             ],
@@ -299,7 +303,9 @@ class SessionMemory:
     async def prepare(self) -> None:
         """Create vector storage; until then only digests are written."""
         await asyncio.to_thread(
-            self._conversations.ensure_session_memory_vectors, self.config.dimensions
+            self._conversations.ensure_session_memory_vectors,
+            self.config.dimensions,
+            self.config.embeddings.model,
         )
         self._vectors = True
 

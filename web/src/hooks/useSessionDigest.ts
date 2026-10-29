@@ -28,16 +28,19 @@ export interface SessionDigest {
 
 export const SESSION_DIGEST_KEY = ["session-digest"] as const;
 
+const DIGEST_POLL_MS = 120_000;
+
 /**
  * The session's memory digest, or ``null`` when the server has session
- * memory disabled (the endpoint answers 404).
+ * memory disabled (the endpoint answers 404). With ``poll``, the digest is
+ * refreshed while the caller is mounted, since later activity rewrites it.
  */
-export function useSessionDigest(sessionId: string | null) {
+export function useSessionDigest(sessionId: string | null, { poll = false } = {}) {
   return useQuery({
     queryKey: [...SESSION_DIGEST_KEY, sessionId],
     enabled: !!sessionId,
     staleTime: 60_000,
-    refetchInterval: (query) => (query.state.data?.status === "ready" ? false : 120_000),
+    refetchInterval: (query) => (poll && query.state.data !== null ? DIGEST_POLL_MS : false),
     queryFn: async (): Promise<SessionDigest | null> => {
       const response = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(sessionId!)}/digest`,

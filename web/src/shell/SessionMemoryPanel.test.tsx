@@ -81,6 +81,39 @@ describe("SessionMemoryPanel", () => {
     expect(authenticatedFetch).toHaveBeenCalledWith(`/v1/sessions/${ROOT}/digest`);
   });
 
+  it("keeps refreshing a ready digest while open", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      respond(200, {
+        session_id: ROOT,
+        status: "ready",
+        summary: "First digest.",
+        topics: [],
+        entries: [],
+        model: "flash",
+        updated_at: 1,
+        error: null,
+      });
+      renderPanel();
+      expect(await screen.findByText("First digest.")).toBeInTheDocument();
+
+      respond(200, {
+        session_id: ROOT,
+        status: "ready",
+        summary: "Updated digest.",
+        topics: [],
+        entries: [],
+        model: "flash",
+        updated_at: 2,
+        error: null,
+      });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(await screen.findByText("Updated digest.")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("explains a pending digest", async () => {
     respond(200, {
       session_id: ROOT,

@@ -184,8 +184,10 @@ def test_digest_cites_messages_and_carries_previous_entries_forward() -> None:
             }
         ],
     }
+    previous["entries"][0]["alternatives"] = ["Firecracker"]
     prompt = render_transcript("Sandboxes", previous, items)
     assert '"id": "p1"' in prompt
+    assert "Firecracker" in prompt
     assert "[3] user: what about spot nodes?" in prompt
 
     digest, entries = build_digest(
@@ -305,7 +307,11 @@ async def test_worker_embeds_entries_on_postgres(db_uri) -> None:
     vertex.embed_status = 500
     assert await memory.embed_query("anything") is None
     hits = store.search_sessions(
-        "isolation choice", None, query_embedding=[1.0, 0.0, 0.0], min_similarity=0.6
+        "isolation choice",
+        None,
+        query_embedding=[1.0, 0.0, 0.0],
+        min_similarity=0.6,
+        memory=True,
     )
     assert [hit.session_id for hit in hits] == [session]
     await memory.aclose()
@@ -380,6 +386,10 @@ def test_digest_route_requires_read_access_and_reports_progress(api) -> None:
     ).json()["data"]
     assert found[0]["session_id"] == session
     assert any(memory["kind"] == "decision" for memory in found[0]["memories"])
+    without_memory = build(False).get(
+        "/v1/sessions/search", params={"q": "gvisor decision"}, headers={"x-user": OWNER}
+    )
+    assert all(hit["memories"] == [] for hit in without_memory.json()["data"])
 
 
 SERVER_CONFIG = {"session_memory": RAW_CONFIG}

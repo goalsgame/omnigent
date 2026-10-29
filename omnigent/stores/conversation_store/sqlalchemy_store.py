@@ -2152,6 +2152,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         limit: int = 20,
         query_embedding: Any = None,
         min_similarity: float = 0.0,
+        memory: bool = False,
     ) -> list[Any]:
         """Rank readable top-level sessions; see :class:`SessionSearch`."""
         from omnigent.stores.conversation_store.session_search import SessionSearch
@@ -2164,6 +2165,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             limit=limit,
             query_embedding=query_embedding,
             min_similarity=min_similarity,
+            memory=memory,
         )
 
     def session_memory(self) -> Any:
@@ -2172,11 +2174,11 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return SessionMemoryStore(self)
 
-    def ensure_session_memory_vectors(self, dimensions: int) -> None:
-        """Prepare pgvector storage for session memory embeddings."""
+    def ensure_session_memory_vectors(self, dimensions: int, model: str) -> None:
+        """Prepare pgvector storage for session memory embeddings from *model*."""
         from omnigent.db.utils import ensure_session_memory_vectors
 
-        ensure_session_memory_vectors(self._conv_engine, dimensions)
+        ensure_session_memory_vectors(self._conv_engine, dimensions, model)
 
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """

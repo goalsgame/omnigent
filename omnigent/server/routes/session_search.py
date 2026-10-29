@@ -17,6 +17,7 @@ from omnigent.stores.conversation_store.session_search import (
     MAX_SESSIONS,
     SearchPrincipal,
     SessionSearchHit,
+    is_natural_language,
 )
 from omnigent.stores.permission_store import PermissionStore
 
@@ -77,8 +78,11 @@ def create_session_search_router(
         if memory is None:
             return {}
         return {
-            "query_embedding": await memory.embed_query(query),
+            "query_embedding": (
+                await memory.embed_query(query) if is_natural_language(query) else None
+            ),
             "min_similarity": memory.config.min_similarity,
+            "memory": True,
         }
 
     def root_of(session_id: str) -> str:

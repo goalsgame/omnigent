@@ -76,7 +76,7 @@ function Entry({ entry, sessionId }: { entry: SessionDigestEntry; sessionId: str
 
 /** Read-only session digest for the session tree rooted at ``rootSessionId``. */
 export function SessionMemoryPanel({ rootSessionId }: { rootSessionId: string }) {
-  const { data: digest, isLoading, isError } = useSessionDigest(rootSessionId);
+  const { data: digest, isLoading, isError } = useSessionDigest(rootSessionId, { poll: true });
   if (isLoading) return <EmptyState title="Loading memory…" />;
   if (isError || digest === undefined) return <EmptyState title="Memory unavailable" />;
   if (digest === null) {

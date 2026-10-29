@@ -16,6 +16,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
 DIMENSIONS = 3
+MODEL = "test-embedder"
 
 
 @pytest.fixture(params=["shared", "split"])
@@ -177,17 +178,63 @@ def test_digest_entries_match_by_word_with_permissions_and_audience(stores) -> N
     )
     _remember(store, private, MemoryEntry("open_question", "Should gVisor run on Spot nodes?"))
 
-    hits = store.search_sessions("why did we choose gvisor", (ALICE,))
+    hits = store.search_sessions("why did we choose gvisor", (ALICE,), memory=True)
     assert {hit.session_id for hit in hits} == {shared, private}
     [first] = [hit for hit in hits if hit.session_id == shared]
     assert [(memory.kind, memory.item_ids) for memory in first.memories] == [("decision", ["i1"])]
     assert first.memories[0].similarity is None
 
-    assert [hit.session_id for hit in store.search_sessions("gvisor", (BOB,))] == [shared]
+    assert [hit.session_id for hit in store.search_sessions("gvisor", (BOB,), memory=True)] == [
+        shared
+    ]
     audience = [SearchPrincipal(ALICE, False), SearchPrincipal(BOB, False)]
     assert [
-        hit.session_id for hit in store.search_sessions("gvisor", (ALICE,), audience=audience)
+        hit.session_id
+        for hit in store.search_sessions("gvisor", (ALICE,), audience=audience, memory=True)
     ] == [shared]
+
+
+def test_memory_matches_only_when_enabled_and_honour_strict_syntax(stores) -> None:
+    store, perms = stores
+    session = _session(store, "Infra sync", "notes")
+    perms.grant(ALICE, session, 4)
+    _remember(
+        store,
+        session,
+        MemoryEntry("decision", "Run sandboxes under gVisor on staging first"),
+    )
+
+    assert store.search_sessions("gvisor", (ALICE,)) == []
+    assert [hit.session_id for hit in store.search_sessions("gvisor", (ALICE,), memory=True)] == [
+        session
+    ]
+    if store._conv_engine.dialect.name == "postgresql":
+        assert store.search_sessions("gvisor -staging", (ALICE,), memory=True) == []
+    assert store.search_sessions('"gvisor kata"', (ALICE,), memory=True) == []
+    assert store.search_sessions("gvisor kata", (ALICE,), memory=True) != []
+
+
+def test_a_save_after_the_session_is_deleted_leaves_nothing_behind(stores) -> None:
+    import asyncio
+
+    store, _ = stores
+    memory = store.session_memory()
+    session = _session(store, "Doomed", "text")
+    now = int(time.time())
+    assert memory.claim(session, now, 600) is not None
+    assert asyncio.run(store.delete_conversation(session))
+
+    memory.save(
+        session,
+        digest={"summary": "late", "topics": [], "entries": []},
+        entries=[MemoryEntry("decision", "late entry")],
+        items_through=0,
+        source_updated_at=now,
+        model="test-model",
+        now=now,
+    )
+    assert memory.get(session) is None
+    assert store.search_sessions("late", None, memory=True) == []
 
 
 def test_postgres_widens_questions_that_match_no_single_message(conversation_store) -> None:
@@ -204,12 +251,25 @@ def test_postgres_widens_questions_that_match_no_single_message(conversation_sto
     assert other not in {hit.session_id for hit in hits}
 
 
+def test_postgres_full_matches_outrank_sessions_with_more_partial_matches(
+    conversation_store,
+) -> None:
+    store = conversation_store
+    if store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL text search")
+    full = _session(store, "Full", "the warm pool drained")
+    partial = _session(store, "Partial", "pool one", "pool two", "pool three")
+
+    hits = store.search_sessions("warm pool", None)
+    assert [hit.session_id for hit in hits] == [full, partial]
+
+
 def test_postgres_semantic_matches_respect_similarity_and_permissions(stores) -> None:
     store, permission_store = stores
     if store._conv_engine.dialect.name != "postgresql":
         pytest.skip("Requires PostgreSQL with pgvector")
-    store.ensure_session_memory_vectors(DIMENSIONS)
-    store.ensure_session_memory_vectors(DIMENSIONS)
+    store.ensure_session_memory_vectors(DIMENSIONS, MODEL)
+    store.ensure_session_memory_vectors(DIMENSIONS, MODEL)
     near = _session(store, "Sandbox isolation", "notes")
     far = _session(store, "Budget", "notes")
     hidden = _session(store, "Hidden", "notes")
@@ -232,15 +292,36 @@ def test_postgres_semantic_matches_respect_similarity_and_permissions(stores) ->
     assert memory.unembedded(10) == []
 
     hits = store.search_sessions(
-        "isolation approach", (ALICE,), query_embedding=[1.0, 0.0, 0.0], min_similarity=0.5
+        "isolation approach",
+        (ALICE,),
+        query_embedding=[1.0, 0.0, 0.0],
+        min_similarity=0.5,
+        memory=True,
     )
     assert [hit.session_id for hit in hits] == [near]
     assert hits[0].memories[0].similarity > 0.9
 
     loose = store.search_sessions(
-        "isolation approach", (ALICE,), query_embedding=[1.0, 0.0, 0.0], min_similarity=0.0
+        "isolation approach",
+        (ALICE,),
+        query_embedding=[1.0, 0.0, 0.0],
+        min_similarity=0.0,
+        memory=True,
     )
     assert [hit.session_id for hit in loose] == [near, far]
 
-    store.ensure_session_memory_vectors(DIMENSIONS + 1)
+    assert (
+        store.search_sessions(
+            '"userspace kernel" -agents', (ALICE,), query_embedding=[1.0, 0.0, 0.0], memory=True
+        )
+        == []
+    )
+
+    store.ensure_session_memory_vectors(DIMENSIONS, MODEL)
+    assert memory.unembedded(10) == []
+    store.ensure_session_memory_vectors(DIMENSIONS, "another-model")
+    assert len(memory.unembedded(10)) == 3
+    for workspace, entry_id, text in memory.unembedded(10):
+        memory.set_embedding(workspace, entry_id, vectors[text])
+    store.ensure_session_memory_vectors(DIMENSIONS + 1, "another-model")
     assert len(memory.unembedded(10)) == 3

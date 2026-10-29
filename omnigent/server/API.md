@@ -678,7 +678,8 @@ messages containing any of its terms, ranked after full matches. Each hit
 carries `session_id`, `title`, `created_at`, `updated_at`, `score`,
 `title_match`, up to three `matches`, each with `item_id`, `conversation_id`
 (the session or sub-agent session holding the message) and `snippet`, and up to
-three `memories`, each with `kind` (`summary`, `decision`, `discussion`,
+three `memories` (by meaning and any term for a plain-language query, by the
+query's syntax otherwise), each with `kind` (`summary`, `decision`, `discussion`,
 `open_question` or `tangent`), `text`, `item_ids`, `created_at` and
 `similarity` (cosine similarity when the entry matched by meaning, otherwise
 `null`). Only direct and group grants qualify; a public link does not make a

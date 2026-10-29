@@ -926,6 +926,7 @@ export function AppShell() {
   // gate, and the header's collapse toggle, so they can never disagree.
   const sessionDigest = useSessionDigest(rootSessionId);
   const sessionMemoryEnabled = !!sessionDigest.data;
+  const sessionMemoryPending = !!rootSessionId && sessionDigest.isPending;
   const railTabsAvailable = useMemo(
     () =>
       ({
@@ -1286,13 +1287,14 @@ export function AppShell() {
       // gated nav tab — always valid, and never a fallback target.
       if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
+      if (tab === "memory" && sessionMemoryPending) return tab;
       return (
         (["files", "changes", "github", "subagents", "memory", "browser"] as const).find(
           (candidate) => railTabsAvailable[candidate],
         ) ?? tab
       );
     });
-  }, [railTabsAvailable, rightRailTab]);
+  }, [railTabsAvailable, rightRailTab, sessionMemoryPending]);
 
   // Selecting the current agent removes the panel query without changing sessions.
   useEffect(() => {

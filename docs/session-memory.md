@@ -12,9 +12,10 @@ a Gemini model on Vertex AI, which records:
 - **tangents** that came up beside the session's main goal.
 
 Each entry cites the messages it came from. Entries are embedded with a Vertex
-AI embedding model and stored in PostgreSQL with pgvector. Session search then
-matches them by meaning as well as by word, alongside its title and message
-matches, and returns them as `memories` on each hit. The digest is shown in the
+AI embedding model and stored in PostgreSQL with pgvector. For a plain-language
+query, session search matches them by meaning and by any word, alongside its
+title and message matches, and returns them as `memories` on each hit. A query
+with quoted phrases, `OR` or `-word` matches entries by that syntax only. The digest is shown in the
 session's **Memory** tab and served by `GET /v1/sessions/{id}/digest`.
 
 Digests follow the session's permissions: search returns only sessions the
@@ -75,7 +76,9 @@ At startup the server runs `CREATE EXTENSION IF NOT EXISTS vector` and adds
 an `embedding vector(<dimensions>)` column with an HNSW cosine index to
 `session_memory_entries`. If the database user may not create extensions, a
 database administrator must create `vector` in the Omnigent database first.
-Changing `dimensions` replaces the column, and every entry is embedded again.
+Replicas preparing the column at the same time are serialized with an advisory
+lock. Changing the embedding `model` or `dimensions` replaces the column, and
+every entry is embedded again.
 
 Configuring session memory sends session transcripts to the configured
 Vertex AI models. Without the block, no digests are written, search matches
