@@ -946,6 +946,37 @@ describe("useStopAndDeleteConversation cache eviction", () => {
   });
 });
 
+describe("ranked session search cache", () => {
+  it("drops cached ranked results when a session is deleted", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+    fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["session-search", "pool"], [{ session_id: "conv_x" }]);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useStopAndDeleteConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x" });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+    expect(queryClient.getQueryData(["session-search", "pool"])).toBeUndefined();
+  });
+
+  it("drops cached ranked results when a session is archived", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(conversation({ id: "conv_x", archived: true })));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["session-search", "pool"], [{ session_id: "conv_x" }]);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useArchiveConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", archived: true });
+    await waitFor(() =>
+      expect(rendered.result.current.isSuccess || rendered.result.current.isError).toBe(true),
+    );
+    expect(queryClient.getQueryData(["session-search", "pool"])).toBeUndefined();
+  });
+});
+
 describe("recently-created keep-alive", () => {
   const listResponse = (ids: string[]) =>
     mockResponse({

@@ -265,6 +265,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "google_drive_create": None,
     "google_docs_append": None,
     "google_sheets_update": None,
+    "search_sessions": None,
     "list_files": _create_list_files,
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,

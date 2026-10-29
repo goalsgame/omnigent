@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
@@ -527,6 +527,121 @@ def _ensure_conversation_tables(engine: Engine) -> None:
         else:
             ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
         ensure_fts_table(engine)
+        if isinstance(engine, Engine) and engine.dialect.name == "postgresql":
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+                ensure_session_search_index(connection)
+
+
+_SESSION_SEARCH_INDEX_BODY = (
+    "USING gin (to_tsvector('english', left(search_text, 100000))) WHERE type IN (1, 6)"
+)
+
+
+def _relkind(connection: Connection, name: str) -> str | None:
+    return connection.execute(
+        text("SELECT relkind FROM pg_class WHERE oid = to_regclass(:name)"), {"name": name}
+    ).scalar()
+
+
+def _index_valid(connection: Connection, name: str) -> bool | None:
+    return connection.execute(
+        text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"),
+        {"name": name},
+    ).scalar()
+
+
+def _ensure_partition_search_indexes(connection: Connection, table: str, index: str) -> None:
+    """Index each partition of *table* concurrently and attach it to *index*."""
+    partitions = connection.execute(
+        text(
+            "SELECT c.oid::regclass::text, c.relkind FROM pg_inherits i "
+            "JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass(:table)"
+        ),
+        {"table": table},
+    ).all()
+    for partition, kind in partitions:
+        child = connection.execute(
+            text(
+                "SELECT x.indexrelid::regclass::text FROM pg_inherits i "
+                "JOIN pg_index x ON x.indexrelid = i.inhrelid "
+                "WHERE i.inhparent = to_regclass(:index) AND x.indrelid = to_regclass(:partition)"
+            ),
+            {"index": index, "partition": partition},
+        ).scalar()
+        if child is not None:
+            if kind == "p":
+                _ensure_partition_search_indexes(connection, partition, child)
+            continue
+        oid, schema = connection.execute(
+            text(
+                "SELECT c.oid, quote_ident(n.nspname) FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass(:name)"
+            ),
+            {"name": partition},
+        ).one()
+        name = f"ix_conversation_items_search_tsv_{oid}"
+        child = f"{schema}.{name}"
+        if kind == "p":
+            connection.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {name} ON ONLY {partition} "
+                    f"{_SESSION_SEARCH_INDEX_BODY}"
+                )
+            )
+            _ensure_partition_search_indexes(connection, partition, child)
+        else:
+            if _index_valid(connection, child) is False:
+                connection.execute(text(f"DROP INDEX CONCURRENTLY {child}"))
+            connection.execute(
+                text(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {partition} "
+                    f"{_SESSION_SEARCH_INDEX_BODY}"
+                )
+            )
+        connection.execute(text(f"ALTER INDEX {index} ATTACH PARTITION {child}"))
+
+
+def ensure_session_search_index(connection: Connection) -> None:
+    """
+    Build the PostgreSQL session-search index if it is missing or invalid.
+
+    ``create_all`` skips indexes on tables that already exist, so databases
+    bootstrapped outside Alembic need this too. A partitioned
+    ``conversation_items`` gets a parent index on the table alone and a
+    concurrently built index attached for each partition.
+
+    :param connection: An autocommit PostgreSQL connection, since the index is
+        built ``CONCURRENTLY``.
+    """
+    from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX as index
+
+    if _relkind(connection, "conversation_items") == "p":
+        connection.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS {index} ON ONLY conversation_items "
+                f"{_SESSION_SEARCH_INDEX_BODY}"
+            )
+        )
+        _ensure_partition_search_indexes(connection, "conversation_items", index)
+        return
+    if _index_valid(connection, index) is False:
+        connection.execute(text(f"DROP INDEX CONCURRENTLY {index}"))
+    connection.execute(
+        text(
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index} ON conversation_items "
+            f"{_SESSION_SEARCH_INDEX_BODY}"
+        )
+    )
+
+
+def drop_session_search_index(connection: Connection) -> None:
+    """Drop the session-search index, with its partition indexes when partitioned."""
+    from omnigent.db.db_models import CONVERSATION_ITEMS_SEARCH_INDEX as index
+
+    if _relkind(connection, index) == "I":
+        connection.execute(text(f"DROP INDEX IF EXISTS {index}"))
+    else:
+        connection.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index}"))
 
 
 def _set_alembic_database_url(config: Config, db_uri: str) -> None:

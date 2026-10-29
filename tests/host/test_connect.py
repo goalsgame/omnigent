@@ -8863,9 +8863,9 @@ async def test_cancelled_grant_preparation_removes_late_written_file(tmp_path, m
     assert not host._runners
 
 
-def test_build_runner_env_forwards_google_drive_flag() -> None:
+def test_build_runner_env_forwards_server_mediated_tool_flags() -> None:
     env = _build_runner_env(
-        {"OMNIGENT_GOOGLE_DRIVE_AUTH": "1"},
+        {"OMNIGENT_GOOGLE_DRIVE_AUTH": "1", "OMNIGENT_SESSION_SEARCH_TOOL": "1"},
         server_url="http://server",
         runner_id="runner_abc",
         binding_token="tok",
@@ -8874,3 +8874,4 @@ def test_build_runner_env_forwards_google_drive_flag() -> None:
     )
 
     assert env["OMNIGENT_GOOGLE_DRIVE_AUTH"] == "1"
+    assert env["OMNIGENT_SESSION_SEARCH_TOOL"] == "1"

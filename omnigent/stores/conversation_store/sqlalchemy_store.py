@@ -2129,21 +2129,38 @@ class SqlAlchemyConversationStore(ConversationStore):
             ]
             if not item_ids:
                 return []
-            rows = (
-                session.execute(
-                    select(SqlConversationItem).where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.id.in_(item_ids),
-                    )
-                )
-                .scalars()
-                .all()
+            hydrate = select(SqlConversationItem).where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.id.in_(item_ids),
             )
+            if conversation_id is not None:
+                hydrate = hydrate.where(SqlConversationItem.conversation_id == conversation_id)
+            rows = session.execute(hydrate).scalars().all()
             # Preserve FTS rank order
             order = {iid: i for i, iid in enumerate(item_ids)}
             ordered = sorted(rows, key=lambda r: order[r.id])
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
+
+    def search_sessions(
+        self,
+        query: str,
+        principals: tuple[str, ...] | None,
+        *,
+        audience: Any = (),
+        exclude_session_id: str | None = None,
+        limit: int = 20,
+    ) -> list[Any]:
+        """Rank readable top-level sessions; see :class:`SessionSearch`."""
+        from omnigent.stores.conversation_store.session_search import SessionSearch
+
+        return SessionSearch(self).search(
+            query,
+            principals,
+            audience=audience,
+            exclude_session_id=exclude_session_id,
+            limit=limit,
+        )
 
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """

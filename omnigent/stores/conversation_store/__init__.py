@@ -957,6 +957,24 @@ class ConversationStore(ABC):
         """
         ...
 
+    def search_sessions(
+        self,
+        query: str,
+        principals: tuple[str, ...] | None,
+        *,
+        audience: Any = (),
+        exclude_session_id: str | None = None,
+        limit: int = 20,
+    ) -> list[Any]:
+        """
+        Rank the top-level sessions *principals* may read by title and message text.
+
+        See :meth:`omnigent.stores.conversation_store.session_search.SessionSearch.search`.
+
+        :raises NotImplementedError: When the backend has no session search.
+        """
+        raise NotImplementedError("This conversation store does not support session search")
+
     @abstractmethod
     def update_conversation(
         self,

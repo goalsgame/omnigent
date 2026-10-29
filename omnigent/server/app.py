@@ -3537,6 +3537,13 @@ def create_app(
             prefix="/v1",
         )
 
+    from omnigent.server.routes.session_search import create_session_search_router
+
+    app.include_router(
+        create_session_search_router(conversation_store, permission_store, auth_provider),
+        prefix="/v1",
+        tags=["sessions"],
+    )
     app.include_router(
         create_sessions_router(
             conversation_store,

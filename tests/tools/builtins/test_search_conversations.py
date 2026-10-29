@@ -20,7 +20,7 @@ from omnigent.tools.builtins.search_conversations import (
     _format_results,
 )
 
-_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
+_CTX = ToolContext(task_id="task_test", agent_id="agent_test", conversation_id="conv_1")
 
 
 # ── Stubs ────────────────────────────────────────────────
@@ -42,8 +42,8 @@ class _FakeConversationStore:
         self._items = items
         self.calls: list[dict[str, Any]] = []
 
-    def search(self, query: str, limit: int = 10) -> list[Any]:
-        self.calls.append({"query": query, "limit": limit})
+    def search(self, query: str, conversation_id: str | None = None, limit: int = 10) -> list[Any]:
+        self.calls.append({"query": query, "conversation_id": conversation_id, "limit": limit})
         return self._items[:limit]
 
 
@@ -183,7 +183,21 @@ def test_invoke_caps_limit(monkeypatch: pytest.MonkeyPatch) -> None:
 
     tool = SearchConversationsTool()
     tool.invoke('{"query": "test", "limit": 1000}', _CTX)
-    assert store.calls == [{"query": "test", "limit": 100}]
+    assert store.calls == [{"query": "test", "conversation_id": "conv_1", "limit": 100}]
+
+
+def test_invoke_requires_a_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """invoke() never searches across sessions when it has no calling session."""
+    store = _FakeConversationStore([])
+    monkeypatch.setattr("omnigent.runtime.get_conversation_store", lambda: store)
+
+    result = json.loads(
+        SearchConversationsTool().invoke(
+            '{"query": "test"}', ToolContext(task_id="task_test", agent_id="agent_test")
+        )
+    )
+    assert "error" in result
+    assert store.calls == []
 
 
 # ── _extract_text ────────────────────────────────────────
@@ -228,7 +242,7 @@ def test_format_results_includes_all_fields() -> None:
     items = [
         _FakeItem("i1", "conv_1", 1000, "message", _message_data()),
     ]
-    results = _format_results(items)
+    results = _format_results(items, "conv_1")
     assert len(results) == 1
     r = results[0]
     assert r["conversation_id"] == "conv_1"

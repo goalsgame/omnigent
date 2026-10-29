@@ -93,6 +93,11 @@ from omnigent.tools.builtins.os_env import (
 from omnigent.tools.builtins.peer_messages import PEER_TOOL_NAMES, PEER_TOOL_TYPES
 from omnigent.tools.builtins.publish_artifact import PublishArtifactTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
+from omnigent.tools.builtins.session_search import (
+    SESSION_SEARCH_TOOL_NAMES,
+    SearchSessionsTool,
+    session_search_tool_enabled,
+)
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
     # (not duplicated) so the runner's REST-backed peek clamps to the same
@@ -476,6 +481,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | PEER_TOOL_NAMES
     | GOOGLE_DRIVE_TOOL_NAMES
+    | SESSION_SEARCH_TOOL_NAMES
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
@@ -595,6 +601,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             PublishArtifactTool,
             *PEER_TOOL_TYPES,
             *(GOOGLE_DRIVE_TOOL_TYPES if google_drive_tools_enabled() else ()),
+            *((SearchSessionsTool,) if session_search_tool_enabled() else ()),
             ListCommentsTool,
             UpdateCommentTool,
             SysSessionListTool,
@@ -879,6 +886,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | PEER_TOOL_NAMES
     | GOOGLE_DRIVE_TOOL_NAMES
+    | SESSION_SEARCH_TOOL_NAMES
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
@@ -6710,6 +6718,10 @@ async def execute_tool(
             output = await execute_google_drive_tool(
                 tool_name, args, conversation_id, server_client
             )
+        elif tool_name in SESSION_SEARCH_TOOL_NAMES:
+            from omnigent.runner.session_search import execute_session_search_tool
+
+            output = await execute_session_search_tool(args, conversation_id, server_client)
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
                 args,

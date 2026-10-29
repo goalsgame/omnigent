@@ -663,6 +663,31 @@ minus `items` and snapshot-only fields.
 Supports cursor pagination and filters such as `search_query` and
 `include_archived`.
 
+```
+GET /v1/sessions/search?q=QUERY&limit=20
+
+200 OK — {"object": "list", "data": [SessionSearchHit, ...], "has_more": false}
+```
+
+Ranks the caller's readable top-level sessions by title and message text.
+`q` accepts web-search syntax (quoted phrases, `OR`, `-word`) and every other
+term must match. Each hit carries `session_id`, `title`, `created_at`,
+`updated_at`, `score`, `title_match` and up to three `matches`, each with
+`item_id`, `conversation_id` (the session or sub-agent session holding the
+message) and `snippet`. Only direct and group grants qualify; a public link
+does not make a session discoverable, and archived sessions are left out.
+On PostgreSQL the search is backed by a full-text index over messages and
+compaction summaries; other databases fall back to substring matching.
+
+```
+GET /v1/sessions/{session_id}/search?q=QUERY&limit=10
+```
+
+The same search on behalf of an agent in `session_id`, which requires read
+access to it. Results are limited to sessions that every user, group or public
+grant on the session's top-level session can also read, and leave out the
+session itself.
+
 Clients should always send `visibility` explicitly: `mine` lists owned
 active sessions, `shared` lists accessible active sessions owned by someone
 else, `archived` lists accessible archived sessions, and `all` lists all

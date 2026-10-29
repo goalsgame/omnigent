@@ -10,7 +10,9 @@ import {
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
+  overlayTitleIntoCaches,
   removeIdsFromPages,
+  removeIdsFromSessionSearch,
 } from "./sessionListCache";
 
 function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
@@ -521,5 +523,41 @@ describe("insertNewRowsIntoPages", () => {
       (id) => id === "gone",
     );
     expect(inserted).toHaveLength(0);
+  });
+});
+
+describe("overlayTitleIntoCaches ranked search", () => {
+  it("renames the session in cached ranked search results", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(
+      ["session-search", "pool"],
+      [
+        { session_id: "a", title: "Old" },
+        { session_id: "b", title: "Other" },
+      ],
+    );
+
+    overlayTitleIntoCaches(queryClient, "a", "New");
+
+    expect(queryClient.getQueryData(["session-search", "pool"])).toEqual([
+      { session_id: "a", title: "New" },
+      { session_id: "b", title: "Other" },
+    ]);
+  });
+});
+
+describe("removeIdsFromSessionSearch", () => {
+  it("drops sessions from every cached ranked search result", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(
+      ["session-search", "pool"],
+      [{ session_id: "a" }, { session_id: "b" }],
+    );
+    queryClient.setQueryData(["session-search", "plan"], [{ session_id: "a" }]);
+
+    removeIdsFromSessionSearch(queryClient, ["a"]);
+
+    expect(queryClient.getQueryData(["session-search", "pool"])).toEqual([{ session_id: "b" }]);
+    expect(queryClient.getQueryData(["session-search", "plan"])).toEqual([]);
   });
 });
