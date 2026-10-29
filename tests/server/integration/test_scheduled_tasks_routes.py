@@ -1519,6 +1519,7 @@ async def test_publish_status_idle_before_the_prompt_does_not_complete_run(db_ur
         assert early is not None and early.status == "running"
         _append_prompt(db_uri, conv_id)
         _publish_status(conv_id, "running")
+        time.sleep(1.1)
         _publish_status(conv_id, "idle")
         done = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
     finally:
@@ -1528,6 +1529,43 @@ async def test_publish_status_idle_before_the_prompt_does_not_complete_run(db_ur
     assert done is not None
     assert done.status == "succeeded"
     assert done.finished_at is not None and done.finished_at >= int(time.time()) - 60
+
+
+async def test_publish_status_idle_handled_after_the_prompt_arrived_does_not_complete_run(
+    db_uri: str,
+) -> None:
+    """A startup idle the worker only reaches after the prompt was stored still does not count."""
+    import threading
+    import time
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = _conversation_with_prompt(db_uri, prompt=False)
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    gate = threading.Event()
+    try:
+        session_live_state.submit("hold", gate.wait, 10)
+        _publish_status(conv_id, "idle")
+        time.sleep(1.1)
+        _append_prompt(db_uri, conv_id)
+        gate.set()
+        session_live_state.submit("barrier", lambda: None).result(timeout=10)
+        row = _wait_for_run_status(db_uri, task_id, run_id, "running", timeout_s=1)
+    finally:
+        gate.set()
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert row is not None
+    assert row.status == "running"
 
 
 async def test_patch_pinning_host_on_managed_task_is_rejected(

@@ -73,7 +73,9 @@ class _RecordingStore:
 
     def list_items(self, conversation_id: str, **_: object) -> SimpleNamespace:
         roles = self.message_roles.get(conversation_id, ["user"])
-        return SimpleNamespace(data=[SimpleNamespace(data=SimpleNamespace(role=r)) for r in roles])
+        return SimpleNamespace(
+            data=[SimpleNamespace(data=SimpleNamespace(role=r), created_at=0) for r in roles]
+        )
 
 
 @pytest.fixture()

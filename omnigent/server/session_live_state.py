@@ -241,6 +241,7 @@ def persist_scheduled_run_completion(
     store = _scheduled_task_store
     if store is None:
         return
+    edge_at = int(time.time())
 
     def _transition() -> None:
         run = store.get_running_run_by_conversation(conversation_id)
@@ -248,7 +249,7 @@ def persist_scheduled_run_completion(
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
-        if run_status == "succeeded" and not _has_user_message(conversation_id):
+        if run_status == "succeeded" and not _has_user_message(conversation_id, edge_at):
             # A native session reports idle when its terminal starts, before
             # the scheduled prompt reaches it; that is not a finished turn.
             return
@@ -263,13 +264,20 @@ def persist_scheduled_run_completion(
     submit("scheduled_run_completion", _transition)
 
 
-def _has_user_message(conversation_id: str) -> bool:
-    """Whether the conversation holds a user message, such as its scheduled prompt."""
+def _has_user_message(conversation_id: str, stored_by: int) -> bool:
+    """Whether the conversation held a user message, such as its prompt, by ``stored_by``.
+
+    :param conversation_id: The conversation to look in.
+    :param stored_by: Unix epoch seconds; a message stored later does not count.
+    """
     conversations = _store
     if conversations is None:
         return True
     page = conversations.list_items(conversation_id, limit=10, type="message")
-    return any(getattr(item.data, "role", None) == "user" for item in page.data)
+    return any(
+        getattr(item.data, "role", None) == "user" and item.created_at <= stored_by
+        for item in page.data
+    )
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:
