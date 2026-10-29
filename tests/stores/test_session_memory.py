@@ -325,3 +325,22 @@ def test_postgres_semantic_matches_respect_similarity_and_permissions(stores) ->
         memory.set_embedding(workspace, entry_id, vectors[text])
     store.ensure_session_memory_vectors(DIMENSIONS + 1, "another-model")
     assert len(memory.unembedded(10)) == 3
+
+
+def test_simultaneous_first_claims_lease_the_session_once(stores) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.db.db_models import workspace_scope
+
+    store, _ = stores
+    memory = store.session_memory()
+    session = _session(store, "Raced", "text")
+    now = _later()
+
+    def claim(_: int):
+        with workspace_scope(0):
+            return memory.claim(session, now, 600)
+
+    with ThreadPoolExecutor(8) as pool:
+        claims = list(pool.map(claim, range(8)))
+    assert sum(record is not None for record in claims) == 1

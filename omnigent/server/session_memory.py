@@ -481,7 +481,12 @@ class SessionMemory:
         )
         for workspace, session_id in rows:
             with workspace_scope(workspace):
-                await self.process(session_id)
+                try:
+                    await self.process(session_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.exception("Session digest pass failed for %s", session_id)
         embedded = await self.embed_backlog() if self._vectors else 0
         return len(rows) == _BATCH or embedded == _EMBED_BATCH
 

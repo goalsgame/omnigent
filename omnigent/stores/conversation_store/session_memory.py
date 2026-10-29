@@ -20,6 +20,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.types import UserDefinedType
 
@@ -178,24 +179,32 @@ class SessionMemoryStore:
 
         def claim(session: Session) -> SessionDigestRecord | None:
             workspace = current_workspace_id()
-            row = session.get(SqlSessionDigest, (workspace, session_id), with_for_update=True)
-            if row is None:
-                row = SqlSessionDigest(
-                    workspace_id=workspace,
-                    conversation_id=session_id,
-                    status="pending",
-                    source_updated_at=0,
-                    items_through=-1,
-                    attempts=0,
-                    next_attempt_at=0,
-                    lease_until=now + lease_seconds,
-                    created_at=now,
-                    updated_at=now,
-                )
-                session.add(row)
-                session.flush()
-                return _record(row)
-            if row.lease_until > now or row.next_attempt_at > now:
+            if session.get(SqlSessionDigest, (workspace, session_id)) is None:
+                try:
+                    with session.begin_nested():
+                        session.add(
+                            SqlSessionDigest(
+                                workspace_id=workspace,
+                                conversation_id=session_id,
+                                status="pending",
+                                source_updated_at=0,
+                                items_through=-1,
+                                attempts=0,
+                                next_attempt_at=0,
+                                lease_until=0,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                        )
+                except IntegrityError:
+                    pass
+            row = session.get(
+                SqlSessionDigest,
+                (workspace, session_id),
+                with_for_update=True,
+                populate_existing=True,
+            )
+            if row is None or row.lease_until > now or row.next_attempt_at > now:
                 return None
             row.lease_until = now + lease_seconds
             return _record(row)
