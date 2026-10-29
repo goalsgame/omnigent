@@ -13,6 +13,7 @@ const RAIL_TABS: readonly RightRailTab[] = [
   "changes",
   "github",
   "subagents",
+  "memory",
   "browser",
   "sidechat",
 ];

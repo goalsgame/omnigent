@@ -11,6 +11,32 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
+def vertex_base_url(project: object, location: object) -> str:
+    """
+    The Vertex AI REST base for *project* and *location*.
+
+    :returns: e.g. ``"https://aiplatform.eu.rep.googleapis.com/v1/projects/p/locations/eu"``.
+    :raises ValueError: When either value is malformed.
+    """
+    if (
+        not isinstance(project, str)
+        or re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]|[0-9]{6,20}", project) is None
+    ):
+        raise ValueError("Invalid Vertex project")
+    if (
+        not isinstance(location, str)
+        or re.fullmatch(r"global|eu|us|[a-z]+-[a-z]+[0-9]+", location) is None
+    ):
+        raise ValueError("Invalid Vertex location")
+    if location == "global":
+        host = "aiplatform.googleapis.com"
+    elif location in ("eu", "us"):
+        host = f"aiplatform.{location}.rep.googleapis.com"
+    else:
+        host = f"{location}-aiplatform.googleapis.com"
+    return f"https://{host}/v1/projects/{project}/locations/{location}"
+
+
 @dataclass(frozen=True)
 class InferenceUpstream:
     kind: str
@@ -39,24 +65,7 @@ class InferenceUpstream:
         if kind in ("vertex-openai", "vertex-anthropic"):
             if set(raw) != {"kind", "project", "location"}:
                 raise ValueError("Vertex upstreams require only kind, project and location")
-            project, location = raw["project"], raw["location"]
-            if (
-                not isinstance(project, str)
-                or re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]|[0-9]{6,20}", project) is None
-            ):
-                raise ValueError("Invalid Vertex project")
-            if (
-                not isinstance(location, str)
-                or re.fullmatch(r"global|eu|us|[a-z]+-[a-z]+[0-9]+", location) is None
-            ):
-                raise ValueError("Invalid Vertex location")
-            if location == "global":
-                host = "aiplatform.googleapis.com"
-            elif location in ("eu", "us"):
-                host = f"aiplatform.{location}.rep.googleapis.com"
-            else:
-                host = f"{location}-aiplatform.googleapis.com"
-            return cls(kind, f"https://{host}/v1/projects/{project}/locations/{location}")
+            return cls(kind, vertex_base_url(raw["project"], raw["location"]))
         if kind == "openai":
             if set(raw) != {"kind", "base_url", "api_key_env"}:
                 raise ValueError("OpenAI-compatible upstreams require base_url and api_key_env")

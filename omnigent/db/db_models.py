@@ -1266,6 +1266,100 @@ class SqlConversationLabel(ConversationBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlSessionDigest(ConversationBase):
+    """
+    SQLAlchemy model for the ``session_digests`` table.
+
+    One row per top-level session describing what it decided and discussed,
+    written by the session memory worker once the session goes quiet.
+
+    :param conversation_id: The top-level session.
+    :param digest: JSON digest (summary, topics, decisions, discussions,
+        open questions and tangents), or ``None`` before the first success.
+    :param source_updated_at: The session's ``updated_at`` when last processed.
+    :param items_through: ``created_at`` of the newest item the digest covers.
+    :param status: ``"pending"``, ``"ready"`` or ``"failed"``.
+    :param error: Last failure, shown to readers of a failed digest.
+    :param attempts: Consecutive failures, used for backoff.
+    :param next_attempt_at: Earliest epoch second to retry a failure.
+    :param lease_until: Epoch second until which one worker owns the row.
+    :param model: Model that wrote the digest, e.g. ``"gemini-2.5-flash"``.
+    """
+
+    __tablename__ = "session_digests"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_updated_at: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_through: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_until: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+
+
+SESSION_MEMORY_EMBEDDING_INDEX = "ix_session_memory_entries_embedding"
+
+
+class SqlSessionMemoryEntry(ConversationBase):
+    """
+    SQLAlchemy model for the ``session_memory_entries`` table.
+
+    Each digest entry (summary, decision, discussion, open question or
+    tangent) is stored separately so it can be searched and cited. On
+    PostgreSQL with session memory enabled the table also has a pgvector
+    ``embedding`` column managed by
+    :func:`omnigent.db.utils.ensure_session_memory_vectors`.
+
+    :param conversation_id: The top-level session the entry describes.
+    :param kind: ``"summary"``, ``"decision"``, ``"discussion"``,
+        ``"open_question"`` or ``"tangent"``.
+    :param ordinal: Position within the digest.
+    :param text: Searchable text of the entry.
+    :param item_ids: JSON list of ``[conversation_id, item_id]`` source messages.
+    :param created_at: ``created_at`` of the newest cited message.
+    :param lease_until: Epoch second until which one worker is embedding the entry.
+    """
+
+    __tablename__ = "session_memory_entries"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    item_ids: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    created_at: Mapped[int] = mapped_column(Integer)
+    lease_until: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index(
+            "ix_session_memory_entries_conversation",
+            "workspace_id",
+            "conversation_id",
+            "ordinal",
+        ),
+    )
+
+
 class SqlComment(OmnigentBase):
     """SQLAlchemy model for the ``comments`` table.
 

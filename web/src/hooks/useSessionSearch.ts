@@ -10,6 +10,14 @@ export interface SessionSearchMatch {
   snippet: string;
 }
 
+export interface SessionSearchMemory {
+  kind: "summary" | "decision" | "discussion" | "open_question" | "tangent";
+  text: string;
+  item_ids: string[];
+  created_at: number;
+  similarity: number | null;
+}
+
 export interface SessionSearchHit {
   session_id: string;
   title: string;
@@ -18,6 +26,8 @@ export interface SessionSearchHit {
   score: number;
   title_match: boolean;
   matches: SessionSearchMatch[];
+  /** Matching digest entries; absent from servers without session memory. */
+  memories?: SessionSearchMemory[];
 }
 
 const SEARCH_TIMEOUT_MS = 10_000;

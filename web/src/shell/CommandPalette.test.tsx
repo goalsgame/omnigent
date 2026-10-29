@@ -387,6 +387,42 @@ describe("CommandPalette — best matches", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c1");
   });
 
+  it("prefers a matching digest entry over a message snippet", () => {
+    setSessions([conv("c1", "Sandboxes")]);
+    useSessionSearch.mockReturnValue({
+      data: [
+        {
+          session_id: "c1",
+          title: "Sandboxes",
+          created_at: 1,
+          updated_at: 2,
+          score: 1,
+          title_match: false,
+          matches: [{ item_id: "i1", conversation_id: "c1", created_at: 1, snippet: "…gvisor…" }],
+          memories: [
+            {
+              kind: "decision",
+              text: "Use gVisor: sandboxes run under gVisor\nWhy: kernel isolation",
+              item_ids: ["i1"],
+              created_at: 1,
+              similarity: 0.82,
+            },
+          ],
+        },
+      ],
+    });
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "why gvisor" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(screen.getByText("Decision: Use gVisor: sandboxes run under gVisor")).toBeTruthy();
+    expect(screen.queryByText("…gvisor…")).toBeNull();
+  });
+
   it("reports a running message search and offers retry when it fails", () => {
     const refetch = vi.fn();
     useSessionSearch.mockReturnValue({ data: undefined, isFetching: true });

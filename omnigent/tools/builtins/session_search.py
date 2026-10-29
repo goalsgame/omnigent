@@ -12,7 +12,7 @@ def session_search_tool_enabled() -> bool:
 
 
 class SearchSessionsTool(Tool):
-    """Rank past sessions by title and message text through the server."""
+    """Rank past sessions by title, message text and digest through the server."""
 
     @classmethod
     def name(cls) -> str:
@@ -23,11 +23,12 @@ class SearchSessionsTool(Tool):
     def description(cls) -> str:
         """Describe the search and its audience limit."""
         return (
-            "Search earlier Omnigent sessions by title and message text to recall decisions, "
-            "findings and context. Supports quoted phrases, OR and -exclusions. Results only "
-            "include sessions that every participant of this session can already read, because "
-            "they all see this tool's output. Returns session ids with matching snippets; read "
-            "more with sys_session_get_history."
+            "Search earlier Omnigent sessions to recall decisions, discussions, open questions "
+            "and findings. Ask in plain language (e.g. why did we choose gVisor for sandboxes) "
+            "or use keywords with quoted phrases, OR and -exclusions. Results only include "
+            "sessions that every participant of this session can already read, because they "
+            "all see this tool's output. Returns session ids with matching digest entries and "
+            "message snippets; read more with sys_session_get_history."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -42,7 +43,10 @@ class SearchSessionsTool(Tool):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": 'Words or phrases, e.g. "warm pool" migration',
+                            "description": (
+                                "A question or keywords, e.g. how do sleeping "
+                                'workspaces migrate, or "warm pool" -staging'
+                            ),
                         },
                         "limit": {
                             "type": "integer",

@@ -145,14 +145,17 @@ def test_audience_limits_results_to_sessions_everyone_can_read(stores) -> None:
     assert search(alice, SearchPrincipal("__public__", False)) == set()
 
 
-def test_requires_every_term(stores) -> None:
+def test_sessions_with_every_term_rank_first(stores) -> None:
     store, perms = stores
     both = _session(store, "Both", "terraform plan for the warm pool")
     one = _session(store, "One", "terraform plan only")
     perms.grant(ALICE, both, 4)
     perms.grant(ALICE, one, 4)
 
-    assert _ids(store.search_sessions("terraform pool", (ALICE,))) == [both]
+    widened = store._conv_engine.dialect.name == "postgresql"
+    expected = [both, one] if widened else [both]
+    assert _ids(store.search_sessions("terraform pool", (ALICE,))) == expected
+    assert _ids(store.search_sessions('"terraform plan" pool', (ALICE,))) == [both]
     assert store.search_sessions("   ", (ALICE,)) == []
     assert store.search_sessions("terraform", ()) == []
 
