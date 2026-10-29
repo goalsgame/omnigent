@@ -54,6 +54,20 @@ export const ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at";
 /** Query-key prefix of the ranked message search results (`useSessionSearch`). */
 export const SESSION_SEARCH_KEY = ["session-search"] as const;
 
+/** Drop sessions from every cached ranked search result, e.g. after losing access. */
+export function removeIdsFromSessionSearch(queryClient: QueryClient, ids: Iterable<string>): void {
+  const drop = new Set(ids);
+  for (const [key, hits] of queryClient.getQueriesData<{ session_id: string }[]>({
+    queryKey: SESSION_SEARCH_KEY,
+  })) {
+    if (!hits?.some((hit) => drop.has(hit.session_id))) continue;
+    queryClient.setQueryData(
+      key,
+      hits.filter((hit) => !drop.has(hit.session_id)),
+    );
+  }
+}
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;

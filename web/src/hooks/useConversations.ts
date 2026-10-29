@@ -45,6 +45,7 @@ import {
   PROJECT_LABEL_KEY,
   recentlyCreatedSessions,
   removeIdsFromPages,
+  removeIdsFromSessionSearch,
   SESSION_SEARCH_KEY,
   unmarkRecentlyCreated,
   type ConversationsInfiniteData,
@@ -1246,6 +1247,7 @@ export function useLeaveSession() {
       revokePermission(id, viewerId),
     onSuccess: (_data, { id }) => {
       const ids = new Set([id]);
+      removeIdsFromSessionSearch(queryClient, ids);
       for (const queryKey of [["conversations"], ["project-sessions"]]) {
         for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
           queryKey,

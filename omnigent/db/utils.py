@@ -560,6 +560,18 @@ def _ensure_partition_search_indexes(connection: Connection, table: str, index: 
         {"table": table},
     ).all()
     for partition, kind in partitions:
+        child = connection.execute(
+            text(
+                "SELECT x.indexrelid::regclass::text FROM pg_inherits i "
+                "JOIN pg_index x ON x.indexrelid = i.inhrelid "
+                "WHERE i.inhparent = to_regclass(:index) AND x.indrelid = to_regclass(:partition)"
+            ),
+            {"index": index, "partition": partition},
+        ).scalar()
+        if child is not None:
+            if kind == "p":
+                _ensure_partition_search_indexes(connection, partition, child)
+            continue
         oid = connection.execute(
             text("SELECT to_regclass(:name)::oid"), {"name": partition}
         ).scalar_one()
@@ -581,15 +593,7 @@ def _ensure_partition_search_indexes(connection: Connection, table: str, index: 
                     f"{_SESSION_SEARCH_INDEX_BODY}"
                 )
             )
-        attached = connection.execute(
-            text(
-                "SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass(:child) "
-                "AND inhparent = to_regclass(:index)"
-            ),
-            {"child": child, "index": index},
-        ).scalar()
-        if not attached:
-            connection.execute(text(f"ALTER INDEX {index} ATTACH PARTITION {child}"))
+        connection.execute(text(f"ALTER INDEX {index} ATTACH PARTITION {child}"))
 
 
 def ensure_session_search_index(connection: Connection) -> None:

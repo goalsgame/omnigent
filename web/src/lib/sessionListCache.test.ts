@@ -12,6 +12,7 @@ import {
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   removeIdsFromPages,
+  removeIdsFromSessionSearch,
 } from "./sessionListCache";
 
 function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
@@ -542,5 +543,21 @@ describe("overlayTitleIntoCaches ranked search", () => {
       { session_id: "a", title: "New" },
       { session_id: "b", title: "Other" },
     ]);
+  });
+});
+
+describe("removeIdsFromSessionSearch", () => {
+  it("drops sessions from every cached ranked search result", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(
+      ["session-search", "pool"],
+      [{ session_id: "a" }, { session_id: "b" }],
+    );
+    queryClient.setQueryData(["session-search", "plan"], [{ session_id: "a" }]);
+
+    removeIdsFromSessionSearch(queryClient, ["a"]);
+
+    expect(queryClient.getQueryData(["session-search", "pool"])).toEqual([{ session_id: "b" }]);
+    expect(queryClient.getQueryData(["session-search", "plan"])).toEqual([]);
   });
 });

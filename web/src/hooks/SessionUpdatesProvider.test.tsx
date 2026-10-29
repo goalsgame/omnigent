@@ -332,6 +332,20 @@ describe("SessionUpdatesProvider project folders", () => {
     expect(folder!.pages[0].data[0]!.pending_elicitations_count).toBe(1);
   });
 
+  it("evicts a removed session from cached ranked search results", () => {
+    const client = new QueryClient();
+    client.setQueryData(
+      ["session-search", "pool"],
+      [{ session_id: "conv_gone" }, { session_id: "conv_kept" }],
+    );
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "removed", ids: ["conv_gone"] }));
+
+    expect(client.getQueryData(["session-search", "pool"])).toEqual([{ session_id: "conv_kept" }]);
+  });
+
   it("evicts a removed session from a project folder's cache", () => {
     const client = new QueryClient();
     seedProjectFolder(client, "Sprint 42", ["conv_filed", "conv_other"]);

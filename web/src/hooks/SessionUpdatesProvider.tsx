@@ -37,6 +37,7 @@ import {
   nullsToUndefined,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
+  removeIdsFromSessionSearch,
 } from "@/lib/sessionListCache";
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
@@ -172,6 +173,7 @@ function applyItemsToCache(
  */
 function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
   const idSet = new Set(ids);
+  removeIdsFromSessionSearch(queryClient, idSet);
   let removedAny = false;
   // Both the global lists and each project folder's own list (same page shape).
   for (const queryKey of [["conversations"], ["project-sessions"]]) {

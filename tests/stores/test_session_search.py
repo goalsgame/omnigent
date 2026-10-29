@@ -236,3 +236,29 @@ def test_underscores_match_literally(stores) -> None:
     perms.grant(ALICE, other, 4)
 
     assert _ids(store.search_sessions("server_key", (ALICE,))) == [exact]
+
+
+def test_postgres_snippets_find_stemmed_matches(stores) -> None:
+    store, perms = stores
+    if store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL stemming")
+    session = _session(store, "Notes", "x " * 200 + "the retention policy changed last week")
+    perms.grant(ALICE, session, 4)
+
+    [hit] = store.search_sessions("policies", (ALICE,))
+    assert "retention policy changed" in hit.matches[0].snippet
+
+
+def test_ranking_does_not_depend_on_the_limit(stores) -> None:
+    store, perms = stores
+    sessions = [
+        _session(store, "Gateway", "unrelated words"),
+        _session(store, "Gateway too", "gateway outage", "gateway restore"),
+        _session(store, "Other", "gateway mention"),
+    ]
+    for session in sessions:
+        perms.grant(ALICE, session, 4)
+
+    full = _ids(store.search_sessions("gateway", (ALICE,), limit=3))
+    assert _ids(store.search_sessions("gateway", (ALICE,), limit=1)) == full[:1]
+    assert _ids(store.search_sessions("gateway", (ALICE,), limit=2)) == full[:2]

@@ -105,8 +105,14 @@ def test_index_is_built_per_partition_on_a_partitioned_table(db_uri: str) -> Non
             ):
                 connection.execute(sa.text(statement))
 
-            for _ in range(2):
-                ensure_session_search_index(connection)
+            ensure_session_search_index(connection)
+            connection.execute(
+                sa.text(
+                    "CREATE TABLE items_later PARTITION OF conversation_items "
+                    "FOR VALUES FROM (2000) TO (3000)"
+                )
+            )
+            ensure_session_search_index(connection)
 
             valid = connection.execute(
                 sa.text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"),
@@ -115,12 +121,12 @@ def test_index_is_built_per_partition_on_a_partitioned_table(db_uri: str) -> Non
             leaves = connection.execute(
                 sa.text(
                     "SELECT count(*) FROM pg_indexes WHERE schemaname = 'search_partitions' "
-                    "AND tablename IN ('items_old', 'items_new_a', 'items_new_b') "
+                    "AND tablename IN ('items_old', 'items_new_a', 'items_new_b', 'items_later') "
                     "AND indexdef LIKE '%to_tsvector%'"
                 )
             ).scalar_one()
             assert valid
-            assert leaves == 3
+            assert leaves == 4
 
             drop_session_search_index(connection)
             assert (

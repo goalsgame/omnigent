@@ -27,6 +27,7 @@ MAX_SESSIONS = 50
 MAX_MATCHES_PER_SESSION = 3
 _CANDIDATE_ITEMS = MAX_SESSIONS * MAX_MATCHES_PER_SESSION
 _STATEMENT_TIMEOUT_MS = 15_000
+_HEADLINE_OPTIONS = 'MaxFragments=1, MaxWords=30, MinWords=12, StartSel="", StopSel=""'
 _TERM = re.compile(r"\w+", re.UNICODE)
 _OPERATORS = frozenset({"or", "and", "not"})
 
@@ -215,6 +216,7 @@ class SessionSearch:
                     text(f"SET LOCAL statement_timeout = {int(_STATEMENT_TIMEOUT_MS)}")
                 )
 
+            tsquery: ColumnElement[Any] | None = None
             if postgres:
                 tsquery = func.websearch_to_tsquery(
                     literal_column(f"'{TEXT_SEARCH_CONFIG}'"), query
@@ -289,7 +291,7 @@ class SessionSearch:
                 select(root.id, title_rank)
                 .where(title_match, *root_filters)
                 .order_by(title_rank.desc())
-                .limit(limit)
+                .limit(MAX_SESSIONS)
             ).all()
 
             scores: dict[str, float] = {}
@@ -326,7 +328,17 @@ class SessionSearch:
                         select(
                             SqlConversationItem.id,
                             SqlConversationItem.conversation_id,
-                            SqlConversationItem.search_text,
+                            func.ts_headline(
+                                literal_column(f"'{TEXT_SEARCH_CONFIG}'"),
+                                func.left(
+                                    SqlConversationItem.search_text,
+                                    literal_column(str(INDEXED_TEXT_CHARS)),
+                                ),
+                                tsquery,
+                                literal_column(f"'{_HEADLINE_OPTIONS}'"),
+                            )
+                            if tsquery is not None
+                            else SqlConversationItem.search_text,
                         ).where(
                             SqlConversationItem.workspace_id == workspace,
                             or_(
@@ -360,7 +372,9 @@ class SessionSearch:
                             item_id=item_id,
                             conversation_id=conversation_id,
                             created_at=created_at,
-                            snippet=_snippet(bodies.get((conversation_id, item_id)), terms),
+                            snippet=_snippet(
+                                bodies.get((conversation_id, item_id)), [] if postgres else terms
+                            ),
                         )
                         for item_id, conversation_id, created_at in picked.get(root_id, [])
                     ],
