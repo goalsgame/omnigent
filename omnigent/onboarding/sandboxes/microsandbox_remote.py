@@ -22,6 +22,7 @@ them in place.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import secrets
@@ -52,6 +53,7 @@ _REQUEST_TIMEOUT_S: float = 60.0
 _CREATE_TIMEOUT_S: float = 900.0
 _RUN_TIMEOUT_S: float = 600.0
 _ID_TOKEN_REFRESH_S: float = 45 * 60
+_CREATE_ATTEMPTS: int = 3
 
 _NAME_INVALID = re.compile(r"[^a-z0-9-]+")
 
@@ -95,7 +97,12 @@ class _Credentials:
                     raise click.ClickException(
                         "an audience requires google-auth; install 'omnigent[vertex]'"
                     ) from exc
-                token = id_token.fetch_id_token(Request(), self._audience)
+                try:
+                    token = id_token.fetch_id_token(Request(), self._audience)
+                except Exception as exc:
+                    raise click.ClickException(
+                        f"could not obtain an ID token for the host API: {exc}"
+                    ) from exc
                 if not token:
                     raise click.ClickException("could not obtain an ID token for the host API")
                 self._token = token
@@ -236,11 +243,26 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             body["workspace_path"] = self._workspace_path
             body["workspace_quota_mib"] = self._workspace_quota_mib
         click.echo(f"▸ Creating remote microsandbox '{sandbox_id}'")
-        response = self._request(
-            "PUT", f"/v1/sandboxes/{sandbox_id}", json=body, timeout=_CREATE_TIMEOUT_S
-        )
-        self._check(response, f"create sandbox '{sandbox_id}'")
-        return sandbox_id
+        failure: click.ClickException | None = None
+        for _attempt in range(_CREATE_ATTEMPTS):
+            try:
+                response = self._request(
+                    "PUT", f"/v1/sandboxes/{sandbox_id}", json=body, timeout=_CREATE_TIMEOUT_S
+                )
+            except click.ClickException as exc:
+                failure = exc
+                continue
+            if response.status_code < 500:
+                self._check(response, f"create sandbox '{sandbox_id}'")
+                return sandbox_id
+            failure = click.ClickException(
+                f"microsandbox host could not create sandbox '{sandbox_id}': "
+                f"HTTP {response.status_code}"
+            )
+        # The host may have created the VM before the response was lost.
+        with contextlib.suppress(click.ClickException):
+            self._request("DELETE", f"/v1/sandboxes/{sandbox_id}", timeout=_CREATE_TIMEOUT_S)
+        raise failure or click.ClickException(f"could not create sandbox '{sandbox_id}'")
 
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         response = self._request(

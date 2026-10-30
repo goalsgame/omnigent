@@ -157,6 +157,64 @@ def test_lifecycle_maps_missing_sandboxes(
         launcher.run(sandbox_id, "true")
 
 
+def test_lost_create_response_retries_the_same_name(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    calls = {"put": 0}
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            calls["put"] += 1
+            if calls["put"] == 1:
+                host(request)
+                raise httpx.ReadTimeout("response lost", request=request)
+        return host(request)
+
+    launcher._transport = httpx.MockTransport(flaky)
+    sandbox_id = launcher.provision("managed")
+    puts = [r for r in host.requests if r.method == "PUT"]
+    assert len(puts) == 2
+    assert {r.url.path for r in puts} == {f"/v1/sandboxes/{sandbox_id}"}
+    assert host.sandboxes[sandbox_id] == "running"
+
+
+def test_failed_create_removes_a_possibly_created_sandbox(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    def broken(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            host(request)
+            raise httpx.ReadTimeout("response lost", request=request)
+        return host(request)
+
+    launcher._transport = httpx.MockTransport(broken)
+    with pytest.raises(click.ClickException, match="response lost"):
+        launcher.provision("managed")
+    deletes = [r for r in host.requests if r.method == "DELETE"]
+    puts = [r for r in host.requests if r.method == "PUT"]
+    assert len(puts) == 3
+    assert [r.url.path for r in deletes] == [puts[0].url.path]
+    assert host.sandboxes == {}
+
+
+def test_id_token_failures_become_lifecycle_errors(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(_request: object, _audience: str) -> str:
+        raise ValueError("metadata server unavailable")
+
+    pytest.importorskip("google.oauth2.id_token")
+    monkeypatch.setattr("google.oauth2.id_token.fetch_id_token", fail)
+    monkeypatch.setattr(remote, "_credentials", {})
+    launcher = RemoteMicrosandboxLauncher(
+        endpoint=ENDPOINT, audience="https://sandbox-host", transport=httpx.MockTransport(host)
+    )
+    assert launcher.is_running("any") is None
+    assert launcher.keep_alive("any") is False
+    with pytest.raises(click.ClickException, match="metadata server unavailable"):
+        launcher.prepare()
+
+
 def test_requires_a_token(host: FakeHost, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(DEFAULT_TOKEN_ENV, raising=False)
     launcher = RemoteMicrosandboxLauncher(endpoint=ENDPOINT, transport=httpx.MockTransport(host))
