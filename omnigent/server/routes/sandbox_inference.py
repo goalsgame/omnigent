@@ -100,7 +100,7 @@ def managed_proxy_catalog(
         or not proxy.config.managed_sandboxes
         or (harness != "auto" and harness not in proxy.config.harnesses)
         or target is None
-        or target.provider not in ("agent_sandbox", "kubernetes")
+        or target.provider not in ("agent_sandbox", "kubernetes", "microsandbox_remote")
         or agent_auth is not None
         or profile
         or parse_inference_config(target.host_config or {})
