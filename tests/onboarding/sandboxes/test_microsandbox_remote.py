@@ -316,3 +316,158 @@ def test_parse_config_rejects_invalid_sections(section: dict[str, object], messa
                 "microsandbox_remote": section,
             }
         )
+
+
+def _exec_bodies(host: FakeHost) -> list[dict[str, object]]:
+    return [json.loads(r.content) for r in host.requests if r.url.path.endswith("/exec")]
+
+
+def test_github_clone_uses_the_brokered_helper_with_the_token_in_env(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
+
+    host.exec_response = {"exit_code": 0, "stdout": "/root", "stderr": "", "timed_out": False}
+    sandbox_id = launcher.provision("managed")
+    launcher.start_host(
+        sandbox_id,
+        token="launch-secret",
+        host_id="host-1",
+        host_name="managed",
+        server_url="https://omnigent.example",
+        repos=[
+            RepoWorkspace(
+                url="https://github.com/org/private.git", branch=None, repo_name="private"
+            ),
+            RepoWorkspace(
+                url="https://gitlab.com/org/public.git", branch=None, repo_name="public"
+            ),
+        ],
+    )
+    clones = [b for b in _exec_bodies(host) if "git clone" in str(b["command"])]
+    assert len(clones) == 2
+    github, other = clones
+    assert github["env"] == {HOST_TOKEN_ENV_VAR: "launch-secret"}
+    assert "launch-secret" not in str(github["command"])
+    assert "omnigent.git_credential_github" in str(github["command"])
+    assert "env" not in other
+    assert "git_credential_github" not in str(other["command"])
+    assert launcher._clone_auth == {}
+
+
+@pytest.mark.parametrize(
+    ("credential", "drop_writes", "exit_code", "expected"),
+    [
+        ({"connected": True, "token": "gh"}, False, 0, "helper"),
+        ({"connected": True, "token": "gh"}, True, 1, ""),
+        ({"connected": False, "reason": "not_connected"}, False, 1, "unconnected"),
+        ({"connected": False, "reason": "disabled"}, False, 0, "guest-config"),
+    ],
+)
+def test_clone_script_wires_a_verified_temporary_helper(
+    tmp_path, credential, drop_writes, exit_code, expected
+) -> None:
+    import http.server
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import threading
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+    from omnigent.host.workspace_errors import (
+        GITHUB_CHECKOUT_UNCONNECTED,
+        WORKSPACE_ERROR_MESSAGES,
+    )
+
+    seen: list[str | None] = []
+
+    class Broker(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            seen.append(self.headers.get("X-Omnigent-Host-Token"))
+            body = json.dumps(credential).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    home, scratch, bin_dir = tmp_path / "home", tmp_path / "tmp", tmp_path / "bin"
+    for directory in (home, scratch, bin_dir):
+        directory.mkdir()
+    (home / ".gitconfig").write_text("[guest]\n\tmarker = kept\n")
+    path = f"{os.path.dirname(sys.executable)}:{os.environ['PATH']}"
+    if drop_writes:
+        real_git = shutil.which("git")
+        wrapper = bin_dir / "git"
+        wrapper.write_text(
+            f'#!/bin/sh\ncase " $* " in *" --add "*) exit 0 ;; esac\nexec {real_git} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        path = f"{bin_dir}:{path}"
+    key = remote._GITHUB_HELPER_KEY
+    clone = f"git config --global --get-all {key}; git config --global guest.marker || true"
+    if expected == "unconnected":
+        clone = "false"
+    server = http.server.HTTPServer(("127.0.0.1", 0), Broker)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = remote._github_clone_script(
+            f"http://127.0.0.1:{server.server_port}", "host-1", clone
+        )
+        env = {
+            "PATH": path,
+            "HOME": str(home),
+            "TMPDIR": str(scratch),
+            HOST_TOKEN_ENV_VAR: "launch-secret",
+        }
+        result = subprocess.run(
+            ["sh", "-c", script], env=env, capture_output=True, text=True, check=False
+        )
+    finally:
+        server.shutdown()
+    assert seen == ["launch-secret"]
+    assert result.returncode == exit_code, result.stderr
+    assert list(scratch.iterdir()) == []
+    if expected == "helper":
+        helpers = result.stdout.splitlines()
+        assert helpers[0] == ""
+        assert "git_credential_github" in helpers[1]
+        assert "launch-secret" not in result.stdout
+        assert "kept" not in result.stdout
+    elif expected == "unconnected":
+        assert WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_UNCONNECTED] in result.stderr
+    elif expected == "guest-config":
+        assert result.stdout.strip() == "kept"
+    else:
+        assert result.stdout == ""
+
+
+def test_git_clone_policy_reaches_the_github_clone(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+
+    assert launcher.capabilities.git_clone_options
+    host.exec_response = {"exit_code": 0, "stdout": "/root", "stderr": "", "timed_out": False}
+    sandbox_id = launcher.provision("managed")
+    launcher.start_host(
+        sandbox_id,
+        token="launch-secret",
+        host_id="host-1",
+        host_name="managed",
+        server_url="https://omnigent.example",
+        repos=[
+            RepoWorkspace(
+                url="https://github.com/org/private.git",
+                branch="main",
+                repo_name="private",
+                git_clone=GitCloneOptions(depth=1),
+            )
+        ],
+    )
+    (clone,) = [b for b in _exec_bodies(host) if "git clone" in str(b["command"])]
+    assert "--depth 1" in str(clone["command"])

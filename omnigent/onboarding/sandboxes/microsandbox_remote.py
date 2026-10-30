@@ -26,21 +26,29 @@ import contextlib
 import os
 import re
 import secrets
+import shlex
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
 
 import click
 import httpx
 
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+from omnigent.host.workspace_errors import (
+    GITHUB_CHECKOUT_MACHINE_UNAVAILABLE,
+    GITHUB_CHECKOUT_UNCONNECTED,
+    WORKSPACE_ERROR_MESSAGES,
+)
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     ExecModelHostLauncher,
     RemoteCommandResult,
     SandboxGoneError,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace, SandboxCapabilities
 
 DEFAULT_TOKEN_ENV: str = "OMNIGENT_MICROSANDBOX_REMOTE_TOKEN"
 """Server environment variable holding a static bearer token for the host API."""
@@ -56,6 +64,55 @@ _ID_TOKEN_REFRESH_S: float = 45 * 60
 _CREATE_ATTEMPTS: int = 3
 
 _NAME_INVALID = re.compile(r"[^a-z0-9-]+")
+
+_GITHUB_HELPER_KEY = "credential.https://github.com.helper"
+
+
+def _github_clone_script(server_url: str, host_id: str, clone: str) -> str:
+    """
+    Shell script that runs *clone* with the server-brokered GitHub credential helper.
+
+    The helper is wired into a temporary global git config removed on exit and
+    reads the launch token from :data:`HOST_TOKEN_ENV_VAR`. The clone uses that
+    config only when the reset-plus-broker helper chain reads back exactly;
+    otherwise it runs with the guest's own git config and, if it fails, reports
+    why no credential was offered.
+    """
+    helper_source = (
+        "import os,sys; from omnigent.git_credential_github import main; "
+        f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
+        f"'--host-token='+os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
+    )
+    helper = f"!python3 -Ic {shlex.quote(helper_source)}"
+    wire = (
+        "import subprocess,sys; import omnigent.git_credential_github as g; "
+        "g._install_broker_helper=lambda *_:("
+        f"g._git_config('--replace-all',{_GITHUB_HELPER_KEY!r},''),"
+        f"g._git_config('--add',{_GITHUB_HELPER_KEY!r},{helper!r})); "
+        "status=getattr(g,'configure_clone_credentials_status',None); "
+        f"wired=(status({server_url!r},{host_id!r}) if status is not None else "
+        f"('broker' if g.configure_clone_credentials({server_url!r},{host_id!r}) "
+        "else 'disabled')); "
+        "helpers=(subprocess.run(['git','config','--global','--get-all',"
+        f"{_GITHUB_HELPER_KEY!r}],capture_output=True,text=True).stdout.splitlines() "
+        "if wired == 'broker' else None); "
+        f"sys.exit(0 if helpers == ['', {helper!r}] else 1 if wired == 'broker' else "
+        "{'unconnected':11,'machine_unavailable':12}.get(wired,10))"
+    )
+    unconnected = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_UNCONNECTED])
+    machine = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_MACHINE_UNAVAILABLE])
+    return (
+        "cfg=$(mktemp) || exit 1\ntrap 'rm -f -- \"$cfg\"' EXIT\nwire_rc=0\n"
+        'GIT_CONFIG_GLOBAL="$cfg" PYTHONSAFEPATH=1 PYTHONNOUSERSITE=1 PYTHONPATH= '
+        f"python3 -c {shlex.quote(wire)} || wire_rc=$?\n"
+        'case "$wire_rc" in 0) export GIT_CONFIG_GLOBAL="$cfg" ;; 10|11|12) ;; '
+        '*) exit "$wire_rc" ;; esac\n'
+        f"{clone} && exit 0\n"
+        "clone_rc=$?\n"
+        f"if [ \"$wire_rc\" -eq 11 ]; then printf '%s\\n' {unconnected} >&2; fi\n"
+        f"if [ \"$wire_rc\" -eq 12 ]; then printf '%s\\n' {machine} >&2; fi\n"
+        'exit "$clone_rc"\n'
+    )
 
 
 def sandbox_name(label: str) -> str:
@@ -181,6 +238,7 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
         self._workspace_path = workspace_path
         self._workspace_quota_mib = workspace_quota_mib
         self._transport = transport
+        self._clone_auth: dict[str, tuple[str, str, str]] = {}
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -193,7 +251,7 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             file_copy=False,
             streaming_exec=False,
             foreground_exec=False,
-            git_clone_options=super().capabilities.git_clone_options,
+            git_clone_options=True,
         )
 
     def _request(
@@ -265,11 +323,91 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             self._request("DELETE", f"/v1/sandboxes/{sandbox_id}", timeout=_CREATE_TIMEOUT_S)
         raise failure or click.ClickException(f"could not create sandbox '{sandbox_id}'")
 
-    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repos: Sequence[RepoWorkspace] = (),
+        host_config: dict[str, object] | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        self._clone_auth[sandbox_id] = (server_url, host_id, token)
+        try:
+            return super().start_host(
+                sandbox_id,
+                token=token,
+                host_id=host_id,
+                host_name=host_name,
+                server_url=server_url,
+                repos=repos,
+                host_config=host_config,
+                on_stage=on_stage,
+            )
+        finally:
+            self._clone_auth.pop(sandbox_id, None)
+
+    def materialize_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        workspace: str,
+        repo_url: str,
+        repo_branch: str | None,
+        repo_name: str | None,
+        on_stage: Callable[[str], None] | None = None,
+        git_clone: GitCloneOptions = GitCloneOptions(),
+    ) -> str:
+        auth = self._clone_auth.get(sandbox_id)
+        parts = urlsplit(repo_url)
+        if auth is None or parts.scheme != "https" or parts.hostname != "github.com":
+            return super().materialize_workspace(
+                sandbox_id,
+                workspace=workspace,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                on_stage=on_stage,
+                git_clone=git_clone,
+            )
+        server_url, host_id, token = auth
+        if on_stage is not None:
+            on_stage("cloning")
+        clone_dir = f"{workspace}/{repo_name}"
+        clone = shlex.join(
+            ["git", "clone", *git_clone.clone_args(repo_branch), "--", repo_url, clone_dir]
+        )
+        try:
+            self.run(
+                sandbox_id,
+                _github_clone_script(server_url, host_id, clone),
+                env={HOST_TOKEN_ENV_VAR: token},
+            )
+        except click.ClickException as exc:
+            raise click.ClickException(
+                f"failed to clone repository '{repo_url}'"
+                f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
+            ) from exc
+        return clone_dir
+
+    def run(
+        self,
+        sandbox_id: str,
+        command: str,
+        *,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> RemoteCommandResult:
+        body: dict[str, Any] = {"command": command, "timeout_s": _RUN_TIMEOUT_S}
+        if env:
+            body["env"] = env
         response = self._request(
             "POST",
             f"/v1/sandboxes/{sandbox_id}/exec",
-            json={"command": command, "timeout_s": _RUN_TIMEOUT_S},
+            json=body,
             timeout=_RUN_TIMEOUT_S + _REQUEST_TIMEOUT_S,
         )
         if response.status_code == 404:
