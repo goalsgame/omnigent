@@ -729,7 +729,7 @@ def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
 def test_slow_event_posts_coalesce_live_deltas_in_order(tmp_path: Path) -> None:
     """Deltas arriving during a slow POST are merged instead of queued one by one.
 
-    The first event POST is held open while 40 tokens arrive, so the handler
+    The first delta POST is held open while 40 tokens arrive, so the handler
     must not block on the network: the POST is still pending once every token
     is delivered, far fewer delta POSTs are made, at most one is in flight,
     text and reasoning keep their order, the joined text is exact, and the
@@ -743,10 +743,15 @@ let maxInFlight = 0;
 let release;
 const gate = new Promise((resolve) => { release = resolve; });
 global.fetch = async (_url, request) => {
+  const body = JSON.parse(request.body);
+  if (!body.type.startsWith("external_output_")) {
+    posted.push(body);
+    return { ok: true, status: 200, async json() { return { result: "" }; } };
+  }
   inFlight += 1;
   maxInFlight = Math.max(maxInFlight, inFlight);
   await gate;
-  posted.push(JSON.parse(request.body));
+  posted.push(body);
   inFlight -= 1;
   return { ok: true, status: 200, async json() { return { result: "" }; } };
 };
@@ -760,7 +765,7 @@ global.fetch = async (_url, request) => {
   const tokens = Array.from({ length: 40 }, (_, i) => `t${i} `);
   for (const token of tokens) await feed(textDelta(1, token));
   assert.equal(inFlight, 1, "message_update must not wait for the network");
-  assert.equal(posted.length, 0);
+  assert.equal(deltas().length, 0);
   release();
 
   await feed(textEnd(1, tokens.join("")));
@@ -789,11 +794,13 @@ global.fetch = async (_url, request) => {
   );
   assert.ok(finalAt < itemAt, "the assistant item must follow the final marker");
   assert.ok(posted.slice(0, finalAt).includes(textChunks[textChunks.length - 1]));
+  console.log("coalesce-complete");
 })().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "coalesce-complete" in result.stdout, result.stdout + result.stderr
 
 
 def test_successive_messages_in_turn_get_distinct_ids(tmp_path: Path) -> None:
