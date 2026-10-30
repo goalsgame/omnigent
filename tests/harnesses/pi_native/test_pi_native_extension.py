@@ -603,10 +603,10 @@ def test_text_deltas_post_incrementally_with_stable_id() -> None:
   await endMessage(chunks.join(""));
 
   const ds = deltas();
-  // One text chunk per delta plus a single final marker.
+  // Text chunks (possibly merged) plus a single final marker.
   const textChunks = ds.filter((d) => d.data.delta !== "");
   const finals = ds.filter((d) => d.data.final === true);
-  assert.equal(textChunks.length, chunks.length, JSON.stringify(ds));
+  assert.ok(textChunks.length >= 1 && textChunks.length <= chunks.length, JSON.stringify(ds));
   assert.equal(finals.length, 1, JSON.stringify(ds));
 
   // Stable message_id across every chunk and the final marker.
@@ -664,12 +664,10 @@ def test_thinking_deltas_post_live_reasoning(tmp_path: Path) -> None:
   await handlers.turn_end({ message, toolResults: [] }, ctx);
 
   const reasoning = posted.filter((e) => e.type === "external_output_reasoning_delta");
+  assert.equal(reasoning.map((e) => e.data.delta).join(""), "plan step");
   assert.deepEqual(
-    reasoning.map((e) => e.data),
-    [
-      { delta: "plan ", started: true },
-      { delta: "step", started: false },
-    ],
+    reasoning.map((e) => e.data.started),
+    reasoning.map((_, i) => i === 0),
   );
   const completed = items().filter((e) => e.data.item_type === "reasoning");
   assert.equal(completed.length, 1, JSON.stringify(completed));
@@ -713,7 +711,7 @@ def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
   assert.equal(ids.size, 1, "both blocks must share one id: " + JSON.stringify([...ids]));
 
   const textChunks = ds.filter((d) => d.data.delta !== "");
-  assert.equal(textChunks.length, 4, JSON.stringify(ds));
+  assert.ok(textChunks.length >= 1 && textChunks.length <= 4, JSON.stringify(ds));
   // Single monotonic index spanning both blocks.
   const indices = ds.map((d) => d.data.index);
   assert.deepEqual(indices, indices.map((_, i) => i), JSON.stringify(indices));
@@ -721,6 +719,72 @@ def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
     textChunks.map((d) => d.data.delta).join(""),
     "First part. Second part.",
   );
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_slow_event_posts_coalesce_live_deltas_in_order(tmp_path: Path) -> None:
+    """Deltas arriving during a slow POST are merged instead of queued one by one.
+
+    With each event POST taking 30 ms and 40 tokens arriving without waiting,
+    the handler must not block on the network: far fewer delta POSTs are made,
+    at most one is in flight, text and reasoning keep their order, the joined
+    text is exact, and the final marker and assistant item follow every delta.
+    """
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+let inFlight = 0;
+let maxInFlight = 0;
+global.fetch = async (_url, request) => {
+  inFlight += 1;
+  maxInFlight = Math.max(maxInFlight, inFlight);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  posted.push(JSON.parse(request.body));
+  inFlight -= 1;
+  return { ok: true, status: 200, async json() { return { result: "" }; } };
+};
+
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+
+  const started = Date.now();
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "think " });
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "more" });
+  const tokens = Array.from({ length: 40 }, (_, i) => `t${i} `);
+  for (const token of tokens) await feed(textDelta(1, token));
+  assert.ok(Date.now() - started < 30, "message_update must not wait for the network");
+
+  await feed(textEnd(1, tokens.join("")));
+  await endMessage(tokens.join(""));
+
+  assert.equal(maxInFlight, 1);
+  const live = posted.filter((e) =>
+    e.type === "external_output_text_delta" || e.type === "external_output_reasoning_delta");
+  const reasoning = live.filter((e) => e.type === "external_output_reasoning_delta");
+  assert.equal(reasoning.map((e) => e.data.delta).join(""), "think more");
+  assert.equal(reasoning[0].data.started, true);
+  const lastReasoning = live.lastIndexOf(reasoning[reasoning.length - 1]);
+  const firstText = live.findIndex((e) => e.type === "external_output_text_delta");
+  assert.ok(lastReasoning < firstText, JSON.stringify(live));
+
+  const ds = deltas();
+  const textChunks = ds.filter((d) => d.data.delta !== "");
+  assert.ok(textChunks.length <= 3, `expected merged chunks, got ${textChunks.length}`);
+  assert.equal(textChunks.map((d) => d.data.delta).join(""), tokens.join(""));
+  assert.deepEqual(ds.map((d) => d.data.index), ds.map((_, i) => i));
+  assert.equal(ds[ds.length - 1].data.final, true);
+
+  const finalAt = posted.indexOf(ds[ds.length - 1]);
+  const itemAt = posted.findIndex(
+    (e) => e.type === "external_conversation_item" && e.data.item_data.role === "assistant",
+  );
+  assert.ok(finalAt < itemAt, "the assistant item must follow the final marker");
+  assert.ok(posted.slice(0, finalAt).includes(textChunks[textChunks.length - 1]));
 })().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
 """
     )

@@ -1543,6 +1543,12 @@ module.exports = function (pi) {
   // so a duplicate text_end (or a stray text_delta after end) can't reopen
   // or double-finalize the preview.
   const finalizedTextBlocks = new Set();
+  // Live deltas waiting to be posted, in arrival order. At most one delta POST
+  // is in flight; chunks for the same message or reasoning block that arrive
+  // meanwhile merge into one pending entry.
+  const pendingDeltas = [];
+  let deltaPump = null;
+  const postedReasoningBlocks = new Set();
 
   // Names of the Omnigent tools registered via pi.registerTool below. Bridged
   // tools are policy-evaluated server-side inside the /mcp proxy (TOOL_CALL +
@@ -1975,15 +1981,43 @@ module.exports = function (pi) {
     return `${responseId}:msg:${streamingMessageOrdinal}:thinking:${contentIndex}`;
   }
 
-  async function postReasoningDelta(update, responseId) {
-    if (typeof update.delta !== "string" || !update.delta) return;
-    const blockKey = reasoningBlockKey(responseId, update.contentIndex);
-    const started = !streamedReasoningBlocks.has(blockKey);
-    streamedReasoningBlocks.add(blockKey);
+  function queueDelta(kind, key, delta) {
+    const last = pendingDeltas[pendingDeltas.length - 1];
+    if (last && last.kind === kind && last.key === key) last.delta += delta;
+    else pendingDeltas.push({ kind, key, delta });
+    if (!deltaPump) deltaPump = pumpDeltas();
+  }
+
+  async function pumpDeltas() {
+    try {
+      while (pendingDeltas.length) {
+        const next = pendingDeltas.shift();
+        if (next.kind === "text") await postOutputTextDelta(next.key, next.delta);
+        else await postReasoningChunk(next.key, next.delta);
+      }
+    } finally {
+      deltaPump = null;
+    }
+  }
+
+  async function flushDeltas() {
+    while (deltaPump) await deltaPump;
+  }
+
+  async function postReasoningChunk(blockKey, delta) {
+    const started = !postedReasoningBlocks.has(blockKey);
+    postedReasoningBlocks.add(blockKey);
     await postEvent(config, {
       type: "external_output_reasoning_delta",
-      data: { delta: update.delta, started },
+      data: { delta, started },
     });
+  }
+
+  function postReasoningDelta(update, responseId) {
+    if (typeof update.delta !== "string" || !update.delta) return;
+    const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+    streamedReasoningBlocks.add(blockKey);
+    queueDelta("reasoning", blockKey, update.delta);
   }
 
   function streamingMessageId(responseId) {
@@ -2019,14 +2053,14 @@ module.exports = function (pi) {
     });
   }
 
-  async function postTextDelta(update, responseId) {
+  function postTextDelta(update, responseId) {
     // assistantMessageEvent of type "text_delta": one streamed token of
     // the current assistant message. All text blocks of the message share
     // its id, so the preview reads as one growing message.
     if (!update || typeof update.delta !== "string" || !update.delta) return;
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
-    await postOutputTextDelta(messageId, update.delta);
+    queueDelta("text", messageId, update.delta);
   }
 
   async function finalizeStreamingMessage(responseId) {
@@ -2036,6 +2070,7 @@ module.exports = function (pi) {
     // message); message_end posts the authoritative item that replaces the
     // preview in place. Only finalize a message we actually streamed (a
     // message with no text_delta has no live preview to close).
+    await flushDeltas();
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
     if (!streamedTextIndex.has(messageId)) return;
@@ -2287,6 +2322,7 @@ module.exports = function (pi) {
     postedReasoning.clear();
     postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
+    postedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
@@ -2351,13 +2387,14 @@ module.exports = function (pi) {
     const update = event ? event.assistantMessageEvent : undefined;
     if (!update || typeof update !== "object") return;
     if (update.type === "text_delta") {
-      await postTextDelta(update, responseId);
+      postTextDelta(update, responseId);
       return;
     }
     if (update.type === "thinking_delta") {
-      await postReasoningDelta(update, responseId);
+      postReasoningDelta(update, responseId);
       return;
     }
+    await flushDeltas();
     if (update.type === "toolcall_end") {
       await postToolCall(update.toolCall, responseId);
       return;
