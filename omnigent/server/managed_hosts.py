@@ -34,7 +34,7 @@ stores into ``create_app``):
 
        sandbox:
          # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|
-         # kubernetes|microsandbox|gensee
+         # kubernetes|microsandbox|microsandbox_remote|gensee
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -112,6 +112,19 @@ stores into ``create_app``):
            network: host                     # host (default)|public-only|all
            host_ports: [8317]                # extra guest-to-host ports (the
                                              # server_url port is always allowed)
+         microsandbox_remote:     # optional block (provider: microsandbox_remote)
+           endpoint: http://10.0.0.5:8740    # required: sandbox host API
+           audience: https://sandbox-host     # ID-token audience; omit to use a
+                                             # static token from token_env
+           token_env: OMNIGENT_MICROSANDBOX_REMOTE_TOKEN  # default shown
+           image: registry/omnigent-host@sha256:...  # default: official image
+           env: [GIT_TOKEN]                  # SERVER env var NAMES injected
+           cpus: 30                          # default 2; idle vCPUs are free
+           memory_mib: 4096                  # starting memory, default 4096
+           max_memory_mib: 16384             # live-growth ceiling
+           idle_timeout_s: 86400             # default 24h; 0 disables
+           workspace_path: /home/omnigent    # volume kept across stop/start
+           workspace_quota_mib: 51200        # workspace volume quota
          gensee:                 # optional block (provider: gensee)
            endpoint: https://sandbox.gensee.ai
            api_token_env: GENSEE_CONTROLLER_API_TOKEN
@@ -219,6 +232,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "openshell",
         "kubernetes",
         "microsandbox",
+        "microsandbox_remote",
         "agent_sandbox",
     }
 )
@@ -235,6 +249,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "openshell",
         "kubernetes",
         "microsandbox",
+        "microsandbox_remote",
         "agent_sandbox",
     }
 )
@@ -281,6 +296,9 @@ BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # The seven-day policy keeps live VMs reconnecting while stale tokens expire.
 # A relaunch mints a fresh token.
 MICROSANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Remote microsandbox hosts keep sandboxes until removed; same policy as local.
+MICROSANDBOX_REMOTE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are
 # deleted by managed-session teardown; use the same 7-day policy bound
@@ -1704,6 +1722,49 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             host_ports=_resolve_microsandbox_host_ports(raw, server_url),
         )
         token_ttl_s = MICROSANDBOX_MANAGED_TOKEN_TTL_S
+    elif provider == "microsandbox_remote":
+        remote_section = _parse_provider_section(raw, "microsandbox_remote")
+        if remote_section is not None:
+            _reject_unknown_keys(
+                remote_section,
+                {
+                    "endpoint",
+                    "audience",
+                    "token_env",
+                    "image",
+                    "cpus",
+                    "memory_mib",
+                    "max_memory_mib",
+                    "idle_timeout_s",
+                    "env",
+                    "workspace_path",
+                    "workspace_quota_mib",
+                },
+                "sandbox.microsandbox_remote",
+            )
+        endpoint = _parse_provider_string(raw, "microsandbox_remote", "endpoint")
+        if endpoint is None:
+            raise ValueError("server config 'sandbox.microsandbox_remote.endpoint' is required")
+        launcher_factory = _microsandbox_remote_launcher_factory(
+            endpoint=endpoint,
+            audience=_parse_provider_string(raw, "microsandbox_remote", "audience"),
+            token_env=_parse_provider_string(raw, "microsandbox_remote", "token_env"),
+            image=_parse_provider_image(raw, "microsandbox_remote"),
+            env=_parse_provider_env(raw, "microsandbox_remote"),
+            cpus=_parse_provider_positive_int(raw, "microsandbox_remote", "cpus"),
+            memory_mib=_parse_provider_positive_int(raw, "microsandbox_remote", "memory_mib"),
+            max_memory_mib=_parse_provider_positive_int(
+                raw, "microsandbox_remote", "max_memory_mib"
+            ),
+            idle_timeout_s=_parse_provider_nonnegative_int(
+                raw, "microsandbox_remote", "idle_timeout_s"
+            ),
+            workspace_path=_parse_provider_string(raw, "microsandbox_remote", "workspace_path"),
+            workspace_quota_mib=_parse_provider_positive_int(
+                raw, "microsandbox_remote", "workspace_quota_mib"
+            ),
+        )
+        token_ttl_s = MICROSANDBOX_REMOTE_MANAGED_TOKEN_TTL_S
     elif provider in community:
         # A provider contributed through the `omnigent.sandbox_providers`
         # entry point group. The registry has validated it (name not shadowing
@@ -2525,6 +2586,64 @@ def _microsandbox_launcher_factory(
             idle_timeout_s=idle_timeout_s,
             network=network,
             host_ports=host_ports,
+        )
+
+    return _build
+
+
+def _microsandbox_remote_launcher_factory(
+    *,
+    endpoint: str,
+    audience: str | None,
+    token_env: str | None,
+    image: str | None,
+    env: list[str] | None,
+    cpus: int | None,
+    memory_mib: int | None,
+    max_memory_mib: int | None,
+    idle_timeout_s: int | None,
+    workspace_path: str | None,
+    workspace_quota_mib: int | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: microsandbox_remote`` path.
+
+    :param endpoint: Base URL of the sandbox host API.
+    :param audience: ID-token audience, or ``None`` to use a static token.
+    :param token_env: Environment variable holding the static token, or ``None``
+        for the launcher default.
+    :param image: Host image reference, or ``None`` for the default host image.
+    :param env: Names of server environment variables injected into every VM.
+    :param cpus: vCPUs per VM, or ``None`` for the launcher default.
+    :param memory_mib: Starting memory per VM in MiB, or ``None`` for the default.
+    :param max_memory_mib: Memory ceiling for live growth, or ``None``.
+    :param idle_timeout_s: Idle-stop timeout in seconds (``0`` disables), or
+        ``None`` for the launcher default.
+    :param workspace_path: Guest path of the per-sandbox workspace volume, or
+        ``None`` to keep the workspace on the root filesystem.
+    :param workspace_quota_mib: Workspace volume quota in MiB, or ``None``.
+    :returns: A factory producing parameterized remote microsandbox launchers.
+    """
+
+    @startup_timed("server.launcher_factory")
+    def _build() -> SandboxHostLauncher:
+        """Construct the remote microsandbox launcher."""
+        from omnigent.onboarding.sandboxes.microsandbox_remote import (
+            RemoteMicrosandboxLauncher,
+        )
+
+        return RemoteMicrosandboxLauncher(
+            endpoint=endpoint,
+            audience=audience,
+            token_env=token_env,
+            image=image,
+            cpus=cpus,
+            memory_mib=memory_mib,
+            max_memory_mib=max_memory_mib,
+            idle_timeout_s=idle_timeout_s,
+            env=env,
+            workspace_path=workspace_path,
+            workspace_quota_mib=workspace_quota_mib,
         )
 
     return _build
