@@ -729,20 +729,23 @@ def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
 def test_slow_event_posts_coalesce_live_deltas_in_order(tmp_path: Path) -> None:
     """Deltas arriving during a slow POST are merged instead of queued one by one.
 
-    With each event POST taking 30 ms and 40 tokens arriving without waiting,
-    the handler must not block on the network: far fewer delta POSTs are made,
-    at most one is in flight, text and reasoning keep their order, the joined
-    text is exact, and the final marker and assistant item follow every delta.
+    The first event POST is held open while 40 tokens arrive, so the handler
+    must not block on the network: the POST is still pending once every token
+    is delivered, far fewer delta POSTs are made, at most one is in flight,
+    text and reasoning keep their order, the joined text is exact, and the
+    final marker and assistant item follow every delta.
     """
     script = (
         _STREAMING_HARNESS
         + r"""
 let inFlight = 0;
 let maxInFlight = 0;
+let release;
+const gate = new Promise((resolve) => { release = resolve; });
 global.fetch = async (_url, request) => {
   inFlight += 1;
   maxInFlight = Math.max(maxInFlight, inFlight);
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await gate;
   posted.push(JSON.parse(request.body));
   inFlight -= 1;
   return { ok: true, status: 200, async json() { return { result: "" }; } };
@@ -752,12 +755,13 @@ global.fetch = async (_url, request) => {
   await handlers.agent_start({}, ctx);
   await handlers.turn_start({ turnIndex: 1 }, ctx);
 
-  const started = Date.now();
   await feed({ type: "thinking_delta", contentIndex: 0, delta: "think " });
   await feed({ type: "thinking_delta", contentIndex: 0, delta: "more" });
   const tokens = Array.from({ length: 40 }, (_, i) => `t${i} `);
   for (const token of tokens) await feed(textDelta(1, token));
-  assert.ok(Date.now() - started < 30, "message_update must not wait for the network");
+  assert.equal(inFlight, 1, "message_update must not wait for the network");
+  assert.equal(posted.length, 0);
+  release();
 
   await feed(textEnd(1, tokens.join("")));
   await endMessage(tokens.join(""));
