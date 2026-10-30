@@ -130,3 +130,42 @@ Pass `--image ghcr.io/omnigent-ai/omnigent-host:latest` to smoke the real host i
   Provisioning runs on a worker thread; if the server process dies at exactly the wrong moment, the created VM is never recorded.
   The idle-drain timeout parks such a VM automatically; `msb ls` / `msb rm` cleans it up.
 - **Beta runtime.** See the pin note under Prerequisites.
+
+## Remote host (`microsandbox_remote`)
+
+`provider: microsandbox_remote` keeps the server where it is (for example on Kubernetes) and runs the VMs on a separate KVM host.
+The server never loads the microsandbox SDK; it talks to a small HTTP service on the host that wraps the SDK.
+Sandboxes are managed-only (no CLI bootstrap).
+
+```yaml
+sandbox:
+  provider: microsandbox_remote
+  server_url: https://omnigent.example.com
+  microsandbox_remote:
+    endpoint: http://10.0.0.5:8740   # host API, reachable from the server only
+    audience: https://sandbox-host    # Google ID-token audience; or omit and
+                                      # set token_env to a static token variable
+    image: registry.example/omnigent-host@sha256:...
+    cpus: 30                          # idle vCPUs cost nothing; sandboxes share cores
+    memory_mib: 4096
+    max_memory_mib: 16384             # live-growth ceiling
+    idle_timeout_s: 86400             # host stops idle VMs; wake restarts them
+    workspace_path: /home/omnigent    # per-sandbox volume kept across stop/start
+    workspace_quota_mib: 51200
+```
+
+The host service must implement this contract (JSON bodies, `Authorization: Bearer <token>` on every request):
+
+| Method and path | Body | Response |
+|---|---|---|
+| `GET /v1/host` | — | `200` with capacity details |
+| `PUT /v1/sandboxes/{name}` | `image`, `cpus`, `memory_mib`, `max_memory_mib`, `idle_timeout_s`, `env`, optional `workspace_path`, `workspace_quota_mib` | `200` `{name, created, status}`; idempotent per name |
+| `GET /v1/sandboxes/{name}` | — | `200` `{name, status}` (`running`, `stopped`, …) or `404` |
+| `POST /v1/sandboxes/{name}/start` | — | `200` `{name, status}` or `404` |
+| `POST /v1/sandboxes/{name}/stop` | — | `200` `{name, status}` or `404` |
+| `POST /v1/sandboxes/{name}/touch` | — | `204`; `409` when not running; `404` |
+| `POST /v1/sandboxes/{name}/exec` | `command`, `timeout_s`, optional `env`, `cwd`, `detach` | `200` `{exit_code, stdout, stderr, timed_out}` or `{job_id}`; `409` when not running; `404` |
+| `DELETE /v1/sandboxes/{name}` | — | `204`, also when already gone |
+
+Names match `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`.
+The host should only accept images it trusts, cap requested resources, and keep the VMs' egress away from private addresses, the metadata server and the host API.
