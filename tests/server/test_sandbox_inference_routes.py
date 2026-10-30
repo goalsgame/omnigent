@@ -874,6 +874,26 @@ async def test_info_advertises_model_discovery_for_managed_proxy(env: _Env, enab
     env.launch.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [("kubernetes", True), ("microsandbox_remote", True), ("e2b", False)],
+)
+async def test_managed_proxy_model_discovery_depends_on_provider(env: _Env, provider, expected):
+    _enable_managed_proxy(env)
+    env.app.state.sandbox_config.default.provider = provider
+    info = await env.client.get("/v1/info")
+    assert info.status_code == 200, info.text
+    caps = info.json()["sandbox_provider_capabilities"][provider]
+    assert caps.get("inference_models", False) is expected
+    preview = await env.client.get(
+        f"/v1/sandbox-providers/{provider}/harnesses/pi-native/model-options"
+    )
+    assert (
+        preview.status_code == 200 and preview.json()["provider_label"] == "Server inference"
+    ) is expected
+    env.launch.assert_not_awaited()
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_managed_proxy_preserves_agent_profiles_in_preview_and_create(env: _Env, legacy):
     _enable_managed_proxy(env)
