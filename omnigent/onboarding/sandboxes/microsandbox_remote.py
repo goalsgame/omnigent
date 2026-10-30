@@ -73,9 +73,10 @@ def _github_clone_script(server_url: str, host_id: str, clone: str) -> str:
     Shell script that runs *clone* with the server-brokered GitHub credential helper.
 
     The helper is wired into a temporary global git config removed on exit and
-    reads the launch token from :data:`HOST_TOKEN_ENV_VAR`. Without a GitHub
-    connection the clone still runs unauthenticated; if it fails, the script
-    reports why no credential was offered.
+    reads the launch token from :data:`HOST_TOKEN_ENV_VAR`. The clone uses that
+    config only when the reset-plus-broker helper chain reads back exactly;
+    otherwise it runs with the guest's own git config and, if it fails, reports
+    why no credential was offered.
     """
     helper_source = (
         "import os,sys; from omnigent.git_credential_github import main; "
@@ -84,12 +85,19 @@ def _github_clone_script(server_url: str, host_id: str, clone: str) -> str:
     )
     helper = f"!python3 -Ic {shlex.quote(helper_source)}"
     wire = (
-        "import sys; import omnigent.git_credential_github as g; "
+        "import subprocess,sys; import omnigent.git_credential_github as g; "
         "g._install_broker_helper=lambda *_:("
         f"g._git_config('--replace-all',{_GITHUB_HELPER_KEY!r},''),"
         f"g._git_config('--add',{_GITHUB_HELPER_KEY!r},{helper!r})); "
-        f"status=g.configure_clone_credentials_status({server_url!r},{host_id!r}); "
-        "sys.exit({'broker':0,'unconnected':11,'machine_unavailable':12}.get(status,10))"
+        "status=getattr(g,'configure_clone_credentials_status',None); "
+        f"wired=(status({server_url!r},{host_id!r}) if status is not None else "
+        f"('broker' if g.configure_clone_credentials({server_url!r},{host_id!r}) "
+        "else 'disabled')); "
+        "helpers=(subprocess.run(['git','config','--global','--get-all',"
+        f"{_GITHUB_HELPER_KEY!r}],capture_output=True,text=True).stdout.splitlines() "
+        "if wired == 'broker' else None); "
+        f"sys.exit(0 if helpers == ['', {helper!r}] else 1 if wired == 'broker' else "
+        "{'unconnected':11,'machine_unavailable':12}.get(wired,10))"
     )
     unconnected = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_UNCONNECTED])
     machine = shlex.quote(WORKSPACE_ERROR_MESSAGES[GITHUB_CHECKOUT_MACHINE_UNAVAILABLE])
@@ -97,8 +105,9 @@ def _github_clone_script(server_url: str, host_id: str, clone: str) -> str:
         "cfg=$(mktemp) || exit 1\ntrap 'rm -f -- \"$cfg\"' EXIT\nwire_rc=0\n"
         'GIT_CONFIG_GLOBAL="$cfg" PYTHONSAFEPATH=1 PYTHONNOUSERSITE=1 PYTHONPATH= '
         f"python3 -c {shlex.quote(wire)} || wire_rc=$?\n"
-        'case "$wire_rc" in 0|10|11|12) ;; *) exit "$wire_rc" ;; esac\n'
-        f'GIT_CONFIG_GLOBAL="$cfg" {clone} && exit 0\n'
+        'case "$wire_rc" in 0) export GIT_CONFIG_GLOBAL="$cfg" ;; 10|11|12) ;; '
+        '*) exit "$wire_rc" ;; esac\n'
+        f"{clone} && exit 0\n"
         "clone_rc=$?\n"
         f"if [ \"$wire_rc\" -eq 11 ]; then printf '%s\\n' {unconnected} >&2; fi\n"
         f"if [ \"$wire_rc\" -eq 12 ]; then printf '%s\\n' {machine} >&2; fi\n"
@@ -242,7 +251,7 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             file_copy=False,
             streaming_exec=False,
             foreground_exec=False,
-            git_clone_options=super().capabilities.git_clone_options,
+            git_clone_options=True,
         )
 
     def _request(
