@@ -53,9 +53,9 @@ def _process_groups(home: Path) -> list[int]:
     return [int(line) for line in record.read_text().split()] if record.exists() else []
 
 
-def _live_groups(home: Path) -> list[int]:
+def _live_groups(groups: list[int]) -> list[int]:
     live = []
-    for group in _process_groups(home):
+    for group in groups:
         try:
             os.killpg(group, 0)
         except (ProcessLookupError, PermissionError):
@@ -64,8 +64,8 @@ def _live_groups(home: Path) -> list[int]:
     return live
 
 
-def _kill_sandbox(home: Path) -> None:
-    for group in _process_groups(home):
+def _kill_groups(groups: list[int]) -> None:
+    for group in groups:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(group, signal.SIGKILL)
 
@@ -137,7 +137,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         box = sandboxes[name]
         if method == "DELETE":
-            _kill_sandbox(box["home"])  # type: ignore[arg-type]
+            _kill_groups(_process_groups(box["home"]))  # type: ignore[arg-type]
             shutil.rmtree(self.server.root / name, ignore_errors=True)
             del sandboxes[name]
             self._reply(204)
@@ -146,7 +146,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif action == "touch":
             self._reply(204 if box["status"] == "running" else 409)
         elif action == "stop":
-            _kill_sandbox(box["home"])  # type: ignore[arg-type]
+            _kill_groups(_process_groups(box["home"]))  # type: ignore[arg-type]
             box["status"] = "stopped"
             self._reply(200, {"name": name, "status": "stopped"})
         elif action == "start":
@@ -280,6 +280,7 @@ def test_managed_session_launches_a_registered_host_on_the_remote_host(tmp_path:
     port = find_free_port()
     proc, log_path = _spawn_server(tmp_path, port, fake.url)
     base_url = f"http://127.0.0.1:{port}"
+    launched_groups: list[int] = []
 
     def server_log() -> str:
         return log_path.read_text()[-4000:]
@@ -297,9 +298,10 @@ def test_managed_session_launches_a_registered_host_on_the_remote_host(tmp_path:
         _wait_for(healthy, _HEALTH_TIMEOUT_S, lambda: f"server never healthy:\n{server_log()}")
         assert httpx.get(f"{base_url}/v1/info", timeout=10.0).json()["managed_sandboxes_enabled"]
         agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
+        [agent] = [a for a in agents if a["name"] == "sdk-chat-builtin"]
         response = httpx.post(
             f"{base_url}/v1/sessions",
-            json={"agent_id": agents[0]["id"], "host_type": "managed"},
+            json={"agent_id": agent["id"], "host_type": "managed"},
             timeout=180.0,
         )
         assert response.status_code == 201, response.text[:500]
@@ -338,8 +340,9 @@ def test_managed_session_launches_a_registered_host_on_the_remote_host(tmp_path:
             "workspace_quota_mib": 4096,
         }
         assert any(c[0] == "POST" and c[1].endswith(f"/{name}/exec") for c in fake.calls)
-        home = fake.sandboxes[name]["home"]
-        assert _live_groups(home), "no host process is running in the sandbox"  # type: ignore[arg-type]
+        groups = _process_groups(fake.sandboxes[name]["home"])  # type: ignore[arg-type]
+        launched_groups.extend(groups)
+        assert _live_groups(groups), "no host process is running in the sandbox"
         assert host["name"]
 
         deleted = httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=60.0)
@@ -349,10 +352,15 @@ def test_managed_session_launches_a_registered_host_on_the_remote_host(tmp_path:
             120.0,
             lambda: f"session delete did not remove the sandbox:\n{server_log()}",
         )
-        assert not _live_groups(home)  # type: ignore[arg-type]
+        _wait_for(
+            lambda: not _live_groups(groups),
+            30.0,
+            lambda: f"host process groups survived the delete: {_live_groups(groups)}",
+        )
     finally:
+        _kill_groups(launched_groups)
         for box in list(fake.sandboxes.values()):
-            _kill_sandbox(box["home"])  # type: ignore[arg-type]
+            _kill_groups(_process_groups(box["home"]))  # type: ignore[arg-type]
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=30)
