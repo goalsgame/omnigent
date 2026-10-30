@@ -252,13 +252,14 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             except click.ClickException as exc:
                 failure = exc
                 continue
-            if response.status_code < 500:
-                self._check(response, f"create sandbox '{sandbox_id}'")
+            if response.is_success:
                 return sandbox_id
-            failure = click.ClickException(
-                f"microsandbox host could not create sandbox '{sandbox_id}': "
-                f"HTTP {response.status_code}"
-            )
+            try:
+                self._check(response, f"create sandbox '{sandbox_id}'")
+            except click.ClickException as exc:
+                failure = exc
+            if response.status_code < 500:
+                break
         # The host may have created the VM before the response was lost.
         with contextlib.suppress(click.ClickException):
             self._request("DELETE", f"/v1/sandboxes/{sandbox_id}", timeout=_CREATE_TIMEOUT_S)

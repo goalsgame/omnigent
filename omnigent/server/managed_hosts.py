@@ -197,7 +197,10 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
-from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.base import (
+    SandboxGoneError,
+    resolve_managed_keepalive_interval_s,
+)
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -1745,6 +1748,10 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         endpoint = _parse_provider_string(raw, "microsandbox_remote", "endpoint")
         if endpoint is None:
             raise ValueError("server config 'sandbox.microsandbox_remote.endpoint' is required")
+        remote_idle_timeout_s = _parse_provider_nonnegative_int(
+            raw, "microsandbox_remote", "idle_timeout_s"
+        )
+        _check_remote_idle_timeout(remote_idle_timeout_s)
         launcher_factory = _microsandbox_remote_launcher_factory(
             endpoint=endpoint,
             audience=_parse_provider_string(raw, "microsandbox_remote", "audience"),
@@ -1756,9 +1763,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             max_memory_mib=_parse_provider_positive_int(
                 raw, "microsandbox_remote", "max_memory_mib"
             ),
-            idle_timeout_s=_parse_provider_nonnegative_int(
-                raw, "microsandbox_remote", "idle_timeout_s"
-            ),
+            idle_timeout_s=remote_idle_timeout_s,
             workspace_path=_parse_provider_string(raw, "microsandbox_remote", "workspace_path"),
             workspace_quota_mib=_parse_provider_positive_int(
                 raw, "microsandbox_remote", "workspace_quota_mib"
@@ -2589,6 +2594,24 @@ def _microsandbox_launcher_factory(
         )
 
     return _build
+
+
+def _check_remote_idle_timeout(idle_timeout_s: int | None) -> None:
+    """
+    Reject an idle-stop timeout the server's keepalive cannot outpace.
+
+    :param idle_timeout_s: The configured timeout; ``None`` and ``0`` are accepted.
+    :raises ValueError: When a positive timeout is shorter than two keepalive
+        refresh intervals.
+    """
+    if not idle_timeout_s:
+        return
+    minimum = 2 * resolve_managed_keepalive_interval_s("microsandbox_remote")
+    if idle_timeout_s < minimum:
+        raise ValueError(
+            "server config 'sandbox.microsandbox_remote.idle_timeout_s' must be 0 or at "
+            f"least {minimum:g} seconds (two keepalive refresh intervals)"
+        )
 
 
 def _microsandbox_remote_launcher_factory(

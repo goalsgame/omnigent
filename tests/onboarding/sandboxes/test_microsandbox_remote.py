@@ -197,6 +197,28 @@ def test_failed_create_removes_a_possibly_created_sandbox(
     assert host.sandboxes == {}
 
 
+def test_rejected_retry_after_a_lost_response_removes_the_sandbox(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    calls = {"put": 0}
+
+    def lost_then_throttled(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            calls["put"] += 1
+            if calls["put"] == 1:
+                host(request)
+                raise httpx.ReadTimeout("response lost", request=request)
+            return httpx.Response(429, json={"detail": "too many boots"})
+        return host(request)
+
+    launcher._transport = httpx.MockTransport(lost_then_throttled)
+    with pytest.raises(click.ClickException, match="429"):
+        launcher.provision("managed")
+    assert calls["put"] == 2
+    assert [r.method for r in host.requests if r.method == "DELETE"] == ["DELETE"]
+    assert host.sandboxes == {}
+
+
 def test_id_token_failures_become_lifecycle_errors(
     host: FakeHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -282,6 +304,7 @@ def test_parse_config_builds_the_remote_launcher() -> None:
         ({"endpoint": ENDPOINT, "bogus": 1}, "bogus"),
         ({"endpoint": ENDPOINT, "cpus": 0}, "cpus"),
         ({"endpoint": ENDPOINT, "idle_timeout_s": -1}, "idle_timeout_s"),
+        ({"endpoint": ENDPOINT, "idle_timeout_s": 60}, "two keepalive refresh intervals"),
     ],
 )
 def test_parse_config_rejects_invalid_sections(section: dict[str, object], message: str) -> None:
