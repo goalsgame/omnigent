@@ -115,6 +115,12 @@ export interface ServerInfo {
    */
   sandbox_providers?: string[];
   /**
+   * Provider the new-session composer pre-selects when the user has no
+   * remembered pick; one of ``sandbox_providers``. Absent or null falls back
+   * to the first offered provider.
+   */
+  preferred_sandbox_provider?: string | null;
+  /**
    * UI-relevant capability flags per launch-capable provider, e.g.
    * ``{ agent_sandbox: { multi_repo: true } }``. The new-session repo picker
    * branches on these (multi-repo list vs single). A provider absent from the
@@ -346,6 +352,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           sandbox_providers: Array.isArray(data.sandbox_providers)
             ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
             : [],
+          preferred_sandbox_provider:
+            typeof data.preferred_sandbox_provider === "string"
+              ? data.preferred_sandbox_provider
+              : null,
           // Plain-object guard only; consumers read `?.[p]?.multi_repo === true`,
           // so any stray shape reads as "unset" (off) rather than throwing.
           sandbox_provider_capabilities:

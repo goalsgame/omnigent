@@ -119,6 +119,30 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
     expect(resolved.sandbox_providers).toEqual(["modal", "e2b"]);
   });
+  it("keeps the preferred provider from the probe", async () => {
+    const resolved = await probe({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+      preferred_sandbox_provider: "e2b",
+    });
+    expect(resolved.preferred_sandbox_provider).toBe("e2b");
+  });
+
+  it.each([
+    ["missing", {}],
+    ["null", { preferred_sandbox_provider: null }],
+    ["a number", { preferred_sandbox_provider: 7 }],
+    ["a list", { preferred_sandbox_provider: ["e2b"] }],
+  ])("resolves a %s preferred provider to null", async (_label, extra) => {
+    const resolved = await probe({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+      ...extra,
+    });
+    expect(resolved.preferred_sandbox_provider).toBeNull();
+  });
 });
 
 describe("resolveServerInfo group sharing", () => {

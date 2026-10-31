@@ -180,6 +180,9 @@ class ServerInfoResponse(BaseModel):
     managed_sandboxes_enabled: bool
     sandbox_provider: str | None
     sandbox_providers: list[str]
+    # Provider the web composer pre-selects for a user with no remembered
+    # pick; one of ``sandbox_providers``, else ``sandbox_provider``.
+    preferred_sandbox_provider: str | None = None
     # UI-relevant capability flags per launchable provider, e.g.
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
@@ -3308,6 +3311,10 @@ def create_app(
                         for harness in proxy.config.harnesses
                     ):
                         sandbox_provider_capabilities[provider]["inference_models"] = True
+        preferred = os.environ.get("OMNIGENT_PREFERRED_SANDBOX_PROVIDER", "").strip()
+        preferred_sandbox_provider = (
+            preferred if preferred in sandbox_providers else sandbox_provider
+        )
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3382,6 +3389,7 @@ def create_app(
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
+                "preferred_sandbox_provider": preferred_sandbox_provider,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
                 "enabled_connections": enabled_connections,
                 "machine_google_cloud_enabled": app.state.google_cloud_machine_broker is not None,

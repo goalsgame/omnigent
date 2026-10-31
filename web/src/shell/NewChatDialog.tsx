@@ -2330,15 +2330,20 @@ export function NewChatLandingScreen() {
     [info],
   );
   // The provider a sandbox pick defaults to: the sticky last pick when the
-  // server still offers it, else the first offered row. Mirrors the sticky
-  // host choice — the composer reopens on the provider used last. Null until
-  // the rows load (info still resolving) so callers hold off seeding.
+  // server still offers it, else the server's preferred provider, else the
+  // first offered row. Mirrors the sticky host choice — the composer reopens
+  // on the provider used last. Null until the rows load (info still
+  // resolving) so callers hold off seeding.
+  const preferredSandboxProvider = info !== "loading" ? info.preferred_sandbox_provider : null;
   const defaultSandboxProvider = useCallback((): string | null => {
     if (sandboxProviderRows.length === 0) return null;
     const stored = readLastSandboxProvider();
     if (stored !== null && sandboxProviderRows.includes(stored)) return stored;
+    if (preferredSandboxProvider && sandboxProviderRows.includes(preferredSandboxProvider)) {
+      return preferredSandboxProvider;
+    }
     return sandboxProviderRows[0];
-  }, [sandboxProviderRows]);
+  }, [sandboxProviderRows, preferredSandboxProvider]);
   // Embed-only docs seam: when the host passes additional docs and managed
   // sandboxes are unavailable, keep the sandbox row visible but disabled and
   // attach a help tooltip with a clickable link.

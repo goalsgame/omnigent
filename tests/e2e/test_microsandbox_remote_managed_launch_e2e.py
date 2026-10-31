@@ -250,15 +250,26 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _spawn_server(
-    tmp_path: Path, port: int, host_url: str, extra: dict[str, object]
+    tmp_path: Path,
+    port: int,
+    host_url: str,
+    extra: dict[str, object],
+    *,
+    providers: list[str] | None = None,
+    server_env: dict[str, str | None] | None = None,
 ) -> tuple[subprocess.Popen[bytes], Path]:
     config_path = tmp_path / "server-config.yaml"
+    selection: dict[str, object] = (
+        {"providers": [{"provider": p} for p in providers]}
+        if providers
+        else {"provider": "microsandbox_remote"}
+    )
     config_path.write_text(
         yaml.safe_dump(
             {
                 "sandbox": {
                     "server_url": f"http://127.0.0.1:{port}",
-                    "provider": "microsandbox_remote",
+                    **selection,
                     "microsandbox_remote": {
                         "endpoint": host_url,
                         "token_env": "E2E_HOST_API_TOKEN",
@@ -284,6 +295,11 @@ def _spawn_server(
             _REPO_ROOT / "tests" / "resources" / "agents" / "sdk-chat-builtin.yaml"
         ),
     }
+    for name, value in (server_env or {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     log_path = tmp_path / "server.log"
     with open(log_path, "w") as log_handle:
         proc = subprocess.Popen(
@@ -411,6 +427,99 @@ def test_managed_session_launches_a_registered_host_on_the_remote_host(
             30.0,
             lambda: f"host process groups survived the delete: {_live_groups(groups)}",
         )
+    finally:
+        _kill_groups(launched_groups)
+        for box in list(fake.sandboxes.values()):
+            _kill_groups(_process_groups(box["home"]))  # type: ignore[arg-type]
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        fake.shutdown()
+
+
+def test_preferred_provider_is_advertised_and_launches(tmp_path: Path) -> None:
+    """
+    A two-provider server advertises its preferred provider; a create naming it
+    launches on the remote host, while a create naming none stays on the default.
+    """
+    fake = FakeSandboxHost(tmp_path / "sandboxes")
+    threading.Thread(target=fake.serve_forever, daemon=True).start()
+    port = find_free_port()
+    proc, log_path = _spawn_server(
+        tmp_path,
+        port,
+        fake.url,
+        {},
+        providers=["e2b", "microsandbox_remote"],
+        server_env={
+            "OMNIGENT_PREFERRED_SANDBOX_PROVIDER": "microsandbox_remote",
+            "E2B_API_KEY": None,
+        },
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    launched_groups: list[int] = []
+
+    def server_log() -> str:
+        return log_path.read_text()[-4000:]
+
+    try:
+
+        def healthy() -> bool:
+            if proc.poll() is not None:
+                pytest.fail(f"server exited early:\n{server_log()}")
+            try:
+                return httpx.get(f"{base_url}/health", timeout=2.0).status_code == 200
+            except httpx.HTTPError:
+                return False
+
+        _wait_for(healthy, _HEALTH_TIMEOUT_S, lambda: f"server never healthy:\n{server_log()}")
+        info = httpx.get(f"{base_url}/v1/info", timeout=10.0).json()
+        assert info["sandbox_provider"] == "e2b"
+        assert info["sandbox_providers"] == ["e2b", "microsandbox_remote"]
+        assert info["preferred_sandbox_provider"] == "microsandbox_remote"
+
+        agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
+        [agent] = [a for a in agents if a["name"] == "sdk-chat-builtin"]
+        default_create = httpx.post(
+            f"{base_url}/v1/sessions",
+            json={"agent_id": agent["id"], "host_type": "managed"},
+            timeout=180.0,
+        )
+        assert default_create.status_code == 201, default_create.text[:500]
+        preferred_create = httpx.post(
+            f"{base_url}/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_type": "managed",
+                "sandbox_provider": info["preferred_sandbox_provider"],
+            },
+            timeout=180.0,
+        )
+        assert preferred_create.status_code == 201, preferred_create.text[:500]
+
+        def registered_host() -> dict[str, object] | None:
+            hosts = httpx.get(f"{base_url}/v1/hosts", timeout=10.0).json()["hosts"]
+            return next(
+                (
+                    h
+                    for h in hosts
+                    if h.get("sandbox_provider") == "microsandbox_remote"
+                    and h.get("status") == "online"
+                ),
+                None,
+            )
+
+        _wait_for(
+            registered_host,
+            _REGISTER_TIMEOUT_S,
+            lambda: f"preferred-provider host never registered online:\n{server_log()}",
+        )
+        creates = [c for c in fake.calls if c[0] == "PUT"]
+        assert len(creates) == 1, [(c[0], c[1]) for c in fake.calls]
+        name = creates[0][1].rsplit("/", 1)[-1]
+        launched_groups.extend(_process_groups(fake.sandboxes[name]["home"]))  # type: ignore[arg-type]
     finally:
         _kill_groups(launched_groups)
         for box in list(fake.sandboxes.values()):

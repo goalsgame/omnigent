@@ -7213,6 +7213,64 @@ describe("NewChatLandingScreen", () => {
     expect(body.sandbox_provider).toBe("e2b");
   });
 
+  it("pre-selects the server's preferred provider when nothing is remembered", async () => {
+    // A first-time user with no sticky pick lands on the provider the server
+    // prefers, not the first configured row; a remembered pick still wins.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+      preferred_sandbox_provider: "e2b",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "E2B Sandbox",
+      ),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "audit the repo" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.sandbox_provider).toBe("e2b");
+  });
+
+  it("keeps a remembered provider over the server's preferred one", async () => {
+    const first = renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+      preferred_sandbox_provider: "e2b",
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "Modal Sandbox",
+      ),
+    );
+    first.unmount();
+    resetLandingDraft();
+
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+      preferred_sandbox_provider: "e2b",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "Modal Sandbox",
+      ),
+    );
+  });
+
   it("reopens on the last-picked provider and highlights its row", async () => {
     // The sticky pick: choosing e2b persists it, so a fresh landing (module
     // draft reset, storage kept) reselects e2b and lights its row up rather
