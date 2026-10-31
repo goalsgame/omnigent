@@ -441,21 +441,36 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   lakebox: "Databricks",
   daytona: "Daytona",
   e2b: "E2B",
+  agent_sandbox: "Agent Sandbox",
+  kubernetes: "Kubernetes",
+  microsandbox: "Microsandbox",
+  microsandbox_remote: "Microsandbox",
+  islo: "Islo",
+  gensee: "Gensee",
+  openshell: "OpenShell",
+  boxlite: "BoxLite",
 };
 
 /**
  * Label for the new-session sandbox option, named per provider.
  *
- * Returns e.g. "Modal Sandbox" or "Databricks Sandbox" when the
- * server reports a provider, and the generic "New Sandbox" when it
+ * Returns e.g. "Modal Sandbox", "Agent Sandbox" or "Microsandbox" when
+ * the server reports a provider, and the generic "New Sandbox" when it
  * names none (``null``) — the same wording the UI used before
- * providers were surfaced.
+ * providers were surfaced. An unknown id such as ``"my_cloud"`` reads
+ * as "My Cloud Sandbox"; a name already ending in "sandbox" gets no
+ * second suffix.
  */
 export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
   const name =
-    SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-  return `${name} Sandbox`;
+    SANDBOX_PROVIDER_NAMES[provider] ??
+    provider
+      .split(/[_\s-]+/)
+      .filter(Boolean)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ");
+  return /sandbox$/i.test(name) ? name : `${name} Sandbox`;
 }
 
 /**
