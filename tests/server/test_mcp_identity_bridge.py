@@ -304,8 +304,8 @@ async def test_runner_recovers_after_a_reset_mid_response(tmp_path, json_respons
         "    def __init__(self, inner):\n"
         "        self.inner = inner\n"
         "    async def __aiter__(self):\n"
+        '        yield b\'event: message\\ndata: {"jsonrpc":"2.0","id":\'\n'
         "        raise httpx.ReadError('connection reset')\n"
-        "        yield b''\n"
         "    async def aclose(self):\n"
         "        await self.inner.aclose()\n"
         "async def reset(self, request):\n"
@@ -387,3 +387,40 @@ async def test_stdio_bridge_exits_when_its_relay_fails(tmp_path):
         await session.initialize()
         with pytest.raises(McpError, match="Connection closed"):
             await session.call_tool("echo", {"value": "lost"})
+
+
+class _Chunks(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes], fail: bool) -> None:
+        self.chunks = chunks
+        self.fail = fail
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+        if self.fail:
+            raise httpx.ReadError("connection reset")
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chunks", "fail", "expected"),
+    [
+        ([b"data: 1\n\nda", b"ta: 2\n\n"], False, b"data: 1\n\ndata: 2\n\n"),
+        ([b"data: 1\r\n\r\ntail"], False, b"data: 1\r\n\r\ntail"),
+        (
+            [b"event: message\ndata: 1\n\nevent: mes", b'sage\ndata: {"jsonrpc":'],
+            True,
+            b"event: message\ndata: 1\n\nevent: message\ndata: "
+            b'{"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, '
+            b'"message": "MCP connector connection lost; retry the call"}}\n\n',
+        ),
+    ],
+)
+async def test_reset_stream_passes_only_complete_events(chunks, fail, expected):
+    from omnigent.host.mcp_identity import _ErrorOnResetStream
+
+    stream = _ErrorOnResetStream(_Chunks(chunks, fail), 7)
+    assert b"".join([chunk async for chunk in stream]) == expected

@@ -34,16 +34,25 @@ def _rpc_error(request: httpx.Request, error: dict[str, object]) -> httpx.Respon
 
 
 class _ErrorOnResetStream(httpx.AsyncByteStream):
-    """SSE body that ends with a JSON-RPC error event for ``request_id`` if the transport fails."""
+    """SSE body that ends with a JSON-RPC error event for ``request_id`` if the transport fails.
+
+    Only complete events are passed on, so a reset never delivers a truncated one.
+    """
 
     def __init__(self, inner: httpx.AsyncByteStream, request_id: object) -> None:
         self.inner = inner
         self.request_id = request_id
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
+        pending = b""
         try:
             async for chunk in self.inner:
-                yield chunk
+                pending += chunk
+                lf, crlf = pending.rfind(b"\n\n"), pending.rfind(b"\r\n\r\n")
+                end = max(lf + 2 if lf >= 0 else 0, crlf + 4 if crlf >= 0 else 0)
+                if end:
+                    yield pending[:end]
+                    pending = pending[end:]
         except httpx.TransportError:
             error = {
                 "jsonrpc": "2.0",
@@ -53,8 +62,10 @@ class _ErrorOnResetStream(httpx.AsyncByteStream):
                     "message": "MCP connector connection lost; retry the call",
                 },
             }
-            # Leading blank lines terminate any partially received event first.
-            yield b"\n\nevent: message\ndata: " + json.dumps(error).encode() + b"\n\n"
+            yield b"event: message\ndata: " + json.dumps(error).encode() + b"\n\n"
+            return
+        if pending:
+            yield pending
 
     async def aclose(self) -> None:
         await self.inner.aclose()
