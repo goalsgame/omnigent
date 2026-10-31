@@ -97,6 +97,7 @@ from omnigent.harnesses.antigravity_native.steps import (
     pending_interaction,
 )
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.native._live_delta_pump import LiveDelta, LiveDeltaPump
 from omnigent.native._native_post_delivery import post_session_event_with_retry
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
@@ -204,6 +205,10 @@ _TRAJECTORY_TYPE_CASCADE = "CORTEX_TRAJECTORY_TYPE_CASCADE"
 # constant is intentionally not duplicated here — the mapper owns that gate. See
 # design §10.2.
 _STATUS_GENERATING = "CORTEX_STEP_STATUS_GENERATING"
+
+# ``LiveDeltaPump`` stream kinds for a GENERATING planner step's live output.
+_DELTA_TEXT = "text"
+_DELTA_REASONING = "reasoning"
 
 # Terminal step statuses — a step in one of these will not produce further
 # content, so its identity is safe to record in the de-dup set (see
@@ -725,6 +730,8 @@ async def _post_event(
     client: httpx.AsyncClient,
     session_id: str,
     event: OutboundEvent,
+    *,
+    deltas: LiveDeltaPump[int] | None = None,
 ) -> None:
     """
     POST one mapped event with the shared bounded-retry delivery loop.
@@ -732,10 +739,14 @@ async def _post_event(
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param event: The mapped event to deliver.
+    :param deltas: Live-delta queue whose pending deltas must be posted first,
+        or ``None`` when the event has no ordering constraint against it.
     :returns: None. Delivery failures are logged inside the retry loop; an
         ambiguous conversation-item failure is intentionally not retried (a
         re-post would duplicate the item).
     """
+    if deltas is not None:
+        await deltas.flush()
     url = f"/v1/sessions/{url_component(session_id)}/events"
     payload: dict[str, object] = {"type": event.event_type, "data": event.data}
     await post_session_event_with_retry(
@@ -1078,7 +1089,7 @@ async def supervise_reader(
             session_id,
             cascade_id,
         )
-        await _post_event(client, session_id, _status_event(_STATUS_IDLE))
+        await _post_event(client, session_id, _status_event(_STATUS_IDLE), deltas=state.deltas)
 
     def _body_should_stop() -> bool:
         # The reader body stops either on the caller's stop OR once a rotation was
@@ -1169,6 +1180,8 @@ async def supervise_reader(
             body_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await body_task
+        if state.deltas is not None:
+            await state.deltas.aclose()
         # Drain the bridge and any chained re-scan tasks. Yield once per pass so
         # a normally-completed bridge's pending ``_clear_slot`` callback lands in
         # ``interaction_rescans`` before the snapshot — otherwise it escapes the
@@ -1222,11 +1235,12 @@ class _ReaderState:
     :param interacted: Identities whose WAITING interaction was already handed to
         the bridge, so a re-sent WAITING frame does not re-fire it.
     :param prefixes: Per-PLANNER ``step_index`` → the ``modifiedResponse`` text
-        actually SENT as deltas so far, so each frame emits only the NEW suffix.
-        Advanced only when a delta goes out: it mirrors the server's buffer, and
-        anchoring it to text that was never sent would cut the next delta from
-        the wrong offset. Cleared for a step when its committed ``message`` is
-        posted (stream path only; the poll path never populates it).
+        queued as deltas so far, so each frame emits only the NEW suffix.
+        Advanced only when a delta is queued: it mirrors the server's buffer once
+        the queue drains, and anchoring it to text that was never queued would
+        cut the next delta from the wrong offset. Cleared for a step when its
+        committed ``message`` is posted (stream path only; the poll path never
+        populates it).
     :param delta_chunks: Per-PLANNER ``step_index`` → how many text deltas have
         been emitted for it, which is the delta ``index`` the server orders on.
         A counter rather than the forwarded byte offset because agy can replace
@@ -1279,6 +1293,9 @@ class _ReaderState:
         held as a strong ref so it is not GC'd mid-run; cancelled on teardown.
         Doubles as the start-once guard — a re-sent step re-enters the handler
         every frame while the sub-agents work.
+    :param deltas: Queue for the stream path's live text/reasoning deltas,
+        created by the first GENERATING planner step; ``None`` until then.
+        Every other post to the session first drains it.
     """
 
     seen: set[_StepKey]
@@ -1297,6 +1314,7 @@ class _ReaderState:
     surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
     interaction_rescans: set[asyncio.Task[None]] = field(default_factory=set)
     subagent_mirrors: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    deltas: LiveDeltaPump[int] | None = None
 
 
 async def _poll_loop(
@@ -1443,6 +1461,8 @@ async def _stream_loop(
                     state=state,
                     on_pending_interaction=on_pending_interaction,
                 )
+        if state.deltas is not None:
+            await state.deltas.flush()
         # Backoff before re-opening the stream so an immediate clean trailer
         # (no frames) cannot busy-spin re-POSTing at zero delay. Skipped when
         # asked to stop so a shutdown is not delayed by the settle backoff.
@@ -1524,6 +1544,7 @@ async def _process_committed_step(
             cascade_id=cascade_id,
             prefixes=state.prefixes,
             delta_chunks=state.delta_chunks,
+            deltas=state.deltas,
         )
         state.turn_active = await _emit_step(
             step,
@@ -1531,6 +1552,7 @@ async def _process_committed_step(
             session_id=session_id,
             cascade_id=cascade_id,
             turn_active=state.turn_active,
+            deltas=state.deltas,
         )
         # Telemetry: model-change detection on USER_INPUT (design §10.4).
         await _maybe_emit_model_change(
@@ -1861,6 +1883,8 @@ async def _maybe_mirror_subagents(
     for spec, child_cascade_id in pairs:
         if child_cascade_id in state.subagent_mirrors:
             continue
+        if state.deltas is not None:
+            await state.deltas.flush()
         child_session_id = await _register_subagent_child(
             client=client,
             session_id=session_id,
@@ -1925,12 +1949,14 @@ async def _process_stream_step(
 
     Dispatch by step ``status`` (design §10.2 discriminator):
 
-    * A GENERATING PLANNER_RESPONSE emits the NEW suffix of its growing reasoning
+    * A GENERATING PLANNER_RESPONSE queues the NEW suffix of its growing reasoning
       (``plannerResponse.thinking``) as an ``output_reasoning_delta`` and then the
       NEW suffix of its growing text (``modifiedResponse``) as an
       ``output_text_delta`` — reasoning FIRST (§10.2: thinking streams before the
-      response). No committed item yet; the step is NOT added to ``state.seen`` so
-      its eventual DONE frame still commits.
+      response). The deltas post in the background (``state.deltas``) so the
+      stream keeps reading while one is in flight. No committed item yet; the
+      step is NOT added to ``state.seen`` so its eventual DONE frame still
+      commits.
     * Any other step is routed through the committed path
       (:func:`_process_committed_step`): DONE planner → the committed ``message``
       (deltas already preceded it); tool-result DONE → ``function_call_output``;
@@ -1946,20 +1972,23 @@ async def _process_stream_step(
     :returns: None.
     """
     if _is_generating_planner(step):
+        if state.deltas is None:
+            state.deltas = _new_delta_pump(
+                client=client,
+                session_id=session_id,
+                cascade_id=cascade_id,
+                delta_chunks=state.delta_chunks,
+            )
         # Reasoning precedes the response (§10.2), so emit its delta first.
-        await _emit_partial_reasoning_delta(
+        _emit_partial_reasoning_delta(
             step,
-            client=client,
-            session_id=session_id,
+            deltas=state.deltas,
             reasoning_prefixes=state.reasoning_prefixes,
         )
-        await _emit_partial_delta(
+        _emit_partial_delta(
             step,
-            client=client,
-            session_id=session_id,
-            cascade_id=cascade_id,
+            deltas=state.deltas,
             prefixes=state.prefixes,
-            delta_chunks=state.delta_chunks,
         )
         return
 
@@ -1978,6 +2007,8 @@ async def _process_stream_step(
     # the slot) starts a fresh delta stream rather than diffing against stale text.
     idx = _step_index(step)
     if idx is not None:
+        if state.deltas is not None and (idx in state.prefixes or idx in state.reasoning_prefixes):
+            await state.deltas.flush()
         state.prefixes.pop(idx, None)
         state.delta_chunks.pop(idx, None)
         state.reasoning_prefixes.pop(idx, None)
@@ -2015,6 +2046,7 @@ async def _close_planner_delta_stream(
     cascade_id: str,
     prefixes: dict[int, str],
     delta_chunks: dict[int, int],
+    deltas: LiveDeltaPump[int] | None = None,
 ) -> None:
     """
     Flush a committed planner step's remaining suffix as a ``final=True`` delta.
@@ -2037,6 +2069,7 @@ async def _close_planner_delta_stream(
     :param prefixes: Per-step forwarded-text trackers.
     :param delta_chunks: Per-step emitted-chunk counters (see
         :func:`_next_delta_index`).
+    :param deltas: Live-delta queue drained before the closing delta.
     """
     idx = _step_index(step)
     if idx is None:
@@ -2049,6 +2082,8 @@ async def _close_planner_delta_stream(
         # Never streamed (committed straight from a poll frame): the committed
         # item stands alone, so there is no live block to close.
         return
+    if deltas is not None:
+        await deltas.flush()
     suffix = text[len(forwarded) :] if text.startswith(forwarded) else text
     await _post_event(
         client,
@@ -2139,17 +2174,14 @@ def _partial_planner_thinking(step: dict[str, object]) -> str | None:
     return thinking if isinstance(thinking, str) else None
 
 
-async def _emit_partial_delta(
+def _emit_partial_delta(
     step: dict[str, object],
     *,
-    client: httpx.AsyncClient,
-    session_id: str,
-    cascade_id: str,
+    deltas: LiveDeltaPump[int],
     prefixes: dict[int, str],
-    delta_chunks: dict[int, int],
 ) -> None:
     """
-    Emit the NEW suffix of a GENERATING planner step's partial text as a delta.
+    Queue the NEW suffix of a GENERATING planner step's partial text as a delta.
 
     Frames are cumulative snapshots, so the reader prefix-diffs: the delta is
     ``modifiedResponse`` minus the prefix already forwarded for this step's
@@ -2160,12 +2192,9 @@ async def _emit_partial_delta(
     concatenate to the full text.
 
     :param step: A GENERATING PLANNER_RESPONSE step dict.
-    :param client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id to mirror into.
-    :param cascade_id: agy cascade id (namespaces the stable message id).
-    :param prefixes: Per-``step_index`` forwarded-prefix tracker (mutated here).
-    :param delta_chunks: Per-``step_index`` emitted-chunk counter (mutated here;
-        see :func:`_next_delta_index`).
+    :param deltas: Live-delta queue the suffix is pushed to (merged with any
+        still-unposted text of the same step).
+    :param prefixes: Per-``step_index`` queued-prefix tracker (mutated here).
     :returns: None.
     """
     idx = _step_index(step)
@@ -2181,33 +2210,22 @@ async def _emit_partial_delta(
     # Only forward growth that extends what we already sent. A frame that does not
     # start with the forwarded prefix (a non-monotonic rewrite) or that has not
     # grown yields no delta — and MUST NOT move the tracker: it records what the
-    # server has actually received, so re-anchoring it to text we never sent would
-    # cut the next delta from the wrong offset and repeat the overlap.
+    # server will have received once the queue drains, so re-anchoring it to text
+    # we never queued would cut the next delta from the wrong offset and repeat the
+    # overlap.
     if text.startswith(forwarded) and len(text) > len(forwarded):
-        suffix = text[len(forwarded) :]
-        await _post_event(
-            client,
-            session_id,
-            output_text_delta_event(
-                conversation_id=cascade_id,
-                step_idx=idx,
-                delta=suffix,
-                final=False,
-                index=_next_delta_index(delta_chunks, idx),
-            ),
-        )
+        deltas.push(_DELTA_TEXT, idx, text[len(forwarded) :])
         prefixes[idx] = text
 
 
-async def _emit_partial_reasoning_delta(
+def _emit_partial_reasoning_delta(
     step: dict[str, object],
     *,
-    client: httpx.AsyncClient,
-    session_id: str,
+    deltas: LiveDeltaPump[int],
     reasoning_prefixes: dict[int, str],
 ) -> None:
     """
-    Emit the NEW suffix of a GENERATING planner step's ``thinking`` as a delta.
+    Queue the NEW suffix of a GENERATING planner step's ``thinking`` as a delta.
 
     The reasoning analogue of :func:`_emit_partial_delta`: ``thinking`` is a
     cumulative snapshot per frame, so the reader prefix-diffs against the suffix
@@ -2225,8 +2243,8 @@ async def _emit_partial_reasoning_delta(
     is — see :func:`output_reasoning_delta_event`.)
 
     :param step: A GENERATING PLANNER_RESPONSE step dict.
-    :param client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id to mirror into.
+    :param deltas: Live-delta queue the suffix is pushed to (merged with any
+        still-unposted reasoning of the same step).
     :param reasoning_prefixes: Per-``step_index`` forwarded-prefix tracker
         (mutated here); a step's first emitted delta also records its membership.
     :returns: None.
@@ -2242,16 +2260,7 @@ async def _emit_partial_reasoning_delta(
     forwarded = reasoning_prefixes.get(idx, "")
     # As on the text path, only forward growth that extends the forwarded prefix.
     if text.startswith(forwarded) and len(text) > len(forwarded):
-        suffix = text[len(forwarded) :]
-        await _post_event(
-            client,
-            session_id,
-            output_reasoning_delta_event(
-                step_idx=idx,
-                delta=suffix,
-                started=started,
-            ),
-        )
+        deltas.push(_DELTA_REASONING, idx, text[len(forwarded) :], started=started)
     # Re-anchored unconditionally, DELIBERATELY unlike the text path (which only
     # advances on an emitted delta). Reasoning has no committed close to flush the
     # remainder, so freezing the tracker on a rewrite would drop the rest of the
@@ -2262,6 +2271,47 @@ async def _emit_partial_reasoning_delta(
     reasoning_prefixes[idx] = text
 
 
+def _new_delta_pump(
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    cascade_id: str,
+    delta_chunks: dict[int, int],
+) -> LiveDeltaPump[int]:
+    """
+    Build the live-delta queue for one reader run's stream path.
+
+    Text deltas take their ``index`` when posted, so a merged delta consumes one
+    index and the indices stay contiguous per step.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param cascade_id: agy cascade id (namespaces the stable message id).
+    :param delta_chunks: Per-step emitted-chunk counters (see
+        :func:`_next_delta_index`).
+    :returns: An idle pump keyed by planner ``step_index``.
+    """
+
+    async def _post(delta: LiveDelta[int]) -> None:
+        if delta.kind == _DELTA_REASONING:
+            event = output_reasoning_delta_event(
+                step_idx=delta.key,
+                delta=delta.delta,
+                started=delta.started,
+            )
+        else:
+            event = output_text_delta_event(
+                conversation_id=cascade_id,
+                step_idx=delta.key,
+                delta=delta.delta,
+                final=False,
+                index=_next_delta_index(delta_chunks, delta.key),
+            )
+        await _post_event(client, session_id, event)
+
+    return LiveDeltaPump(_post, name="antigravity-live-deltas")
+
+
 async def _emit_step(
     step: dict[str, object],
     *,
@@ -2269,6 +2319,7 @@ async def _emit_step(
     session_id: str,
     cascade_id: str,
     turn_active: bool,
+    deltas: LiveDeltaPump[int] | None = None,
 ) -> bool:
     """
     Emit one new step's status edges + mapped conversation items.
@@ -2283,14 +2334,15 @@ async def _emit_step(
     :param session_id: Omnigent conversation id to mirror into.
     :param cascade_id: agy cascade id (namespaces response/call ids).
     :param turn_active: Whether a turn is currently considered open on entry.
+    :param deltas: Live-delta queue drained before each post.
     :returns: The updated ``turn_active`` flag after this step.
     """
     if _is_user_turn_step(step) and not turn_active:
         turn_active = True
-        await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
+        await _post_event(client, session_id, _status_event(_STATUS_RUNNING), deltas=deltas)
 
     for event in map_step_to_events(step, conversation_id=cascade_id):
-        await _post_event(client, session_id, event)
+        await _post_event(client, session_id, event, deltas=deltas)
 
     if _is_turn_close_step(step) and turn_active:
         turn_active = False
@@ -2299,7 +2351,7 @@ async def _emit_step(
         # failed turn (alongside the error item the mapper now emits), not a
         # silent empty success that looks identical to a normal reply (#6).
         close_status = _STATUS_FAILED if _step_is_error_planner(step) else _STATUS_IDLE
-        await _post_event(client, session_id, _status_event(close_status))
+        await _post_event(client, session_id, _status_event(close_status), deltas=deltas)
 
     return turn_active
 
@@ -2539,6 +2591,8 @@ async def _maybe_withdraw_interaction(
     # Left WAITING out-of-band (or the web verdict already advanced it): withdraw
     # the card exactly once.
     state.surfaced_elicitations.pop(key, None)
+    if state.deltas is not None:
+        await state.deltas.flush()
     await _post_external_elicitation_resolved(client, session_id, elicitation_id)
 
 
@@ -2671,6 +2725,7 @@ async def _maybe_emit_session_usage(
             data=payload,
             step_index=step_idx,
         ),
+        deltas=state.deltas,
     )
 
 
@@ -2715,6 +2770,7 @@ async def _maybe_emit_model_change(
             data={"model": display_name},
             step_index=step_idx,
         ),
+        deltas=state.deltas,
     )
     state.posted_model_enum = model_enum
 

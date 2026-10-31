@@ -810,12 +810,14 @@ async def test_reasoning_part_streams_suffix_deltas() -> None:
             },
         )
     )
+    await fwd._deltas.flush()
     deltas = [
         b["data"] for _u, b in server.posts if b["type"] == "external_output_reasoning_delta"
     ]
-    # First snapshot opens the block (started); second posts only the new suffix.
-    assert deltas[0] == {"delta": "Let me", "started": True}
-    assert deltas[1] == {"delta": " think", "started": False}
+    # Suffix-only deltas join to the latest snapshot; only the first opens the block.
+    assert "".join(d["delta"] for d in deltas) == "Let me think"
+    assert all(d["delta"] for d in deltas)
+    assert [d["started"] for d in deltas] == [True] + [False] * (len(deltas) - 1)
 
 
 async def test_reasoning_part_no_repost_when_unchanged() -> None:
@@ -826,8 +828,124 @@ async def test_reasoning_part_no_repost_when_unchanged() -> None:
     part = {"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "stable"}
     await fwd.handle_event(_event("message.part.updated", part=part))
     await fwd.handle_event(_event("message.part.updated", part=dict(part)))
+    await fwd._deltas.flush()
     deltas = [b for _u, b in server.posts if b["type"] == "external_output_reasoning_delta"]
     assert len(deltas) == 1
+
+
+class _GatedReasoningServerClient(_RecordingServerClient):
+    """Records posts; the first reasoning-delta POST blocks until ``gate`` opens.
+
+    The wait is bounded so a forwarder that awaits the POST inline cannot hang
+    the test; it times out and the test's assertions report the failure.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.first_delta_started = asyncio.Event()
+        self.first_delta_done = False
+        self.deltas_in_flight = 0
+        self.max_deltas_in_flight = 0
+
+    async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
+        if json["type"] != "external_output_reasoning_delta":
+            return await super().post(url, json=json)
+        self.deltas_in_flight += 1
+        self.max_deltas_in_flight = max(self.max_deltas_in_flight, self.deltas_in_flight)
+        try:
+            if not self.first_delta_started.is_set():
+                self.first_delta_started.set()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self.gate.wait(), timeout=1.0)
+                self.first_delta_done = True
+            else:
+                await asyncio.sleep(0)
+            return await super().post(url, json=json)
+        finally:
+            self.deltas_in_flight -= 1
+
+
+async def test_reasoning_updates_keep_flowing_while_a_delta_post_is_in_flight() -> None:
+    """Reasoning updates are not blocked by an in-flight delta POST; they merge.
+
+    The first reasoning POST is held open. Later updates must still be handled,
+    with at most one delta POST in flight; their suffixes merge into the next
+    POST, and a following tool item waits until the deltas have drained.
+    """
+    server, opencode = _GatedReasoningServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+
+    def _reasoning(text: str) -> OpenCodeEvent:
+        return _event(
+            "message.part.updated",
+            part={"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": text},
+        )
+
+    full = "Let me think about this carefully."
+    await fwd.handle_event(_reasoning(full[:6]))
+    await asyncio.wait_for(server.first_delta_started.wait(), timeout=2.0)
+    for cut in (12, 20, len(full)):
+        await asyncio.wait_for(fwd.handle_event(_reasoning(full[:cut])), timeout=2.0)
+    first_delta_pending = not server.first_delta_done
+
+    tool_event = _event(
+        "message.part.updated",
+        part={
+            "id": "prt_t",
+            "messageID": "msg_1",
+            "type": "tool",
+            "callID": "call_1",
+            "tool": "bash",
+            "state": {"status": "completed", "input": {"command": "ls"}, "output": "a.txt"},
+        },
+    )
+    tool_task = asyncio.create_task(fwd.handle_event(tool_event))
+    await asyncio.sleep(0)
+    tool_posted_early = any(b["type"] == "external_conversation_item" for _u, b in server.posts)
+    server.gate.set()
+    await asyncio.wait_for(tool_task, timeout=2.0)
+
+    assert first_delta_pending
+    assert not tool_posted_early
+    assert server.max_deltas_in_flight == 1
+    deltas = [
+        b["data"] for _u, b in server.posts if b["type"] == "external_output_reasoning_delta"
+    ]
+    assert deltas == [
+        {"delta": full[:6], "started": True},
+        {"delta": full[6:], "started": False},
+    ]
+    types = _types(server.posts)
+    last_delta = max(i for i, t in enumerate(types) if t == "external_output_reasoning_delta")
+    first_item = types.index("external_conversation_item")
+    assert last_delta < first_item
+
+
+async def test_run_cancel_abandons_in_flight_reasoning_delta() -> None:
+    """Cancelling ``run`` mid-delta cancels the in-flight POST without leaking it."""
+    server = _GatedReasoningServerClient()
+
+    class _StalledEvents(_FakeOpenCodeClient):
+        async def events(self) -> Any:
+            yield _event("message.updated", info={"id": "msg_1", "role": "assistant"})
+            yield _event(
+                "message.part.updated",
+                part={"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "Hmm"},
+            )
+            await asyncio.Event().wait()
+
+    fwd = _forwarder(server, _StalledEvents())
+    run = asyncio.create_task(fwd.run(max_reconnects=0))
+    await asyncio.wait_for(server.first_delta_started.wait(), timeout=2.0)
+    run.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=2.0)
+
+    assert not server.first_delta_done
+    assert server.deltas_in_flight == 0
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "opencode-live-deltas"]
 
 
 async def test_image_file_part_posts_image_block() -> None:
