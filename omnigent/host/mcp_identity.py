@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -17,6 +18,7 @@ from mcp.server.stdio import stdio_server
 from omnigent.host.inference_credential import _coords_path
 
 _UNAVAILABLE = "MCP identity unavailable; sign in again or renew API delegation"
+_LINE_END = re.compile(rb"\r\n|\r|\n")
 
 
 def _rpc_request(request: httpx.Request) -> dict[str, object] | None:
@@ -38,28 +40,6 @@ def _rpc_error(request: httpx.Request, error: dict[str, object]) -> httpx.Respon
     return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "error": error})
 
 
-def _complete_events_end(buffer: bytes) -> int:
-    """Return the offset just past the last complete SSE event in ``buffer``, or 0.
-
-    An event ends at an empty line; lines end in CRLF, LF or CR. Bytes pass through
-    unchanged, so a CR that later turns out to start a CRLF only adds a blank line.
-    """
-    end = line_start = index = 0
-    while index < len(buffer):
-        byte = buffer[index]
-        if byte == 0x0D:
-            line_end = index + 2 if buffer[index + 1 : index + 2] == b"\n" else index + 1
-        elif byte == 0x0A:
-            line_end = index + 1
-        else:
-            index += 1
-            continue
-        if index == line_start:
-            end = line_end
-        line_start = index = line_end
-    return end
-
-
 class _ErrorOnResetStream(httpx.AsyncByteStream):
     """SSE body that ends with a JSON-RPC error event for ``request_id`` if the transport fails.
 
@@ -71,14 +51,24 @@ class _ErrorOnResetStream(httpx.AsyncByteStream):
         self.request_id = request_id
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        pending = b""
+        # An event ends at an empty line. Bytes pass through unchanged, so a CR that
+        # later turns out to start a CRLF only adds a blank line.
+        pending = bytearray()
+        index = line_start = 0
         try:
             async for chunk in self.inner:
                 pending += chunk
-                end = _complete_events_end(pending)
+                end = 0
+                for line_end in _LINE_END.finditer(pending, index):
+                    if line_end.start() == line_start:
+                        end = line_end.end()
+                    line_start = line_end.end()
+                index = len(pending)
                 if end:
-                    yield pending[:end]
-                    pending = pending[end:]
+                    yield bytes(pending[:end])
+                    del pending[:end]
+                    index -= end
+                    line_start -= end
         except httpx.TransportError:
             error = {
                 "jsonrpc": "2.0",
@@ -91,7 +81,7 @@ class _ErrorOnResetStream(httpx.AsyncByteStream):
             yield b"event: message\ndata: " + json.dumps(error).encode() + b"\n\n"
             return
         if pending:
-            yield pending
+            yield bytes(pending)
 
     async def aclose(self) -> None:
         await self.inner.aclose()

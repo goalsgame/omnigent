@@ -472,3 +472,16 @@ async def test_transport_surfaces_a_failed_reply(failure):
         else:
             response = await client.post("http://relay/mcp", json=reply)
             assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_reset_stream_scans_a_large_event_in_linear_time():
+    from omnigent.host.mcp_identity import _ErrorOnResetStream
+
+    payload = b"data: " + b"x" * (8 * 2**20) + b"\n\n"
+    chunks = [payload[i : i + 4096] for i in range(0, len(payload), 4096)]
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    received = b"".join([c async for c in _ErrorOnResetStream(_Chunks(chunks, False), 7)])
+    assert received == payload
+    assert loop.time() - started < 5
