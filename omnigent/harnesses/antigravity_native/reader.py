@@ -2439,6 +2439,8 @@ def _maybe_handle_interaction(
     )
 
     async def _run_bridge() -> None:
+        if state.deltas is not None:
+            await state.deltas.flush()
         await on_pending_interaction(cascade_id, state.port, pending)
 
     def _clear_rescan(done: asyncio.Task[None]) -> None:

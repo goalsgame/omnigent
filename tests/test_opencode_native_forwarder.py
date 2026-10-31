@@ -849,7 +849,7 @@ class _GatedReasoningServerClient(_RecordingServerClient):
         self.max_deltas_in_flight = 0
 
     async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
-        if json["type"] != "external_output_reasoning_delta":
+        if json.get("type") != "external_output_reasoning_delta":
             return await super().post(url, json=json)
         self.deltas_in_flight += 1
         self.max_deltas_in_flight = max(self.max_deltas_in_flight, self.deltas_in_flight)
@@ -921,6 +921,37 @@ async def test_reasoning_updates_keep_flowing_while_a_delta_post_is_in_flight() 
     last_delta = max(i for i, t in enumerate(types) if t == "external_output_reasoning_delta")
     first_item = types.index("external_conversation_item")
     assert last_delta < first_item
+
+
+async def test_permission_evaluation_waits_for_queued_reasoning() -> None:
+    """A permission prompt is evaluated only after pending reasoning is posted."""
+    server, opencode = _GatedReasoningServerClient(), _FakeOpenCodeClient()
+    seen_delta_done: list[bool] = []
+
+    async def allow(_normalized: Any) -> dict[str, Any]:
+        seen_delta_done.append(server.first_delta_done)
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=allow)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={"id": "prt_r", "messageID": "msg_1", "type": "reasoning", "text": "Hmm"},
+        )
+    )
+    await asyncio.wait_for(server.first_delta_started.wait(), timeout=2.0)
+    permission = asyncio.create_task(
+        fwd.handle_event(_event("permission.v2.asked", id="per_o", action="bash"))
+    )
+    await asyncio.sleep(0)
+    evaluated_early = bool(seen_delta_done)
+    server.gate.set()
+    await asyncio.wait_for(permission, timeout=2.0)
+
+    assert not evaluated_early
+    assert seen_delta_done == [True]
+    assert opencode.replies[0][1]["reply"] == "once"
 
 
 async def test_run_cancel_abandons_in_flight_reasoning_delta() -> None:

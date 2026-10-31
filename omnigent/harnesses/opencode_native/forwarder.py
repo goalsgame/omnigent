@@ -1049,6 +1049,7 @@ class OpenCodeNativeForwarder:
             # No policy gate wired → fail closed (default ``reject``). A
             # forwarder with no evaluator must never auto-approve.
             return self._default_decision
+        await self._deltas.flush()
         normalized = normalize_for_policy(
             request_dict,
             omnigent_session_id=self._session_id,
@@ -1223,6 +1224,7 @@ class OpenCodeNativeForwarder:
         if preview is not None:
             body["content_preview"] = preview
         url = f"/v1/sessions/{quote(self._session_id, safe='')}/hooks/native-permission-request"
+        await self._deltas.flush()
         try:
             response = await self._server.post(url, json=body)
         except httpx.HTTPError:

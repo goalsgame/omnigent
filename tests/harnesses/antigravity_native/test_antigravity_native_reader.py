@@ -1697,6 +1697,53 @@ async def test_stream_keeps_reading_while_a_delta_post_is_in_flight(
 
 
 @pytest.mark.asyncio
+async def test_interaction_is_surfaced_after_queued_deltas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A WAITING interaction reaches the bridge only after pending deltas are posted."""
+    sink = _GatedDeltaSink()
+    seen_delta_done: list[bool] = []
+    bridged = asyncio.Event()
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        seen_delta_done.append(sink.first_delta_done)
+        bridged.set()
+
+    class _Frames:
+        def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+            async def _gen() -> AsyncIterator[dict[str, object]]:
+                yield _frame([_generating_planner("Let me check")])
+                yield _frame([_permission_waiting()])
+                await bridged.wait()
+
+            return _gen()
+
+    run = asyncio.create_task(
+        _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_Frames(),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
+            on_pending=_on_pending,
+        )
+    )
+    await asyncio.wait_for(sink.first_delta_started.wait(), timeout=2.0)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    bridged_early = bool(seen_delta_done)
+    sink.gate.set()
+    await asyncio.wait_for(bridged.wait(), timeout=2.0)
+    await asyncio.wait_for(run, timeout=5.0)
+
+    assert not bridged_early
+    assert seen_delta_done == [True]
+
+
+@pytest.mark.asyncio
 async def test_reader_cancel_abandons_in_flight_delta_post(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
