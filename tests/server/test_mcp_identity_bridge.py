@@ -421,6 +421,13 @@ class _Chunks(httpx.AsyncByteStream):
         ),
         ([b"data: 1\r", b"\n\r", b"\n"], False, b"data: 1\r\n\r\n"),
         (
+            [b'data: 1\n\ndata: {"part\r', b"", b"\n"],
+            True,
+            b"data: 1\n\nevent: message\ndata: "
+            b'{"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, '
+            b'"message": "MCP connector connection lost; retry the call"}}\n\n',
+        ),
+        (
             [b"event: message\ndata: 1\n\nevent: mes", b'sage\ndata: {"jsonrpc":'],
             True,
             b"event: message\ndata: 1\n\nevent: message\ndata: "
@@ -493,3 +500,27 @@ async def test_reset_stream_scans_a_large_event_in_linear_time():
     received = b"".join([c async for c in _ErrorOnResetStream(_Chunks(chunks, False), 7)])
     assert received == payload
     assert loop.time() - started < 5
+
+
+@pytest.mark.asyncio
+async def test_reset_stream_forwards_the_lf_completing_a_forwarded_event():
+    from omnigent.host.mcp_identity import _ErrorOnResetStream
+
+    release = asyncio.Event()
+
+    class Held(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"event: message\r\ndata: elicitation\r\n\r"
+            yield b"\n"
+            await release.wait()
+
+        async def aclose(self) -> None:
+            return None
+
+    events = _ErrorOnResetStream(Held(), 7).__aiter__()
+    first = await asyncio.wait_for(events.__anext__(), timeout=2)
+    assert first == b"event: message\r\ndata: elicitation\r\n\r"
+    assert await asyncio.wait_for(events.__anext__(), timeout=2) == b"\n"
+    release.set()
+    with pytest.raises(StopAsyncIteration):
+        await events.__anext__()

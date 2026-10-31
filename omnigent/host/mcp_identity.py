@@ -58,10 +58,14 @@ class _ErrorOnResetStream(httpx.AsyncByteStream):
         split_crlf = False
         try:
             async for chunk in self.inner:
+                if not chunk:
+                    continue
                 pending += chunk
                 end = 0
                 if split_crlf and pending[index : index + 1] == b"\n":
                     index = line_start = index + 1
+                    if index == 1:
+                        end = 1
                 split_crlf = False
                 for line_end in _LINE_END.finditer(pending, index):
                     if line_end.start() == line_start:
