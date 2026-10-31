@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import shlex
+import ssl
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -198,6 +199,8 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
         env: Sequence[str] | None = None,
         workspace_path: str | None = None,
         workspace_quota_mib: int | None = None,
+        user: str | None = None,
+        ca_cert: str | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         """
@@ -220,9 +223,14 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
         :param env: Names of server environment variables injected into every
             sandbox, e.g. ``["GIT_TOKEN"]``.
         :param workspace_path: Guest path of a per-sandbox workspace volume that
-            survives stop/start, e.g. ``"/home/omnigent"``; ``None`` keeps the
-            workspace on the root filesystem.
+            survives stop/start and is the guest's ``HOME``, e.g.
+            ``"/home/omnigent"``; ``None`` keeps the workspace on the root
+            filesystem.
         :param workspace_quota_mib: Quota of the workspace volume in MiB.
+        :param user: Guest user commands run as, e.g. ``"sandbox"``; the host
+            gives it the workspace volume. ``None`` keeps the image default.
+        :param ca_cert: PEM certificates trusted for an ``https`` endpoint;
+            ``None`` uses the system trust store.
         :param transport: Optional HTTP transport, for tests.
         """
         self._endpoint = endpoint.rstrip("/")
@@ -237,6 +245,10 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
         self._env_names = tuple(env or ())
         self._workspace_path = workspace_path
         self._workspace_quota_mib = workspace_quota_mib
+        self._user = user
+        self._verify: ssl.SSLContext | bool = (
+            ssl.create_default_context(cadata=ca_cert) if ca_cert else True
+        )
         self._transport = transport
         self._clone_auth: dict[str, tuple[str, str, str]] = {}
 
@@ -264,7 +276,9 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
     ) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._credentials.token()}"}
         try:
-            with httpx.Client(transport=self._transport, timeout=timeout) as client:
+            with httpx.Client(
+                transport=self._transport, timeout=timeout, verify=self._verify
+            ) as client:
                 return client.request(method, self._endpoint + path, json=json, headers=headers)
         except httpx.HTTPError as exc:
             raise click.ClickException(f"microsandbox host request failed: {exc}") from exc
@@ -300,6 +314,9 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
         if self._workspace_path:
             body["workspace_path"] = self._workspace_path
             body["workspace_quota_mib"] = self._workspace_quota_mib
+            body["env"].setdefault("HOME", self._workspace_path)
+        if self._user:
+            body["user"] = self._user
         click.echo(f"▸ Creating remote microsandbox '{sandbox_id}'")
         failure: click.ClickException | None = None
         for _attempt in range(_CREATE_ATTEMPTS):
