@@ -111,7 +111,7 @@ def test_provision_creates_a_sized_sandbox_with_workspace_and_env(
         "memory_mib": 4096,
         "max_memory_mib": 16384,
         "idle_timeout_s": 900,
-        "env": {"GIT_TOKEN": "ghp_test"},
+        "env": {"GIT_TOKEN": "ghp_test", "HOME": "/home/omnigent"},
         "workspace_path": "/home/omnigent",
         "workspace_quota_mib": 51200,
     }
@@ -282,6 +282,7 @@ def test_parse_config_builds_the_remote_launcher() -> None:
                 "idle_timeout_s": 0,
                 "workspace_path": "/home/omnigent",
                 "workspace_quota_mib": 51200,
+                "user": "sandbox",
             },
         }
     )
@@ -305,6 +306,7 @@ def test_parse_config_builds_the_remote_launcher() -> None:
         ({"endpoint": ENDPOINT, "cpus": 0}, "cpus"),
         ({"endpoint": ENDPOINT, "idle_timeout_s": -1}, "idle_timeout_s"),
         ({"endpoint": ENDPOINT, "idle_timeout_s": 60}, "two keepalive refresh intervals"),
+        ({"endpoint": ENDPOINT, "ca_cert": "not a certificate"}, "ca_cert"),
     ],
 )
 def test_parse_config_rejects_invalid_sections(section: dict[str, object], message: str) -> None:
@@ -471,3 +473,86 @@ def test_git_clone_policy_reaches_the_github_clone(
     )
     (clone,) = [b for b in _exec_bodies(host) if "git clone" in str(b["command"])]
     assert "--depth 1" in str(clone["command"])
+
+
+def test_a_guest_user_is_requested_on_create(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DEFAULT_TOKEN_ENV, "static-token")
+    launcher = RemoteMicrosandboxLauncher(
+        endpoint=ENDPOINT,
+        workspace_path="/home/omnigent",
+        user="sandbox",
+        transport=httpx.MockTransport(host),
+    )
+    launcher.provision("managed")
+    body = json.loads(host.requests[-1].content)
+    assert body["user"] == "sandbox"
+    assert body["env"]["HOME"] == "/home/omnigent"
+
+
+def test_an_https_endpoint_trusts_the_configured_ca(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import datetime
+    import http.server
+    import ipaddress
+    import ssl
+    import threading
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "sandbox-host")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    (tmp_path / "cert.pem").write_text(pem)
+    (tmp_path / "key.pem").write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    class Host(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"cpus": 32}')
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Host)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(tmp_path / "cert.pem", tmp_path / "key.pem")
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv(DEFAULT_TOKEN_ENV, "static-token")
+    endpoint = f"https://127.0.0.1:{server.server_port}"
+    try:
+        RemoteMicrosandboxLauncher(endpoint=endpoint, ca_cert=pem).prepare()
+        with pytest.raises(click.ClickException, match="CERTIFICATE_VERIFY_FAILED"):
+            RemoteMicrosandboxLauncher(endpoint=endpoint).prepare()
+    finally:
+        server.shutdown()

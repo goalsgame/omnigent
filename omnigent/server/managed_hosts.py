@@ -123,8 +123,11 @@ stores into ``create_app``):
            memory_mib: 4096                  # starting memory, default 4096
            max_memory_mib: 16384             # live-growth ceiling
            idle_timeout_s: 86400             # default 24h; 0 disables
-           workspace_path: /home/omnigent    # volume kept across stop/start
+           workspace_path: /home/omnigent    # volume kept across stop/start; HOME
            workspace_quota_mib: 51200        # workspace volume quota
+           user: sandbox                     # guest user; default: image default
+           ca_cert: |                        # PEM CA trusted for an https endpoint
+             -----BEGIN CERTIFICATE-----
          gensee:                 # optional block (provider: gensee)
            endpoint: https://sandbox.gensee.ai
            api_token_env: GENSEE_CONTROLLER_API_TOKEN
@@ -1742,6 +1745,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "env",
                     "workspace_path",
                     "workspace_quota_mib",
+                    "user",
+                    "ca_cert",
                 },
                 "sandbox.microsandbox_remote",
             )
@@ -1752,6 +1757,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             raw, "microsandbox_remote", "idle_timeout_s"
         )
         _check_remote_idle_timeout(remote_idle_timeout_s)
+        remote_ca_cert = _parse_provider_string(raw, "microsandbox_remote", "ca_cert")
+        _check_remote_ca_cert(remote_ca_cert)
         launcher_factory = _microsandbox_remote_launcher_factory(
             endpoint=endpoint,
             audience=_parse_provider_string(raw, "microsandbox_remote", "audience"),
@@ -1768,6 +1775,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             workspace_quota_mib=_parse_provider_positive_int(
                 raw, "microsandbox_remote", "workspace_quota_mib"
             ),
+            user=_parse_provider_string(raw, "microsandbox_remote", "user"),
+            ca_cert=remote_ca_cert,
         )
         token_ttl_s = MICROSANDBOX_REMOTE_MANAGED_TOKEN_TTL_S
     elif provider in community:
@@ -2614,6 +2623,25 @@ def _check_remote_idle_timeout(idle_timeout_s: int | None) -> None:
         )
 
 
+def _check_remote_ca_cert(ca_cert: str | None) -> None:
+    """
+    Reject a ``sandbox.microsandbox_remote.ca_cert`` that holds no usable PEM certificate.
+
+    :param ca_cert: The configured PEM text, or ``None`` when unset.
+    :raises ValueError: The text does not load as one or more PEM certificates.
+    """
+    if ca_cert is None:
+        return
+    import ssl
+
+    try:
+        ssl.create_default_context(cadata=ca_cert)
+    except (ssl.SSLError, ValueError) as exc:
+        raise ValueError(
+            "server config 'sandbox.microsandbox_remote.ca_cert' is not a valid PEM certificate"
+        ) from exc
+
+
 def _microsandbox_remote_launcher_factory(
     *,
     endpoint: str,
@@ -2627,6 +2655,8 @@ def _microsandbox_remote_launcher_factory(
     idle_timeout_s: int | None,
     workspace_path: str | None,
     workspace_quota_mib: int | None,
+    user: str | None = None,
+    ca_cert: str | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: microsandbox_remote`` path.
@@ -2645,6 +2675,9 @@ def _microsandbox_remote_launcher_factory(
     :param workspace_path: Guest path of the per-sandbox workspace volume, or
         ``None`` to keep the workspace on the root filesystem.
     :param workspace_quota_mib: Workspace volume quota in MiB, or ``None``.
+    :param user: Guest user commands run as, or ``None`` for the image default.
+    :param ca_cert: PEM certificates trusted for an ``https`` endpoint, or
+        ``None`` for the system trust store.
     :returns: A factory producing parameterized remote microsandbox launchers.
     """
 
@@ -2667,6 +2700,8 @@ def _microsandbox_remote_launcher_factory(
             env=env,
             workspace_path=workspace_path,
             workspace_quota_mib=workspace_quota_mib,
+            user=user,
+            ca_cert=ca_cert,
         )
 
     return _build

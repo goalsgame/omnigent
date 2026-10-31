@@ -142,7 +142,11 @@ sandbox:
   provider: microsandbox_remote
   server_url: https://omnigent.example.com
   microsandbox_remote:
-    endpoint: http://10.0.0.5:8740   # host API, reachable from the server only
+    endpoint: https://10.0.0.5:8740  # host API, reachable from the server only
+    ca_cert: |                        # PEM trusted for the endpoint (see below)
+      -----BEGIN CERTIFICATE-----
+      ...
+      -----END CERTIFICATE-----
     audience: https://sandbox-host    # Google ID-token audience; or omit and
                                       # set token_env to a static token variable
     image: registry.example/omnigent-host@sha256:...
@@ -150,16 +154,20 @@ sandbox:
     memory_mib: 4096
     max_memory_mib: 16384             # live-growth ceiling
     idle_timeout_s: 86400             # host stops idle VMs; wake restarts them
-    workspace_path: /home/omnigent    # per-sandbox volume kept across stop/start
+    workspace_path: /home/omnigent    # per-sandbox volume kept across stop/start; HOME
     workspace_quota_mib: 51200
+    user: sandbox                     # guest user; the host gives it the workspace
 ```
+
+`ca_cert` holds the PEM certificates the server trusts for an `https` endpoint, such as the host's self-signed certificate; omit it to use the system trust store, or for an `http` endpoint.
+The server rejects a `ca_cert` that is not valid PEM at startup.
 
 The host service must implement this contract (JSON bodies, `Authorization: Bearer <token>` on every request):
 
 | Method and path | Body | Response |
 |---|---|---|
 | `GET /v1/host` | — | `200` with capacity details |
-| `PUT /v1/sandboxes/{name}` | `image`, `cpus`, `memory_mib`, `max_memory_mib`, `idle_timeout_s`, `env`, optional `workspace_path`, `workspace_quota_mib` | `200` `{name, created, status}`; idempotent per name |
+| `PUT /v1/sandboxes/{name}` | `image`, `cpus`, `memory_mib`, `max_memory_mib`, `idle_timeout_s`, `env`, optional `workspace_path`, `workspace_quota_mib`, `user` | `200` `{name, created, status}`; idempotent per name |
 | `GET /v1/sandboxes/{name}` | — | `200` `{name, status}` (`running`, `stopped`, …) or `404` |
 | `POST /v1/sandboxes/{name}/start` | — | `200` `{name, status}` or `404` |
 | `POST /v1/sandboxes/{name}/stop` | — | `200` `{name, status}` or `404` |
