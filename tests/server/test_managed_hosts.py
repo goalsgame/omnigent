@@ -4621,6 +4621,38 @@ async def test_info_lists_every_offered_provider(db_uri: str, tmp_path: Path) ->
     assert body["sandbox_providers"] == ["modal", "e2b"]
 
 
+@pytest.mark.parametrize(
+    ("preferred", "expected"),
+    [("e2b", "e2b"), ("lakebox", "modal"), ("", "modal"), (None, "modal")],
+)
+async def test_info_reports_the_preferred_provider(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preferred: str | None,
+    expected: str,
+) -> None:
+    """
+    ``preferred_sandbox_provider`` names the configured preference when it is
+    launchable, otherwise the deployment default.
+    """
+    if preferred is None:
+        monkeypatch.delenv("OMNIGENT_PREFERRED_SANDBOX_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_PREFERRED_SANDBOX_PROVIDER", preferred)
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "providers": [{"provider": "modal"}, {"provider": "e2b"}, {"provider": "lakebox"}],
+        }
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["preferred_sandbox_provider"] == expected
+
+
 async def test_info_lists_single_provider(db_uri: str, tmp_path: Path) -> None:
     """
     A single-provider server reports its one provider in the list too, so
