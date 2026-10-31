@@ -51,18 +51,23 @@ class _ErrorOnResetStream(httpx.AsyncByteStream):
         self.request_id = request_id
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        # An event ends at an empty line. Bytes pass through unchanged, so a CR that
-        # later turns out to start a CRLF only adds a blank line.
+        # An event ends at an empty line. A CR ending one chunk and an LF starting the
+        # next are one line ending.
         pending = bytearray()
         index = line_start = 0
+        split_crlf = False
         try:
             async for chunk in self.inner:
                 pending += chunk
                 end = 0
+                if split_crlf and pending[index : index + 1] == b"\n":
+                    index = line_start = index + 1
+                split_crlf = False
                 for line_end in _LINE_END.finditer(pending, index):
                     if line_end.start() == line_start:
                         end = line_end.end()
                     line_start = line_end.end()
+                    split_crlf = line_end.group() == b"\r" and line_end.end() == len(pending)
                 index = len(pending)
                 if end:
                     yield bytes(pending[:end])

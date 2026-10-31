@@ -413,6 +413,14 @@ class _Chunks(httpx.AsyncByteStream):
         ([b"data: 1\r\rdata: 2\r\r"], False, b"data: 1\r\rdata: 2\r\r"),
         ([b"data: 1\n\r", b"\ndata: 2\n\n"], False, b"data: 1\n\r\ndata: 2\n\n"),
         (
+            [b'event: message\r\ndata: 1\r\n\r\nevent: message\r\ndata: {"part\r', b"\n"],
+            True,
+            b"event: message\r\ndata: 1\r\n\r\nevent: message\ndata: "
+            b'{"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, '
+            b'"message": "MCP connector connection lost; retry the call"}}\n\n',
+        ),
+        ([b"data: 1\r", b"\n\r", b"\n"], False, b"data: 1\r\n\r\n"),
+        (
             [b"event: message\ndata: 1\n\nevent: mes", b'sage\ndata: {"jsonrpc":'],
             True,
             b"event: message\ndata: 1\n\nevent: message\ndata: "
