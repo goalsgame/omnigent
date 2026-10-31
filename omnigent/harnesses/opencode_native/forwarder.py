@@ -45,6 +45,7 @@ from omnigent.harnesses.opencode_native.permissions import (
     parse_permission_request,
     reply_body,
 )
+from omnigent.native._live_delta_pump import LiveDelta, LiveDeltaPump
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -205,10 +206,15 @@ class OpenCodeNativeForwarder:
         self._last_usage_signature: tuple[tuple[str, object], ...] | None = None
         # Last model mirrored to Omnigent (provider/id), to dedupe switches.
         self._last_model: str | None = None
-        # reasoning part id -> chars already streamed as a delta. opencode sends
+        # reasoning part id -> chars already queued as a delta. opencode sends
         # the cumulative reasoning text on each ``part.updated``; we forward only
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
+        # Reasoning deltas post in the background, one request at a time;
+        # ``_post_event`` drains them first so nothing overtakes them.
+        self._deltas: LiveDeltaPump[str] = LiveDeltaPump(
+            self._post_reasoning_delta, name="opencode-live-deltas"
+        )
         # The in-flight turn's assistant messageID (its per-turn ``response_id``),
         # captured from ``message.updated`` and stamped on the running/idle status
         # edges so the web chat renders this turn's tool calls live — the mirrored
@@ -365,6 +371,7 @@ class OpenCodeNativeForwarder:
             # Never leave a parked ``question`` task orphaned when the consume
             # loop exits (cap reached, return, or cancellation): cancel them all.
             await self._cancel_question_tasks()
+            await self._deltas.aclose()
 
     async def _cancel_question_tasks(self) -> None:
         """Cancel and await every in-flight question park task."""
@@ -379,6 +386,7 @@ class OpenCodeNativeForwarder:
         """Consume the SSE stream once, dispatching each event."""
         async for event in self._opencode.events():
             await self.handle_event(event)
+        await self._deltas.flush()
 
     async def handle_event(self, event: OpenCodeEvent) -> None:
         """
@@ -434,7 +442,19 @@ class OpenCodeNativeForwarder:
 
     async def _post_event(self, event_type: str, data: _JsonObject) -> httpx.Response | None:
         """
-        POST one Omnigent session event with a single retry.
+        POST one Omnigent session event after any queued reasoning deltas.
+
+        :param event_type: Omnigent event type, e.g.
+            ``"external_session_status"``.
+        :param data: Event data payload.
+        :returns: The HTTP response, or ``None`` on transport failure.
+        """
+        await self._deltas.flush()
+        return await self._send_event(event_type, data)
+
+    async def _send_event(self, event_type: str, data: _JsonObject) -> httpx.Response | None:
+        """
+        POST one Omnigent session event without waiting for queued deltas.
 
         :param event_type: Omnigent event type, e.g.
             ``"external_session_status"``.
@@ -741,8 +761,10 @@ class OpenCodeNativeForwarder:
         ``part.updated`` (like text parts). We forward only the new suffix as an
         ``external_output_reasoning_delta`` so the web paints one growing
         reasoning block, with ``started`` set on the first chunk of each part
-        (the codex-native reasoning contract). Reasoning is transient — not
-        persisted as a chat item — so nothing is flushed on step end.
+        (the codex-native reasoning contract). Deltas are queued, not awaited:
+        updates arriving while one is in flight merge into the next post.
+        Reasoning is transient — not persisted as a chat item — so nothing is
+        flushed on step end.
         """
         part_id = part.get("id")
         text = part.get("text")
@@ -755,13 +777,16 @@ class OpenCodeNativeForwarder:
         posted = self._reasoning_posted.get(part_id, 0)
         if len(text) <= posted:
             return
-        delta = text[posted:]
         await self._begin_turn_if_needed()
-        await self._post_event(
-            _EXTERNAL_OUTPUT_REASONING_DELTA,
-            {"delta": delta, "started": posted == 0},
-        )
+        self._deltas.push("reasoning", part_id, text[posted:], started=posted == 0)
         self._reasoning_posted[part_id] = len(text)
+
+    async def _post_reasoning_delta(self, delta: LiveDelta[str]) -> None:
+        """Post one (possibly merged) reasoning delta queued by the pump."""
+        await self._send_event(
+            _EXTERNAL_OUTPUT_REASONING_DELTA,
+            {"delta": delta.delta, "started": delta.started},
+        )
 
     async def _handle_file_part(self, part: _JsonMapping) -> None:
         """Mirror an opencode ``file`` part — images as image blocks, else a note.
@@ -1024,6 +1049,7 @@ class OpenCodeNativeForwarder:
             # No policy gate wired → fail closed (default ``reject``). A
             # forwarder with no evaluator must never auto-approve.
             return self._default_decision
+        await self._deltas.flush()
         normalized = normalize_for_policy(
             request_dict,
             omnigent_session_id=self._session_id,
@@ -1198,6 +1224,7 @@ class OpenCodeNativeForwarder:
         if preview is not None:
             body["content_preview"] = preview
         url = f"/v1/sessions/{quote(self._session_id, safe='')}/hooks/native-permission-request"
+        await self._deltas.flush()
         try:
             response = await self._server.post(url, json=body)
         except httpx.HTTPError:

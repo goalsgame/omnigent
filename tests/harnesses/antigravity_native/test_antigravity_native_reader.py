@@ -1559,8 +1559,10 @@ async def test_stream_generating_emits_incremental_deltas(
 ) -> None:
     """Growing ``modifiedResponse`` while GENERATING emits non-overlapping deltas.
 
-    The deltas concatenate to the full partial text and share one stable
-    ``message_id`` for the step (so the SPA coalesces them into one live block).
+    The deltas concatenate to the full partial text, carry contiguous indices and
+    share one stable ``message_id`` for the step (so the SPA coalesces them into
+    one live block). Frames that arrive while a delta is unposted may merge, so
+    the number of deltas is not pinned.
     """
     full = "Hello! I am Antigravity, your AI coding assistant, ready to help."
     cut1, cut2 = 6, 30  # "Hello!" then "Hello! I am Antigravity, your "
@@ -1581,16 +1583,241 @@ async def test_stream_generating_emits_incremental_deltas(
     )
 
     deltas = sink.deltas()
-    # Three growing frames → three non-empty deltas.
-    assert [d["delta"] for d in deltas] == [full[:cut1], full[cut1:cut2], full[cut2:]]
+    assert 1 <= len(deltas) <= 3
+    assert all(d["delta"] for d in deltas)
     # Suffixes concatenate exactly to the full text (no overlap, no gap).
     assert "".join(cast(str, d["delta"]) for d in deltas) == full
+    assert [d["index"] for d in deltas] == list(range(len(deltas)))
     # One stable per-step message_id; deltas are not final (committed item follows).
     message_ids = {d["message_id"] for d in deltas}
     assert message_ids == {f"antigravity:{_CASCADE_ID}:2:planner"}
     assert all(d["final"] is False for d in deltas)
     # No committed message yet — the step never reached DONE in this script.
     assert sink.item_types() == []
+
+
+class _GatedDeltaSink(_PostSink):
+    """A sink whose first live-delta POST blocks until the test opens ``gate``.
+
+    The wait is bounded so a reader that awaits the POST inline cannot hang the
+    test; it times out and the test's assertions report the failure.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.first_delta_started = asyncio.Event()
+        self.first_delta_done = False
+        self.deltas_in_flight = 0
+        self.max_deltas_in_flight = 0
+
+    async def __call__(self, **kwargs: Any) -> httpx.Response:
+        event_type = kwargs["event_type"]
+        if event_type not in {"external_output_text_delta", "external_output_reasoning_delta"}:
+            return await super().__call__(**kwargs)
+        self.deltas_in_flight += 1
+        self.max_deltas_in_flight = max(self.max_deltas_in_flight, self.deltas_in_flight)
+        try:
+            if not self.first_delta_started.is_set():
+                self.first_delta_started.set()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self.gate.wait(), timeout=1.0)
+                self.first_delta_done = True
+            else:
+                await asyncio.sleep(0)
+            return await super().__call__(**kwargs)
+        finally:
+            self.deltas_in_flight -= 1
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_reading_while_a_delta_post_is_in_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Frames keep flowing while a delta POST is held open; queued deltas merge.
+
+    The first delta POST blocks until released. Later frames must still be
+    processed, with at most one delta POST in flight; their growth merges into
+    the next POST, and the committed message only follows the drained deltas.
+    """
+    thinking = "Weighing the options carefully."
+    full = "Hello! I am Antigravity, your AI coding assistant."
+    cuts = [6, 14, 30]
+    sink = _GatedDeltaSink()
+    observed: dict[str, bool] = {}
+
+    def _gen_frame(text: str) -> dict[str, Any]:
+        return _frame([_generating_planner_with_thinking(thinking=thinking, text=text)])
+
+    class _GatedFrames:
+        def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+            async def _gen() -> AsyncIterator[dict[str, object]]:
+                yield _gen_frame(full[: cuts[0]])
+                await asyncio.wait_for(sink.first_delta_started.wait(), timeout=2.0)
+                for cut in cuts[1:]:
+                    yield _gen_frame(full[:cut])
+                yield _gen_frame(full)
+                observed["first_delta_pending"] = not sink.first_delta_done
+                sink.gate.set()
+                yield _frame([_done_planner(full)])
+
+            return _gen()
+
+    await asyncio.wait_for(
+        _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_GatedFrames(),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
+        ),
+        timeout=10.0,
+    )
+
+    assert observed == {"first_delta_pending": True}
+    assert sink.max_deltas_in_flight == 1
+    reasonings = sink.reasonings()
+    assert [r["delta"] for r in reasonings] == [thinking]
+    assert [r["started"] for r in reasonings] == [True]
+    deltas = sink.deltas()
+    live = [d for d in deltas if d["final"] is False]
+    # The held-open first POST is the reasoning delta; all text growth that
+    # arrived behind it merges into one POST.
+    assert [d["delta"] for d in live] == [full]
+    assert "".join(cast(str, d["delta"]) for d in deltas) == full
+    assert [d["index"] for d in deltas] == list(range(len(deltas)))
+    assert deltas[-1]["final"] is True
+    types = sink.event_types()
+    committed_idx = types.index("external_conversation_item")
+    delta_types = {"external_output_text_delta", "external_output_reasoning_delta"}
+    assert max(i for i, t in enumerate(types) if t in delta_types) < committed_idx
+
+
+@pytest.mark.asyncio
+async def test_interaction_is_surfaced_after_queued_deltas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A WAITING interaction reaches the bridge only after pending deltas are posted."""
+    sink = _GatedDeltaSink()
+    seen_delta_done: list[bool] = []
+    bridged = asyncio.Event()
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        seen_delta_done.append(sink.first_delta_done)
+        bridged.set()
+
+    class _Frames:
+        def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+            async def _gen() -> AsyncIterator[dict[str, object]]:
+                yield _frame([_generating_planner("Let me check")])
+                yield _frame([_permission_waiting()])
+                await bridged.wait()
+
+            return _gen()
+
+    run = asyncio.create_task(
+        _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_Frames(),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
+            on_pending=_on_pending,
+        )
+    )
+    await asyncio.wait_for(sink.first_delta_started.wait(), timeout=2.0)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    bridged_early = bool(seen_delta_done)
+    sink.gate.set()
+    await asyncio.wait_for(bridged.wait(), timeout=2.0)
+    await asyncio.wait_for(run, timeout=5.0)
+
+    assert not bridged_early
+    assert seen_delta_done == [True]
+
+
+@pytest.mark.asyncio
+async def test_reader_cancel_abandons_in_flight_delta_post(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Cancelling the reader mid-delta cancels the in-flight POST without leaking it."""
+    sink = _GatedDeltaSink()
+
+    class _StalledFrames:
+        def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+            async def _gen() -> AsyncIterator[dict[str, object]]:
+                yield _frame([_generating_planner("Hello")])
+                await asyncio.Event().wait()
+
+            return _gen()
+
+    run = asyncio.create_task(
+        _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_StalledFrames(),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
+        )
+    )
+    await asyncio.wait_for(sink.first_delta_started.wait(), timeout=2.0)
+    run.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=2.0)
+
+    assert not sink.first_delta_done
+    assert sink.deltas_in_flight == 0
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "antigravity-live-deltas"]
+
+
+@pytest.mark.asyncio
+async def test_reader_failure_abandons_in_flight_delta_post(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A reader body that fails mid-delta still cancels the in-flight POST."""
+    sink = _GatedDeltaSink()
+    process_stream_step = reader._process_stream_step
+    calls = 0
+
+    async def _fail_on_second_step(step: dict[str, object], **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("reader body failed")
+        await process_stream_step(step, **kwargs)
+
+    monkeypatch.setattr(reader, "_process_stream_step", _fail_on_second_step)
+    frames = [_frame([_generating_planner("Hello")]), _frame([_generating_planner("Hello, ")])]
+    run = asyncio.create_task(
+        _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_FrameScript(frames),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
+        )
+    )
+    await asyncio.wait_for(sink.first_delta_started.wait(), timeout=2.0)
+    with pytest.raises(RuntimeError, match="reader body failed"):
+        await asyncio.wait_for(run, timeout=2.0)
+
+    assert calls == 2
+    assert not sink.first_delta_done
+    assert sink.deltas_in_flight == 0
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "antigravity-live-deltas"]
 
 
 @pytest.mark.asyncio
@@ -2006,12 +2233,12 @@ async def test_stream_generating_emits_incremental_reasoning_deltas(
     )
 
     reasonings = sink.reasonings()
-    # Three growing frames → three non-empty reasoning deltas.
-    assert [r["delta"] for r in reasonings] == [full[:cut1], full[cut1:cut2], full[cut2:]]
+    assert 1 <= len(reasonings) <= 3
+    assert all(r["delta"] for r in reasonings)
     # Suffixes concatenate exactly to the full reasoning (no overlap, no gap).
     assert "".join(cast(str, r["delta"]) for r in reasonings) == full
     # Only the first delta starts a new reasoning block.
-    assert [r["started"] for r in reasonings] == [True, False, False]
+    assert [r["started"] for r in reasonings] == [True] + [False] * (len(reasonings) - 1)
     # Reasoning has no committed conversation item (the step never reached DONE).
     assert sink.item_types() == []
 
@@ -2169,10 +2396,11 @@ async def test_stream_reasoning_reanchors_after_non_monotonic_rewrite(
         iterations=1,
     )
 
-    deltas = [r["delta"] for r in sink.reasonings()]
+    reasonings = sink.reasonings()
     # The first frame emits "abcdef"; the rewrite emits nothing; the recovery
     # frame emits "more" only because the tracker re-anchored to "XYZ".
-    assert deltas == ["abcdef", "more"]
+    assert "".join(cast(str, r["delta"]) for r in reasonings) == "abcdefmore"
+    assert [r["started"] for r in reasonings] == [True] + [False] * (len(reasonings) - 1)
 
 
 @pytest.mark.asyncio
