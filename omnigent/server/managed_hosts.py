@@ -1757,6 +1757,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             raw, "microsandbox_remote", "idle_timeout_s"
         )
         _check_remote_idle_timeout(remote_idle_timeout_s)
+        remote_ca_cert = _parse_provider_string(raw, "microsandbox_remote", "ca_cert")
+        _check_remote_ca_cert(remote_ca_cert)
         launcher_factory = _microsandbox_remote_launcher_factory(
             endpoint=endpoint,
             audience=_parse_provider_string(raw, "microsandbox_remote", "audience"),
@@ -1774,7 +1776,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 raw, "microsandbox_remote", "workspace_quota_mib"
             ),
             user=_parse_provider_string(raw, "microsandbox_remote", "user"),
-            ca_cert=_parse_provider_string(raw, "microsandbox_remote", "ca_cert"),
+            ca_cert=remote_ca_cert,
         )
         token_ttl_s = MICROSANDBOX_REMOTE_MANAGED_TOKEN_TTL_S
     elif provider in community:
@@ -2619,6 +2621,25 @@ def _check_remote_idle_timeout(idle_timeout_s: int | None) -> None:
             "server config 'sandbox.microsandbox_remote.idle_timeout_s' must be 0 or at "
             f"least {minimum:g} seconds (two keepalive refresh intervals)"
         )
+
+
+def _check_remote_ca_cert(ca_cert: str | None) -> None:
+    """
+    Reject a ``sandbox.microsandbox_remote.ca_cert`` that holds no usable PEM certificate.
+
+    :param ca_cert: The configured PEM text, or ``None`` when unset.
+    :raises ValueError: The text does not load as one or more PEM certificates.
+    """
+    if ca_cert is None:
+        return
+    import ssl
+
+    try:
+        ssl.create_default_context(cadata=ca_cert)
+    except (ssl.SSLError, ValueError) as exc:
+        raise ValueError(
+            "server config 'sandbox.microsandbox_remote.ca_cert' is not a valid PEM certificate"
+        ) from exc
 
 
 def _microsandbox_remote_launcher_factory(

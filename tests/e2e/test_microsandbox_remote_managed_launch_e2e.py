@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -94,7 +95,50 @@ class FakeSandboxHost(ThreadingHTTPServer):
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.server_address[1]}"
+        scheme = "https" if isinstance(self.socket, ssl.SSLSocket) else "http"
+        return f"{scheme}://127.0.0.1:{self.server_address[1]}"
+
+    def serve_tls(self, root: Path) -> str:
+        """Serve HTTPS with a fresh self-signed certificate; returns its PEM."""
+        import datetime
+        import ipaddress
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "sandbox-host")])
+        now = datetime.datetime.now(datetime.UTC)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(
+                x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+                critical=False,
+            )
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+        (root / "cert.pem").write_text(pem)
+        (root / "key.pem").write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(root / "cert.pem", root / "key.pem")
+        self.socket = context.wrap_socket(self.socket, server_side=True)
+        return pem
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -206,7 +250,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _spawn_server(
-    tmp_path: Path, port: int, host_url: str
+    tmp_path: Path, port: int, host_url: str, extra: dict[str, object]
 ) -> tuple[subprocess.Popen[bytes], Path]:
     config_path = tmp_path / "server-config.yaml"
     config_path.write_text(
@@ -225,6 +269,7 @@ def _spawn_server(
                         "idle_timeout_s": 3600,
                         "workspace_path": "/home/omnigent",
                         "workspace_quota_mib": 4096,
+                        **extra,
                     },
                 }
             }
@@ -274,11 +319,19 @@ def _wait_for(predicate, timeout_s: float, failure):
     pytest.fail(failure())
 
 
-def test_managed_session_launches_a_registered_host_on_the_remote_host(tmp_path: Path) -> None:
+@pytest.mark.parametrize("secure", [False, True], ids=["http", "https-guest-user"])
+def test_managed_session_launches_a_registered_host_on_the_remote_host(
+    tmp_path: Path, secure: bool
+) -> None:
     fake = FakeSandboxHost(tmp_path / "sandboxes")
+    extra: dict[str, object] = {}
+    expected_extra: dict[str, object] = {}
+    if secure:
+        extra = {"ca_cert": fake.serve_tls(tmp_path), "user": "sandbox"}
+        expected_extra = {"user": "sandbox"}
     threading.Thread(target=fake.serve_forever, daemon=True).start()
     port = find_free_port()
-    proc, log_path = _spawn_server(tmp_path, port, fake.url)
+    proc, log_path = _spawn_server(tmp_path, port, fake.url, extra)
     base_url = f"http://127.0.0.1:{port}"
     launched_groups: list[int] = []
 
@@ -335,9 +388,10 @@ def test_managed_session_launches_a_registered_host_on_the_remote_host(tmp_path:
             "memory_mib": 2048,
             "max_memory_mib": 8192,
             "idle_timeout_s": 3600,
-            "env": {},
+            "env": {"HOME": "/home/omnigent"},
             "workspace_path": "/home/omnigent",
             "workspace_quota_mib": 4096,
+            **expected_extra,
         }
         assert any(c[0] == "POST" and c[1].endswith(f"/{name}/exec") for c in fake.calls)
         groups = _process_groups(fake.sandboxes[name]["home"])  # type: ignore[arg-type]

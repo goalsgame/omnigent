@@ -306,6 +306,7 @@ def test_parse_config_builds_the_remote_launcher() -> None:
         ({"endpoint": ENDPOINT, "cpus": 0}, "cpus"),
         ({"endpoint": ENDPOINT, "idle_timeout_s": -1}, "idle_timeout_s"),
         ({"endpoint": ENDPOINT, "idle_timeout_s": 60}, "two keepalive refresh intervals"),
+        ({"endpoint": ENDPOINT, "ca_cert": "not a certificate"}, "ca_cert"),
     ],
 )
 def test_parse_config_rejects_invalid_sections(section: dict[str, object], message: str) -> None:
