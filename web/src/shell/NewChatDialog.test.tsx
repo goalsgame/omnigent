@@ -7271,6 +7271,25 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("names each provider row in the host picker", async () => {
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_providers: ["agent_sandbox", "kubernetes", "microsandbox_remote"],
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-sandbox-option").textContent).toContain(
+      "Agent Sandbox",
+    );
+    expect(screen.getByTestId("new-chat-landing-sandbox-option-kubernetes").textContent).toContain(
+      "Kubernetes Sandbox",
+    );
+    expect(
+      screen.getByTestId("new-chat-landing-sandbox-option-microsandbox_remote").textContent,
+    ).toContain("Microsandbox");
+    expect(document.body.textContent).not.toMatch(/_sandbox|_remote/i);
+  });
+
   it("reopens on the last-picked provider and highlights its row", async () => {
     // The sticky pick: choosing e2b persists it, so a fresh landing (module
     // draft reset, storage kept) reselects e2b and lights its row up rather

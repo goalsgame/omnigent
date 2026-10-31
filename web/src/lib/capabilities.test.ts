@@ -89,6 +89,23 @@ describe("sandboxProviderOptions", () => {
   });
 });
 
+describe("sandboxOptionLabel", () => {
+  it.each([
+    [null, "New Sandbox"],
+    ["modal", "Modal Sandbox"],
+    ["lakebox", "Databricks Sandbox"],
+    ["e2b", "E2B Sandbox"],
+    ["agent_sandbox", "Agent Sandbox"],
+    ["kubernetes", "Kubernetes Sandbox"],
+    ["microsandbox", "Microsandbox"],
+    ["microsandbox_remote", "Microsandbox"],
+    ["my_cloud", "My Cloud Sandbox"],
+    ["edge-sandbox", "Edge Sandbox"],
+  ])("labels %s as %s", (provider, label) => {
+    expect(sandboxOptionLabel(provider)).toBe(label);
+  });
+});
+
 describe("resolveServerInfo sandbox_providers", () => {
   it("keeps the provider list from the probe", async () => {
     // Regression: the probe rebuilds ServerInfo field by field, so a
