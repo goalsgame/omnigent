@@ -4,7 +4,9 @@ import asyncio
 import json
 import socket
 import sys
+from contextlib import asynccontextmanager
 
+import httpx
 import pytest
 import uvicorn
 from mcp import ClientSession, StdioServerParameters
@@ -159,15 +161,43 @@ async def test_stdio_bridge_reports_expired_identity_without_timeout(
         sock.close()
 
 
-async def _serve(app):
+@asynccontextmanager
+async def _serving(app):
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sock.listen()
     server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on"))
     task = asyncio.create_task(server.serve(sockets=[sock]))
-    while not server.started:
-        await asyncio.sleep(0.01)
-    return server, task, sock
+    try:
+        async with asyncio.timeout(10):
+            while not server.started:
+                if task.done():
+                    raise RuntimeError("fixture server exited before startup")
+                await asyncio.sleep(0.01)
+        yield sock
+    finally:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(task, timeout=10)
+        except Exception:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        sock.close()
+
+
+def _echo_app(json_response: bool = False):
+    mcp = FastMCP(
+        "fixture",
+        streamable_http_path="/v1/hosts/host-one/mcp",
+        stateless_http=True,
+        json_response=json_response,
+    )
+
+    @mcp.tool()
+    def echo(value: str) -> str:
+        return value
+
+    return mcp.streamable_http_app()
 
 
 def _bridge_params(coords, setup: str = "") -> StdioServerParameters:
@@ -198,21 +228,37 @@ def _write_coords(tmp_path, sock):
     return coords
 
 
+@asynccontextmanager
+async def _runner_manager(tmp_path, params):
+    from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.spec.types import AgentSpec, MCPServerConfig
+
+    manager = RunnerMcpManager(stdio_cwd=tmp_path)
+    spec = AgentSpec(
+        spec_version=1,
+        name="fixture",
+        mcp_servers=[
+            MCPServerConfig(
+                name="connectors", transport="stdio", command=params.command, args=params.args
+            )
+        ],
+    )
+
+    async def call(value: str) -> str:
+        return await manager.call_tool(spec, "connectors__echo", {"value": value})
+
+    try:
+        yield call
+    finally:
+        await manager.shutdown()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [502, 503, 504])
 async def test_runner_recovers_after_one_upstream_error(tmp_path, status):
     from mcp.shared.exceptions import McpError
 
-    from omnigent.runner.mcp_manager import RunnerMcpManager
-    from omnigent.spec.types import AgentSpec, MCPServerConfig
-
-    mcp = FastMCP("fixture", streamable_http_path="/v1/hosts/host-one/mcp", stateless_http=True)
-
-    @mcp.tool()
-    def echo(value: str) -> str:
-        return value
-
-    app = mcp.streamable_http_app()
+    app = _echo_app()
     fail_next = []
     posts = []
 
@@ -232,64 +278,112 @@ async def test_runner_recovers_after_one_upstream_error(tmp_path, status):
                 return
         await app(scope, receive, send)
 
-    server, task, sock = await _serve(flaky)
-    params = _bridge_params(_write_coords(tmp_path, sock))
-    manager = RunnerMcpManager(stdio_cwd=tmp_path)
-    spec = AgentSpec(
-        spec_version=1,
-        name="fixture",
-        mcp_servers=[
-            MCPServerConfig(
-                name="connectors", transport="stdio", command=params.command, args=params.args
-            )
-        ],
+    async with (
+        _serving(flaky) as sock,
+        _runner_manager(tmp_path, _bridge_params(_write_coords(tmp_path, sock))) as call,
+        asyncio.timeout(30),
+    ):
+        assert await call("a") == "a"
+        fail_next.append(True)
+        with pytest.raises(McpError, match=f"HTTP {status}"):
+            await call("b")
+        sent = len(posts)
+        assert await call("c") == "c"
+        assert len(posts) > sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("json_response", [False, True])
+async def test_runner_recovers_after_a_reset_mid_response(tmp_path, json_response):
+    from mcp.shared.exceptions import McpError
+
+    reset_once = (
+        "import httpx\n"
+        "forward = httpx.AsyncHTTPTransport.handle_async_request\n"
+        "class Reset(httpx.AsyncByteStream):\n"
+        "    def __init__(self, inner):\n"
+        "        self.inner = inner\n"
+        "    async def __aiter__(self):\n"
+        "        raise httpx.ReadError('connection reset')\n"
+        "        yield b''\n"
+        "    async def aclose(self):\n"
+        "        await self.inner.aclose()\n"
+        "async def reset(self, request):\n"
+        "    response = await forward(self, request)\n"
+        "    marker = Path(sys.argv[1]).with_name('reset-once')\n"
+        "    if b'tools/call' in request.content and not marker.exists():\n"
+        "        marker.touch()\n"
+        "        response.stream = Reset(response.stream)\n"
+        "    return response\n"
+        "httpx.AsyncHTTPTransport.handle_async_request = reset\n"
     )
-    try:
-        async with asyncio.timeout(30):
-            assert await manager.call_tool(spec, "connectors__echo", {"value": "a"}) == "a"
-            fail_next.append(True)
-            with pytest.raises(McpError, match=f"HTTP {status}"):
-                await manager.call_tool(spec, "connectors__echo", {"value": "b"})
-            sent = len(posts)
-            assert await manager.call_tool(spec, "connectors__echo", {"value": "c"}) == "c"
-            assert len(posts) > sent
-    finally:
-        await manager.shutdown()
-        server.should_exit = True
-        await asyncio.wait_for(task, timeout=10)
-        sock.close()
+    async with (
+        _serving(_echo_app(json_response)) as sock,
+        _runner_manager(
+            tmp_path, _bridge_params(_write_coords(tmp_path, sock), reset_once)
+        ) as call,
+        asyncio.timeout(30),
+    ):
+        if json_response:
+            assert await call("b") == "b"
+        else:
+            with pytest.raises(McpError, match="connection lost"):
+                await call("b")
+        assert (tmp_path / "reset-once").exists()
+        assert await call("c") == "c"
+
+
+@pytest.mark.asyncio
+async def test_transport_answers_connect_errors_with_correlated_rpc_errors():
+    from omnigent.host.mcp_identity import _IdentityTransport
+
+    failures = [True, True]
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if failures:
+            failures.pop()
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 8, "result": {}})
+
+    transport = _IdentityTransport()
+    transport.transport = httpx.MockTransport(upstream)
+    async with httpx.AsyncClient(transport=transport) as client:
+        failed = await client.post(
+            "http://relay/mcp", json={"jsonrpc": "2.0", "id": 7, "method": "tools/call"}
+        )
+        assert failed.status_code == 200
+        assert failed.json()["id"] == 7
+        assert failed.json()["error"]["code"] == -32603
+        notification = await client.post(
+            "http://relay/mcp",
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        assert notification.status_code == 202
+        assert notification.content == b""
+        recovered = await client.post(
+            "http://relay/mcp", json={"jsonrpc": "2.0", "id": 8, "method": "tools/list"}
+        )
+        assert recovered.json() == {"jsonrpc": "2.0", "id": 8, "result": {}}
 
 
 @pytest.mark.asyncio
 async def test_stdio_bridge_exits_when_its_relay_fails(tmp_path):
     from mcp.shared.exceptions import McpError
 
-    mcp = FastMCP("fixture", streamable_http_path="/v1/hosts/host-one/mcp", stateless_http=True)
-
-    @mcp.tool()
-    def echo(value: str) -> str:
-        return value
-
-    server, task, sock = await _serve(mcp.streamable_http_app())
-    params = _bridge_params(
-        _write_coords(tmp_path, sock),
+    crash = (
         "forward = bridge._IdentityTransport.handle_async_request\n"
         "async def crash(self, request):\n"
         "    if request.method == 'POST' and b'tools/call' in request.content:\n"
         "        raise RuntimeError('relay crashed')\n"
         "    return await forward(self, request)\n"
-        "bridge._IdentityTransport.handle_async_request = crash\n",
+        "bridge._IdentityTransport.handle_async_request = crash\n"
     )
-    try:
-        async with (
-            asyncio.timeout(30),
-            stdio_client(params) as (read, write),
-            ClientSession(read, write) as session,
-        ):
-            await session.initialize()
-            with pytest.raises(McpError, match="Connection closed"):
-                await session.call_tool("echo", {"value": "lost"})
-    finally:
-        server.should_exit = True
-        await asyncio.wait_for(task, timeout=10)
-        sock.close()
+    async with (
+        _serving(_echo_app()) as sock,
+        asyncio.timeout(30),
+        stdio_client(_bridge_params(_write_coords(tmp_path, sock), crash)) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        with pytest.raises(McpError, match="Connection closed"):
+            await session.call_tool("echo", {"value": "lost"})

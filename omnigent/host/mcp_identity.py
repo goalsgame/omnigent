@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from urllib.parse import quote
 
@@ -18,18 +19,52 @@ from omnigent.host.inference_credential import _coords_path
 _UNAVAILABLE = "MCP identity unavailable; sign in again or renew API delegation"
 
 
-def _rpc_error(request: httpx.Request, error: dict[str, object]) -> httpx.Response:
+def _rpc_request(request: httpx.Request) -> dict[str, object] | None:
     body = json.loads(request.content)
     if not isinstance(body, dict) or "id" not in body or "method" not in body:
+        return None
+    return body
+
+
+def _rpc_error(request: httpx.Request, error: dict[str, object]) -> httpx.Response:
+    body = _rpc_request(request)
+    if body is None:
         return httpx.Response(202)
     return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "error": error})
+
+
+class _ErrorOnResetStream(httpx.AsyncByteStream):
+    """SSE body that ends with a JSON-RPC error event for ``request_id`` if the transport fails."""
+
+    def __init__(self, inner: httpx.AsyncByteStream, request_id: object) -> None:
+        self.inner = inner
+        self.request_id = request_id
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self.inner:
+                yield chunk
+        except httpx.TransportError:
+            error = {
+                "jsonrpc": "2.0",
+                "id": self.request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "MCP connector connection lost; retry the call",
+                },
+            }
+            # Leading blank lines terminate any partially received event first.
+            yield b"\n\nevent: message\ndata: " + json.dumps(error).encode() + b"\n\n"
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
 
 
 class _IdentityTransport(httpx.AsyncBaseTransport):
     """Answer a failed POST with a JSON-RPC error the stdio caller can correlate."""
 
     def __init__(self) -> None:
-        self.transport = httpx.AsyncHTTPTransport(trust_env=False)
+        self.transport: httpx.AsyncBaseTransport = httpx.AsyncHTTPTransport(trust_env=False)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.method != "POST":
@@ -44,6 +79,13 @@ class _IdentityTransport(httpx.AsyncBaseTransport):
         status = response.status_code
         # 404 is the SDK's session-terminated signal and is handled there.
         if status < 400 or status == 404:
+            body = _rpc_request(request)
+            if (
+                body is not None
+                and response.headers.get("content-type", "").startswith("text/event-stream")
+                and isinstance(response.stream, httpx.AsyncByteStream)
+            ):
+                response.stream = _ErrorOnResetStream(response.stream, body["id"])
             return response
         await response.aclose()
         if status in (401, 403):
