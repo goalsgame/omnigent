@@ -1734,6 +1734,46 @@ async def test_reader_cancel_abandons_in_flight_delta_post(
 
 
 @pytest.mark.asyncio
+async def test_reader_failure_abandons_in_flight_delta_post(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A reader body that fails mid-delta still cancels the in-flight POST."""
+    sink = _GatedDeltaSink()
+    process_stream_step = reader._process_stream_step
+    calls = 0
+
+    async def _fail_on_second_step(step: dict[str, object], **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("reader body failed")
+        await process_stream_step(step, **kwargs)
+
+    monkeypatch.setattr(reader, "_process_stream_step", _fail_on_second_step)
+    frames = [_frame([_generating_planner("Hello")]), _frame([_generating_planner("Hello, ")])]
+    run = asyncio.create_task(
+        _run_stream(
+            bridge_dir=_bridge_dir(tmp_path),
+            sink=sink,
+            stream=_FrameScript(frames),
+            poll_steps=_StepScript([[]]),
+            monkeypatch=monkeypatch,
+            iterations=1,
+        )
+    )
+    await asyncio.wait_for(sink.first_delta_started.wait(), timeout=2.0)
+    with pytest.raises(RuntimeError, match="reader body failed"):
+        await asyncio.wait_for(run, timeout=2.0)
+
+    assert calls == 2
+    assert not sink.first_delta_done
+    assert sink.deltas_in_flight == 0
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "antigravity-live-deltas"]
+
+
+@pytest.mark.asyncio
 async def test_stream_done_emits_one_committed_message_after_deltas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

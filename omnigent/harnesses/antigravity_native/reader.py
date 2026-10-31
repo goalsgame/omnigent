@@ -1178,10 +1178,12 @@ async def supervise_reader(
         # already done, making this a no-op.
         if not body_task.done():
             body_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await body_task
-        if state.deltas is not None:
-            await state.deltas.aclose()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await body_task
+        finally:
+            if state.deltas is not None:
+                await state.deltas.aclose()
         # Drain the bridge and any chained re-scan tasks. Yield once per pass so
         # a normally-completed bridge's pending ``_clear_slot`` callback lands in
         # ``interaction_rescans`` before the snapshot — otherwise it escapes the
