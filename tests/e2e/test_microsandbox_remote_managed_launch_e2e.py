@@ -256,7 +256,7 @@ def _spawn_server(
     extra: dict[str, object],
     *,
     providers: list[str] | None = None,
-    server_env: dict[str, str] | None = None,
+    server_env: dict[str, str | None] | None = None,
 ) -> tuple[subprocess.Popen[bytes], Path]:
     config_path = tmp_path / "server-config.yaml"
     selection: dict[str, object] = (
@@ -294,8 +294,12 @@ def _spawn_server(
         "OMNIGENT_BUILTIN_AGENT_DIRS": str(
             _REPO_ROOT / "tests" / "resources" / "agents" / "sdk-chat-builtin.yaml"
         ),
-        **(server_env or {}),
     }
+    for name, value in (server_env or {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     log_path = tmp_path / "server.log"
     with open(log_path, "w") as log_handle:
         proc = subprocess.Popen(
@@ -449,7 +453,10 @@ def test_preferred_provider_is_advertised_and_launches(tmp_path: Path) -> None:
         fake.url,
         {},
         providers=["e2b", "microsandbox_remote"],
-        server_env={"OMNIGENT_PREFERRED_SANDBOX_PROVIDER": "microsandbox_remote"},
+        server_env={
+            "OMNIGENT_PREFERRED_SANDBOX_PROVIDER": "microsandbox_remote",
+            "E2B_API_KEY": None,
+        },
     )
     base_url = f"http://127.0.0.1:{port}"
     launched_groups: list[int] = []
