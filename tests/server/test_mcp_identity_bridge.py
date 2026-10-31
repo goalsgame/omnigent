@@ -410,6 +410,8 @@ class _Chunks(httpx.AsyncByteStream):
     [
         ([b"data: 1\n\nda", b"ta: 2\n\n"], False, b"data: 1\n\ndata: 2\n\n"),
         ([b"data: 1\r\n\r\ntail"], False, b"data: 1\r\n\r\ntail"),
+        ([b"data: 1\r\rdata: 2\r\r"], False, b"data: 1\r\rdata: 2\r\r"),
+        ([b"data: 1\n\r", b"\ndata: 2\n\n"], False, b"data: 1\n\r\ndata: 2\n\n"),
         (
             [b"event: message\ndata: 1\n\nevent: mes", b'sage\ndata: {"jsonrpc":'],
             True,
@@ -424,3 +426,49 @@ async def test_reset_stream_passes_only_complete_events(chunks, fail, expected):
 
     stream = _ErrorOnResetStream(_Chunks(chunks, fail), 7)
     assert b"".join([chunk async for chunk in stream]) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("framing", [b"\n\n", b"\r\n\r\n", b"\r\r", b"\n\r\n", b"\r\n\r"])
+async def test_reset_stream_forwards_a_complete_event_before_eof(framing):
+    from omnigent.host.mcp_identity import _ErrorOnResetStream
+
+    release = asyncio.Event()
+
+    class Held(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"event: message\ndata: elicitation" + framing[:1]
+            yield framing[1:]
+            await release.wait()
+
+        async def aclose(self) -> None:
+            return None
+
+    events = _ErrorOnResetStream(Held(), 7).__aiter__()
+    first = await asyncio.wait_for(events.__anext__(), timeout=2)
+    assert first == b"event: message\ndata: elicitation" + framing
+    release.set()
+    with pytest.raises(StopAsyncIteration):
+        await events.__anext__()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["connect", "503"])
+async def test_transport_surfaces_a_failed_reply(failure):
+    from omnigent.host.mcp_identity import _IdentityTransport
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if failure == "connect":
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(503)
+
+    transport = _IdentityTransport()
+    transport.transport = httpx.MockTransport(upstream)
+    reply = {"jsonrpc": "2.0", "id": 3, "result": {"action": "accept"}}
+    async with httpx.AsyncClient(transport=transport) as client:
+        if failure == "connect":
+            with pytest.raises(httpx.ConnectError):
+                await client.post("http://relay/mcp", json=reply)
+        else:
+            response = await client.post("http://relay/mcp", json=reply)
+            assert response.status_code == 503

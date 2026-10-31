@@ -26,11 +26,38 @@ def _rpc_request(request: httpx.Request) -> dict[str, object] | None:
     return body
 
 
+def _is_reply(request: httpx.Request) -> bool:
+    body = json.loads(request.content)
+    return isinstance(body, dict) and "id" in body and "method" not in body
+
+
 def _rpc_error(request: httpx.Request, error: dict[str, object]) -> httpx.Response:
     body = _rpc_request(request)
     if body is None:
         return httpx.Response(202)
     return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "error": error})
+
+
+def _complete_events_end(buffer: bytes) -> int:
+    """Return the offset just past the last complete SSE event in ``buffer``, or 0.
+
+    An event ends at an empty line; lines end in CRLF, LF or CR. Bytes pass through
+    unchanged, so a CR that later turns out to start a CRLF only adds a blank line.
+    """
+    end = line_start = index = 0
+    while index < len(buffer):
+        byte = buffer[index]
+        if byte == 0x0D:
+            line_end = index + 2 if buffer[index + 1 : index + 2] == b"\n" else index + 1
+        elif byte == 0x0A:
+            line_end = index + 1
+        else:
+            index += 1
+            continue
+        if index == line_start:
+            end = line_end
+        line_start = index = line_end
+    return end
 
 
 class _ErrorOnResetStream(httpx.AsyncByteStream):
@@ -48,8 +75,7 @@ class _ErrorOnResetStream(httpx.AsyncByteStream):
         try:
             async for chunk in self.inner:
                 pending += chunk
-                lf, crlf = pending.rfind(b"\n\n"), pending.rfind(b"\r\n\r\n")
-                end = max(lf + 2 if lf >= 0 else 0, crlf + 4 if crlf >= 0 else 0)
+                end = _complete_events_end(pending)
                 if end:
                     yield pending[:end]
                     pending = pending[end:]
@@ -83,6 +109,9 @@ class _IdentityTransport(httpx.AsyncBaseTransport):
         try:
             response = await self.transport.handle_async_request(request)
         except httpx.TransportError:
+            # A lost reply to an upstream request must end the relay, not vanish.
+            if _is_reply(request):
+                raise
             return _rpc_error(
                 request,
                 {"code": -32603, "message": "MCP connector unreachable; retry the call"},
@@ -99,6 +128,8 @@ class _IdentityTransport(httpx.AsyncBaseTransport):
                 response.stream = _ErrorOnResetStream(response.stream, body["id"])
             return response
         await response.aclose()
+        if _is_reply(request):
+            return httpx.Response(status, request=request)
         if status in (401, 403):
             return _rpc_error(
                 request,
