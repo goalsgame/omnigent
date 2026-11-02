@@ -3116,3 +3116,45 @@ async def test_bounded_discovery_rejects_repeated_cursor() -> None:
             session.list_tools.assert_awaited_with(cursor="same-page")
         finally:
             await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_refresh_waits_for_in_flight_call_and_is_its_own_attempt() -> None:
+    """A tools/list refresh never runs inside a tool call's attempt window.
+
+    Both requests share one session, and a network failure is attributed to the
+    attempt whose serial was stamped on the request; the listing must not carry
+    the in-flight call's serial.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    call_started = asyncio.Event()
+    release_call = asyncio.Event()
+    events: list[tuple[str, int]] = []
+
+    class _Session:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+            events.append(("call_start", conn._call_serial))
+            call_started.set()
+            await release_call.wait()
+            events.append(("call_end", conn._call_serial))
+            return CallToolResult(content=[TextContent(type="text", text="done")])
+
+        async def list_tools(self, cursor: str | None = None) -> Any:
+            events.append(("list", conn._call_serial))
+            return MagicMock(tools=[], nextCursor=None)
+
+    conn._session = _Session()  # type: ignore[assignment]
+    call = asyncio.create_task(conn._invoke_tool("slow", {}))
+    await call_started.wait()
+    refresh = asyncio.create_task(conn.refresh_tools())
+    await asyncio.sleep(0.05)
+    assert [kind for kind, _ in events] == ["call_start"]
+
+    release_call.set()
+    assert await call == "done"
+    assert await refresh == []
+    assert [kind for kind, _ in events] == ["call_start", "call_end", "list"]
+    call_serial = events[0][1]
+    list_serial = events[2][1]
+    assert list_serial != call_serial
+    assert conn._transport_error is None

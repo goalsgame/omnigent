@@ -106,6 +106,7 @@ from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_f
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
+from omnigent.runner.mcp_manager import MCP_LISTING_FAILED
 from omnigent.runner.mcp_routes import register_mcp_routes
 from omnigent.runner.model_option_routes import register_model_option_routes
 from omnigent.runner.native import (
@@ -830,10 +831,6 @@ def _is_mcp_tool_schema(schema: object) -> bool:
     return isinstance(name, str) and "__" in name
 
 
-# Failure key for a listing that failed as a whole rather than for one server.
-_MCP_LISTING_FAILED = ""
-
-
 def _merge_mcp_listing(
     previous: list[_JsonObject],
     schemas: list[_JsonObject],
@@ -843,7 +840,7 @@ def _merge_mcp_listing(
     Combine a fresh MCP listing with the previous one for servers that failed.
 
     A server that failed to list keeps its previously listed tools, and a
-    listing that failed as a whole (:data:`_MCP_LISTING_FAILED`) keeps them all.
+    listing that failed as a whole (:data:`MCP_LISTING_FAILED`) keeps them all.
 
     :param previous: MCP schemas from the previous listing, e.g.
         ``[{"name": "github__search", ...}]``.
@@ -852,7 +849,7 @@ def _merge_mcp_listing(
         ``{"github": "MCP server unavailable"}``.
     :returns: The merged MCP schemas.
     """
-    if _MCP_LISTING_FAILED in failures:
+    if MCP_LISTING_FAILED in failures:
         listed = {schema.get("name") for schema in schemas}
         return list(schemas) + [t for t in previous if t.get("name") not in listed]
     prefixes = tuple(f"{server}__" for server in failures)
@@ -4687,7 +4684,7 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-            return [], {_MCP_LISTING_FAILED: type(exc).__name__}
+            return [], {MCP_LISTING_FAILED: type(exc).__name__}
         for server, error in result.failures.items():
             _logger.warning(
                 "Native MCP %r unavailable for session %s: %s",

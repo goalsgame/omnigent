@@ -30,7 +30,7 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
     McpExecutionResult,
 )
-from omnigent.runner.mcp_manager import McpSchemasResult
+from omnigent.runner.mcp_manager import MCP_LISTING_FAILED, McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 
@@ -280,7 +280,7 @@ async def test_schemas_for_http_error_returns_failure() -> None:
 
     assert result.schemas == [], "No schemas on proxy error"
     assert result.tool_names == set(), "No tool names on proxy error"
-    assert "proxy" in result.failures, "Error must surface in failures['proxy']"
+    assert MCP_LISTING_FAILED in result.failures, "Error must surface as a whole-listing failure"
 
 
 @pytest.mark.asyncio
@@ -303,11 +303,11 @@ async def test_schemas_for_rpc_error_body_returns_failure() -> None:
     result = await manager.schemas_for(_make_spec("github"))
 
     assert result.schemas == []
-    assert "proxy" in result.failures
-    assert "-32601" in result.failures["proxy"], (
+    assert MCP_LISTING_FAILED in result.failures
+    assert "-32601" in result.failures[MCP_LISTING_FAILED], (
         "Error code must appear in the failure message for diagnostics"
     )
-    assert "Method not found" in result.failures["proxy"]
+    assert "Method not found" in result.failures[MCP_LISTING_FAILED]
 
 
 @pytest.mark.asyncio
@@ -330,7 +330,7 @@ async def test_schemas_for_malformed_rpc_objects_return_failure(
 
     assert result.schemas == []
     assert result.tool_names == set()
-    assert expected_message in result.failures["proxy"]
+    assert expected_message in result.failures[MCP_LISTING_FAILED]
 
 
 # ── call_tool ──────────────────────────────────────────────────────────────

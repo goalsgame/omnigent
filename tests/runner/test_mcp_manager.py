@@ -240,6 +240,31 @@ async def test_tool_refresh_is_rate_limited_and_coalesced(
 
 
 @pytest.mark.asyncio
+async def test_call_to_tool_missing_from_fresh_listing_relists_once(
+    patch_connection: dict[str, Any],
+) -> None:
+    """A call to an unlisted allowed tool re-lists even inside the refresh interval."""
+    tools_for = patch_connection["__tools_for__"]
+    tools_for["jira"] = [_make_tool_def("search")]
+    spec = _make_spec(_make_config("jira"))
+    manager = RunnerMcpManager()
+    try:
+        await manager.schemas_for(spec)
+        tools_for["jira"] = [_make_tool_def("search"), _make_tool_def("create")]
+        results = await asyncio.gather(
+            manager.call_tool(spec, "jira__create", {}),
+            manager.call_tool(spec, "jira__create", {}),
+        )
+        with pytest.raises(RuntimeError, match="no live MCP serving tool"):
+            await manager.call_tool(spec, "jira__missing", {})
+    finally:
+        await manager.shutdown()
+
+    assert results == ["called create with {}", "called create with {}"]
+    assert patch_connection["jira"].refresh_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_failed_tool_refresh_keeps_previous_tools(
     patch_connection: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,

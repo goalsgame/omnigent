@@ -98,7 +98,6 @@ async def test_next_listing_exposes_added_and_drops_removed_tools(
 @pytest.mark.asyncio
 async def test_call_to_unlisted_tool_relists_before_failing(
     http_server: tuple[Path, str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state, url = http_server
     spec = _http_spec(url)
@@ -106,7 +105,6 @@ async def test_call_to_unlisted_tool_relists_before_failing(
     try:
         assert (await manager.schemas_for(spec)).tool_names == {"dyn__alpha", "dyn__gamma"}
         _write_tools(state, "alpha", "beta")
-        monkeypatch.setattr(mcp_manager_module, "_TOOL_REFRESH_INTERVAL_S", 0.0, raising=False)
         assert await manager.call_tool(spec, "dyn__beta", {"text": "now"}) == "beta: now"
     finally:
         await manager.shutdown()

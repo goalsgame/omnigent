@@ -88,6 +88,9 @@ _POOL_SPEC_CAPACITY = 8
 _TOOL_REFRESH_INTERVAL_S = 5.0
 # A refresh that takes longer keeps the previous tool list.
 _TOOL_REFRESH_TIMEOUT_S = 10.0
+# ``McpSchemasResult.failures`` key for a listing that failed as a whole
+# rather than for one named server.
+MCP_LISTING_FAILED = ""
 
 
 @dataclass
@@ -129,7 +132,7 @@ class McpSchemasResult:
 
     schemas: list[_JsonObject]
     tool_names: set[str]
-    failures: dict[str, str]  # server_name → error message
+    failures: dict[str, str]  # server_name (or MCP_LISTING_FAILED) → error message
 
 
 def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
@@ -529,7 +532,7 @@ class RunnerMcpManager:
                     and ref.entry.connection is not None
                     and not self._server_has_allowed_tool(ref, bare_name)
                 ):
-                    await self._refresh_stale_tools([ref.entry])
+                    await self._refresh_stale_tools([ref.entry], force=True)
                 if (
                     ref.entry.error is None
                     and ref.entry.connection is not None
@@ -820,26 +823,31 @@ class RunnerMcpManager:
             )
         return server.connect_task
 
-    async def _refresh_stale_tools(self, servers: Iterable[_SharedServerEntry]) -> None:
-        """Re-list tools of connected *servers* whose listing is due."""
+    async def _refresh_stale_tools(
+        self, servers: Iterable[_SharedServerEntry], *, force: bool = False
+    ) -> None:
+        """Re-list tools of connected *servers* whose listing is due, or all with *force*."""
         async with self._lock:
             tasks = {
                 id(server): task
                 for server in servers
-                if (task := self._ensure_refresh_task(server)) is not None
+                if (task := self._ensure_refresh_task(server, force=force)) is not None
             }
         if tasks:
             await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-    def _ensure_refresh_task(self, server: _SharedServerEntry) -> asyncio.Task[None] | None:
-        """Return an in-flight refresh, creating one when due. Caller holds lock."""
+    def _ensure_refresh_task(
+        self, server: _SharedServerEntry, *, force: bool = False
+    ) -> asyncio.Task[None] | None:
+        """Return an in-flight refresh, creating one when due or forced. Caller holds lock."""
         conn = server.connection
         if conn is None or server.error is not None:
             return None
         if server.refresh_task is not None and not server.refresh_task.done():
             return server.refresh_task
         if (
-            not conn.tools_list_changed
+            not force
+            and not conn.tools_list_changed
             and time.monotonic() - server.tools_listed_at < _TOOL_REFRESH_INTERVAL_S
         ):
             return None

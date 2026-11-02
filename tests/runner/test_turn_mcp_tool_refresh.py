@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 
 from omnigent.runner import create_runner_app
+from omnigent.runner.mcp_manager import MCP_LISTING_FAILED
+from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 from tests.runner.conftest import (
     _FakeMcpManager,
@@ -23,9 +25,12 @@ _AGENT_ID = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
 
 
 class _ChangingToolsServerClient(NullServerClient):
-    """Server client whose MCP proxy lists ``listings[0]`` until a test pops it."""
+    """Server client whose MCP proxy lists ``listings[0]`` until a test pops it.
 
-    def __init__(self, listings: list[list[str]]) -> None:
+    A ``None`` listing answers with a JSON-RPC error, as an unavailable proxy does.
+    """
+
+    def __init__(self, listings: list[list[str] | None]) -> None:
         self.listings = listings
 
     async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
@@ -35,6 +40,8 @@ class _ChangingToolsServerClient(NullServerClient):
 
             class _ToolsListResponse(NullServerClient._Response):
                 def json(self) -> dict[str, Any]:
+                    if names is None:
+                        return {"error": {"code": -32000, "message": "Runner MCP execute failed."}}
                     return {
                         "result": {
                             "tools": [
@@ -73,8 +80,9 @@ async def _send_turn(client: Any, harness_client: _ScriptedHarnessClient, turn: 
     return [str(tool["name"]) for tool in tools if str(tool.get("name")).startswith("jira__")]
 
 
-@pytest.mark.asyncio
-async def test_next_turn_sees_added_and_not_removed_mcp_tools() -> None:
+def _app(
+    server_client: _ChangingToolsServerClient,
+) -> tuple[Any, _ScriptedHarnessClient]:
     spec = AgentSpec(
         spec_version=1,
         name="t",
@@ -85,9 +93,6 @@ async def test_next_turn_sees_added_and_not_removed_mcp_tools() -> None:
             _sse({"type": "response.created", "response": {"id": "resp_1"}}),
             _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
         ]
-    )
-    server_client = _ChangingToolsServerClient(
-        [["jira__alpha", "jira__gamma"], ["jira__alpha", "jira__beta"]]
     )
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -100,6 +105,15 @@ async def test_next_turn_sees_added_and_not_removed_mcp_tools() -> None:
         server_client=server_client,  # type: ignore[arg-type]
         mcp_manager=_FakeMcpManager(),
     )
+    return app, harness_client
+
+
+@pytest.mark.asyncio
+async def test_next_turn_sees_added_and_not_removed_mcp_tools() -> None:
+    server_client = _ChangingToolsServerClient(
+        [["jira__alpha", "jira__gamma"], ["jira__alpha", "jira__beta"]]
+    )
+    app, harness_client = _app(server_client)
     async with _runner_client(app) as client:
         first = await _send_turn(client, harness_client, 1)
         assert {"jira__alpha", "jira__gamma"} <= set(first)
@@ -114,8 +128,34 @@ async def test_next_turn_sees_added_and_not_removed_mcp_tools() -> None:
     assert len(second) == len(set(second))
 
 
+@pytest.mark.asyncio
+async def test_unavailable_mcp_proxy_keeps_previous_turns_tools() -> None:
+    server_client = _ChangingToolsServerClient([["jira__alpha"], None])
+    app, harness_client = _app(server_client)
+    async with _runner_client(app) as client:
+        assert await _send_turn(client, harness_client, 1) == ["jira__alpha"]
+        await asyncio.sleep(0.1)
+
+        server_client.listings.pop(0)
+        second = await _send_turn(client, harness_client, 2)
+
+    assert second == ["jira__alpha"]
+
+
+@pytest.mark.asyncio
+async def test_proxy_listing_failure_is_kept_apart_from_a_server_named_proxy() -> None:
+    proxy_down = _ChangingToolsServerClient([None])
+    result = await ProxyMcpManager("conv_x", proxy_down).schemas_for(  # type: ignore[arg-type]
+        AgentSpec(
+            spec_version=1,
+            mcp_servers=[MCPServerConfig(name="proxy", transport="http", url="http://x")],
+        )
+    )
+    assert set(result.failures) == {MCP_LISTING_FAILED}
+
+
 def test_failed_servers_keep_their_previous_mcp_tools() -> None:
-    from omnigent.runner.app import _MCP_LISTING_FAILED, _merge_mcp_listing
+    from omnigent.runner.app import _merge_mcp_listing
 
     previous = [{"name": "jira__alpha"}, {"name": "github__search"}]
     fresh = [{"name": "jira__alpha"}, {"name": "jira__beta"}]
@@ -125,5 +165,5 @@ def test_failed_servers_keep_their_previous_mcp_tools() -> None:
         *fresh,
         {"name": "github__search"},
     ]
-    assert _merge_mcp_listing(previous, [], {_MCP_LISTING_FAILED: "HTTPError"}) == previous
+    assert _merge_mcp_listing(previous, [], {MCP_LISTING_FAILED: "HTTPError"}) == previous
     assert _merge_mcp_listing(previous, [], {"proxy": "unavailable"}) == []

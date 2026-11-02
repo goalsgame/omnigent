@@ -956,13 +956,17 @@ class McpServerConnection:
         Re-list the server's tools over the live session, bypassing the cache.
 
         Updates the shared discovery cache so later connections see the
-        same list.
+        same list. Runs as its own attempt under :attr:`_call_lock`, so a
+        transport failure of the listing is never attributed to a tool call.
 
         :returns: The server's current tool definitions.
         :raises RuntimeError: If the connection has no live session.
         """
-        self.tools_list_changed = False
-        return await self._list_tools_live()
+        async with self._call_lock:
+            self.tools_list_changed = False
+            self._call_serial += 1
+            self._transport_error = None
+            return await self._list_tools_live()
 
     async def _message_handler(
         self,
