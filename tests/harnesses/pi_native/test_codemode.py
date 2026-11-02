@@ -25,7 +25,8 @@ def test_bridge_discovery_registration_and_legacy_fallback() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_native_codemode_sdk_preserves_authorization() -> None:
+def _installed_pi_sdk() -> tuple[str, Path, str]:
+    """Return ``(node, package_root, version)`` for an installed Pi 1.3+ npm package."""
     node, pi = shutil.which("node"), shutil.which("pi")
     if node is None or pi is None:
         pytest.skip("Native SDK integration requires Node and Pi")
@@ -42,6 +43,11 @@ def test_native_codemode_sdk_preserves_authorization() -> None:
     version = json.loads((package / "package.json").read_text())["version"]
     if tuple(int(part) for part in version.split(".")[:2]) < (1, 3):
         pytest.skip("Native discovery integration requires Pi 1.3 or newer")
+    return node, package, version
+
+
+def test_native_codemode_sdk_preserves_authorization() -> None:
+    node, package, version = _installed_pi_sdk()
     result = subprocess.run(
         [
             node,
@@ -55,3 +61,24 @@ def test_native_codemode_sdk_preserves_authorization() -> None:
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("startup", ["listed", "empty"])
+@pytest.mark.parametrize("exposure", ["direct", "codemode"])
+def test_native_session_follows_added_and_removed_mcp_tools(exposure: str, startup: str) -> None:
+    node, package, _version = _installed_pi_sdk()
+    result = subprocess.run(
+        [
+            node,
+            str(Path(__file__).with_name("verify_mcp_refresh.mjs")),
+            str(package),
+            str(ROOT / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"),
+            exposure,
+            startup,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"MCP refresh verified ({exposure}, {startup} startup)" in result.stdout

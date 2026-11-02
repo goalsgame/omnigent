@@ -1289,6 +1289,25 @@ class ClaudeNativeToolRelay:
         self._httpd = httpd
         self._advertised_url = advertised_url
 
+    def advertise_tools(self, tools: list[_JsonObject]) -> bool:
+        """
+        Replace the tool list this relay advertises in ``tool_relay.json``.
+
+        The relay's URL and token stay unchanged.
+
+        :param tools: Omnigent tool schemas to advertise, e.g.
+            ``[{"name": "github__search", "parameters": {...}}]``.
+        :returns: ``False`` when the file no longer advertises this relay.
+        """
+        relay_file = self._bridge_dir / _TOOL_RELAY_FILE
+        relay_info = _read_json_file(relay_file)
+        if relay_info.get("url") != self._advertised_url:
+            return False
+        relay_info["tools"] = _normalize_relay_tool_specs(tools)
+        relay_info["updated_at"] = time.time()
+        _write_json_file(relay_file, relay_info)
+        return True
+
     def close(self) -> None:
         """
         Stop the relay's HTTP server and remove its advertisement file.
@@ -6834,7 +6853,10 @@ def _tool_relay_handler_factory(
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            if payload.get("jsonrpc") != "2.0" or payload.get("method") != "tools/call":
+            if payload.get("jsonrpc") != "2.0" or payload.get("method") not in (
+                "tools/call",
+                "tools/list",
+            ):
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
             import urllib.parse as _up

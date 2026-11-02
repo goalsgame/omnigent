@@ -39,7 +39,7 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     McpExecutionRegistry,
 )
-from omnigent.runner.mcp_manager import McpSchemasResult
+from omnigent.runner.mcp_manager import MCP_LISTING_FAILED, McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -203,7 +203,8 @@ class ProxyMcpManager:
         :param spec: The agent spec.  When ``spec.mcp_servers`` is empty,
             returns an empty result immediately without hitting the network.
         :returns: :class:`McpSchemasResult` containing schemas, tool name
-            set, and per-server failure messages.
+            set, and per-server failure messages; a listing that failed as a
+            whole is keyed by :data:`MCP_LISTING_FAILED`.
         """
         if not spec.mcp_servers:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
@@ -231,7 +232,7 @@ class ProxyMcpManager:
             return McpSchemasResult(
                 schemas=[],
                 tool_names=set(),
-                failures={"proxy": f"{type(exc).__name__}: {exc}"},
+                failures={MCP_LISTING_FAILED: f"{type(exc).__name__}: {exc}"},
             )
 
         if "error" in data:
@@ -249,7 +250,7 @@ class ProxyMcpManager:
             return McpSchemasResult(
                 schemas=[],
                 tool_names=set(),
-                failures={"proxy": msg},
+                failures={MCP_LISTING_FAILED: msg},
             )
 
         result = _json_object(data.get("result"))
@@ -262,7 +263,7 @@ class ProxyMcpManager:
             return McpSchemasResult(
                 schemas=[],
                 tool_names=set(),
-                failures={"proxy": msg},
+                failures={MCP_LISTING_FAILED: msg},
             )
         tools_list = _json_object_list(result.get("tools"))
         schemas: list[_JsonObject] = []

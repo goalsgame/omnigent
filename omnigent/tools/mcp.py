@@ -50,7 +50,9 @@ from mcp.types import (
     ElicitRequestParams,
     ElicitResult,
     ImageContent,
+    ServerNotification,
     TextContent,
+    ToolListChangedNotification,
 )
 from mcp.types import Tool as McpToolDef
 
@@ -571,6 +573,12 @@ class McpServerConnection:
         default=None, init=False, repr=False
     )
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
+    # Set when the server sends ``notifications/tools/list_changed``;
+    # cleared by :meth:`refresh_tools`.
+    tools_list_changed: bool = field(default=False, init=False, repr=False)
+    # ``time.monotonic()`` of the last live ``tools/list``; 0 while the
+    # tool list came from the discovery cache.
+    tools_listed_at: float = field(default=0.0, init=False, repr=False)
     _breaker: _CircuitBreaker = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -876,6 +884,7 @@ class McpServerConnection:
                         if self.elicitation_callback is not None
                         else None
                     ),
+                    message_handler=self._message_handler,
                 )
                 await stack.enter_async_context(session)
                 await session.initialize()
@@ -934,6 +943,54 @@ class McpServerConnection:
             )
             return cached
 
+        tools = await self._list_tools_live()
+        _logger.info(
+            "MCP server %r: discovered %d tool(s)",
+            self.config.name,
+            len(tools),
+        )
+        return tools
+
+    async def refresh_tools(self) -> list[McpToolDef]:
+        """
+        Re-list the server's tools over the live session, bypassing the cache.
+
+        Updates the shared discovery cache so later connections see the
+        same list. Runs as its own attempt under :attr:`_call_lock`, so a
+        transport failure of the listing is never attributed to a tool call.
+
+        :returns: The server's current tool definitions.
+        :raises RuntimeError: If the connection has no live session.
+        """
+        async with self._call_lock:
+            self.tools_list_changed = False
+            self._call_serial += 1
+            self._transport_error = None
+            return await self._list_tools_live()
+
+    async def _message_handler(
+        self,
+        message: object,
+    ) -> None:
+        """
+        Record ``notifications/tools/list_changed`` from the server.
+
+        :param message: Incoming request responder, notification or
+            transport exception from the MCP session.
+        """
+        if isinstance(message, ServerNotification) and isinstance(
+            message.root, ToolListChangedNotification
+        ):
+            _logger.info("MCP server %r: tool list changed", self.config.name)
+            self.tools_list_changed = True
+
+    async def _list_tools_live(self) -> list[McpToolDef]:
+        """
+        Perform ``tools/list`` on the live session and record the result.
+
+        :returns: The listed tool definitions.
+        :raises RuntimeError: If the connection has no live session.
+        """
         if self._session is None:
             raise RuntimeError("MCP session not initialized — call connect() first")
         tools_result = await self._session.list_tools()
@@ -951,11 +1008,7 @@ class McpServerConnection:
         else:
             self._update_cache(tools)
         self._discovered_tools = tools
-        _logger.info(
-            "MCP server %r: discovered %d tool(s)",
-            self.config.name,
-            len(tools),
-        )
+        self.tools_listed_at = time.monotonic()
         return tools
 
     async def close(self) -> None:
