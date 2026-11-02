@@ -7,7 +7,8 @@ import contextlib
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -82,6 +83,11 @@ def _build_accept_content(
 
 
 _POOL_SPEC_CAPACITY = 8
+# Minimum seconds between two ``tools/list`` refreshes of one connected
+# server, unless the server announced ``notifications/tools/list_changed``.
+_TOOL_REFRESH_INTERVAL_S = 5.0
+# A refresh that takes longer keeps the previous tool list.
+_TOOL_REFRESH_TIMEOUT_S = 10.0
 
 
 @dataclass
@@ -95,6 +101,9 @@ class _SharedServerEntry:
     error: str | None = None
     ref_count: int = 0
     connect_task: asyncio.Task[None] | None = None
+    refresh_task: asyncio.Task[None] | None = None
+    # ``time.monotonic()`` of the last tools/list attempt; 0 forces a refresh.
+    tools_listed_at: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -415,7 +424,12 @@ class RunnerMcpManager:
             self._touch(spec_hash)
 
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
-        """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
+        """Resolve MCP schemas for *spec*; awaits any in-flight connect.
+
+        Connected servers re-list their tools when the last listing is older
+        than ``_TOOL_REFRESH_INTERVAL_S`` or the server sent
+        ``notifications/tools/list_changed``.
+        """
         configs = list(spec.mcp_servers or [])
         if not configs:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
@@ -441,6 +455,7 @@ class RunnerMcpManager:
                         "runner mcp connect task raised; surfacing partial results",
                         extra={"session_id": runner_primary_session_id()},
                     )
+            await self._refresh_stale_tools(ref.entry for ref in refs)
 
             schemas: list[_JsonObject] = []
             tool_names: set[str] = set()
@@ -509,6 +524,12 @@ class RunnerMcpManager:
 
                 if connect_task is not None:
                     await connect_task
+                if (
+                    ref.entry.error is None
+                    and ref.entry.connection is not None
+                    and not self._server_has_allowed_tool(ref, bare_name)
+                ):
+                    await self._refresh_stale_tools([ref.entry])
                 if (
                     ref.entry.error is None
                     and ref.entry.connection is not None
@@ -657,7 +678,8 @@ class RunnerMcpManager:
             connect_tasks = [
                 task
                 for server in servers
-                if (task := server.connect_task) is not None and not task.done()
+                for task in (server.connect_task, server.refresh_task)
+                if task is not None and not task.done()
             ]
             for server in servers:
                 server.ref_count = 0
@@ -798,6 +820,75 @@ class RunnerMcpManager:
             )
         return server.connect_task
 
+    async def _refresh_stale_tools(self, servers: Iterable[_SharedServerEntry]) -> None:
+        """Re-list tools of connected *servers* whose listing is due."""
+        async with self._lock:
+            tasks = {
+                id(server): task
+                for server in servers
+                if (task := self._ensure_refresh_task(server)) is not None
+            }
+        if tasks:
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    def _ensure_refresh_task(self, server: _SharedServerEntry) -> asyncio.Task[None] | None:
+        """Return an in-flight refresh, creating one when due. Caller holds lock."""
+        conn = server.connection
+        if conn is None or server.error is not None:
+            return None
+        if server.refresh_task is not None and not server.refresh_task.done():
+            return server.refresh_task
+        if (
+            not conn.tools_list_changed
+            and time.monotonic() - server.tools_listed_at < _TOOL_REFRESH_INTERVAL_S
+        ):
+            return None
+        server.refresh_task = asyncio.create_task(
+            self._refresh_server_tools(server, conn),
+            name=f"runner-mcp-refresh:{server.server_hash}",
+        )
+        return server.refresh_task
+
+    async def _refresh_server_tools(
+        self, server: _SharedServerEntry, conn: McpServerConnection
+    ) -> None:
+        """Replace *server*'s tool list with a live listing; keep it on failure."""
+        current_task = asyncio.current_task()
+        try:
+            try:
+                tools = await asyncio.wait_for(conn.refresh_tools(), _TOOL_REFRESH_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001 — a stale list beats no list
+                _logger.warning(
+                    "runner mcp tool refresh failed: server_hash=%s server=%s error=%s",
+                    server.server_hash,
+                    server.config.name,
+                    mcp_connection_failure(exc),
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                async with self._lock:
+                    server.tools_listed_at = time.monotonic()
+                return
+            async with self._lock:
+                if server.connection is not conn:
+                    return
+                before = {td.name for td in server.tools}
+                server.tools = tools
+                server.tools_listed_at = time.monotonic()
+            after = {td.name for td in tools}
+            if after != before:
+                _logger.info(
+                    "runner mcp tools changed: server_hash=%s server=%s added=%s removed=%s",
+                    server.server_hash,
+                    server.config.name,
+                    sorted(after - before),
+                    sorted(before - after),
+                    extra={"session_id": runner_primary_session_id()},
+                )
+        finally:
+            async with self._lock:
+                if server.refresh_task is current_task:
+                    server.refresh_task = None
+
     async def _connect_server(self, server: _SharedServerEntry, spec_hash: str) -> None:
         """Connect one shared MCP server if needed."""
         close_after_connect: McpServerConnection | None = None
@@ -835,6 +926,7 @@ class RunnerMcpManager:
                 async with self._lock:
                     server.connection = conn
                     server.tools = tools
+                    server.tools_listed_at = conn.tools_listed_at
                     server.error = None
                     if server.ref_count <= 0:
                         self._servers.pop(server.server_hash, None)

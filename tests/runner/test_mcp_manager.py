@@ -23,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +77,7 @@ class _FakeConn:
     def __init__(self, tools: list[McpToolDef]) -> None:
         self._tools = tools
         self.connect_calls = 0
+        self.refresh_calls = 0
         self.close_calls = 0
         self.call_tool_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -115,12 +118,24 @@ def patch_connection(
             self._config = config
             self._inner = _FakeConn(tools_for.get(config.name, []))
             conns[config.name] = self._inner
+            self.tools_list_changed = False
+            self.tools_listed_at = 0.0
 
         async def connect(self) -> list[McpToolDef]:
             """Surface either a scripted error or the canned tool list."""
             if self._config.name in raise_for:
                 raise raise_for[self._config.name]
+            self.tools_listed_at = time.monotonic()
             return await self._inner.connect()
+
+        async def refresh_tools(self) -> list[McpToolDef]:
+            """Re-list the scripted tools; a scripted error fails the refresh."""
+            self.tools_list_changed = False
+            self._inner.refresh_calls += 1
+            if self._config.name in raise_for:
+                raise raise_for[self._config.name]
+            self.tools_listed_at = time.monotonic()
+            return list(tools_for.get(self._config.name, []))
 
         async def close(self) -> None:
             """Forward close to the underlying _FakeConn for assertion."""
@@ -196,6 +211,56 @@ async def test_pool_reuses_connection_for_same_spec(
     assert patch_connection["jira"].connect_calls == 1, (
         f"expected 1 connect, got {patch_connection['jira'].connect_calls}"
     )
+
+
+@pytest.mark.asyncio
+async def test_tool_refresh_is_rate_limited_and_coalesced(
+    patch_connection: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Listings inside the refresh interval reuse the list; due ones share one tools/list."""
+    tools_for = patch_connection["__tools_for__"]
+    tools_for["jira"] = [_make_tool_def("search")]
+    spec = _make_spec(_make_config("jira"))
+    manager = RunnerMcpManager()
+    try:
+        await manager.schemas_for(spec)
+        tools_for["jira"] = [_make_tool_def("search"), _make_tool_def("create")]
+        assert (await manager.schemas_for(spec)).tool_names == {"jira__search"}
+        assert patch_connection["jira"].refresh_calls == 0
+
+        monkeypatch.setattr(_mcp_manager_module, "_TOOL_REFRESH_INTERVAL_S", 0.0, raising=False)
+        results = await asyncio.gather(*(manager.schemas_for(spec) for _ in range(3)))
+    finally:
+        await manager.shutdown()
+
+    assert all(r.tool_names == {"jira__search", "jira__create"} for r in results)
+    assert patch_connection["jira"].refresh_calls == 1
+    assert patch_connection["jira"].connect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_refresh_keeps_previous_tools(
+    patch_connection: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing tools/list on a live connection keeps the last good tool list."""
+    patch_connection["__tools_for__"]["jira"] = [_make_tool_def("search")]
+    spec = _make_spec(_make_config("jira"))
+    manager = RunnerMcpManager()
+    try:
+        await manager.schemas_for(spec)
+        monkeypatch.setattr(_mcp_manager_module, "_TOOL_REFRESH_INTERVAL_S", 0.0, raising=False)
+        patch_connection["__raise_for__"]["jira"] = RuntimeError("list failed")
+        result = await manager.schemas_for(spec)
+        dispatched = await manager.call_tool(spec, "jira__search", {})
+    finally:
+        await manager.shutdown()
+
+    assert patch_connection["jira"].refresh_calls >= 1
+    assert result.tool_names == {"jira__search"}
+    assert result.failures == {}
+    assert dispatched == "called search with {}"
 
 
 @pytest.mark.asyncio
@@ -415,6 +480,9 @@ async def test_call_tool_connects_only_target_namespaced_server(
     class _TargetedConn:
         """Connection stub that records which server was connected."""
 
+        tools_list_changed = False
+        tools_listed_at = math.inf
+
         def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
             """Record config for connect/call assertions."""
             self._config = config
@@ -500,6 +568,9 @@ async def test_lru_eviction_at_pool_capacity(
     class _CountingConn:
         """Standin for McpServerConnection that records close()."""
 
+        tools_list_changed = False
+        tools_listed_at = math.inf
+
         def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
             """Bind to the config so close() records the server name."""
             self._config = config
@@ -557,6 +628,9 @@ async def test_prewarm_registers_without_connecting(
     class _CountingConn:
         """Connection that records when an actual spawn/connect happens."""
 
+        tools_list_changed = False
+        tools_listed_at = math.inf
+
         def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
             """Record the config for the returned tool name."""
             self._config = config
@@ -607,6 +681,9 @@ async def test_shutdown_cancels_in_flight_schema_connect(
 
     class _HangingConn:
         """Connection whose connect() never completes."""
+
+        tools_list_changed = False
+        tools_listed_at = math.inf
 
         def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
             """Capture config (unused)."""
@@ -662,6 +739,9 @@ async def test_evicted_spec_closes_late_completed_shared_connect(
     class _SlowConn:
         """Connection whose connect can be completed after LRU eviction."""
 
+        tools_list_changed = False
+        tools_listed_at = math.inf
+
         def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
             self._config = config
 
@@ -713,6 +793,9 @@ async def test_shared_connect_survives_one_spec_eviction_while_referenced(
 
     class _SlowConn:
         """Shared connection that records connect count."""
+
+        tools_list_changed = False
+        tools_listed_at = math.inf
 
         def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
             self._config = config
@@ -801,6 +884,9 @@ async def test_stdio_cwd_threaded_to_connection(
 
     class _CwdRecorder:
         """Standin that records the cwd kwarg on construction."""
+
+        tools_list_changed = False
+        tools_listed_at = math.inf
 
         def __init__(
             self,
