@@ -115,7 +115,7 @@ async def test_next_turn_sees_added_and_not_removed_mcp_tools() -> None:
 
 
 def test_failed_servers_keep_their_previous_mcp_tools() -> None:
-    from omnigent.runner.app import _merge_mcp_listing
+    from omnigent.runner.app import _MCP_LISTING_FAILED, _merge_mcp_listing
 
     previous = [{"name": "jira__alpha"}, {"name": "github__search"}]
     fresh = [{"name": "jira__alpha"}, {"name": "jira__beta"}]
@@ -125,4 +125,5 @@ def test_failed_servers_keep_their_previous_mcp_tools() -> None:
         *fresh,
         {"name": "github__search"},
     ]
-    assert _merge_mcp_listing(previous, [], {"proxy": "HTTPError"}) == previous
+    assert _merge_mcp_listing(previous, [], {_MCP_LISTING_FAILED: "HTTPError"}) == previous
+    assert _merge_mcp_listing(previous, [], {"proxy": "unavailable"}) == []
