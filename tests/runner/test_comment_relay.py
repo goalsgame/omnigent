@@ -14,6 +14,7 @@ the runner-side wiring that the e2e test cannot pinpoint when it fails.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
@@ -1422,7 +1423,6 @@ async def test_relay_retries_an_incomplete_mcp_listing(
         return results.pop(0)
 
     monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
-    monkeypatch.setattr(runner_app, "_MCP_RELAY_RETRY_S", 0.0)
     agent_id = "ag_connectors"
     app = _switch_app(
         tmp_path, _SwitchableServerClient(agent_id), {agent_id: _connectors_spec("connectors")}
@@ -1439,6 +1439,83 @@ async def test_relay_retries_an_incomplete_mcp_listing(
             assert "backstage_find_entity" not in _relay_tool_names(relay_file)
             await _launch_bridged(c, session_id)
             assert "backstage_find_entity" in _relay_tool_names(relay_file)
+            assert results == []
+            await c.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+async def _settle_background_notifications() -> None:
+    """Let fire-and-forget tools-changed notifications run to completion."""
+    pending = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("tools-changed:") and not task.done()
+    ]
+    await asyncio.gather(*pending)
+
+
+@pytest.mark.asyncio
+async def test_relay_readvertises_changed_mcp_tools_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later relay ensure advertises added MCP tools and drops removed ones.
+
+    The relay keeps its URL and token, the bridge MCP server is told the list
+    changed, and a server that fails to list keeps its previous tools.
+    """
+    from omnigent.runner import app as runner_app
+
+    results = [
+        _mcp_result(["connectors__alpha", "connectors__gamma"]),
+        _mcp_result(["connectors__alpha", "connectors__beta"]),
+        _mcp_result([], {"connectors": "temporarily unavailable"}),
+    ]
+
+    async def schemas_for(self: object, spec: AgentSpec) -> Any:
+        return results.pop(0)
+
+    notified: list[Path] = []
+
+    def post_tools_changed(bridge_dir: Path, **_kwargs: object) -> None:
+        notified.append(bridge_dir)
+
+    monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.post_tools_changed", post_tools_changed
+    )
+    agent_id = "ag_connectors"
+    app = _switch_app(
+        tmp_path, _SwitchableServerClient(agent_id), {agent_id: _connectors_spec("connectors")}
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as c:
+            await _launch_bridged(c, session_id)
+            first = json.loads(relay_file.read_text())
+            assert {"connectors__alpha", "connectors__gamma"} <= _relay_tool_names(relay_file)
+            await _settle_background_notifications()
+            notified.clear()
+
+            await _launch_bridged(c, session_id)
+            second = json.loads(relay_file.read_text())
+            names = _relay_tool_names(relay_file)
+            assert "connectors__beta" in names
+            assert "connectors__gamma" not in names
+            assert "list_comments" in names
+            assert (second["url"], second["token"]) == (first["url"], first["token"])
+            await _settle_background_notifications()
+            assert notified == [bridge_dir]
+
+            await _launch_bridged(c, session_id)
+            assert {"connectors__alpha", "connectors__beta"} <= _relay_tool_names(relay_file)
+            await _settle_background_notifications()
+            assert notified == [bridge_dir]
             assert results == []
             await c.delete(f"/v1/sessions/{session_id}")
     finally:
