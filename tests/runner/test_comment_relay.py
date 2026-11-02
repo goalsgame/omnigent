@@ -1523,6 +1523,67 @@ async def test_relay_readvertises_changed_mcp_tools_in_place(
 
 
 @pytest.mark.asyncio
+async def test_relay_retries_an_undelivered_tools_changed_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed tools-changed notification is retried on later turns until delivered."""
+    from omnigent.runner import app as runner_app
+
+    results = [
+        _mcp_result(["connectors__alpha"]),
+        _mcp_result(["connectors__alpha", "connectors__beta"]),
+        _mcp_result(["connectors__alpha", "connectors__beta"]),
+        _mcp_result(["connectors__alpha", "connectors__beta"]),
+    ]
+
+    async def schemas_for(self: object, spec: AgentSpec) -> Any:
+        return results.pop(0)
+
+    attempts: list[bool] = []
+    failing = True
+
+    def post_tools_changed(bridge_dir: Path, **_kwargs: object) -> None:
+        attempts.append(failing)
+        if failing:
+            raise RuntimeError("bridge control endpoint unavailable")
+
+    monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.post_tools_changed", post_tools_changed
+    )
+    agent_id = "ag_connectors"
+    app = _switch_app(
+        tmp_path, _SwitchableServerClient(agent_id), {agent_id: _connectors_spec("connectors")}
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as c:
+            await _launch_bridged(c, session_id)
+            await _settle_background_notifications()
+            await _launch_bridged(c, session_id)
+            await _settle_background_notifications()
+            assert attempts and all(attempts)
+            failing = False
+            attempts.clear()
+
+            await _launch_bridged(c, session_id)
+            await _settle_background_notifications()
+            assert attempts == [False]
+
+            await _launch_bridged(c, session_id)
+            await _settle_background_notifications()
+            assert attempts == [False]
+            assert results == []
+            await c.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_slow_mcp_listing_does_not_replace_a_newer_agents_relay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -4734,10 +4734,26 @@ def create_runner_app(
         schemas = [schema for schema in result.schemas if schema["name"] not in registered]
         return schemas, dict(result.failures)
 
+    def _mark_relay_tools_delivered(session_id: str, delivered: _CommentRelayBinding) -> None:
+        """Clear the pending notification if *delivered*'s tools are still the advertised ones."""
+        current = _session_comment_relays.get(session_id)
+        if (
+            current is not None
+            and current.notify_pending
+            and current.relay is delivered.relay
+            and current.mcp_tools == delivered.mcp_tools
+        ):
+            _session_comment_relays[session_id] = dataclasses.replace(
+                current, notify_pending=False
+            )
+
     def _notify_relay_tools_changed(
-        session_id: str, bridge_dir: Path, *, await_notify: bool
+        session_id: str, binding: _CommentRelayBinding, *, await_notify: bool
     ) -> Awaitable[None] | None:
-        """Tell the bridge MCP server in *bridge_dir* that the relay's tools changed.
+        """Tell the bridge MCP server of *binding* that the relay's tools changed.
+
+        A delivered notification clears *binding*'s pending flag; a failed one
+        leaves it set so a later turn retries.
 
         :returns: The notification to await when *await_notify*, else ``None``
             after scheduling it in the background.
@@ -4749,7 +4765,9 @@ def create_runner_app(
         async def _notify_tools_changed() -> None:
             cancelled = Event()
             try:
-                await asyncio.to_thread(post_tools_changed, bridge_dir, cancelled=cancelled)
+                await asyncio.to_thread(
+                    post_tools_changed, binding.bridge_dir, cancelled=cancelled
+                )
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -4761,9 +4779,11 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+                return
             finally:
                 # Cancelling an executor future does not stop its worker thread.
                 cancelled.set()
+            _mark_relay_tools_delivered(session_id, binding)
 
         if await_notify:
             return _notify_tools_changed()
@@ -4806,10 +4826,17 @@ def create_runner_app(
             )
         )
         if mcp_tools == binding.mcp_tools:
+            if binding.notify_pending:
+                notification = _notify_relay_tools_changed(
+                    session_id, binding, await_notify=await_notify
+                )
+                if notification is not None:
+                    await notification
             return
         if not binding.relay.advertise_tools([*binding.base_tools, *mcp_tools]):
             return
-        _session_comment_relays[session_id] = dataclasses.replace(binding, mcp_tools=mcp_tools)
+        updated = dataclasses.replace(binding, mcp_tools=mcp_tools, notify_pending=True)
+        _session_comment_relays[session_id] = updated
         _logger.info(
             "native relay MCP tools changed for session=%s: added=%s removed=%s",
             session_id,
@@ -4821,9 +4848,7 @@ def create_runner_app(
             ),
             extra={"session_id": session_id},
         )
-        notification = _notify_relay_tools_changed(
-            session_id, binding.bridge_dir, await_notify=await_notify
-        )
+        notification = _notify_relay_tools_changed(session_id, updated, await_notify=await_notify)
         if notification is not None:
             await notification
 
@@ -5020,13 +5045,15 @@ def create_runner_app(
             )
             return
         superseded = _session_comment_relays.get(session_id)
-        _session_comment_relays[session_id] = _CommentRelayBinding(
+        binding = _CommentRelayBinding(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             base_tools=tuple(base_schemas),
             mcp_tools=tuple(mcp_schemas),
+            notify_pending=True,
         )
+        _session_comment_relays[session_id] = binding
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
         # still points at the relay being closed, so a shared bridge dir
@@ -5034,9 +5061,7 @@ def create_runner_app(
         if superseded is not None:
             superseded.relay.close()
 
-        notification = _notify_relay_tools_changed(
-            session_id, bridge_dir, await_notify=await_notify
-        )
+        notification = _notify_relay_tools_changed(session_id, binding, await_notify=await_notify)
         if notification is not None:
             await notification
 

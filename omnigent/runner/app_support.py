@@ -116,6 +116,8 @@ class _CommentRelayBinding:
     :param base_tools: Advertised Omnigent tool schemas other than the
         agent's MCP tools.
     :param mcp_tools: Advertised MCP tool schemas from the latest listing.
+    :param notify_pending: Whether the harness has yet to be told that the
+        advertised tools changed; retried on later turns until delivered.
     """
 
     relay: ClaudeNativeToolRelay
@@ -123,6 +125,7 @@ class _CommentRelayBinding:
     bridge_dir: Path
     base_tools: tuple[_JsonObject, ...] = ()
     mcp_tools: tuple[_JsonObject, ...] = ()
+    notify_pending: bool = False
 
 
 def _require_full_native_lock_coverage(
