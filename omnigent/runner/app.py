@@ -4847,11 +4847,17 @@ def create_runner_app(
             {str(schema["name"]) for schema in binding.base_tools},
             turn_listing,
         )
+        current = _session_comment_relays.get(session_id)
         if (
             not _session_cache_generation_is_current(session_id, generation)
-            or _session_comment_relays.get(session_id) is not binding
+            or current is None
+            or current.relay is not binding.relay
+            or current.spec_entry is not binding.spec_entry
+            or current.mcp_tools != binding.mcp_tools
         ):
             return
+        # The notification flag may have changed while listing; carry the current one.
+        binding = current
         mcp_tools = tuple(
             _merge_mcp_listing(
                 list(binding.mcp_tools),

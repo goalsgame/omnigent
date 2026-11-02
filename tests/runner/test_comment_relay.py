@@ -1584,6 +1584,63 @@ async def test_relay_retries_an_undelivered_tools_changed_notification(
 
 
 @pytest.mark.asyncio
+async def test_notification_landing_during_a_refresh_keeps_the_fresh_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tools-changed delivery that lands mid-listing does not discard that listing."""
+    import asyncio
+    import threading
+
+    from omnigent.runner import app as runner_app
+
+    listing_started = asyncio.Event()
+    release_listing = asyncio.Event()
+    release_notification = threading.Event()
+    results = [_mcp_result(["connectors__alpha"])]
+
+    async def schemas_for(self: object, spec: AgentSpec) -> Any:
+        if results:
+            return results.pop(0)
+        listing_started.set()
+        await release_listing.wait()
+        return _mcp_result(["connectors__alpha", "connectors__beta"])
+
+    def post_tools_changed(bridge_dir: Path, **_kwargs: object) -> None:
+        release_notification.wait(timeout=10)
+
+    monkeypatch.setattr(runner_app.ProxyMcpManager, "schemas_for", schemas_for)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.post_tools_changed", post_tools_changed
+    )
+    agent_id = "ag_connectors"
+    app = _switch_app(
+        tmp_path, _SwitchableServerClient(agent_id), {agent_id: _connectors_spec("connectors")}
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as c:
+            await _launch_bridged(c, session_id)
+            second = asyncio.create_task(_launch_bridged(c, session_id))
+            await asyncio.wait_for(listing_started.wait(), timeout=5)
+            release_notification.set()
+            await asyncio.wait_for(_settle_background_notifications(), timeout=5)
+            release_listing.set()
+            await asyncio.wait_for(second, timeout=10)
+            await asyncio.wait_for(_settle_background_notifications(), timeout=5)
+            assert "connectors__beta" in _relay_tool_names(relay_file)
+            await c.delete(f"/v1/sessions/{session_id}")
+    finally:
+        release_notification.set()
+        release_listing.set()
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_slow_mcp_listing_does_not_replace_a_newer_agents_relay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
