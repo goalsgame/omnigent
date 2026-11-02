@@ -32,10 +32,12 @@ class _ChangingToolsServerClient(NullServerClient):
 
     def __init__(self, listings: list[list[str] | None]) -> None:
         self.listings = listings
+        self.list_calls = 0
 
     async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
         body = kwargs.get("json")
         if url.endswith("/mcp") and isinstance(body, dict) and body.get("method") == "tools/list":
+            self.list_calls += 1
             names = self.listings[0]
 
             class _ToolsListResponse(NullServerClient._Response):
@@ -143,6 +145,21 @@ async def test_unavailable_mcp_proxy_keeps_previous_turns_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_each_turn_lists_mcp_tools_once_even_when_the_proxy_fails() -> None:
+    server_client = _ChangingToolsServerClient([["jira__alpha"], None])
+    app, harness_client = _app(server_client)
+    async with _runner_client(app) as client:
+        await _send_turn(client, harness_client, 1)
+        await asyncio.sleep(0.1)
+        assert server_client.list_calls == 1
+
+        server_client.listings.pop(0)
+        await _send_turn(client, harness_client, 2)
+        await asyncio.sleep(0.1)
+        assert server_client.list_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_proxy_listing_failure_is_kept_apart_from_a_server_named_proxy() -> None:
     proxy_down = _ChangingToolsServerClient([None])
     result = await ProxyMcpManager("conv_x", proxy_down).schemas_for(  # type: ignore[arg-type]
@@ -167,3 +184,16 @@ def test_failed_servers_keep_their_previous_mcp_tools() -> None:
     ]
     assert _merge_mcp_listing(previous, [], {MCP_LISTING_FAILED: "HTTPError"}) == previous
     assert _merge_mcp_listing(previous, [], {"proxy": "unavailable"}) == []
+
+
+def test_failed_server_keeps_only_its_own_tools_when_names_overlap() -> None:
+    from omnigent.runner.app import _merge_mcp_listing
+
+    previous = [{"name": "docs__search"}, {"name": "docs__archive__old"}]
+    fresh = [{"name": "docs__archive__new"}]
+
+    merged = _merge_mcp_listing(
+        previous, fresh, {"docs": "MCP server unavailable"}, ["docs", "docs__archive"]
+    )
+
+    assert merged == [{"name": "docs__archive__new"}, {"name": "docs__search"}]

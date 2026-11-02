@@ -345,6 +345,7 @@ def write_extension_files(
     tools: list[_JsonObject] | None = None,
     system_prompt: str | None = None,
     mcp_tool_exposure: str | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -367,6 +368,8 @@ def write_extension_files(
         tools before each agent run and registers new ones with this Pi
         exposure, e.g. ``"direct"`` or ``"codemode"``. MCP tools in *tools*
         carry ``"mcp": True``.
+    :param mcp_servers: The agent's MCP server names, e.g. ``["docs"]``; the
+        extension attributes each MCP tool to the longest matching name.
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -382,6 +385,8 @@ def write_extension_files(
     }
     if mcp_tool_exposure is not None:
         payload["mcpToolExposure"] = mcp_tool_exposure
+    if mcp_servers is not None:
+        payload["mcpServers"] = mcp_servers
     # A marker left by a previous Pi process would report this launch ready early.
     (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
     _atomic_json(config_path(bridge_dir), payload)

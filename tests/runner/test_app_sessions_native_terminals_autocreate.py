@@ -362,6 +362,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         assert external["parameters"]["properties"]["query"] == {"type": "string"}
         assert external.get("exposure") == ("codemode" if nested_tool_audit else None)
         assert external["mcp"] is True
+    assert config.get("mcpServers") == (None if mcp_status == "absent" else ["search"])
     assert config.get("mcpToolExposure") == (
         None if mcp_status == "absent" else ("codemode" if nested_tool_audit else "direct")
     )

@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -106,7 +106,7 @@ from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_f
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
-from omnigent.runner.mcp_manager import MCP_LISTING_FAILED
+from omnigent.runner.mcp_manager import MCP_LISTING_FAILED, McpSchemasResult
 from omnigent.runner.mcp_routes import register_mcp_routes
 from omnigent.runner.model_option_routes import register_model_option_routes
 from omnigent.runner.native import (
@@ -831,10 +831,38 @@ def _is_mcp_tool_schema(schema: object) -> bool:
     return isinstance(name, str) and "__" in name
 
 
+# An MCP listing resolved for one turn, keyed by the ``compute_spec_hash`` it was
+# listed for.
+_TurnMcpListing = tuple[str, McpSchemasResult]
+
+
+def _turn_mcp_listing_for(listing: _TurnMcpListing | None, spec: Any) -> McpSchemasResult | None:
+    """Return *listing*'s result when it was listed for *spec*'s MCP servers."""
+    from omnigent.runner.mcp_manager import compute_spec_hash
+
+    servers = getattr(spec, "mcp_servers", None)
+    if listing is None or not servers or listing[0] != compute_spec_hash(list(servers)):
+        return None
+    return listing[1]
+
+
+def _mcp_tool_server(tool_name: str, servers: Iterable[str]) -> str | None:
+    """
+    The server owning a namespaced MCP tool: the longest matching server name.
+
+    :param tool_name: Namespaced tool name, e.g. ``"docs__archive__search"``.
+    :param servers: Configured MCP server names, e.g. ``{"docs", "docs__archive"}``.
+    :returns: The owning server name, e.g. ``"docs__archive"``, or ``None``.
+    """
+    owners = [server for server in servers if server and tool_name.startswith(f"{server}__")]
+    return max(owners, key=len) if owners else None
+
+
 def _merge_mcp_listing(
     previous: list[_JsonObject],
     schemas: list[_JsonObject],
     failures: Mapping[str, str],
+    servers: Iterable[str] = (),
 ) -> list[_JsonObject]:
     """
     Combine a fresh MCP listing with the previous one for servers that failed.
@@ -847,19 +875,21 @@ def _merge_mcp_listing(
     :param schemas: Schemas from the fresh listing.
     :param failures: Per-server failures from the fresh listing, e.g.
         ``{"github": "MCP server unavailable"}``.
+    :param servers: Configured MCP server names, used to attribute each tool
+        to its server when one name prefixes another.
     :returns: The merged MCP schemas.
     """
-    if MCP_LISTING_FAILED in failures:
-        listed = {schema.get("name") for schema in schemas}
-        return list(schemas) + [t for t in previous if t.get("name") not in listed]
-    prefixes = tuple(f"{server}__" for server in failures)
-    if not prefixes:
-        return list(schemas)
     listed = {schema.get("name") for schema in schemas}
+    if MCP_LISTING_FAILED in failures:
+        return list(schemas) + [t for t in previous if t.get("name") not in listed]
+    if not failures:
+        return list(schemas)
+    known_servers = {*servers, *failures}
     kept = [
         t
         for t in previous
-        if str(t.get("name")).startswith(prefixes) and t.get("name") not in listed
+        if t.get("name") not in listed
+        and _mcp_tool_server(str(t.get("name")), known_servers) in failures
     ]
     return list(schemas) + kept
 
@@ -4670,13 +4700,21 @@ def create_runner_app(
         relay.close()
 
     async def _native_relay_mcp_schemas(
-        session_id: str, spec: Any, registered: set[str]
+        session_id: str,
+        spec: Any,
+        registered: set[str],
+        turn_listing: _TurnMcpListing | None = None,
     ) -> tuple[list[_JsonObject], dict[str, str]]:
-        """The agent's MCP tools via the server's MCP proxy, and the servers that failed."""
+        """The agent's MCP tools via the server's MCP proxy, and the servers that failed.
+
+        Reuses *turn_listing* when it was listed for *spec*'s MCP servers.
+        """
         if server_client is None or spec is None or not getattr(spec, "mcp_servers", None):
             return [], {}
         try:
-            result = await ProxyMcpManager(session_id, server_client).schemas_for(spec)
+            result = _turn_mcp_listing_for(turn_listing, spec) or (
+                await ProxyMcpManager(session_id, server_client).schemas_for(spec)
+            )
         except Exception as exc:  # noqa: BLE001 — external tools are additive
             _logger.warning(
                 "Failed to list MCP tools for native session %s",
@@ -4737,7 +4775,11 @@ def create_runner_app(
         return None
 
     async def _refresh_relay_mcp_tools(
-        session_id: str, binding: _CommentRelayBinding, *, await_notify: bool
+        session_id: str,
+        binding: _CommentRelayBinding,
+        *,
+        await_notify: bool,
+        turn_listing: _TurnMcpListing | None = None,
     ) -> None:
         """Re-list the agent's MCP tools and re-advertise *binding*'s relay when they changed."""
         spec = _unwrap_spec_entry(binding.spec_entry)
@@ -4745,14 +4787,24 @@ def create_runner_app(
             return
         generation = _session_cache_generation(session_id)
         schemas, failures = await _native_relay_mcp_schemas(
-            session_id, spec, {str(schema["name"]) for schema in binding.base_tools}
+            session_id,
+            spec,
+            {str(schema["name"]) for schema in binding.base_tools},
+            turn_listing,
         )
         if (
             not _session_cache_generation_is_current(session_id, generation)
             or _session_comment_relays.get(session_id) is not binding
         ):
             return
-        mcp_tools = tuple(_merge_mcp_listing(list(binding.mcp_tools), schemas, failures))
+        mcp_tools = tuple(
+            _merge_mcp_listing(
+                list(binding.mcp_tools),
+                schemas,
+                failures,
+                [server.name for server in spec.mcp_servers],
+            )
+        )
         if mcp_tools == binding.mcp_tools:
             return
         if not binding.relay.advertise_tools([*binding.base_tools, *mcp_tools]):
@@ -4782,6 +4834,7 @@ def create_runner_app(
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
+        turn_listing: _TurnMcpListing | None = None,
     ) -> None:
         import json as _json
 
@@ -4826,7 +4879,9 @@ def create_runner_app(
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
         if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
-            await _refresh_relay_mcp_tools(session_id, current, await_notify=await_notify)
+            await _refresh_relay_mcp_tools(
+                session_id, current, await_notify=await_notify, turn_listing=turn_listing
+            )
             return
 
         bridge_dir = known_bridge_dir
@@ -4848,7 +4903,9 @@ def create_runner_app(
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
         ):
-            await _refresh_relay_mcp_tools(session_id, current, await_notify=await_notify)
+            await _refresh_relay_mcp_tools(
+                session_id, current, await_notify=await_notify, turn_listing=turn_listing
+            )
             return
 
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
@@ -4862,6 +4919,7 @@ def create_runner_app(
             session_id,
             _unwrap_spec_entry(spec_entry),
             {str(schema["name"]) for schema in base_schemas},
+            turn_listing,
         )
         relay_schemas = [*base_schemas, *mcp_schemas]
         # The MCP listing awaited the network: the session may have been reset or
@@ -5317,6 +5375,7 @@ def create_runner_app(
                     )
             _session_tool_schemas[conv] = all_tools
 
+        turn_listing: _TurnMcpListing | None = None
         if cached_spec and cached_spec.mcp_servers:
             from omnigent.runner.mcp_manager import compute_spec_hash
 
@@ -5330,6 +5389,7 @@ def create_runner_app(
                 mcp_result = await _session_mcp_proxy.schemas_for(
                     cached_spec,
                 )
+                turn_listing = (_mcp_hash, mcp_result)
                 _cached_tools = _session_tool_schemas.get(conv, [])
                 _builtin_tools = [t for t in _cached_tools if not _is_mcp_tool_schema(t)]
                 _previous_mcp = (
@@ -5338,7 +5398,10 @@ def create_runner_app(
                     else []
                 )
                 _session_tool_schemas[conv] = _builtin_tools + _merge_mcp_listing(
-                    _previous_mcp, mcp_result.schemas, mcp_result.failures
+                    _previous_mcp,
+                    mcp_result.schemas,
+                    mcp_result.failures,
+                    [server.name for server in cached_spec.mcp_servers],
                 )
                 _session_mcp_spec_hash[conv] = _mcp_hash
             except (
@@ -5391,6 +5454,7 @@ def create_runner_app(
                 conv,
                 await_notify=False,
                 session_labels=startup_labels,
+                turn_listing=turn_listing,
             )
         elif harness_name == "codex-native":
             from omnigent.harnesses.codex_native.bridge import (
@@ -5409,7 +5473,7 @@ def create_runner_app(
             codex_bdir = codex_bridge_dir_for_id(codex_bid or conv)
             write_mcp_bridge_config(codex_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=codex_bdir, await_notify=False
+                conv, explicit_bridge_dir=codex_bdir, await_notify=False, turn_listing=turn_listing
             )
         elif harness_name == "antigravity-native":
             from omnigent.harnesses.antigravity_native.bridge import (
@@ -5428,7 +5492,10 @@ def create_runner_app(
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
             write_mcp_bridge_config(antigravity_bdir)
             await _ensure_comment_relay_started(
-                conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
+                conv,
+                explicit_bridge_dir=antigravity_bdir,
+                await_notify=False,
+                turn_listing=turn_listing,
             )
         elif harness_name == "hermes":
             from omnigent.harnesses.hermes_native.bridge import (
@@ -5439,6 +5506,7 @@ def create_runner_app(
                 conv,
                 explicit_bridge_dir=hermes_bridge_dir_for_session(conv),
                 await_notify=False,
+                turn_listing=turn_listing,
             )
 
         try:
@@ -5446,6 +5514,7 @@ def create_runner_app(
                 harness_body,
                 conv,
                 dispatch=ctx,
+                turn_listing=turn_listing,
             )
         finally:
             _session_init_envelopes.pop(conv, None)
@@ -5510,6 +5579,7 @@ def create_runner_app(
         body: _JsonObject,
         conv_id: str,
         dispatch: TurnDispatch | None = None,
+        turn_listing: _TurnMcpListing | None = None,
     ) -> Response:
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
@@ -5731,7 +5801,9 @@ def create_runner_app(
             )
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
-                    _mcp = await _turn_mcp.schemas_for(cast(AgentSpec, _turn_spec))
+                    _mcp = _turn_mcp_listing_for(turn_listing, _turn_spec) or (
+                        await _turn_mcp.schemas_for(cast(AgentSpec, _turn_spec))
+                    )
                     _mcp_schemas = _mcp.schemas
                     _mcp_tool_names = _mcp.tool_names
                     if any(

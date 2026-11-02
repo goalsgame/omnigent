@@ -1711,9 +1711,17 @@ module.exports = function (pi) {
       removedMcpTools.delete(name);
       registerBridgedTool(name, description, parameters, exposure);
     }
-    const failedPrefixes = Object.keys(listing.failures).map((server) => `${server}__`);
+    const failedServers = new Set(Object.keys(listing.failures));
+    const servers = [
+      ...(Array.isArray(config.mcpServers) ? config.mcpServers : []),
+      ...failedServers,
+    ].filter((server) => typeof server === "string" && server);
+    const owningServer = (name) =>
+      servers
+        .filter((server) => name.startsWith(`${server}__`))
+        .reduce((longest, server) => (server.length > longest.length ? server : longest), "");
     for (const name of [...mcpTools.keys()]) {
-      if (listed.has(name) || failedPrefixes.some((prefix) => name.startsWith(prefix))) continue;
+      if (listed.has(name) || failedServers.has(owningServer(name))) continue;
       mcpTools.delete(name);
       removedMcpTools.add(name);
       discoveryTools.delete(name);

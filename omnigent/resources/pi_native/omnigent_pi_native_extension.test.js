@@ -653,6 +653,41 @@ async function testConnectorToolsFoundAfterEmptyStartupUseNativeDiscovery() {
   }
 }
 
+async function testFailedServerDoesNotKeepToolsOfAnOverlappingServer() {
+  const schema = { type: "object", properties: {} };
+  const h = makeHarness({
+    captureEvents: true,
+    extraConfig: { mcpToolExposure: "direct", mcpServers: ["docs", "docs__archive"] },
+    tools: [
+      { name: "docs__search", description: "Search", parameters: schema, mcp: true },
+      { name: "docs__archive__old", description: "Old", parameters: schema, mcp: true },
+    ],
+  });
+  const eventsFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = options && typeof options.body === "string" ? JSON.parse(options.body) : {};
+    if (String(url).endsWith("/mcp") && body.method === "tools/list") {
+      return {
+        ok: true,
+        headers: { get: () => "application/json" },
+        json: async () => ({ result: {
+          tools: [{ name: "docs__archive__new", description: "New", inputSchema: schema }],
+          failures: { docs: "MCP server unavailable" },
+        } }),
+      };
+    }
+    return eventsFetch(url, options);
+  };
+  try {
+    await h.handlers.before_agent_start({ systemPrompt: "base" }, makeCtx({ idle: true }));
+    assert("failed server keeps its own tool", h.registeredTools.docs__search.exposure === undefined);
+    assert("listed overlapping server drops its removed tool", h.registeredTools.docs__archive__old.exposure === "hidden");
+    assert("listed overlapping server adds its new tool", h.registeredTools.docs__archive__new.exposure === undefined);
+  } finally {
+    global.fetch = eventsFetch;
+  }
+}
+
 async function testLegacyPiRetainsConnectorTools() {
   const h = makeHarness({ tools: [{ name: "docs__lookup", exposure: "codemode" }] });
   await h.handlers.session_start({}, makeCtx({ idle: true }));
@@ -747,6 +782,7 @@ async function testPeerActorBindingAndInstructions() {
     await testPeerNotificationsAreTypedDeduplicatedAndSteered();
     await testConnectorCatalogUsesNativeDiscovery();
     await testConnectorToolsFoundAfterEmptyStartupUseNativeDiscovery();
+    await testFailedServerDoesNotKeepToolsOfAnOverlappingServer();
     await testLegacyPiRetainsConnectorTools();
     await testEmptyLengthCompletionFailsVisiblyAndRetryResets();
     await testLengthCompletionWithToolCallIsNotEmptyFailure();
