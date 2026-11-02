@@ -846,6 +846,41 @@ def _turn_mcp_listing_for(listing: _TurnMcpListing | None, spec: Any) -> McpSche
     return listing[1]
 
 
+def _carry_mcp_tools_into_rebuilt_relay(
+    previous: _CommentRelayBinding | None,
+    spec: Any,
+    schemas: list[_JsonObject],
+    failures: Mapping[str, str],
+) -> list[_JsonObject]:
+    """
+    MCP tools for a rebuilt relay: *previous*'s tools of failed servers are kept.
+
+    Applies only when *previous* served the same MCP servers; another agent's
+    tools are never carried over.
+
+    :param previous: The relay being replaced, or ``None``.
+    :param spec: The agent spec the new relay is built for.
+    :param schemas: The fresh MCP listing for *spec*.
+    :param failures: Servers that failed in that listing.
+    :returns: The MCP schemas to advertise.
+    """
+    from omnigent.runner.mcp_manager import compute_spec_hash
+
+    servers = list(getattr(spec, "mcp_servers", None) or [])
+    previous_spec = _unwrap_spec_entry(previous.spec_entry) if previous is not None else None
+    previous_servers = list(getattr(previous_spec, "mcp_servers", None) or [])
+    if (
+        previous is None
+        or not failures
+        or not servers
+        or compute_spec_hash(previous_servers) != compute_spec_hash(servers)
+    ):
+        return schemas
+    return _merge_mcp_listing(
+        list(previous.mcp_tools), schemas, failures, [server.name for server in servers]
+    )
+
+
 def _mcp_tool_server(tool_name: str, servers: Iterable[str]) -> str | None:
     """
     The server owning a namespaced MCP tool: the longest matching server name.
@@ -4945,6 +4980,9 @@ def create_runner_app(
             _unwrap_spec_entry(spec_entry),
             {str(schema["name"]) for schema in base_schemas},
             turn_listing,
+        )
+        mcp_schemas = _carry_mcp_tools_into_rebuilt_relay(
+            relay_before, _unwrap_spec_entry(spec_entry), mcp_schemas, _mcp_failures
         )
         relay_schemas = [*base_schemas, *mcp_schemas]
         # The MCP listing awaited the network: the session may have been reset or

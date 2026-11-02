@@ -197,3 +197,31 @@ def test_failed_server_keeps_only_its_own_tools_when_names_overlap() -> None:
     )
 
     assert merged == [{"name": "docs__archive__new"}, {"name": "docs__search"}]
+
+
+def test_rebuilt_relay_keeps_failed_servers_tools_only_for_the_same_servers() -> None:
+    from types import SimpleNamespace
+
+    from omnigent.runner.app import _carry_mcp_tools_into_rebuilt_relay
+
+    jira = MCPServerConfig(name="jira", transport="http", url="http://localhost/jira")
+    github = MCPServerConfig(name="github", transport="http", url="http://localhost/github")
+    spec = SimpleNamespace(mcp_servers=[jira, github])
+    previous = SimpleNamespace(
+        spec_entry=SimpleNamespace(mcp_servers=[jira, github]),
+        mcp_tools=({"name": "jira__search"}, {"name": "github__search"}),
+    )
+    fresh = [{"name": "jira__search"}]
+
+    assert _carry_mcp_tools_into_rebuilt_relay(previous, spec, fresh, {"github": "down"}) == [
+        {"name": "jira__search"},
+        {"name": "github__search"},
+    ]
+    assert _carry_mcp_tools_into_rebuilt_relay(previous, spec, fresh, {}) == fresh
+    assert _carry_mcp_tools_into_rebuilt_relay(None, spec, fresh, {"github": "down"}) == fresh
+    other_agent = SimpleNamespace(
+        spec_entry=SimpleNamespace(mcp_servers=[github]), mcp_tools=previous.mcp_tools
+    )
+    assert (
+        _carry_mcp_tools_into_rebuilt_relay(other_agent, spec, fresh, {"github": "down"}) == fresh
+    )

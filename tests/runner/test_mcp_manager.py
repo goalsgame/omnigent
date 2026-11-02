@@ -109,6 +109,7 @@ def patch_connection(
     conns: dict[str, _FakeConn] = {}
     raise_for: dict[str, Exception] = {}
     tools_for: dict[str, list[McpToolDef]] = {}
+    refresh_gates: dict[str, asyncio.Event] = {}
 
     class _PatchedConn:
         """Standin for ``McpServerConnection`` that pulls scripted behavior from the closure."""
@@ -132,6 +133,8 @@ def patch_connection(
             """Re-list the scripted tools; a scripted error fails the refresh."""
             self.tools_list_changed = False
             self._inner.refresh_calls += 1
+            if (gate := refresh_gates.get(self._config.name)) is not None:
+                await gate.wait()
             if self._config.name in raise_for:
                 raise raise_for[self._config.name]
             self.tools_listed_at = time.monotonic()
@@ -153,6 +156,7 @@ def patch_connection(
     # calling schemas_for; the closure above honors the script.
     conns["__raise_for__"] = raise_for  # type: ignore[assignment]
     conns["__tools_for__"] = tools_for  # type: ignore[assignment]
+    conns["__refresh_gates__"] = refresh_gates  # type: ignore[assignment]
     return conns
 
 
@@ -237,6 +241,37 @@ async def test_tool_refresh_is_rate_limited_and_coalesced(
     assert all(r.tool_names == {"jira__search", "jira__create"} for r in results)
     assert patch_connection["jira"].refresh_calls == 1
     assert patch_connection["jira"].connect_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_caller_does_not_abort_a_shared_refresh(
+    patch_connection: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh shared by two listings completes for one when the other is cancelled."""
+    tools_for = patch_connection["__tools_for__"]
+    tools_for["jira"] = [_make_tool_def("search")]
+    spec = _make_spec(_make_config("jira"))
+    manager = RunnerMcpManager()
+    try:
+        await manager.schemas_for(spec)
+        tools_for["jira"] = [_make_tool_def("search"), _make_tool_def("create")]
+        gate = patch_connection["__refresh_gates__"]["jira"] = asyncio.Event()
+        monkeypatch.setattr(_mcp_manager_module, "_TOOL_REFRESH_INTERVAL_S", 0.0, raising=False)
+        first = asyncio.create_task(manager.schemas_for(spec))
+        second = asyncio.create_task(manager.schemas_for(spec))
+        while patch_connection["jira"].refresh_calls == 0:
+            await asyncio.sleep(0)
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        gate.set()
+        result = await asyncio.wait_for(second, timeout=5)
+    finally:
+        await manager.shutdown()
+
+    assert result.tool_names == {"jira__search", "jira__create"}
+    assert patch_connection["jira"].refresh_calls == 1
 
 
 @pytest.mark.asyncio

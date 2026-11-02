@@ -834,7 +834,10 @@ class RunnerMcpManager:
                 if (task := self._ensure_refresh_task(server, force=force)) is not None
             }
         if tasks:
-            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            # Shielded: the refreshes are shared, so one caller's cancellation must not abort them.
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks.values()), return_exceptions=True
+            )
 
     def _ensure_refresh_task(
         self, server: _SharedServerEntry, *, force: bool = False
