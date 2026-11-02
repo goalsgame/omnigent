@@ -1722,6 +1722,7 @@ module.exports = function (pi) {
         exposure: "hidden",
       });
     }
+    if (!discoveryEnabled) enableToolDiscovery();
   }
 
   let taskList = [];

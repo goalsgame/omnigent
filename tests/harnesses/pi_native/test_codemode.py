@@ -63,8 +63,9 @@ def test_native_codemode_sdk_preserves_authorization() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("startup", ["listed", "empty"])
 @pytest.mark.parametrize("exposure", ["direct", "codemode"])
-def test_native_session_follows_added_and_removed_mcp_tools(exposure: str) -> None:
+def test_native_session_follows_added_and_removed_mcp_tools(exposure: str, startup: str) -> None:
     node, package, _version = _installed_pi_sdk()
     result = subprocess.run(
         [
@@ -73,10 +74,11 @@ def test_native_session_follows_added_and_removed_mcp_tools(exposure: str) -> No
             str(package),
             str(ROOT / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"),
             exposure,
+            startup,
         ],
         capture_output=True,
         text=True,
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"MCP refresh verified ({exposure})" in result.stdout
+    assert f"MCP refresh verified ({exposure}, {startup} startup)" in result.stdout

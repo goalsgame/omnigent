@@ -6,7 +6,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-const [packageRoot, extensionPath, exposure] = process.argv.slice(2);
+const [packageRoot, extensionPath, exposure, startup = "listed"] = process.argv.slice(2);
 const {
   createAgentSession,
   createCodemodeExtension,
@@ -40,7 +40,7 @@ fs.writeFileSync(
     relayUrl: "http://relay.test",
     relayToken: "relay-token",
     mcpToolExposure: exposure,
-    tools: [configured("docs__alpha"), configured("docs__gamma")],
+    tools: startup === "empty" ? [] : [configured("docs__alpha"), configured("docs__gamma")],
   }),
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
@@ -203,7 +203,7 @@ try {
     assert.match(codemodeDescription(), /docs__gamma/);
     assert.doesNotMatch(codemodeDescription(), /docs__beta/);
   }
-  console.log(`MCP refresh verified (${exposure})`);
+  console.log(`MCP refresh verified (${exposure}, ${startup} startup)`);
 } finally {
   await session?.dispose();
   globalThis.fetch = originalFetch;

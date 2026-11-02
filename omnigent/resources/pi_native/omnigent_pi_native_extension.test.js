@@ -32,7 +32,7 @@ const harnesses = [];
 // Build a fresh extension instance with its own temp inbox directory. Each call
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
-function makeHarness({ captureEvents = false, existingTools = [], tools = [], discoveryApi = false } = {}) {
+function makeHarness({ captureEvents = false, existingTools = [], tools = [], discoveryApi = false, extraConfig = {} } = {}) {
   const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
   const configPath = path.join(inboxDir, "config.json");
   // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
@@ -42,6 +42,7 @@ function makeHarness({ captureEvents = false, existingTools = [], tools = [], di
     ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
     : { inboxDir, bridgeDir: inboxDir };
   config.tools = tools;
+  Object.assign(config, extraConfig);
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -619,6 +620,39 @@ async function testConnectorCatalogUsesNativeDiscovery() {
   assert("resume does not re-expose the catalog", !h.pi.getActiveTools().some(name => name.startsWith("docs__")));
 }
 
+async function testConnectorToolsFoundAfterEmptyStartupUseNativeDiscovery() {
+  const h = makeHarness({
+    captureEvents: true,
+    discoveryApi: true,
+    extraConfig: { mcpToolExposure: "codemode" },
+    existingTools: [{ name: "read" }, { name: "codemode", defaultActive: false }],
+  });
+  const eventsFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = options && typeof options.body === "string" ? JSON.parse(options.body) : {};
+    if (String(url).endsWith("/mcp") && body.method === "tools/list") {
+      return {
+        ok: true,
+        headers: { get: () => "application/json" },
+        json: async () => ({ result: { tools: [{ name: "docs__lookup", description: "Find", inputSchema: { type: "object", properties: {} } }], failures: {} } }),
+      };
+    }
+    return eventsFetch(url, options);
+  };
+  try {
+    await h.handlers.session_start({}, makeCtx({ idle: true }));
+    assert("empty startup catalog leaves discovery off", !h.pi.getActiveTools().includes("codemode"));
+    await h.handlers.before_agent_start({ systemPrompt: "base" }, makeCtx({ idle: true }));
+    assert("refreshed connector tool is registered", Boolean(h.registeredTools.docs__lookup));
+    assert("refreshed connector tool uses codemode exposure", h.registeredTools.docs__lookup.exposure === "codemode");
+    assert("refreshed connector namespace is discoverable", h.registeredTools.docs__lookup.namespace?.name === "docs");
+    assert("refreshed connector schema is not declared", !h.pi.getActiveTools().includes("docs__lookup"));
+    assert("native discovery is enabled after refresh", h.pi.getActiveTools().includes("codemode"));
+  } finally {
+    global.fetch = eventsFetch;
+  }
+}
+
 async function testLegacyPiRetainsConnectorTools() {
   const h = makeHarness({ tools: [{ name: "docs__lookup", exposure: "codemode" }] });
   await h.handlers.session_start({}, makeCtx({ idle: true }));
@@ -712,6 +746,7 @@ async function testPeerActorBindingAndInstructions() {
     await testPeerSubmissionFailureRetries();
     await testPeerNotificationsAreTypedDeduplicatedAndSteered();
     await testConnectorCatalogUsesNativeDiscovery();
+    await testConnectorToolsFoundAfterEmptyStartupUseNativeDiscovery();
     await testLegacyPiRetainsConnectorTools();
     await testEmptyLengthCompletionFailsVisiblyAndRetryResets();
     await testLengthCompletionWithToolCallIsNotEmptyFailure();
