@@ -70,7 +70,7 @@ async def test_mcp_relay_preserves_rpc_and_uses_fresh_session_bound_auth(
                 assert refused.status_code == 401
                 assert not seen
                 headers = {"Authorization": "Bearer " + info["token"]}
-                for method in ("tools/list", "initialize", "unknown"):
+                for method in ("initialize", "unknown"):
                     refused = await local.post(
                         url, headers=headers, json={**body, "method": method}
                     )
@@ -90,7 +90,11 @@ async def test_mcp_relay_preserves_rpc_and_uses_fresh_session_bound_auth(
                     assert response.json() == response_body
                     assert int(response.headers["Content-Length"]) == len(response.content)
                     assert seen[-1] == sent
-                assert len(seen) == 2
+                listing = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                response = await local.post(url, headers=headers, json=listing)
+                assert response.status_code == upstream_status
+                assert seen[-1] == listing
+                assert len(seen) == 3
                 executor.assert_not_called()
         finally:
             relay.close()

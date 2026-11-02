@@ -486,11 +486,57 @@ function mcpContentTypeIsJson(resp) {
  *   200 response; ``piResult`` is a terminal fail-closed tool result the caller
  *   returns as-is.
  */
-async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
+function mcpEndpoint(config) {
   const relay = relayCredentials();
-  const url = relay
-    ? `${relay.url}/mcp`
-    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`;
+  return relay
+    ? {
+        url: `${relay.url}/mcp`,
+        headers: { "content-type": "application/json", authorization: `Bearer ${relay.token}` },
+      }
+    : {
+        url: `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`,
+        headers: { "content-type": "application/json", ...freshAuthHeaders(config.authHeaders) },
+      };
+}
+
+const _MCP_TOOLS_LIST_TIMEOUT_MS = 15_000;
+
+/**
+ * List the session's MCP tools through the server's per-session MCP proxy.
+ *
+ * @returns {Promise<{tools: object[], failures: object} | null>} The listed
+ *   tools and per-server failures, or ``null`` when the listing failed.
+ */
+async function postMcpToolsList(config) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const { url, headers } = mcpEndpoint(config);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), _MCP_TOOLS_LIST_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      signal: controller.signal,
+    });
+    if (!resp.ok || !mcpContentTypeIsJson(resp)) return null;
+    const json = await resp.json();
+    const result = json && json.result;
+    if (!result || typeof result !== "object" || !Array.isArray(result.tools)) return null;
+    const failures =
+      result.failures && typeof result.failures === "object" ? result.failures : {};
+    return { tools: result.tools, failures };
+  } catch (_err) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
+  const { url, headers } = mcpEndpoint(config);
   const body = JSON.stringify({
     jsonrpc: "2.0",
     id: rpcId,
@@ -500,9 +546,7 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: relay
-        ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
-        : { "content-type": "application/json", ...freshAuthHeaders(config.authHeaders) },
+      headers,
       body,
     });
     if (!resp.ok) {
@@ -1558,35 +1602,68 @@ module.exports = function (pi) {
   // in this set and stay gated by the hook below.
   const bridgedTools = new Set();
   const discoveryTools = new Map();
-  if (config && Array.isArray(config.tools)) {
+  // MCP tools from config.tools and later listings: name -> schema fingerprint.
+  const mcpTools = new Map();
+  const removedMcpTools = new Set();
+  let discoveryEnabled = false;
+
+  function bridgedToolDefinition(name, description, parameters) {
+    // Pi passes tool.parameters straight to the LLM as JSON Schema, so the
+    // Omnigent schema is usable as-is. execute() round-trips the call to the
+    // Omnigent server's MCP proxy and returns the result to Pi.
+    return {
+      name,
+      label: name,
+      description,
+      promptSnippet: description ? description.slice(0, 120) : name,
+      parameters,
+      async execute(_toolCallId, params) {
+        return callOmnigentTool(config, name, params || {});
+      },
+    };
+  }
+
+  function discoveryDefinition(name, definition) {
+    const namespace = name.includes("__") ? name.split("__")[0] : "connected_tools";
+    return {
+      ...definition,
+      exposure: "codemode",
+      namespace: { name: namespace, description: `Connected tools from ${namespace}.` },
+    };
+  }
+
+  function registerBridgedTool(name, description, parameters, exposure) {
+    const definition = bridgedToolDefinition(name, description, parameters);
+    bridgedTools.add(name);
+    if (exposure !== "codemode") {
+      pi.registerTool(definition);
+      return;
+    }
+    discoveryTools.set(name, definition);
+    pi.registerTool(discoveryEnabled ? discoveryDefinition(name, definition) : definition);
+  }
+
+  function schemaFingerprint(description, parameters) {
+    return JSON.stringify([description, parameters]);
+  }
+
+  if (config && Array.isArray(config.tools) && typeof pi.registerTool === "function") {
     for (const tool of config.tools) {
       if (!tool || typeof tool !== "object") continue;
       const name = typeof tool.name === "string" ? tool.name : "";
       if (!name) continue;
-      bridgedTools.add(name);
       const description =
         typeof tool.description === "string" ? tool.description : "";
       const parameters =
         tool.parameters && typeof tool.parameters === "object"
           ? tool.parameters
           : { type: "object", properties: {} };
-      // Pi passes tool.parameters straight to the LLM as JSON Schema, so the
-      // Omnigent schema is usable as-is. execute() round-trips the call to the
-      // Omnigent server's MCP proxy and returns the result to Pi.
-      if (typeof pi.registerTool === "function") {
-        const definition = {
-          name,
-          label: name,
-          description,
-          promptSnippet: description ? description.slice(0, 120) : name,
-          parameters,
-          async execute(_toolCallId, params) {
-            return callOmnigentTool(config, name, params || {});
-          },
-        };
-        pi.registerTool(definition);
-        if (tool.exposure === "codemode") discoveryTools.set(name, definition);
-      }
+      registerBridgedTool(name, description, parameters, tool.exposure);
+      if (tool.mcp === true) mcpTools.set(name, schemaFingerprint(description, parameters));
+    }
+  } else if (config && Array.isArray(config.tools)) {
+    for (const tool of config.tools) {
+      if (tool && typeof tool.name === "string" && tool.name) bridgedTools.add(tool.name);
     }
   }
 
@@ -1594,18 +1671,57 @@ module.exports = function (pi) {
     if (!discoveryTools.size || typeof pi.getAllTools !== "function" ||
         typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
     if (!pi.getAllTools().some((tool) => tool.name === "codemode")) return;
+    discoveryEnabled = true;
     for (const [name, definition] of discoveryTools) {
-      const namespace = name.includes("__") ? name.split("__")[0] : "connected_tools";
-      pi.registerTool({
-        ...definition,
-        exposure: "codemode",
-        namespace: { name: namespace, description: `Connected tools from ${namespace}.` },
-      });
+      pi.registerTool(discoveryDefinition(name, definition));
     }
     pi.setActiveTools([...new Set([
       ...pi.getActiveTools().filter((name) => !discoveryTools.has(name)),
       "codemode",
     ])]);
+  }
+
+  // Registers MCP tools the session's servers added since the last listing and
+  // hides the ones they removed. A server that failed to list keeps its tools.
+  async function refreshMcpTools() {
+    if (!config || typeof config.mcpToolExposure !== "string" ||
+        typeof pi.registerTool !== "function") return;
+    const listing = await postMcpToolsList(config);
+    if (!listing) return;
+    const exposure = config.mcpToolExposure;
+    const otherTools = new Set(
+      typeof pi.getAllTools === "function"
+        ? pi.getAllTools().map((tool) => tool.name)
+          .filter((name) => !mcpTools.has(name) && !removedMcpTools.has(name))
+        : [],
+    );
+    const listed = new Set();
+    for (const tool of listing.tools) {
+      const name = tool && typeof tool.name === "string" ? tool.name : "";
+      if (!name || otherTools.has(name)) continue;
+      listed.add(name);
+      const description = typeof tool.description === "string" ? tool.description : "";
+      const parameters =
+        tool.inputSchema && typeof tool.inputSchema === "object"
+          ? tool.inputSchema
+          : { type: "object", properties: {} };
+      const fingerprint = schemaFingerprint(description, parameters);
+      if (mcpTools.get(name) === fingerprint) continue;
+      mcpTools.set(name, fingerprint);
+      removedMcpTools.delete(name);
+      registerBridgedTool(name, description, parameters, exposure);
+    }
+    const failedPrefixes = Object.keys(listing.failures).map((server) => `${server}__`);
+    for (const name of [...mcpTools.keys()]) {
+      if (listed.has(name) || failedPrefixes.some((prefix) => name.startsWith(prefix))) continue;
+      mcpTools.delete(name);
+      removedMcpTools.add(name);
+      discoveryTools.delete(name);
+      pi.registerTool({
+        ...bridgedToolDefinition(name, "", { type: "object", properties: {} }),
+        exposure: "hidden",
+      });
+    }
   }
 
   let taskList = [];
@@ -2295,6 +2411,7 @@ module.exports = function (pi) {
     await ensureSupportedThinking(
       pi, config, ctx || latestContext, (ctx || latestContext)?.model,
     );
+    await refreshMcpTools();
     const latest = readConfig() || config;
     const instructions = latest && latest.systemPrompt;
     if (typeof instructions !== "string" || !instructions.trim()) return;

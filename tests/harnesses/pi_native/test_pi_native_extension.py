@@ -4038,3 +4038,137 @@ const message = {role: "assistant", responseId: "reply-1",
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+_MCP_REFRESH_SCRIPT = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const refreshEnabled = process.argv[3] === "true";
+const configPath = path.join(tmpDir, "config.json");
+const schema = { type: "object", properties: { text: { type: "string" } } };
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "conv_abc",
+    authHeaders: { authorization: "Bearer test" },
+    ...(refreshEnabled ? { mcpToolExposure: "direct" } : {}),
+    tools: [
+      { name: "sys_os_read", description: "Read", parameters: schema },
+      { name: "docs__alpha", description: "alpha", parameters: schema, mcp: true },
+      { name: "docs__gamma", description: "gamma", parameters: schema, mcp: true },
+    ],
+  }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+let listing = null;
+const listCalls = [];
+const toolCalls = [];
+global.fetch = async (url, request) => {
+  assert.equal(url, "http://omnigent.test/v1/sessions/conv_abc/mcp");
+  assert.equal(request.headers.authorization, "Bearer test");
+  const body = JSON.parse(request.body);
+  const reply = (payload) => ({
+    ok: true,
+    headers: { get: () => "application/json" },
+    async json() { return { jsonrpc: "2.0", id: body.id, ...payload }; },
+  });
+  if (body.method === "tools/list") {
+    listCalls.push(body);
+    return reply({ result: listing });
+  }
+  assert.equal(body.method, "tools/call");
+  toolCalls.push(body.params.name);
+  return reply({ result: { content: [{ type: "text", text: `ran ${body.params.name}` }] } });
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const registered = new Map([["read", { name: "read", builtin: true }]]);
+const registrations = [];
+const handlers = {};
+const pi = {
+  registerCommand() {},
+  on(name, handler) { handlers[name] = handler; },
+  registerTool(definition) {
+    registered.set(definition.name, definition);
+    registrations.push(definition.name);
+  },
+  getAllTools() {
+    return [...registered.values()].map((tool) => ({ name: tool.name, exposure: tool.exposure }));
+  },
+  sendUserMessage() {},
+};
+
+require(extensionPath)(pi);
+const sysRead = registered.get("sys_os_read");
+const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
+const tool = (name) => ({ name, description: name.split("__").pop(), inputSchema: schema });
+
+(async () => {
+  assert.equal(typeof handlers.before_agent_start, "function");
+  listing = {
+    tools: [tool("docs__alpha"), tool("docs__beta"), tool("sys_os_read"), tool("read")],
+    failures: {},
+  };
+  registrations.length = 0;
+  await handlers.before_agent_start({ systemPrompt: "base" }, ctx);
+
+  if (!refreshEnabled) {
+    assert.equal(listCalls.length, 0);
+    assert.equal(registered.has("docs__beta"), false);
+    console.log("MCP_REFRESH_DISABLED_OK");
+    return;
+  }
+
+  assert.equal(listCalls.length, 1);
+  assert.deepEqual(registrations.sort(), ["docs__beta", "docs__gamma"]);
+  assert.equal(registered.get("docs__beta").exposure, undefined);
+  assert.equal(registered.get("docs__gamma").exposure, "hidden");
+  assert.equal(registered.get("sys_os_read"), sysRead);
+  assert.equal(registered.get("read").builtin, true);
+  const result = await registered.get("docs__beta").execute("call-1", { text: "hi" });
+  assert.equal(result.content[0].text, "ran docs__beta");
+  assert.equal(result.isError, false);
+  assert.deepEqual(toolCalls, ["docs__beta"]);
+
+  listing = { tools: [], failures: { docs: "MCP server unavailable" } };
+  registrations.length = 0;
+  await handlers.before_agent_start({ systemPrompt: "base" }, ctx);
+  assert.deepEqual(registrations, []);
+
+  listing = { tools: [tool("docs__alpha"), tool("docs__gamma")], failures: {} };
+  registrations.length = 0;
+  await handlers.before_agent_start({ systemPrompt: "base" }, ctx);
+  assert.deepEqual(registrations.sort(), ["docs__beta", "docs__gamma"]);
+  assert.equal(registered.get("docs__gamma").exposure, undefined);
+  assert.equal(registered.get("docs__beta").exposure, "hidden");
+  assert.equal(listCalls.length, 3);
+  console.log("MCP_REFRESH_OK");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+
+
+@pytest.mark.parametrize("refresh_enabled", [True, False])
+def test_agent_start_registers_added_and_hides_removed_mcp_tools(
+    tmp_path: Path, refresh_enabled: bool
+) -> None:
+    """Each agent run re-lists MCP tools and updates the bridged registrations.
+
+    New tools become callable through the MCP proxy, removed ones are hidden,
+    a failed server keeps its tools, and names owned by Omnigent or Pi tools
+    are never taken over. Without ``mcpToolExposure`` nothing is listed.
+    """
+    result = _run_node(
+        _MCP_REFRESH_SCRIPT, str(_extension_path()), str(tmp_path), str(refresh_enabled).lower()
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = "MCP_REFRESH_OK" if refresh_enabled else "MCP_REFRESH_DISABLED_OK"
+    assert marker in result.stdout, result.stdout + result.stderr

@@ -2580,9 +2580,11 @@ async def _auto_create_pi_terminal(
             )
     # External tools use the same authenticated, policy-enforcing MCP proxy.
     identity_login_required = False
+    mcp_tool_exposure: str | None = None
     with startup_span("pi.discover_mcp_tools", session_id=session_id):
         spec_for_mcp = _unwrap_resolved_spec(agent_spec)
         if server_client is not None and spec_for_mcp is not None and spec_for_mcp.mcp_servers:
+            mcp_tool_exposure = "codemode" if launch_config.nested_tool_audit else "direct"
             try:
                 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 
@@ -2596,9 +2598,9 @@ async def _auto_create_pi_terminal(
                 registered_names = {tool["name"] for tool in pi_tools}
                 pi_tools.extend(
                     (
-                        {**schema, "exposure": "codemode"}
+                        {**schema, "exposure": "codemode", "mcp": True}
                         if launch_config.nested_tool_audit
-                        else schema
+                        else {**schema, "mcp": True}
                     )
                     for schema in mcp_result.schemas
                     if schema["name"] not in registered_names
@@ -2633,6 +2635,7 @@ async def _auto_create_pi_terminal(
             auth_headers=auth_headers,
             tools=pi_tools,
             system_prompt=system_prompt,
+            mcp_tool_exposure=mcp_tool_exposure,
         )
     pi_command = resolve_pi_executable()
     # Rebuild the local Pi session JSONL from committed Omnigent items so a

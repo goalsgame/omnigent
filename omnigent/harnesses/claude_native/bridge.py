@@ -6853,7 +6853,10 @@ def _tool_relay_handler_factory(
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            if payload.get("jsonrpc") != "2.0" or payload.get("method") != "tools/call":
+            if payload.get("jsonrpc") != "2.0" or payload.get("method") not in (
+                "tools/call",
+                "tools/list",
+            ):
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
             import urllib.parse as _up

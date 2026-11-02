@@ -80,3 +80,13 @@ jobs:
             "$RUNNER_TEMP/omnigent-harness-clis/pi/${{ steps.restore.outputs.version }}/node_modules/@earendil-works/pi-coding-agent" \
             "$PWD/omnigent/resources/pi_native/omnigent_pi_native_extension.js" \
             "$(cat deploy/docker/pi-version)"
+
+      - name: Verify native Pi sessions follow MCP tool changes
+        if: matrix.harness == 'pi'
+        run: |
+          for exposure in direct codemode; do
+            node tests/harnesses/pi_native/verify_mcp_refresh.mjs \
+              "$RUNNER_TEMP/omnigent-harness-clis/pi/${{ steps.restore.outputs.version }}/node_modules/@earendil-works/pi-coding-agent" \
+              "$PWD/omnigent/resources/pi_native/omnigent_pi_native_extension.js" \
+              "$exposure"
+          done
