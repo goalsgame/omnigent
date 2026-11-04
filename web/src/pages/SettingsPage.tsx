@@ -53,6 +53,7 @@ import {
   FileDiffIcon,
   FilesIcon,
   GitPullRequestIcon,
+  BrainIcon,
   KeyRoundIcon,
   Loader2Icon,
   LogOutIcon,
@@ -420,6 +421,7 @@ const workspaceTabCards: {
   { value: "changes", label: "Changes", icon: FileDiffIcon },
   { value: "github", label: "Pull Requests", icon: GitPullRequestIcon },
   { value: "subagents", label: "Agents", icon: BotIcon },
+  { value: "memory", label: "Memory", icon: BrainIcon },
 ];
 
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */

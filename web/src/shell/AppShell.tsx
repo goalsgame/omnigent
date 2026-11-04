@@ -131,6 +131,7 @@ import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
+import { useSessionDigest } from "@/hooks/useSessionDigest";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
   TerminalFirstContextProvider,
@@ -923,6 +924,9 @@ export function AppShell() {
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
+  const sessionDigest = useSessionDigest(rootSessionId);
+  const sessionMemoryEnabled = !!sessionDigest.data;
+  const sessionMemoryPending = !!rootSessionId && sessionDigest.isPending;
   const railTabsAvailable = useMemo(
     () =>
       ({
@@ -940,11 +944,13 @@ export function AppShell() {
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
+        // Memory tab: only when the server has session memory enabled.
+        memory: sessionMemoryEnabled,
         // Shells have no nav tab — they open as closable soft tabs in the
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel],
+    [showFilesPanel, sessionMemoryEnabled],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1281,13 +1287,14 @@ export function AppShell() {
       // gated nav tab — always valid, and never a fallback target.
       if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
+      if (tab === "memory" && sessionMemoryPending) return tab;
       return (
-        (["files", "changes", "github", "subagents", "browser"] as const).find(
+        (["files", "changes", "github", "subagents", "memory", "browser"] as const).find(
           (candidate) => railTabsAvailable[candidate],
         ) ?? tab
       );
     });
-  }, [railTabsAvailable, rightRailTab]);
+  }, [railTabsAvailable, rightRailTab, sessionMemoryPending]);
 
   // Selecting the current agent removes the panel query without changing sessions.
   useEffect(() => {
@@ -2576,6 +2583,7 @@ export function AppShell() {
                     onRightRailTabChange={handleRightRailTabChange}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
+                    showMemoryTab={railTabsAvailable.memory}
                     showBrowserTab={railTabsAvailable.browser}
                     onBrowserTabOpened={revealRightPanel}
                     changedCount={changedCount}

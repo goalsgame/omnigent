@@ -669,15 +669,23 @@ GET /v1/sessions/search?q=QUERY&limit=20
 200 OK — {"object": "list", "data": [SessionSearchHit, ...], "has_more": false}
 ```
 
-Ranks the caller's readable top-level sessions by title and message text.
-`q` accepts web-search syntax (quoted phrases, `OR`, `-word`) and every other
-term must match. Each hit carries `session_id`, `title`, `created_at`,
-`updated_at`, `score`, `title_match` and up to three `matches`, each with
-`item_id`, `conversation_id` (the session or sub-agent session holding the
-message) and `snippet`. Only direct and group grants qualify; a public link
-does not make a session discoverable, and archived sessions are left out.
-On PostgreSQL the search is backed by a full-text index over messages and
-compaction summaries; other databases fall back to substring matching.
+Ranks the caller's readable top-level sessions by title, message text and,
+with [session memory](../../docs/session-memory.md), their digests. `q` accepts
+web-search syntax (quoted phrases, `OR`, `-word`), in which every other term
+must match, or a plain-language question. On PostgreSQL a query without that
+syntax that matches fewer sessions than `limit` with every term also matches
+messages containing any of its terms, ranked after full matches. Each hit
+carries `session_id`, `title`, `created_at`, `updated_at`, `score`,
+`title_match`, up to three `matches`, each with `item_id`, `conversation_id`
+(the session or sub-agent session holding the message) and `snippet`, and up to
+three `memories` (by meaning and any term for a plain-language query, by the
+query's syntax otherwise), each with `kind` (`summary`, `decision`, `discussion`,
+`open_question` or `tangent`), `text`, `item_ids`, `created_at` and
+`similarity` (cosine similarity when the entry matched by meaning, otherwise
+`null`). Only direct and group grants qualify; a public link does not make a
+session discoverable, and archived sessions are left out. On PostgreSQL the
+search is backed by a full-text index over messages and compaction summaries;
+other databases fall back to substring matching.
 
 ```
 GET /v1/sessions/{session_id}/search?q=QUERY&limit=10
@@ -687,6 +695,22 @@ The same search on behalf of an agent in `session_id`, which requires read
 access to it. Results are limited to sessions that every user, group or public
 grant on the session's top-level session can also read, and leave out the
 session itself.
+
+```
+GET /v1/sessions/{session_id}/digest
+
+200 OK — {"object": "session.digest", "session_id", "status", "summary",
+          "topics", "entries", "model", "updated_at", "error"}
+404 Not Found — no read access, or session memory is not configured
+```
+
+The digest of the session's top-level session, which requires read access.
+`status` is `pending` before the first digest, `ready`, `empty` when the
+session has no messages, or `failed` with `error` set when no digest could be
+written. Each entry has `kind` (`decision`, `discussion`, `open_question` or
+`tangent`), `title`, `text`, optional `rationale` and `alternatives`,
+`item_ids` and `message_ids` of the top-level session's messages it cites
+(`message_ids` are the transcript deep-link ids), and `created_at`.
 
 Clients should always send `visibility` explicitly: `mine` lists owned
 active sessions, `shared` lists accessible active sessions owned by someone

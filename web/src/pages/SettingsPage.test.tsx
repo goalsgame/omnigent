@@ -572,8 +572,8 @@ describe("SettingsPage", () => {
 
     const group = screen.getByRole("radiogroup", { name: "Default Workspace tab" });
     const options = within(group).getAllByRole("radio");
-    expect(options).toHaveLength(4);
-    ["Files", "Changes", "Pull Requests", "Agents"].forEach((label, index) => {
+    expect(options).toHaveLength(5);
+    ["Files", "Changes", "Pull Requests", "Agents", "Memory"].forEach((label, index) => {
       expect(options[index]).toHaveAccessibleName(label);
     });
     expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(

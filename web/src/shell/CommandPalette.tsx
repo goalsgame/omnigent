@@ -33,7 +33,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
-import { useSessionSearch } from "@/hooks/useSessionSearch";
+import { type SessionSearchMemory, useSessionSearch } from "@/hooks/useSessionSearch";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -70,6 +70,14 @@ interface ActionCommand {
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
 const SEARCH_DEBOUNCE_MS = 300;
+
+const MEMORY_LABELS: Record<SessionSearchMemory["kind"], string> = {
+  summary: "Summary",
+  decision: "Decision",
+  discussion: "Discussion",
+  open_question: "Open question",
+  tangent: "Tangent",
+};
 
 /** Split `text` on case-insensitive occurrences of `query`, bolding the matches
     so a search hit is visible in the title / content snippet. Returns the raw
@@ -404,10 +412,17 @@ export function CommandPalette({
                           query={debouncedQuery}
                         />
                       </span>
-                      {hit.matches[0] && (
+                      {hit.memories?.[0] ? (
                         <span className="truncate text-left text-muted-foreground text-sm">
-                          {hit.matches[0].snippet}
+                          {MEMORY_LABELS[hit.memories[0].kind]}:{" "}
+                          {hit.memories[0].text.split("\n")[0]}
                         </span>
+                      ) : (
+                        hit.matches[0] && (
+                          <span className="truncate text-left text-muted-foreground text-sm">
+                            {hit.matches[0].snippet}
+                          </span>
+                        )
                       )}
                     </div>
                   </CommandItem>
