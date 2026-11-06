@@ -147,7 +147,7 @@ class MCPDelegationBroker:
                 and isinstance(granted, str)
                 and not requested <= set(granted.split())
             ):
-                raise DelegationNotEntitled(f"{self.provider} access is not granted to {owner}")
+                raise DelegationNotEntitled(f"{self.provider} access is not granted to this identity")
             if (
                 claims is None
                 or claims.get("sub") != subject
