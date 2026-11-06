@@ -1318,3 +1318,40 @@ async def test_managed_proxy_fork_launch_and_policy_use_same_provider(
         env.launch.assert_awaited_once()
         assert env.launch.call_args.kwargs["provider"] == expected
         assert env.launch.call_args.kwargs["session_id"] == fork.id
+
+
+@pytest.mark.parametrize(
+    "proxy_source,destination,expected",
+    [
+        (False, None, "kubernetes"),
+        (False, "modal", "modal"),
+        (True, None, "agent_sandbox"),
+    ],
+)
+async def test_managed_fork_provider_prefers_explicit_then_source_then_preference(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, proxy_source, destination, expected
+):
+    from dataclasses import replace
+
+    if proxy_source:
+        _enable_managed_proxy(env)
+        source_id = await _proxy_session(env)
+    else:
+        source_id = env.store.create_conversation(agent_id=await _builtin(env, "codex")).id
+    original = env.app.state.sandbox_config.default
+    env.app.state.sandbox_config = ManagedSandboxDeployment(
+        configs=(
+            replace(original, provider="modal", host_config={}),
+            replace(original, provider="kubernetes", host_config={}),
+            original,
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_PREFERRED_SANDBOX_PROVIDER", "kubernetes")
+    env.launch.reset_mock()
+    body = {"host_type": "managed"}
+    if destination is not None:
+        body["sandbox_provider"] = destination
+    response = await env.client.post(f"/v1/sessions/{source_id}/fork", json=body)
+    assert response.status_code == 201, response.text
+    env.launch.assert_awaited_once()
+    assert env.launch.call_args.kwargs["provider"] == expected
