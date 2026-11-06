@@ -135,6 +135,48 @@ async def test_session_post_captures_idp_owner(
 
 
 @pytest.mark.asyncio
+async def test_unentitled_sign_in_removes_a_previous_subjects_grant(
+    delegation_app, signing_key, oidc
+):
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    owner = "person@example.test"
+    broker = delegation_app.state.test_identity_broker
+    broker.store.upsert(
+        owner,
+        broker.provider,
+        secret={
+            "access_token": "previous-subject-token",
+            "refresh_token": "previous-subject-refresh",
+            "expires_at": time.time() + 3600,
+        },
+        metadata={"issuer": oidc.issuer, "subject": "previous-subject"},
+    )
+
+    def exchange(request):
+        return httpx.Response(
+            200,
+            json={
+                "access_token": signed_token(
+                    signing_key, sub="human-subject", azp=oidc.client_id, aud="other-api"
+                ),
+                "refresh_token": "unentitled-refresh",
+                "expires_in": 300,
+                "scope": "openid email",
+                "token_type": "Bearer",
+            },
+        )
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(exchange))
+    response = await _post_session(delegation_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    assert broker.store.get(owner, broker.provider) is None
+    with pytest.raises(DelegationUnavailable):
+        broker.credential(owner)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method,path", [("GET", "/v1/sessions"), ("POST", "/v1/sessions-other")])
 async def test_non_session_writes_do_not_exchange(delegation_app, signing_key, method, path):
     exchanges = []

@@ -172,7 +172,18 @@ class MCPDelegationBroker:
             ) from None
 
     def capture(self, owner: str, subject: str, token: str) -> None:
-        """Persist a grant only after the caller's IdP token and owner have been verified."""
+        """Persist a grant only after the caller's IdP token and owner have been verified.
+
+        :raises DelegationNotEntitled: The IdP gives this identity no access to the
+            upstream; any grant the owner already holds for it is deleted first.
+        """
+        try:
+            self._capture(owner, subject, token)
+        except DelegationNotEntitled:
+            self.store.delete(owner, self.provider)
+            raise
+
+    def _capture(self, owner: str, subject: str, token: str) -> None:
         if self.login_broker is not None and not owner.startswith("oidc-machine:"):
             self._capture_login(owner, subject, token)
             return
