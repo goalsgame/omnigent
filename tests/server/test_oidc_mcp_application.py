@@ -428,6 +428,57 @@ async def test_non_renewable_bearer_returns_distinct_403(login_app, signing_key,
     assert login_app.state.oidc_login_broker.known_subject("person@example.test") is None
 
 
+class _UnentitledIdp(_Idp):
+    """Answers the upstream exchange the way Keycloak does for a person without its role."""
+
+    def __init__(self, signing_key, oidc, *, granted_scope):
+        super().__init__(signing_key, oidc)
+        self.granted_scope = granted_scope
+
+    def handler(self, request):
+        form = parse_qs(request.content.decode())
+        if form.get("requested_token_type") != [
+            "urn:ietf:params:oauth:token-type:access_token"
+        ] or form.get("scope") != ["openid tools-api"]:
+            return super().handler(request)
+        self.requests.append(form)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": signed_token(
+                    self.signing_key, sub=self.subject, azp=self.oidc.client_id, aud="other-api"
+                ),
+                "expires_in": 300,
+                "scope": self.granted_scope,
+                "token_type": "Bearer",
+            },
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("granted_scope", "status"), [("openid email", None), ("openid email tools-api", 403)]
+)
+async def test_upstream_scope_withheld_by_the_idp_skips_delegation(
+    login_app, signing_key, oidc, granted_scope, status
+):
+    from omnigent.server.oidc_mcp import DelegationNotEntitled, DelegationUnavailable
+
+    idp = _UnentitledIdp(signing_key, oidc, granted_scope=granted_scope)
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    broker = login_app.state.test_identity_broker
+    if status is None:
+        assert response.status_code in (404, 422), response.text
+        with pytest.raises(DelegationNotEntitled):
+            broker.credential("person@example.test")
+    else:
+        assert response.status_code == status, response.text
+        with pytest.raises(DelegationUnavailable) as exc:
+            broker.credential("person@example.test")
+        assert not isinstance(exc.value, DelegationNotEntitled)
+
+
 @pytest.mark.asyncio
 async def test_exchange_outage_returns_503(login_app, signing_key, oidc):
     idp = _Idp(signing_key, oidc, login=lambda form: httpx.Response(503))

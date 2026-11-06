@@ -30,6 +30,10 @@ class DelegationNotRenewable(DelegationUnavailable):
     """The caller's IdP session cannot yield an offline grant; the person must sign in again."""
 
 
+class DelegationNotEntitled(DelegationUnavailable):
+    """The IdP withheld this upstream's scope from the owner, who has no access to it."""
+
+
 @dataclass(frozen=True)
 class MCPDelegationConfig:
     upstream_url: str
@@ -136,6 +140,14 @@ class MCPDelegationBroker:
             result = response.json()
             token = result["access_token"]
             claims = verify_access_token(token, self.jwks, self.oidc.issuer, self.config.audience)
+            requested = set(str(form.get("scope", "")).split()) - {"openid"}
+            granted = result.get("scope")
+            if (
+                claims is None
+                and isinstance(granted, str)
+                and not requested <= set(granted.split())
+            ):
+                raise DelegationNotEntitled(f"{self.provider} access is not granted to {owner}")
             if (
                 claims is None
                 or claims.get("sub") != subject

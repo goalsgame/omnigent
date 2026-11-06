@@ -2129,7 +2129,11 @@ def create_app(
 
         @app.middleware("http")
         async def capture_delegated_identity(request: Request, call_next):
-            from omnigent.server.oidc_mcp import DelegationNotRenewable, DelegationUnavailable
+            from omnigent.server.oidc_mcp import (
+                DelegationNotEntitled,
+                DelegationNotRenewable,
+                DelegationUnavailable,
+            )
 
             path = request.url.path.removeprefix(resolved_base_path)
             bearer = request.headers.get("authorization", "")
@@ -2141,7 +2145,10 @@ def create_app(
                 broker = None
                 try:
                     for broker in delegation_brokers:
-                        await asyncio.to_thread(broker.capture_bearer, bearer[7:])
+                        try:
+                            await asyncio.to_thread(broker.capture_bearer, bearer[7:])
+                        except DelegationNotEntitled as exc:
+                            _logger.info("Skipping identity delegation: %s", exc)
                 except DelegationTemporarilyUnavailable:
                     return JSONResponse(
                         {"error": "temporarily_unavailable"},

@@ -24,6 +24,7 @@ import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import jwt
@@ -36,6 +37,7 @@ from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig
+from omnigent.server.oidc_mcp import DelegationNotEntitled, DelegationUnavailable
 from omnigent.server.routes.auth import (
     _AUTH_STATE_COOKIE_PLAIN,
     _resolve_oidc_email,
@@ -859,3 +861,46 @@ def test_native_exchange_preserves_verified_groups(callback_client):
     assert exchanged.status_code == 200, exchanged.text
     payload = jwt.decode(exchanged.json()["token"], _TEST_SECRET, algorithms=["HS256"])
     assert payload["group_authority"]["groups"] == ["/engineering"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "lore_captured"),
+    [(DelegationNotEntitled, 302, True), (DelegationUnavailable, 503, False)],
+)
+def test_callback_skips_only_delegation_the_idp_does_not_grant(
+    callback_client: tuple[TestClient, _IdpKeys],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[DelegationUnavailable],
+    status: int,
+    lore_captured: bool,
+) -> None:
+    """
+    A person the IdP gives no access to one delegated upstream still signs in,
+    and the remaining upstreams are captured; any other delegation failure
+    still fails the sign-in.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    async def _fake_post(self: httpx.AsyncClient, url: str, **kwargs: object) -> httpx.Response:
+        """Return an access token alongside the id_token, as a delegating IdP does."""
+        return httpx.Response(200, json={"id_token": token, "access_token": "idp-access"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    captured: list[tuple[str, str, str]] = []
+
+    def _refuse(owner: str, subject: str, access_token: str) -> None:
+        """Fail the MCP capture with the parametrized delegation error."""
+        raise failure("no access")
+
+    client.app.state.mcp_identity_broker = SimpleNamespace(capture=_refuse)
+    client.app.state.lore_identity_broker = SimpleNamespace(
+        capture=lambda *args: captured.append(args)
+    )
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == status, resp.text
+    assert captured == (
+        [("alice@example.com", "idp-subject-123", "idp-access")] if lore_captured else []
+    )
