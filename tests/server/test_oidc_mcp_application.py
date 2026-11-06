@@ -135,6 +135,48 @@ async def test_session_post_captures_idp_owner(
 
 
 @pytest.mark.asyncio
+async def test_unentitled_sign_in_removes_a_previous_subjects_grant(
+    delegation_app, signing_key, oidc
+):
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    owner = "person@example.test"
+    broker = delegation_app.state.test_identity_broker
+    broker.store.upsert(
+        owner,
+        broker.provider,
+        secret={
+            "access_token": "previous-subject-token",
+            "refresh_token": "previous-subject-refresh",
+            "expires_at": time.time() + 3600,
+        },
+        metadata={"issuer": oidc.issuer, "subject": "previous-subject"},
+    )
+
+    def exchange(request):
+        return httpx.Response(
+            200,
+            json={
+                "access_token": signed_token(
+                    signing_key, sub="human-subject", azp=oidc.client_id, aud="other-api"
+                ),
+                "refresh_token": "unentitled-refresh",
+                "expires_in": 300,
+                "scope": "openid email",
+                "token_type": "Bearer",
+            },
+        )
+
+    broker.client.close()
+    broker.client = httpx.Client(transport=httpx.MockTransport(exchange))
+    response = await _post_session(delegation_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    assert broker.store.get(owner, broker.provider) is None
+    with pytest.raises(DelegationUnavailable):
+        broker.credential(owner)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method,path", [("GET", "/v1/sessions"), ("POST", "/v1/sessions-other")])
 async def test_non_session_writes_do_not_exchange(delegation_app, signing_key, method, path):
     exchanges = []
@@ -426,6 +468,57 @@ async def test_non_renewable_bearer_returns_distinct_403(login_app, signing_key,
     assert response.json()["detail"].endswith("requires re-login with offline_access")
     assert response.headers["cache-control"] == "no-store"
     assert login_app.state.oidc_login_broker.known_subject("person@example.test") is None
+
+
+class _UnentitledIdp(_Idp):
+    """Answers the upstream exchange the way Keycloak does for a person without its role."""
+
+    def __init__(self, signing_key, oidc, *, granted_scope):
+        super().__init__(signing_key, oidc)
+        self.granted_scope = granted_scope
+
+    def handler(self, request):
+        form = parse_qs(request.content.decode())
+        if form.get("requested_token_type") != [
+            "urn:ietf:params:oauth:token-type:access_token"
+        ] or form.get("scope") != ["openid tools-api"]:
+            return super().handler(request)
+        self.requests.append(form)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": signed_token(
+                    self.signing_key, sub=self.subject, azp=self.oidc.client_id, aud="other-api"
+                ),
+                "expires_in": 300,
+                "scope": self.granted_scope,
+                "token_type": "Bearer",
+            },
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("granted_scope", "status"), [("openid email", None), ("openid email tools-api", 403)]
+)
+async def test_upstream_scope_withheld_by_the_idp_skips_delegation(
+    login_app, signing_key, oidc, granted_scope, status
+):
+    from omnigent.server.oidc_mcp import DelegationNotEntitled, DelegationUnavailable
+
+    idp = _UnentitledIdp(signing_key, oidc, granted_scope=granted_scope)
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    broker = login_app.state.test_identity_broker
+    if status is None:
+        assert response.status_code in (404, 422), response.text
+        with pytest.raises(DelegationNotEntitled):
+            broker.credential("person@example.test")
+    else:
+        assert response.status_code == status, response.text
+        with pytest.raises(DelegationUnavailable) as exc:
+            broker.credential("person@example.test")
+        assert not isinstance(exc.value, DelegationNotEntitled)
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,10 @@ class DelegationNotRenewable(DelegationUnavailable):
     """The caller's IdP session cannot yield an offline grant; the person must sign in again."""
 
 
+class DelegationNotEntitled(DelegationUnavailable):
+    """The IdP withheld this upstream's scope from the owner, who has no access to it."""
+
+
 @dataclass(frozen=True)
 class MCPDelegationConfig:
     upstream_url: str
@@ -136,6 +140,16 @@ class MCPDelegationBroker:
             result = response.json()
             token = result["access_token"]
             claims = verify_access_token(token, self.jwks, self.oidc.issuer, self.config.audience)
+            requested = set(str(form.get("scope", "")).split()) - {"openid"}
+            granted = result.get("scope")
+            if (
+                claims is None
+                and isinstance(granted, str)
+                and not requested <= set(granted.split())
+            ):
+                raise DelegationNotEntitled(
+                    f"{self.provider} access is not granted to this identity"
+                )
             if (
                 claims is None
                 or claims.get("sub") != subject
@@ -160,7 +174,18 @@ class MCPDelegationBroker:
             ) from None
 
     def capture(self, owner: str, subject: str, token: str) -> None:
-        """Persist a grant only after the caller's IdP token and owner have been verified."""
+        """Persist a grant only after the caller's IdP token and owner have been verified.
+
+        :raises DelegationNotEntitled: The IdP gives this identity no access to the
+            upstream; any grant the owner already holds for it is deleted first.
+        """
+        try:
+            self._capture(owner, subject, token)
+        except DelegationNotEntitled:
+            self.store.delete(owner, self.provider)
+            raise
+
+    def _capture(self, owner: str, subject: str, token: str) -> None:
         if self.login_broker is not None and not owner.startswith("oidc-machine:"):
             self._capture_login(owner, subject, token)
             return
