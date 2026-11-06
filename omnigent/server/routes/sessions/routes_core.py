@@ -9,7 +9,7 @@ import json
 import secrets
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from fastapi import (
@@ -24,7 +24,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import Response
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent.codex_approval_modes import (
@@ -241,6 +241,29 @@ from omnigent.util.session_lifecycle import (
 )
 from omnigent.version import VERSION
 
+_CreateBody = TypeVar("_CreateBody", bound=BaseModel)
+
+
+def _with_preferred_sandbox_provider(request: Request, body: _CreateBody) -> _CreateBody:
+    """
+    Fill a managed create's missing ``sandbox_provider`` with the preferred provider.
+
+    Applied before inference preparation and launch, so both use the same
+    provider.
+
+    :param request: The originating request, for ``app.state.sandbox_config``.
+    :param body: A validated create or fork request.
+    :returns: *body*, or a copy naming the preferred provider when *body* is a
+        managed create without one and the server has a launchable preference.
+    """
+    if getattr(body, "host_type", None) != "managed" or getattr(body, "sandbox_provider", None):
+        return body
+    sandbox_config = getattr(request.app.state, "sandbox_config", None)
+    preferred = sandbox_config.preferred_provider() if sandbox_config is not None else None
+    if preferred is None:
+        return body
+    return body.model_copy(update={"sandbox_provider": preferred})
+
 
 def _require_attachment_compatible_history(
     session_id: str,
@@ -442,8 +465,7 @@ def register_core_routes(
             auth-disabled server (registers under the reserved local
             owner).
         :param sandbox_provider: Provider to provision, or ``None`` for
-            the server's preferred provider, falling back to its first
-            configured provider.
+            the server's first configured provider.
         :param workspaces: Managed workspaces — git repository URLs
             (each optionally ``#<branch>``) cloned into the sandbox in
             parallel; empty for an empty sandbox. One repo becomes the
@@ -467,8 +489,6 @@ def register_core_routes(
             parse_repo_workspace,
         )
 
-        if sandbox_provider is None:
-            sandbox_provider = sandbox_config.preferred_provider()
         # Reject an unconfigured provider on the POST rather than in the
         # background launch.
         if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
@@ -791,6 +811,7 @@ def register_core_routes(
             # on this route 500'd as internal_error. The human-readable
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
+        body = _with_preferred_sandbox_provider(request, body)
 
         machine_cloud = getattr(request.app.state, "google_cloud_machine_broker", None)
         if body.google_cloud_access:
@@ -1050,7 +1071,9 @@ def register_core_routes(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("metadata")])
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
-        parsed_metadata = _parse_session_create_metadata(metadata)
+        parsed_metadata = _with_preferred_sandbox_provider(
+            request, _parse_session_create_metadata(metadata)
+        )
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -3596,6 +3619,7 @@ def register_core_routes(
             assert target is not None
             destination_proxy_policy = {**source_proxy_policy, "provider": target.provider}
             body = body.model_copy(update={"sandbox_provider": target.provider})
+        body = _with_preferred_sandbox_provider(request, body)
         if source_configured or source_proxy_policy is not None:
             selected_model = (
                 (None if clear_override_model else override_model)
