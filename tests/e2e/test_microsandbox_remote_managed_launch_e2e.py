@@ -441,8 +441,8 @@ def test_managed_session_launches_a_registered_host_on_the_remote_host(
 
 def test_preferred_provider_is_advertised_and_launches(tmp_path: Path) -> None:
     """
-    A two-provider server advertises its preferred provider; a create naming it
-    launches on the remote host, while a create naming none stays on the default.
+    A two-provider server advertises its preferred provider, and both a create
+    naming it and a create naming no provider launch on the remote host.
     """
     fake = FakeSandboxHost(tmp_path / "sandboxes")
     threading.Thread(target=fake.serve_forever, daemon=True).start()
@@ -499,27 +499,23 @@ def test_preferred_provider_is_advertised_and_launches(tmp_path: Path) -> None:
         )
         assert preferred_create.status_code == 201, preferred_create.text[:500]
 
-        def registered_host() -> dict[str, object] | None:
+        def registered_hosts() -> bool:
             hosts = httpx.get(f"{base_url}/v1/hosts", timeout=10.0).json()["hosts"]
-            return next(
-                (
-                    h
-                    for h in hosts
-                    if h.get("sandbox_provider") == "microsandbox_remote"
-                    and h.get("status") == "online"
-                ),
-                None,
+            online = [h for h in hosts if h.get("status") == "online"]
+            return len(online) == 2 and all(
+                h.get("sandbox_provider") == "microsandbox_remote" for h in online
             )
 
         _wait_for(
-            registered_host,
+            registered_hosts,
             _REGISTER_TIMEOUT_S,
-            lambda: f"preferred-provider host never registered online:\n{server_log()}",
+            lambda: f"preferred-provider hosts never registered online:\n{server_log()}",
         )
         creates = [c for c in fake.calls if c[0] == "PUT"]
-        assert len(creates) == 1, [(c[0], c[1]) for c in fake.calls]
-        name = creates[0][1].rsplit("/", 1)[-1]
-        launched_groups.extend(_process_groups(fake.sandboxes[name]["home"]))  # type: ignore[arg-type]
+        assert len(creates) == 2, [(c[0], c[1]) for c in fake.calls]
+        for create in creates:
+            name = create[1].rsplit("/", 1)[-1]
+            launched_groups.extend(_process_groups(fake.sandboxes[name]["home"]))  # type: ignore[arg-type]
     finally:
         _kill_groups(launched_groups)
         for box in list(fake.sandboxes.values()):

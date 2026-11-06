@@ -3311,10 +3311,9 @@ def create_app(
                         for harness in proxy.config.harnesses
                     ):
                         sandbox_provider_capabilities[provider]["inference_models"] = True
-        preferred = os.environ.get("OMNIGENT_PREFERRED_SANDBOX_PROVIDER", "").strip()
-        preferred_sandbox_provider = (
-            preferred if preferred in sandbox_providers else sandbox_provider
-        )
+        preferred_sandbox_provider = sandbox_provider
+        if sandbox_config is not None and managed_sandboxes_enabled:
+            preferred_sandbox_provider = sandbox_config.preferred_provider() or sandbox_provider
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
