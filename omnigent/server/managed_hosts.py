@@ -184,6 +184,7 @@ import asyncio
 import itertools
 import logging
 import math
+import os
 import posixpath
 import re
 import secrets
@@ -813,6 +814,20 @@ class ManagedSandboxDeployment:
             for config in self.configs
             if config.managed_launch_supported and config.provider is not None
         )
+
+    def preferred_provider(self) -> str | None:
+        """
+        The launchable provider named by ``OMNIGENT_PREFERRED_SANDBOX_PROVIDER``.
+
+        New sessions that name no provider launch on it, and the web UI
+        pre-selects it. Hosts already launched keep their recorded provider.
+
+        :returns: The preferred provider's short name, e.g.
+            ``"microsandbox_remote"``, or ``None`` when the variable is unset
+            or names a provider this deployment cannot launch.
+        """
+        preferred = os.environ.get("OMNIGENT_PREFERRED_SANDBOX_PROVIDER", "").strip()
+        return preferred if preferred in self.launchable_providers() else None
 
     def provider_ui_capabilities(self) -> dict[str, dict[str, bool]]:
         """

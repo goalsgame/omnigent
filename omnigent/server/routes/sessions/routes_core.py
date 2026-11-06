@@ -442,7 +442,8 @@ def register_core_routes(
             auth-disabled server (registers under the reserved local
             owner).
         :param sandbox_provider: Provider to provision, or ``None`` for
-            the server's first configured provider.
+            the server's preferred provider, falling back to its first
+            configured provider.
         :param workspaces: Managed workspaces — git repository URLs
             (each optionally ``#<branch>``) cloned into the sandbox in
             parallel; empty for an empty sandbox. One repo becomes the
@@ -466,6 +467,8 @@ def register_core_routes(
             parse_repo_workspace,
         )
 
+        if sandbox_provider is None:
+            sandbox_provider = sandbox_config.preferred_provider()
         # Reject an unconfigured provider on the POST rather than in the
         # background launch.
         if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
