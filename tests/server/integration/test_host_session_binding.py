@@ -765,6 +765,61 @@ async def test_managed_session_create_defaults_to_the_preferred_provider(
         assert await asyncio.wait_for(launched.get(), timeout=10) == expected
 
 
+@pytest.mark.parametrize(
+    ("providers", "expected"),
+    [(["modal", "e2b"], None), (["modal", "kubernetes"], "kubernetes")],
+)
+async def test_a_lore_create_keeps_a_provider_that_can_check_it_out(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    providers: list[str],
+    expected: str | None,
+) -> None:
+    """
+    A managed create on a ``lores://`` workspace takes the preferred provider
+    only when that provider can check out Lore repositories.
+    """
+    monkeypatch.setenv("OMNIGENT_PREFERRED_SANDBOX_PROVIDER", providers[1])
+    launched: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _record_launch(**kwargs: object) -> None:
+        """Record the provider the background launch asked for, then fail it."""
+        launched.put_nowait(kwargs.get("provider"))  # type: ignore[arg-type]
+        raise HTTPException(status_code=503, detail="test launch")
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.launch_managed_host", _record_launch)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+        sandbox_config=parse_sandbox_config(
+            {
+                "server_url": "https://managed-test.example.com",
+                "providers": [{"provider": p} for p in providers],
+            }
+        ),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        agent = await create_test_agent(client, name="managed-lore-provider-agent")
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_type": "managed",
+                "workspace": "lores://lore.example.com/apps/demo#main",
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        assert await asyncio.wait_for(launched.get(), timeout=10) == expected
+
+
 async def test_managed_session_create_without_config_fails_clearly(
     runtime_init: None,
     db_uri: str,

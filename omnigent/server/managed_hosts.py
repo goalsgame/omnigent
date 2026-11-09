@@ -888,6 +888,10 @@ _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _BRANCH_FORBIDDEN_CHARS = set(" \t~^:?*[\\#")
 
 
+LORE_PROVIDERS = ("kubernetes", "agent_sandbox")
+"""Sandbox providers that can check out ``lores://`` repositories."""
+
+
 def is_repo_workspace(workspace: str) -> bool:
     """
     Return whether *workspace* is a repository-URL workspace.
@@ -3866,9 +3870,9 @@ def _apply_git_clone_options(
     options: GitCloneOptions,
 ) -> Sequence[RepoWorkspace]:
     """Apply admin clone policy before provisioning or replacing any sandbox."""
-    if any(repo.url.startswith("lores://") for repo in repos) and launcher.provider not in (
-        "kubernetes",
-        "agent_sandbox",
+    if (
+        any(repo.url.startswith("lores://") for repo in repos)
+        and launcher.provider not in LORE_PROVIDERS
     ):
         raise HTTPException(400, "Lore checkouts require the Kubernetes or Agent Sandbox provider")
     if options == GitCloneOptions():

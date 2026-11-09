@@ -254,7 +254,8 @@ def _with_preferred_sandbox_provider(request: Request, body: _CreateBody) -> _Cr
     :param request: The originating request, for ``app.state.sandbox_config``.
     :param body: A validated create or fork request.
     :returns: *body*, or a copy naming the preferred provider when *body* is a
-        managed create without one and the server has a launchable preference.
+        managed create without one, the server has a launchable preference,
+        and that provider can check out every repository the request names.
     """
     if getattr(body, "host_type", None) != "managed" or getattr(body, "sandbox_provider", None):
         return body
@@ -262,7 +263,27 @@ def _with_preferred_sandbox_provider(request: Request, body: _CreateBody) -> _Cr
     preferred = sandbox_config.preferred_provider() if sandbox_config is not None else None
     if preferred is None:
         return body
+    from omnigent.server.managed_hosts import LORE_PROVIDERS
+
+    if preferred not in LORE_PROVIDERS and any(
+        workspace.startswith("lores://") for workspace in _requested_workspaces(body)
+    ):
+        return body
     return body.model_copy(update={"sandbox_provider": preferred})
+
+
+def _requested_workspaces(body: BaseModel) -> list[str]:
+    """
+    The repository workspaces a create or fork request names.
+
+    :param body: A validated create or fork request.
+    :returns: Its ``workspaces``, else its ``workspace``, else empty.
+    """
+    workspaces = getattr(body, "workspaces", None)
+    if workspaces:
+        return list(workspaces)
+    workspace = getattr(body, "workspace", None)
+    return [workspace] if workspace else []
 
 
 def _require_attachment_compatible_history(
