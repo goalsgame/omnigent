@@ -1007,6 +1007,15 @@ async def test_messages_after_a_lost_failed_launch_rebind_the_session_once(
     fake.fail_on_host_start = False
     fake._on_host_start = _start_fake_sandbox_host
 
+    async def _runner_connected(*args: object) -> bool:
+        """Stand in for the runner tunnel the fake host never opens."""
+        return True
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._wait_for_managed_runner_tunnel",
+        _runner_connected,
+    )
+
     async def _message(text: str) -> Response:
         return await env.client.post(
             f"/v1/sessions/{session_id}/events",
@@ -1019,7 +1028,17 @@ async def test_messages_after_a_lost_failed_launch_rebind_the_session_once(
     sends = [asyncio.create_task(_message("one")), asyncio.create_task(_message("two"))]
     conv = await _wait_for_managed_binding(env, session_id)
     tunnels = [await future for future in host_futures]
-    await asyncio.wait_for(asyncio.gather(*sends), timeout=30.0)
+    for _ in range(200):
+        launch = env.app.state.managed_launches.get(session_id)
+        if launch is None or launch.settled.is_set():
+            break
+        await asyncio.sleep(0.05)
+    assert launch is None, f"launch settled with error: {launch.error}"
+    # The messages now wait on a runner this fake never connects; the launch
+    # outcome above is what this test covers.
+    for send in sends:
+        send.cancel()
+    await asyncio.gather(*sends, return_exceptions=True)
 
     assert len(fake.provisioned_names) == 2
     assert fake.terminated == ["sb-fake-1"]

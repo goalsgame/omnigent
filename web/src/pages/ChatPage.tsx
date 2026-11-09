@@ -727,10 +727,17 @@ export function ChatPage() {
   // merely offline gets the CLI reconnect dialog like any other session;
   // opening the picker for it would 400 ("already has a runner bound").
   // Mirrors the server's needs_workspace flag (fork label + workspace NULL).
-  const isUnboundFork = isUnboundCodingFork({
-    forkSourceId,
-    workspace: activeSession?.workspace ?? activeConv?.workspace ?? null,
-  });
+  // A managed session never opens the machine picker: the server launches its
+  // sandbox on the next message.
+  const isManagedSession = Boolean(
+    (activeSession?.labels ?? activeConv?.labels)?.[MANAGED_PROVIDER_LABEL_KEY],
+  );
+  const isUnboundFork =
+    !isManagedSession &&
+    isUnboundCodingFork({
+      forkSourceId,
+      workspace: activeSession?.workspace ?? activeConv?.workspace ?? null,
+    });
   // An unbound session (no host, no runner — e.g. an imported one) routes the
   // offline guard to the directory picker (bind + launch a runner on a chosen
   // machine) instead of the terminal reconnect dead-end — but only when that
@@ -746,13 +753,15 @@ export function ChatPage() {
     activeSession?.labels?.[IMPORT_SOURCE_LABEL_KEY] ??
     activeConv?.labels?.[IMPORT_SOURCE_LABEL_KEY] ??
     null;
-  const canResumeOnLocalHost = unboundSessionResumableInApp({
-    unbound:
-      (activeSession?.hostId ?? activeConv?.host_id ?? null) === null &&
-      (activeSession?.runnerId ?? activeConv?.runner_id ?? null) === null,
-    isOwner: isOwnerLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null),
-    importSource,
-  });
+  const canResumeOnLocalHost =
+    !isManagedSession &&
+    unboundSessionResumableInApp({
+      unbound:
+        (activeSession?.hostId ?? activeConv?.host_id ?? null) === null &&
+        (activeSession?.runnerId ?? activeConv?.runner_id ?? null) === null,
+      isOwner: isOwnerLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null),
+      importSource,
+    });
 
   // Author labels show only once a session is shared. A non-owner viewer
   // already implies a share; the owner needs the grant list (manage-only,
@@ -807,9 +816,7 @@ export function ChatPage() {
         // resume picker shows at once. Snapshot labels win; sidebar row is the
         // fallback for an off-page session.
         imported: Boolean((activeSession?.labels ?? activeConv.labels)?.[IMPORT_SOURCE_LABEL_KEY]),
-        managed: Boolean(
-          (activeSession?.labels ?? activeConv.labels)?.[MANAGED_PROVIDER_LABEL_KEY],
-        ),
+        managed: isManagedSession,
       }
     : livenessRowFromSession(activeSession);
   // Host-switch launch marker; see the store field. Keeps this surface's
