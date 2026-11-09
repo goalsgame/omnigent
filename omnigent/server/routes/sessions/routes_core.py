@@ -536,22 +536,28 @@ def register_core_routes(
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
+        # Claimed before the provider label exists, so a message that sees the
+        # label joins this launch instead of starting another.
+        managed_launches.begin(session_id)
         # The session row's workspace is overwritten with the CLONED path at
         # bind time; record the raw request value(s) so a sandbox relaunch
         # can re-clone the same repositories. Stored one label per repo (not
         # a single joined value) so the 256-char label-value cap can't
         # silently truncate the list and drop repos on relaunch.
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {
-                MANAGED_PROVIDER_LABEL_KEY: sandbox_provider
-                or sandbox_config.default.provider
-                or "default",
-                **managed_repo_labels(workspaces),
-            },
-        )
-        managed_launches.begin(session_id)
+        try:
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {
+                    MANAGED_PROVIDER_LABEL_KEY: sandbox_provider
+                    or sandbox_config.default.provider
+                    or "default",
+                    **managed_repo_labels(workspaces),
+                },
+            )
+        except Exception:
+            managed_launches.fail(session_id, "could not record the sandbox launch")
+            raise
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
         # session page immediately after this 201) already carries the

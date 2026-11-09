@@ -916,6 +916,48 @@ async def test_message_relaunches_a_failed_first_launch_after_its_record_is_lost
     assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
 
 
+async def test_a_raising_unbound_launch_settles_so_the_next_message_retries(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception inside the claimed launch fails it rather than leaving it pending."""
+    env = managed_session_env
+    fake = FakeSandboxLauncher(fail_on_host_start=True)
+    install_fake_modal_launcher(monkeypatch, fake)
+    agent = await create_test_agent(env.client, name="managed-raising-agent")
+    resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    first = env.app.state.managed_launches.get(session_id)
+    assert first is not None
+    await asyncio.wait_for(first.settled.wait(), timeout=15.0)
+    env.app.state.managed_launches = ManagedLaunchTracker()
+
+    calls = 0
+
+    async def _raise(**kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._run_managed_launch", _raise
+    )
+    body = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    }
+    for _ in range(2):
+        retry = await asyncio.wait_for(
+            env.client.post(f"/v1/sessions/{session_id}/events", json=body), timeout=15.0
+        )
+        assert retry.status_code == 503, retry.text
+        assert "store unavailable" in retry.text
+    assert calls == 2
+
+
 async def test_messages_after_a_lost_failed_launch_rebind_the_session_once(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,

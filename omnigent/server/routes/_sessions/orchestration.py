@@ -5019,20 +5019,32 @@ async def _launch_unbound_managed_session(
         session_id,
         extra={"session_id": session_id},
     )
-    await _run_managed_launch(
-        session_id=session_id,
-        owner=owner if owner is not None else RESERVED_USER_LOCAL,
-        sandbox_config=sandbox_config,
-        repos=repos,
-        tracker=tracker,
-        conversation_store=conversation_store,
-        host_store=host_store,
-        host_registry=getattr(app_state, "host_registry", None),
-        tunnel_registry=getattr(app_state, "tunnel_registry", None),
-        provider=provider,
-        agent_store=getattr(app_state, "agent_store", None),
-        agent_id=conv.agent_id,
-    )
+    try:
+        await _run_managed_launch(
+            session_id=session_id,
+            owner=owner if owner is not None else RESERVED_USER_LOCAL,
+            sandbox_config=sandbox_config,
+            repos=repos,
+            tracker=tracker,
+            conversation_store=conversation_store,
+            host_store=host_store,
+            host_registry=getattr(app_state, "host_registry", None),
+            tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            provider=provider,
+            agent_store=getattr(app_state, "agent_store", None),
+            agent_id=conv.agent_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — the claimed entry must always settle
+        launch = tracker.get(session_id)
+        if launch is not None and not launch.settled.is_set():
+            _logger.warning(
+                "Sandbox launch for session %s raised",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            tracker.fail(session_id, f"sandbox launch failed: {exc}")
+            _publish_sandbox_status(session_id, "failed", "sandbox launch failed")
 
 
 def _kick_managed_wake(
