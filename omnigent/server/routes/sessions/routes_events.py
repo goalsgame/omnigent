@@ -235,6 +235,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
+    _maybe_launch_unbound_managed_sandbox,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
     _native_pane_harness,
@@ -2359,8 +2360,24 @@ def register_events_routes(
             _managed_launch = (
                 _managed_tracker.get(session_id) if _managed_tracker is not None else None
             )
-            if _managed_launch is not None:
+            _launch_failed = (
+                _managed_launch is not None
+                and _managed_launch.settled.is_set()
+                and _managed_launch.error is not None
+            )
+            if _managed_launch is not None and not _launch_failed:
                 await _await_settled_managed_launch(_managed_launch)
+                _rebound = True
+            else:
+                _rebound = await _maybe_launch_unbound_managed_sandbox(
+                    session_id=session_id,
+                    conv=conv,
+                    app_state=request.app.state,
+                    conversation_store=conversation_store,
+                )
+                if not _rebound and _managed_launch is not None:
+                    await _await_settled_managed_launch(_managed_launch)
+            if _rebound:
                 # The launch bound host_id / workspace / runner_id to
                 # the row after this handler's fetch — re-read so the
                 # resolution below sees the bound runner.

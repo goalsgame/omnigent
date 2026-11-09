@@ -99,6 +99,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    MANAGED_PROVIDER_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationAlreadyExistsError,
@@ -1334,7 +1335,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(unique_ids),
-                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY, IMPORT_SOURCE_LABEL_KEY]),
+                    SqlConversationLabel.key.in_(
+                        [
+                            FORK_SOURCE_LABEL_KEY,
+                            IMPORT_SOURCE_LABEL_KEY,
+                            MANAGED_PROVIDER_LABEL_KEY,
+                        ]
+                    ),
                 )
             ).all()
         needs_workspace_ids = {
@@ -1343,6 +1350,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         imported_ids = {
             row.conversation_id for row in label_rows if row.key == IMPORT_SOURCE_LABEL_KEY
         }
+        managed_ids = {
+            row.conversation_id for row in label_rows if row.key == MANAGED_PROVIDER_LABEL_KEY
+        }
         return {
             row.id: SessionConnectivity(
                 runner_id=row.runner_id,
@@ -1350,6 +1360,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 needs_workspace=row.id in needs_workspace_ids,
                 imported=row.id in imported_ids,
                 runner_last_seen=row.runner_last_seen,
+                managed=row.id in managed_ids,
             )
             for row in meta_rows
         }

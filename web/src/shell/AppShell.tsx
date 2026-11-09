@@ -109,6 +109,7 @@ import { supportsSideChat } from "@/lib/sideChat";
 import {
   STARTING_GRACE_S,
   livenessRowFromSession,
+  MANAGED_PROVIDER_LABEL_KEY,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
@@ -600,7 +601,14 @@ export function AppShell() {
   // Set when this client launches a runner outside the send path (a host
   // switch); extends the liveness startup grace so the move spins.
   const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
-  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  const livenessRow = activeConv
+    ? {
+        ...activeConv,
+        managed: Boolean(
+          (activeSession?.labels ?? activeConv.labels)?.[MANAGED_PROVIDER_LABEL_KEY],
+        ),
+      }
+    : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(conversationId ?? undefined, livenessRow, {
     turnActive: chatStatus === "streaming",
     launchedAt: runnerLaunchedAt,

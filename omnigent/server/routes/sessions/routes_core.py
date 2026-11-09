@@ -506,6 +506,7 @@ def register_core_routes(
             )
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
+            MANAGED_PROVIDER_LABEL_KEY,
             managed_repo_labels,
             parse_repo_workspace,
         )
@@ -535,18 +536,28 @@ def register_core_routes(
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
-        if workspaces:
-            # The session row's workspace is overwritten with the CLONED path at
-            # bind time; record the raw request value(s) so a sandbox relaunch
-            # can re-clone the same repositories. Stored one label per repo (not
-            # a single joined value) so the 256-char label-value cap can't
-            # silently truncate the list and drop repos on relaunch.
+        # Claimed before the provider label exists, so a message that sees the
+        # label joins this launch instead of starting another.
+        managed_launches.begin(session_id)
+        # The session row's workspace is overwritten with the CLONED path at
+        # bind time; record the raw request value(s) so a sandbox relaunch
+        # can re-clone the same repositories. Stored one label per repo (not
+        # a single joined value) so the 256-char label-value cap can't
+        # silently truncate the list and drop repos on relaunch.
+        try:
             await asyncio.to_thread(
                 conversation_store.set_labels,
                 session_id,
-                managed_repo_labels(workspaces),
+                {
+                    MANAGED_PROVIDER_LABEL_KEY: sandbox_provider
+                    or sandbox_config.default.provider
+                    or "default",
+                    **managed_repo_labels(workspaces),
+                },
             )
-        managed_launches.begin(session_id)
+        except Exception:
+            managed_launches.fail(session_id, "could not record the sandbox launch")
+            raise
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
         # session page immediately after this 201) already carries the
@@ -3692,9 +3703,12 @@ def register_core_routes(
         )
 
         # Physical placement belongs to this fork's own launch, not its source.
+        from omnigent.server.managed_hosts import MANAGED_PROVIDER_LABEL_KEY
+
         dropped_label_keys_set: set[str] = {
             INFERENCE_HOST_POLICY_LABEL,
             SEPARATE_INFERENCE_RUNNER_LABEL,
+            MANAGED_PROVIDER_LABEL_KEY,
         }
         if launch_args_set:
             dropped_label_keys_set |= {

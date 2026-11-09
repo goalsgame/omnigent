@@ -27,6 +27,7 @@ from omnigent.entities import (
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
+    MANAGED_PROVIDER_LABEL_KEY,
     MANAGED_REPO_LABEL_KEY,
     ManagedLaunchTracker,
     parse_sandbox_config,
@@ -1921,7 +1922,7 @@ async def test_fork_managed_schedules_sandbox_launch(
     assert launch["provider"] == "modal"
     # No repository on either side, so the clone gets an empty sandbox.
     assert launch["repos"] == []
-    assert conv_store.label_writes == []
+    assert conv_store.label_writes == [(body["id"], {MANAGED_PROVIDER_LABEL_KEY: "modal"})]
 
 
 @pytest.mark.asyncio
@@ -2043,6 +2044,7 @@ async def test_fork_managed_inherits_source_repository(
         (
             resp.json()["id"],
             {
+                MANAGED_PROVIDER_LABEL_KEY: "modal",
                 f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/repo#release-1.2",
                 MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2",
             },
@@ -2090,6 +2092,7 @@ async def test_fork_managed_inherits_all_source_repositories(
         (
             resp.json()["id"],
             {
+                MANAGED_PROVIDER_LABEL_KEY: "kubernetes",
                 f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
                 f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
                 MANAGED_REPO_LABEL_KEY: "https://github.com/org/api#main https://github.com/org/web",
@@ -2146,7 +2149,12 @@ async def test_fork_never_inherits_source_sandbox_repo_label(
     store, so the route asks for nothing here; this covers the route's two
     entries into that path.
     """
-    conv = _make_conversation(labels={MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo"})
+    conv = _make_conversation(
+        labels={
+            MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo",
+            MANAGED_PROVIDER_LABEL_KEY: "modal",
+        }
+    )
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     _arm_managed_app(app, monkeypatch)
@@ -2165,7 +2173,12 @@ async def test_fork_never_inherits_source_sandbox_repo_label(
         fork = conv_store.get_conversation(response.json()["id"])
         assert fork is not None
         assert MANAGED_REPO_LABEL_KEY not in fork.labels
-    assert conv_store.label_writes == [], "no workspace resolved, so nothing to re-stamp"
+    external_fork = conv_store.get_conversation(external.json()["id"])
+    assert external_fork is not None
+    assert MANAGED_PROVIDER_LABEL_KEY not in external_fork.labels
+    assert conv_store.label_writes == [
+        (emptied.json()["id"], {MANAGED_PROVIDER_LABEL_KEY: "modal"})
+    ], "only the managed fork records its provider; no workspace resolved to re-stamp"
 
 
 @pytest.mark.asyncio

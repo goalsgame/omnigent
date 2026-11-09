@@ -180,6 +180,18 @@ describe("useSessionLiveness — derivation truth table", () => {
     });
   });
 
+  it("runner_asleep (not local_stranded) for a managed session without a host", () => {
+    // The server launches a sandbox for it on the next message, so the composer
+    // stays open; while that message's turn runs it reads as starting.
+    expect(derive(false, null, conv({ host_id: null, managed: true }))).toEqual({
+      kind: "runner_asleep",
+    });
+    expect(
+      derive(false, null, conv({ host_id: null, managed: true }), { turnActive: true }),
+    ).toEqual({ kind: "starting" });
+    expect(derive(false, null, conv({ host_id: null }))).toEqual({ kind: "local_stranded" });
+  });
+
   describe("host-switch launch grace", () => {
     it("starting while a just-launched runner has not registered yet", () => {
       // A switch binds a runner on the new host, but nothing on the wire
@@ -350,12 +362,17 @@ describe("useSessionLiveness — derivation truth table", () => {
         host_resumable: false,
         kind: undefined,
         imported: false,
+        managed: false,
       });
       // hostResumable flows through so an off-sidebar resumable host can
       // classify host_asleep rather than dead-ending on host_offline.
       expect(livenessRowFromSession(session({ hostId: "h1", hostResumable: true }))).toMatchObject({
         host_resumable: true,
       });
+      // The managed-sandbox label marks a session the server can relaunch.
+      expect(
+        livenessRowFromSession(session({ labels: { "omnigent.sandbox.provider": "modal" } })),
+      ).toMatchObject({ managed: true });
       // kind flows through so sub-agent sessions are not misclassified.
       expect(livenessRowFromSession(session({ kind: "sub_agent" }))).toMatchObject({
         kind: "sub_agent",

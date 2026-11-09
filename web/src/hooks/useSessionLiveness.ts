@@ -55,10 +55,20 @@ export type LivenessRow = Pick<Conversation, "host_id" | "permission_level" | "c
    * should offer the resume picker immediately. Absent ⇒ treated `false`.
    */
   imported?: boolean;
+  /**
+   * Whether this session was created on a managed sandbox (the server-written
+   * `omnigent.sandbox.provider` label). The server launches a sandbox for such
+   * a session on the next message even when it never got a host, so it is
+   * never `local_stranded`. Absent ⇒ treated `false`.
+   */
+  managed?: boolean;
 };
 
 /** Label marking a session imported from a local harness transcript. */
 export const IMPORT_SOURCE_LABEL_KEY = "omnigent.import.source";
+
+/** Server-written label marking a session created on a managed sandbox. */
+export const MANAGED_PROVIDER_LABEL_KEY = "omnigent.sandbox.provider";
 
 /**
  * Build a {@link LivenessRow} from the single-session snapshot
@@ -87,6 +97,7 @@ export function livenessRowFromSession(
     host_resumable: session.hostResumable ?? false,
     kind: session.kind,
     imported: Boolean(session.labels?.[IMPORT_SOURCE_LABEL_KEY]),
+    managed: Boolean(session.labels?.[MANAGED_PROVIDER_LABEL_KEY]),
   };
 }
 
@@ -340,6 +351,13 @@ function useSessionLivenessRaw(
   // composer open so the send reaches the server; never show the CLI
   // reconnect modal for these.
   if (conv?.kind === "sub_agent") return { kind: "runner_asleep" };
+
+  // 7b. Managed session without a host (its sandbox launch failed or never
+  // ran). The server launches a sandbox on the next message, so keep the
+  // composer open, and show `starting` while that message's turn is active.
+  if (conv?.managed) {
+    return opts?.turnActive ? { kind: "starting" } : { kind: "runner_asleep" };
+  }
 
   // 7. Not host-bound. `host_online` is `null` for these (no host to be
   // online); once the runner is known-down there's no host to relaunch
