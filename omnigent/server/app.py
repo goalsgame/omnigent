@@ -3037,7 +3037,11 @@ def create_app(
                 # transcript (no live executor anywhere). Reporting those
                 # offline routes the first message into the resume picker
                 # instead of dropping it against a runner that can't start.
-                runner_online = not (conn.needs_workspace or conn.imported)
+                runner_online = not (
+                    conn.needs_workspace
+                    or conn.imported
+                    or (conn.managed and conn.host_id is None)
+                )
             else:
                 # Strict: reachable only if the runner tunnel is up. No
                 # host-relaunch optimism — host state lives in host_online.

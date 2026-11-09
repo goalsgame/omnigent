@@ -874,6 +874,48 @@ async def test_managed_session_create_without_config_fails_clearly(
     assert "managed hosts are not configured" in resp.text
 
 
+async def test_message_relaunches_a_failed_first_launch_after_its_record_is_lost(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A managed session whose first launch failed reports offline, and a message
+    launches a fresh sandbox even after a restart dropped the in-memory failure.
+    """
+    env = managed_session_env
+    fake = FakeSandboxLauncher(fail_on_host_start=True)
+    install_fake_modal_launcher(monkeypatch, fake)
+    agent = await create_test_agent(env.client, name="managed-unbound-agent")
+    resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    first = env.app.state.managed_launches.get(session_id)
+    assert first is not None
+    await asyncio.wait_for(first.settled.wait(), timeout=15.0)
+    assert first.error is not None
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.host_id is None
+    assert conv.labels["omnigent.sandbox.provider"] == "modal"
+
+    env.app.state.managed_launches = ManagedLaunchTracker()
+    snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["runner_online"] is False
+
+    retry = await env.client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+        },
+    )
+    assert retry.status_code == 503, retry.text
+    assert "managed sandbox failed to launch" in retry.text
+    assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
+
+
 async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -894,7 +936,8 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
 
     Releasing the gate lets the launch proceed into a host-start
     failure, which must surface the recorded reason on the waiting
-    message POST (and on later ones), and tear the sandbox down.
+    message POST, and tear the sandbox down. A later message retries the
+    launch, which fails the same way and is torn down too.
     """
     import threading
 
@@ -951,7 +994,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     assert "managed sandbox failed to launch" in message_resp.text
     assert "host startup failed" in message_resp.text
 
-    # A later message hits the retained failure record immediately.
+    # A later message launches a fresh sandbox, which fails at host start too.
     late_resp = await env.client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -965,9 +1008,9 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     assert late_resp.status_code == 503, late_resp.text
     assert "managed sandbox failed to launch" in late_resp.text
 
-    # The failed launch tore the sandbox down (launch_managed_host's
+    # Each failed launch tore its sandbox down (launch_managed_host's
     # cleanup path), so nothing leaks until the provider lifetime cap.
-    assert fake.terminated == ["sb-fake-1"]
+    assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
 
     # The failure is retained on the snapshot (mirroring the tracker's
     # failed-entry retention) so a client reloading the dead session

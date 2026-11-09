@@ -211,6 +211,9 @@ from omnigent.onboarding.sandboxes.base import (
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
 from omnigent.startup_timing import startup_span, startup_timed
+from omnigent.stores.conversation_store import (
+    MANAGED_PROVIDER_LABEL_KEY as MANAGED_PROVIDER_LABEL_KEY,
+)
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:

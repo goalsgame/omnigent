@@ -31,6 +31,12 @@ if TYPE_CHECKING:
 # the SQLAlchemy store both import it.
 FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 
+# Server-written marker that a session was created on a managed sandbox; its
+# value is the provider the create resolved. Presence makes an unbound session
+# report offline, and lets a message launch a fresh sandbox for a session whose
+# first launch failed. Forks drop it.
+MANAGED_PROVIDER_LABEL_KEY = "omnigent.sandbox.provider"
+
 # One-shot fork directive: the SOURCE session's runtime-native session id
 # (e.g. the source claude-native Claude Code session uuid), stamped on the
 # clone at fork time when the source had one. A native harness launching
@@ -281,6 +287,10 @@ class SessionConnectivity:
         an imported transcript has no live executor anywhere, so it must
         launch a runner on a host before it can run — reporting it offline
         routes the first message into the resume picker.
+    :param managed: ``True`` when the session was created on a managed
+        sandbox (the ``omnigent.sandbox.provider`` label is set). Forces the
+        online dot off while ``host_id`` is ``None``: the session has no
+        in-process executor and needs a sandbox launch before it can run.
     :param runner_last_seen: Epoch seconds the bound runner's tunnel was
         last observed alive, written by the replica holding the tunnel.
         ``None`` when never observed (or cleared on graceful disconnect).
@@ -294,6 +304,7 @@ class SessionConnectivity:
     needs_workspace: bool
     imported: bool = False
     runner_last_seen: int | None = None
+    managed: bool = False
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel

@@ -4887,6 +4887,95 @@ def _kick_managed_relaunch(
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
 
 
+async def _maybe_launch_unbound_managed_sandbox(
+    *,
+    session_id: str,
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+) -> bool:
+    """
+    Launch a sandbox for a managed session that never got a host.
+
+    A managed create whose first launch failed leaves the session without a
+    host, and a restart loses the in-memory record of that failure. A message
+    to such a session launches a fresh sandbox on the provider its create
+    recorded, then waits for it, so the message is delivered once the runner
+    connects. Only sessions carrying the server-written
+    ``MANAGED_PROVIDER_LABEL_KEY`` qualify.
+
+    Single-flighted through the app's :class:`ManagedLaunchTracker`, like
+    :func:`_maybe_relaunch_managed_sandbox`: an in-flight launch is joined,
+    and a failed one is replaced by a new attempt.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: The session row, with ``host_id`` unset.
+    :param app_state: ``request.app.state`` — supplies the host store,
+        sandbox config, tracker, registries and agent store.
+    :param conversation_store: Store holding the session row.
+    :returns: ``True`` when a launch settled successfully (re-read the row and
+        re-resolve the runner client); ``False`` when the session is not an
+        unbound managed session or managed hosts are not configured.
+    :raises OmnigentError: 503 when the launch failed or timed out.
+    """
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.managed_hosts import MANAGED_PROVIDER_LABEL_KEY
+
+    host_store = getattr(app_state, "host_store", None)
+    sandbox_config = getattr(app_state, "sandbox_config", None)
+    tracker = getattr(app_state, "managed_launches", None)
+    if host_store is None or sandbox_config is None or tracker is None:
+        return False
+    recorded_provider = (conv.labels or {}).get(MANAGED_PROVIDER_LABEL_KEY)
+    if conv.host_id is not None or recorded_provider is None:
+        return False
+    owner = await asyncio.to_thread(
+        conversation_store.get_session_owner, session_id, owner_only=True
+    )
+    launch = tracker.get(session_id)
+    if launch is None or (launch.settled.is_set() and launch.error is not None):
+        provider = (
+            recorded_provider
+            if sandbox_config.for_provider(recorded_provider) is not None
+            else None
+        )
+        repos = _recorded_repo_workspaces(
+            session_id,
+            conv.labels,
+            invalid_label_fallback="launching with an empty workspace",
+        )
+        _logger.info(
+            "Managed session %s has no sandbox host; launching one for its message",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        tracker.begin(session_id)
+        _publish_sandbox_status(session_id, "provisioning")
+        launch_task = asyncio.create_task(
+            _run_managed_launch(
+                session_id=session_id,
+                owner=owner if owner is not None else RESERVED_USER_LOCAL,
+                sandbox_config=sandbox_config,
+                repos=repos,
+                tracker=tracker,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                host_registry=getattr(app_state, "host_registry", None),
+                tunnel_registry=getattr(app_state, "tunnel_registry", None),
+                provider=provider,
+                agent_store=getattr(app_state, "agent_store", None),
+                agent_id=conv.agent_id,
+            )
+        )
+        _managed_launch_tasks.add(launch_task)
+        launch_task.add_done_callback(_managed_launch_tasks.discard)
+        launch = tracker.get(session_id)
+    if launch is None:
+        return False
+    await _await_settled_managed_launch(launch)
+    return True
+
+
 def _kick_managed_wake(
     *,
     session_id: str,
