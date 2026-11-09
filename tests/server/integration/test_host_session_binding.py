@@ -765,9 +765,20 @@ async def test_managed_session_create_defaults_to_the_preferred_provider(
         assert await asyncio.wait_for(launched.get(), timeout=10) == expected
 
 
+_LORE_WORKSPACE = "lores://lore.example.com/apps/demo#main"
+
+
 @pytest.mark.parametrize(
-    ("providers", "expected"),
-    [(["modal", "e2b"], None), (["modal", "kubernetes"], "kubernetes")],
+    ("providers", "repos", "expected"),
+    [
+        (["modal", "e2b"], {"workspace": _LORE_WORKSPACE}, None),
+        (
+            ["kubernetes", "e2b"],
+            {"workspaces": ["https://github.com/example/tools", _LORE_WORKSPACE]},
+            None,
+        ),
+        (["modal", "kubernetes"], {"workspace": _LORE_WORKSPACE}, "kubernetes"),
+    ],
 )
 async def test_a_lore_create_keeps_a_provider_that_can_check_it_out(
     runtime_init: None,
@@ -775,6 +786,7 @@ async def test_a_lore_create_keeps_a_provider_that_can_check_it_out(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     providers: list[str],
+    repos: dict[str, object],
     expected: str | None,
 ) -> None:
     """
@@ -810,11 +822,7 @@ async def test_a_lore_create_keeps_a_provider_that_can_check_it_out(
         agent = await create_test_agent(client, name="managed-lore-provider-agent")
         resp = await client.post(
             "/v1/sessions",
-            json={
-                "agent_id": agent["id"],
-                "host_type": "managed",
-                "workspace": "lores://lore.example.com/apps/demo#main",
-            },
+            json={"agent_id": agent["id"], "host_type": "managed", **repos},
         )
         assert resp.status_code == 201, resp.text
         assert await asyncio.wait_for(launched.get(), timeout=10) == expected
