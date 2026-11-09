@@ -16,7 +16,7 @@ import pytest
 import pytest_asyncio
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI, HTTPException
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -914,6 +914,81 @@ async def test_message_relaunches_a_failed_first_launch_after_its_record_is_lost
     assert retry.status_code == 503, retry.text
     assert "managed sandbox failed to launch" in retry.text
     assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
+
+
+async def test_messages_after_a_lost_failed_launch_rebind_the_session_once(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Concurrent messages to a managed session whose failed first launch was
+    forgotten share one new launch, which re-clones the recorded repository and
+    binds the session to a fresh host.
+    """
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(fail_on_host_start=True)
+    install_fake_modal_launcher(monkeypatch, fake)
+    agent = await create_test_agent(env.client, name="managed-recover-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "workspace": "https://github.com/org/myrepo.git#main",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    first = env.app.state.managed_launches.get(session_id)
+    assert first is not None
+    await asyncio.wait_for(first.settled.wait(), timeout=15.0)
+    assert first.error is not None
+
+    env.app.state.managed_launches = ManagedLaunchTracker()
+    fake.fail_on_host_start = False
+    fake._on_host_start = _start_fake_sandbox_host
+
+    async def _message(text: str) -> Response:
+        return await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            },
+        )
+
+    sends = [asyncio.create_task(_message("one")), asyncio.create_task(_message("two"))]
+    conv = await _wait_for_managed_binding(env, session_id)
+    tunnels = [await future for future in host_futures]
+    await asyncio.wait_for(asyncio.gather(*sends), timeout=30.0)
+
+    assert len(fake.provisioned_names) == 2
+    assert fake.terminated == ["sb-fake-1"]
+    assert len(tunnels) == 1
+    assert conv.host_id is not None
+    assert conv.workspace == "/root/workspace/myrepo"
+    assert (
+        "git clone --branch main --single-branch "
+        "-- https://github.com/org/myrepo.git /root/workspace/myrepo"
+    ) in fake.commands
+    del tunnels
 
 
 async def test_managed_create_returns_during_provision_and_message_rendezvouses(

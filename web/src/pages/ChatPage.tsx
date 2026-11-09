@@ -191,6 +191,7 @@ import {
   type SessionLiveness,
   IMPORT_SOURCE_LABEL_KEY,
   livenessRowFromSession,
+  MANAGED_PROVIDER_LABEL_KEY,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
@@ -806,6 +807,9 @@ export function ChatPage() {
         // resume picker shows at once. Snapshot labels win; sidebar row is the
         // fallback for an off-page session.
         imported: Boolean((activeSession?.labels ?? activeConv.labels)?.[IMPORT_SOURCE_LABEL_KEY]),
+        managed: Boolean(
+          (activeSession?.labels ?? activeConv.labels)?.[MANAGED_PROVIDER_LABEL_KEY],
+        ),
       }
     : livenessRowFromSession(activeSession);
   // Host-switch launch marker; see the store field. Keeps this surface's

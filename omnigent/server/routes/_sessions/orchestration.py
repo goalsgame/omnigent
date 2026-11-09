@@ -4906,7 +4906,10 @@ async def _maybe_launch_unbound_managed_sandbox(
 
     Single-flighted through the app's :class:`ManagedLaunchTracker`, like
     :func:`_maybe_relaunch_managed_sandbox`: an in-flight launch is joined,
-    and a failed one is replaced by a new attempt.
+    and a failed one is replaced by a new attempt. The claim follows the
+    tracker check with no ``await`` in between, and the claimed task re-reads
+    the row first, so a request holding a stale unbound row joins a launch
+    that already bound the session instead of provisioning a second sandbox.
 
     :param session_id: Session/conversation identifier.
     :param conv: The session row, with ``host_id`` unset.
@@ -4918,7 +4921,6 @@ async def _maybe_launch_unbound_managed_sandbox(
         unbound managed session or managed hosts are not configured.
     :raises OmnigentError: 503 when the launch failed or timed out.
     """
-    from omnigent.server.auth import RESERVED_USER_LOCAL
     from omnigent.server.managed_hosts import MANAGED_PROVIDER_LABEL_KEY
 
     host_store = getattr(app_state, "host_store", None)
@@ -4926,45 +4928,20 @@ async def _maybe_launch_unbound_managed_sandbox(
     tracker = getattr(app_state, "managed_launches", None)
     if host_store is None or sandbox_config is None or tracker is None:
         return False
-    recorded_provider = (conv.labels or {}).get(MANAGED_PROVIDER_LABEL_KEY)
-    if conv.host_id is not None or recorded_provider is None:
+    if conv.host_id is not None or MANAGED_PROVIDER_LABEL_KEY not in (conv.labels or {}):
         return False
-    owner = await asyncio.to_thread(
-        conversation_store.get_session_owner, session_id, owner_only=True
-    )
     launch = tracker.get(session_id)
     if launch is None or (launch.settled.is_set() and launch.error is not None):
-        provider = (
-            recorded_provider
-            if sandbox_config.for_provider(recorded_provider) is not None
-            else None
-        )
-        repos = _recorded_repo_workspaces(
-            session_id,
-            conv.labels,
-            invalid_label_fallback="launching with an empty workspace",
-        )
-        _logger.info(
-            "Managed session %s has no sandbox host; launching one for its message",
-            session_id,
-            extra={"session_id": session_id},
-        )
         tracker.begin(session_id)
         _publish_sandbox_status(session_id, "provisioning")
         launch_task = asyncio.create_task(
-            _run_managed_launch(
+            _launch_unbound_managed_session(
                 session_id=session_id,
-                owner=owner if owner is not None else RESERVED_USER_LOCAL,
                 sandbox_config=sandbox_config,
-                repos=repos,
                 tracker=tracker,
                 conversation_store=conversation_store,
                 host_store=host_store,
-                host_registry=getattr(app_state, "host_registry", None),
-                tunnel_registry=getattr(app_state, "tunnel_registry", None),
-                provider=provider,
-                agent_store=getattr(app_state, "agent_store", None),
-                agent_id=conv.agent_id,
+                app_state=app_state,
             )
         )
         _managed_launch_tasks.add(launch_task)
@@ -4974,6 +4951,88 @@ async def _maybe_launch_unbound_managed_sandbox(
         return False
     await _await_settled_managed_launch(launch)
     return True
+
+
+async def _launch_unbound_managed_session(
+    *,
+    session_id: str,
+    sandbox_config: ManagedSandboxDeployment,
+    tracker: ManagedLaunchTracker,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    app_state: Any,
+) -> None:
+    """
+    Run the launch claimed by :func:`_maybe_launch_unbound_managed_sandbox`.
+
+    Settles the claimed tracker entry on every path. A session another launch
+    already bound settles successfully without provisioning.
+
+    :param session_id: Session/conversation identifier.
+    :param sandbox_config: The deployment's sandbox config.
+    :param tracker: The app's launch tracker; this session's entry is claimed.
+    :param conversation_store: Store holding the session row.
+    :param host_store: Persistent host registrations.
+    :param app_state: ``request.app.state`` — supplies the registries and the
+        agent store.
+    """
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.managed_hosts import MANAGED_PROVIDER_LABEL_KEY
+
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            tracker.fail(session_id, "session was deleted")
+            _publish_sandbox_status(session_id, "failed", "session was deleted")
+            return
+        if conv.host_id is not None:
+            tracker.finish(session_id)
+            _publish_sandbox_status(session_id, "ready")
+            return
+        owner = await asyncio.to_thread(
+            conversation_store.get_session_owner, session_id, owner_only=True
+        )
+        recorded_provider = (conv.labels or {}).get(MANAGED_PROVIDER_LABEL_KEY)
+        provider = (
+            recorded_provider
+            if recorded_provider is not None
+            and sandbox_config.for_provider(recorded_provider) is not None
+            else None
+        )
+        repos = _recorded_repo_workspaces(
+            session_id,
+            conv.labels,
+            invalid_label_fallback="launching with an empty workspace",
+        )
+    except Exception as exc:  # noqa: BLE001 — the claimed entry must always settle
+        _logger.warning(
+            "Could not prepare the sandbox launch for session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        tracker.fail(session_id, f"could not prepare the sandbox launch: {exc}")
+        _publish_sandbox_status(session_id, "failed", "could not prepare the sandbox launch")
+        return
+    _logger.info(
+        "Managed session %s has no sandbox host; launching one for its message",
+        session_id,
+        extra={"session_id": session_id},
+    )
+    await _run_managed_launch(
+        session_id=session_id,
+        owner=owner if owner is not None else RESERVED_USER_LOCAL,
+        sandbox_config=sandbox_config,
+        repos=repos,
+        tracker=tracker,
+        conversation_store=conversation_store,
+        host_store=host_store,
+        host_registry=getattr(app_state, "host_registry", None),
+        tunnel_registry=getattr(app_state, "tunnel_registry", None),
+        provider=provider,
+        agent_store=getattr(app_state, "agent_store", None),
+        agent_id=conv.agent_id,
+    )
 
 
 def _kick_managed_wake(
