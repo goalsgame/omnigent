@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import click
 import httpx
@@ -356,6 +357,69 @@ def test_github_clone_uses_the_brokered_helper_with_the_token_in_env(
     assert "env" not in other
     assert "git_credential_github" not in str(other["command"])
     assert launcher._clone_auth == {}
+
+
+def test_lore_checkout_runs_the_brokered_checkout_with_the_token_in_env(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
+
+    host.exec_response = {"exit_code": 0, "stdout": "/root", "stderr": "", "timed_out": False}
+    sandbox_id = launcher.provision("managed")
+    launcher.start_host(
+        sandbox_id,
+        token="launch-secret",
+        host_id="host-1",
+        host_name="managed",
+        server_url="https://omnigent.example",
+        repos=[
+            RepoWorkspace(
+                url="lores://lore.example.test/goalables/demo", branch="main", repo_name="demo"
+            )
+        ],
+    )
+    checkouts = [b for b in _exec_bodies(host) if "omnigent.lore_checkout" in str(b["command"])]
+    assert len(checkouts) == 1
+    assert checkouts[0]["env"] == {HOST_TOKEN_ENV_VAR: "launch-secret"}
+    command = str(checkouts[0]["command"])
+    assert "launch-secret" not in command
+    assert "--remote lores://lore.example.test/goalables/demo" in command
+    assert "--target /root/workspace/demo" in command
+    assert "--ref main" in command
+    assert not [b for b in _exec_bodies(host) if "git clone" in str(b["command"])]
+
+
+_LORE_REMOTE = "lores://lore.example.test/goalables/demo"
+
+
+def test_a_failed_lore_checkout_names_the_repository(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    sandbox_id = launcher.provision("managed")
+    launcher._clone_auth[sandbox_id] = ("https://omnigent.example", "host-1", "launch-secret")
+    host.exec_response = {
+        "exit_code": 87,
+        "stdout": "",
+        "stderr": "Lore clone failed; verify access, revision, view and available disk space",
+        "timed_out": False,
+    }
+    with pytest.raises(click.ClickException, match=re.escape(_LORE_REMOTE)):
+        launcher.materialize_workspace(
+            sandbox_id,
+            workspace="/home/omnigent",
+            repo_url=_LORE_REMOTE,
+            repo_branch=None,
+            repo_name="demo",
+        )
+    with pytest.raises(click.ClickException, match="outside a managed host launch"):
+        launcher.materialize_workspace(
+            "other",
+            workspace="/home/omnigent",
+            repo_url=_LORE_REMOTE,
+            repo_branch=None,
+            repo_name="demo",
+        )
 
 
 @pytest.mark.parametrize(

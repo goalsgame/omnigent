@@ -379,6 +379,16 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
         git_clone: GitCloneOptions = GitCloneOptions(),
     ) -> str:
         auth = self._clone_auth.get(sandbox_id)
+        if repo_url.startswith("lores://"):
+            return self._lore_checkout(
+                sandbox_id,
+                auth,
+                workspace=workspace,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                on_stage=on_stage,
+            )
         parts = urlsplit(repo_url)
         if auth is None or parts.scheme != "https" or parts.hostname != "github.com":
             return super().materialize_workspace(
@@ -407,6 +417,51 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             raise click.ClickException(
                 f"failed to clone repository '{repo_url}'"
                 f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
+            ) from exc
+        return clone_dir
+
+    def _lore_checkout(
+        self,
+        sandbox_id: str,
+        auth: tuple[str, str, str] | None,
+        *,
+        workspace: str,
+        repo_url: str,
+        repo_branch: str | None,
+        repo_name: str | None,
+        on_stage: Callable[[str], None] | None,
+    ) -> str:
+        """Check out a ``lores://`` repository with the server-brokered Lore identity."""
+        if auth is None:
+            raise click.ClickException(
+                f"cannot check out Lore repository '{repo_url}' outside a managed host launch"
+            )
+        server_url, host_id, token = auth
+        if on_stage is not None:
+            on_stage("cloning")
+        clone_dir = f"{workspace}/{repo_name}"
+        args = [
+            "python3",
+            "-I",
+            "-m",
+            "omnigent.lore_checkout",
+            "--server",
+            server_url,
+            "--host-id",
+            host_id,
+            "--remote",
+            repo_url,
+            "--target",
+            clone_dir,
+        ]
+        if repo_branch:
+            args += ["--ref", repo_branch]
+        try:
+            self.run(sandbox_id, shlex.join(args), env={HOST_TOKEN_ENV_VAR: token})
+        except click.ClickException as exc:
+            raise click.ClickException(
+                f"failed to check out Lore repository '{repo_url}'"
+                f"{f' (ref {repo_branch!r})' if repo_branch else ''}: {exc.message}"
             ) from exc
         return clone_dir
 

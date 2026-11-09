@@ -888,7 +888,7 @@ _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _BRANCH_FORBIDDEN_CHARS = set(" \t~^:?*[\\#")
 
 
-LORE_PROVIDERS = ("kubernetes", "agent_sandbox")
+LORE_PROVIDERS = ("kubernetes", "agent_sandbox", "microsandbox_remote")
 """Sandbox providers that can check out ``lores://`` repositories."""
 
 
@@ -3874,7 +3874,10 @@ def _apply_git_clone_options(
         any(repo.url.startswith("lores://") for repo in repos)
         and launcher.provider not in LORE_PROVIDERS
     ):
-        raise HTTPException(400, "Lore checkouts require the Kubernetes or Agent Sandbox provider")
+        raise HTTPException(
+            400,
+            "Lore checkouts require the Kubernetes, Agent Sandbox or remote microsandbox provider",
+        )
     if options == GitCloneOptions():
         return repos
     if not launcher.capabilities.git_clone_options:

@@ -778,6 +778,11 @@ _LORE_WORKSPACE = "lores://lore.example.com/apps/demo#main"
             None,
         ),
         (["modal", "kubernetes"], {"workspace": _LORE_WORKSPACE}, "kubernetes"),
+        (
+            ["modal", "microsandbox_remote"],
+            {"workspace": _LORE_WORKSPACE},
+            "microsandbox_remote",
+        ),
     ],
 )
 async def test_a_lore_create_keeps_a_provider_that_can_check_it_out(
@@ -815,6 +820,11 @@ async def test_a_lore_create_keeps_a_provider_that_can_check_it_out(
             {
                 "server_url": "https://managed-test.example.com",
                 "providers": [{"provider": p} for p in providers],
+                **(
+                    {"microsandbox_remote": {"endpoint": "http://sandbox-host:8740"}}
+                    if "microsandbox_remote" in providers
+                    else {}
+                ),
             }
         ),
     )
