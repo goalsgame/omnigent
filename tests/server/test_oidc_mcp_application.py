@@ -580,6 +580,77 @@ async def test_offline_session_bearer_gets_a_bearer_only_grant(login_app, signin
 
 
 @pytest.mark.asyncio
+async def test_bearer_only_grant_never_switches_subject(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    previous = {"access_token": "previous-subject-token", "expires_at": time.time() + 600}
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret=previous,
+        metadata={"issuer": oidc.issuer, "subject": "previous-subject", "bearer_only": True},
+    )
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403, response.text
+    kept = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert kept.metadata["subject"] == "previous-subject"
+    assert kept.secret["access_token"] == "previous-subject-token"
+
+
+def test_bearer_only_grant_yields_to_a_conflicting_login_binding(login_app, oidc, monkeypatch):
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    broker = login_app.state.test_identity_broker
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret={"access_token": "bearer-only-token", "expires_at": time.time() + 600},
+        metadata={"issuer": oidc.issuer, "subject": "human-subject", "bearer_only": True},
+    )
+    assert broker.credential("person@example.test") == "bearer-only-token"
+    monkeypatch.setattr(
+        login_app.state.oidc_login_broker, "known_subject", lambda owner: "other-subject"
+    )
+    with pytest.raises(DelegationUnavailable):
+        broker.credential("person@example.test")
+
+
+@pytest.mark.asyncio
+async def test_goproxy_alone_captures_a_bearer_only_grant(
+    db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier, signing_key
+):
+    monkeypatch.setenv("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", "1")
+    oidc = dataclasses.replace(oidc, scopes="openid email offline_access")
+    app = _goproxy_app(
+        db_uri,
+        tmp_path,
+        monkeypatch,
+        oidc,
+        human,
+        verifier,
+        {
+            "oidc_goproxy": {
+                "url": "https://go.example.test",
+                "audience": "tools-api",
+                "scope": "openid tools-api",
+            }
+        },
+    )
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    goproxy = app.state.goproxy_identity_broker
+    for broker in (goproxy, app.state.oidc_login_broker):
+        broker.client.close()
+        broker.client = httpx.Client(transport=httpx.MockTransport(idp.handler))
+    response = await _post_session(app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    grant = goproxy.store.get("person@example.test", goproxy.provider)
+    assert grant is not None and grant.metadata["bearer_only"] is True
+    assert goproxy.credential("person@example.test")
+    goproxy.client.close()
+
+
+@pytest.mark.asyncio
 async def test_other_invalid_request_keeps_the_generic_refusal(login_app, signing_key, oidc):
     idp = _Idp(
         signing_key,

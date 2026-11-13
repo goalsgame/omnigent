@@ -19,7 +19,7 @@ from mcp.client.stdio import stdio_client
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -276,8 +276,17 @@ async def test_login_owner_invokes_mcp_from_managed_stdio_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("offline_subject", [False, True])
 async def test_bearer_only_owner_invokes_mcp_from_managed_stdio_host(
-    db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier, signing_key
+    db_uri,
+    tmp_path,
+    monkeypatch,
+    runtime_init,
+    oidc,
+    human,
+    verifier,
+    signing_key,
+    offline_subject,
 ):
     owner, subject = "person@example.test", "human-subject"
     host_id = uuid.uuid4().hex
@@ -293,13 +302,15 @@ async def test_bearer_only_owner_invokes_mcp_from_managed_stdio_host(
     monkeypatch.setenv("TEST_MCP_CLIENT_SECRET", "fixture-secret")
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     hosts = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
+        conversation_store=conversations,
         artifact_store=artifacts,
         agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
+        permission_store=permissions,
         host_store=hosts,
         auth_provider=UnifiedAuthProvider(
             "oidc", oidc_config=oidc, human_verifier=human, machine_verifier=verifier
@@ -324,6 +335,15 @@ async def test_bearer_only_owner_invokes_mcp_from_managed_stdio_host(
         if form["requested_token_type"] == ["urn:ietf:params:oauth:token-type:refresh_token"]:
             assert form["subject_token"] == [bearer]
             assert "offline_access" in form["scope"][0].split()
+            if offline_subject:
+                return httpx.Response(
+                    400,
+                    json={
+                        "error": "invalid_request",
+                        "error_description": "Refresh token not valid as requested_token_type"
+                        " because creating a new session is needed",
+                    },
+                )
             return httpx.Response(
                 200,
                 json={
@@ -414,14 +434,22 @@ async def test_bearer_only_owner_invokes_mcp_from_managed_stdio_host(
                     pytest.fail("Server did not start")
                 await asyncio.sleep(0.01)
             assert app.state.oidc_login_broker.known_subject(owner) is None
+            conversation = conversations.create_conversation(agent_id=uuid.uuid4().hex)
+            permissions.ensure_user(owner)
+            permissions.grant(owner, conversation.id, LEVEL_OWNER)
             async with httpx.AsyncClient(base_url=base) as api:
                 response = await api.post(
-                    "/v1/sessions/missing/events",
+                    f"/v1/sessions/{conversation.id}/delegation",
                     headers={"Authorization": f"Bearer {bearer}"},
-                    json={},
                 )
-            assert response.status_code != 403, response.text
-            assert app.state.oidc_login_broker.state(owner)["subject"] == subject
+            assert response.status_code == 204, response.text
+            broker = app.state.mcp_identity_broker
+            if offline_subject:
+                assert app.state.oidc_login_broker.known_subject(owner) is None
+                grant = broker.store.get(owner, broker.provider)
+                assert grant is not None and grant.metadata["bearer_only"] is True
+            else:
+                assert app.state.oidc_login_broker.state(owner)["subject"] == subject
             hosts.register_managed_host(
                 host_id=host_id,
                 name="fixture",
@@ -458,6 +486,22 @@ async def test_bearer_only_owner_invokes_mcp_from_managed_stdio_host(
                 result = await session.call_tool("whoami", {})
                 assert not result.isError
                 assert result.content[0].text == subject
+                if offline_subject:
+                    before = len(exchanges)
+                    bearer = human_token(signing_key)
+                    async with httpx.AsyncClient(base_url=base) as api:
+                        renewed = await api.post(
+                            f"/v1/sessions/{conversation.id}/delegation",
+                            headers={"Authorization": f"Bearer {bearer}"},
+                        )
+                    assert renewed.status_code == 204, renewed.text
+                    assert [f["requested_token_type"] for f in exchanges[before:]] == [
+                        ["urn:ietf:params:oauth:token-type:access_token"]
+                    ]
+                    assert exchanges[-1]["subject_token"] == [bearer]
+                    result = await session.call_tool("whoami", {})
+                    assert not result.isError
+                    assert result.content[0].text == subject
             assert callers and set(callers) == {subject}
             assert (
                 sum(

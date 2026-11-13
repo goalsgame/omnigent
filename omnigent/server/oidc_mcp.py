@@ -253,8 +253,17 @@ class MCPDelegationBroker:
 
         Used when the bearer comes from an offline IdP session, from which no refresh
         grant can be exchanged. The grant lasts as long as the exchanged access token,
-        and each later call carrying a fresh bearer replaces it.
+        and each later call carrying a fresh bearer replaces it. An unexpired grant for
+        a different subject is never replaced.
         """
+        current = self.store.get(owner, self.provider, with_secret=True)
+        if (
+            current is not None
+            and current.secret is not None
+            and current.metadata.get("subject") != subject
+            and float(current.secret.get("expires_at", 0)) > time.time()
+        ):
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
         tokens = self._tokens(
             owner,
             subject,
@@ -275,13 +284,18 @@ class MCPDelegationBroker:
         )
 
     def _bearer_only_credential(self, owner: str) -> str | None:
-        """The owner's unexpired bearer-only access token, if that is what is stored."""
+        """The owner's unexpired bearer-only access token, if that is what is stored.
+
+        A grant whose subject differs from the owner's login binding is never returned.
+        """
         current = self.store.get(owner, self.provider, with_secret=True)
+        known = self.login_broker.known_subject(owner) if self.login_broker else None
         if (
             current is None
             or current.secret is None
             or not current.metadata.get("bearer_only")
             or current.metadata.get("issuer") != self.oidc.issuer
+            or (known is not None and current.metadata.get("subject") != known)
             or float(current.secret.get("expires_at", 0)) <= time.time() + 30
         ):
             return None
