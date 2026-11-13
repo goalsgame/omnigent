@@ -2304,6 +2304,34 @@ def register_core_routes(
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
     @router.post(
+        "/sessions/{session_id}/delegation",
+        status_code=204,
+        response_class=Response,
+    )
+    async def renew_session_delegation(request: Request, session_id: str) -> Response:
+        """
+        Renew the caller's delegated identity for a session.
+
+        The delegation middleware captures the caller's IdP bearer on every session
+        ``POST``. A caller whose IdP session is offline has a delegated grant without a
+        refresh credential, lasting only as long as the exchanged access token; it calls
+        this while a turn runs to keep the session's connector access current.
+
+        :param request: The inbound request, used for identity extraction.
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: An empty ``204`` response.
+        :raises OmnigentError: 404 if the session does not exist or the caller cannot
+            edit it.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        if await asyncio.to_thread(conversation_store.get_conversation, session_id) is None:
+            raise _session_not_found()
+        return Response(status_code=204)
+
+    @router.post(
         "/sessions/{session_id}/agent-title",
         response_model=AutomaticSessionRenameResponse,
     )

@@ -521,6 +521,79 @@ async def test_upstream_scope_withheld_by_the_idp_skips_delegation(
         assert not isinstance(exc.value, DelegationNotEntitled)
 
 
+def _offline_session_refusal(form):
+    return httpx.Response(
+        400,
+        json={
+            "error": "invalid_request",
+            "error_description": (
+                "Refresh token not valid as requested_token_type because creating a new"
+                " session is needed"
+            ),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_offline_session_bearer_gets_a_bearer_only_grant(login_app, signing_key, oidc):
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    broker = login_app.state.test_identity_broker
+    grant = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert grant is not None and grant.metadata["bearer_only"] is True
+    assert "refresh_token" not in grant.secret
+    assert broker.credential("person@example.test") == grant.secret["access_token"]
+    with pytest.raises(DelegationUnavailable):
+        login_app.state.oidc_login_broker.state("person@example.test")
+
+    refusals = sum(
+        1
+        for form in idp.requests
+        if form.get("requested_token_type") == ["urn:ietf:params:oauth:token-type:refresh_token"]
+    )
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    assert (
+        sum(
+            1
+            for form in idp.requests
+            if form.get("requested_token_type")
+            == ["urn:ietf:params:oauth:token-type:refresh_token"]
+        )
+        == refusals
+    )
+    renewed = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert renewed is not None and renewed.metadata["bearer_only"] is True
+
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret={**renewed.secret, "expires_at": time.time() + 5},
+        metadata=renewed.metadata,
+    )
+    with pytest.raises(DelegationUnavailable):
+        broker.credential("person@example.test")
+
+
+@pytest.mark.asyncio
+async def test_other_invalid_request_keeps_the_generic_refusal(login_app, signing_key, oidc):
+    idp = _Idp(
+        signing_key,
+        oidc,
+        login=lambda form: httpx.Response(400, json={"error": "invalid_request"}),
+    )
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403
+    assert response.json()["detail"].endswith("renew your IdP session")
+    broker = login_app.state.test_identity_broker
+    assert broker.store.get("person@example.test", broker.provider) is None
+
+
 @pytest.mark.asyncio
 async def test_exchange_outage_returns_503(login_app, signing_key, oidc):
     idp = _Idp(signing_key, oidc, login=lambda form: httpx.Response(503))

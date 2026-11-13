@@ -2149,6 +2149,11 @@ def create_app(
                             await asyncio.to_thread(broker.capture_bearer, bearer[7:])
                         except DelegationNotEntitled as exc:
                             _logger.info("Skipping identity delegation: %s", exc)
+                    if goproxy_broker is not None:
+                        try:
+                            await asyncio.to_thread(goproxy_broker.capture_bearer, bearer[7:])
+                        except (DelegationUnavailable, DelegationTemporarilyUnavailable) as exc:
+                            _logger.info("Skipping Go proxy delegation: %s", exc)
                 except DelegationTemporarilyUnavailable:
                     return JSONResponse(
                         {"error": "temporarily_unavailable"},
