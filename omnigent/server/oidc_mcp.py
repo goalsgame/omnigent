@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -279,7 +280,13 @@ class MCPDelegationBroker:
             },
         )
         tokens.pop("refresh_token", None)
-        metadata = {"issuer": self.oidc.issuer, "subject": subject, "bearer_only": True}
+        # A fresh revision makes every publication change the row, so a stale read never wins.
+        metadata = {
+            "issuer": self.oidc.issuer,
+            "subject": subject,
+            "bearer_only": True,
+            "revision": secrets.token_hex(16),
+        }
         for _ in range(3):
             current = self.store.get(owner, self.provider, with_secret=True)
             if conflicting(current):

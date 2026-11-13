@@ -626,6 +626,62 @@ async def test_concurrent_capture_for_another_subject_wins_the_race(
 
 
 @pytest.mark.asyncio
+async def test_renewal_between_read_and_write_is_not_overwritten(
+    login_app, signing_key, oidc, monkeypatch
+):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    owner = "person@example.test"
+    stale = {
+        "issuer": oidc.issuer,
+        "subject": "other-subject",
+        "bearer_only": True,
+        "revision": "a",
+    }
+    broker.store.upsert(
+        owner,
+        broker.provider,
+        secret={"access_token": "expired-other-token", "expires_at": time.time() - 1},
+        metadata=stale,
+    )
+    publish = broker.store.upsert_if_metadata
+    renewed = []
+
+    def renew_first(*args, **kwargs):
+        if not renewed:
+            renewed.append(True)
+            broker.store.upsert(
+                owner,
+                broker.provider,
+                secret={"access_token": "renewed-other-token", "expires_at": time.time() + 600},
+                metadata={**stale, "revision": "b"},
+            )
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(broker.store, "upsert_if_metadata", renew_first)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403, response.text
+    kept = broker.store.get(owner, broker.provider, with_secret=True)
+    assert kept.metadata["subject"] == "other-subject"
+    assert kept.secret["access_token"] == "renewed-other-token"
+
+
+@pytest.mark.asyncio
+async def test_every_bearer_only_renewal_changes_the_stored_metadata(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    seen = []
+    for _ in range(2):
+        response = await _post_session(login_app, human_token(signing_key))
+        assert response.status_code in (404, 422), response.text
+        seen.append(broker.store.get("person@example.test", broker.provider).metadata)
+    assert seen[0]["subject"] == seen[1]["subject"] == "human-subject"
+    assert seen[0] != seen[1]
+
+
+@pytest.mark.asyncio
 async def test_expired_bearer_only_grant_renews_for_its_subject(login_app, signing_key, oidc):
     idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
     idp.attach(login_app)
@@ -639,11 +695,8 @@ async def test_expired_bearer_only_grant_renews_for_its_subject(login_app, signi
     response = await _post_session(login_app, human_token(signing_key))
     assert response.status_code in (404, 422), response.text
     renewed = broker.store.get("person@example.test", broker.provider, with_secret=True)
-    assert renewed.metadata == {
-        "issuer": oidc.issuer,
-        "subject": "human-subject",
-        "bearer_only": True,
-    }
+    assert renewed.metadata["subject"] == "human-subject"
+    assert renewed.metadata["bearer_only"] is True
     assert renewed.secret["access_token"] != "expired-token"
     assert broker.credential("person@example.test") == renewed.secret["access_token"]
 
