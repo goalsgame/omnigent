@@ -256,13 +256,16 @@ class MCPDelegationBroker:
         and each later call carrying a fresh bearer replaces it. An unexpired grant for
         a different subject is never replaced.
         """
-        current = self.store.get(owner, self.provider, with_secret=True)
-        if (
-            current is not None
-            and current.secret is not None
-            and current.metadata.get("subject") != subject
-            and float(current.secret.get("expires_at", 0)) > time.time()
-        ):
+
+        def conflicting(connection: ProviderConnection | None) -> bool:
+            return (
+                connection is not None
+                and connection.secret is not None
+                and connection.metadata.get("subject") != subject
+                and float(connection.secret.get("expires_at", 0)) > time.time()
+            )
+
+        if conflicting(self.store.get(owner, self.provider, with_secret=True)):
             raise DelegationUnavailable("Sign in again to renew identity delegation")
         tokens = self._tokens(
             owner,
@@ -276,12 +279,20 @@ class MCPDelegationBroker:
             },
         )
         tokens.pop("refresh_token", None)
-        self.store.upsert(
-            owner,
-            self.provider,
-            secret=tokens,
-            metadata={"issuer": self.oidc.issuer, "subject": subject, "bearer_only": True},
-        )
+        metadata = {"issuer": self.oidc.issuer, "subject": subject, "bearer_only": True}
+        for _ in range(3):
+            current = self.store.get(owner, self.provider, with_secret=True)
+            if conflicting(current):
+                raise DelegationUnavailable("Sign in again to renew identity delegation")
+            if self.store.upsert_if_metadata(
+                owner,
+                self.provider,
+                secret=tokens,
+                metadata=metadata,
+                expected_metadata=current.metadata if current is not None else None,
+            ):
+                return
+        raise DelegationUnavailable("Sign in again to renew identity delegation")
 
     def _bearer_only_credential(self, owner: str) -> str | None:
         """The owner's unexpired bearer-only access token, if that is what is stored.

@@ -598,6 +598,56 @@ async def test_bearer_only_grant_never_switches_subject(login_app, signing_key, 
     assert kept.secret["access_token"] == "previous-subject-token"
 
 
+@pytest.mark.asyncio
+async def test_concurrent_capture_for_another_subject_wins_the_race(
+    login_app, signing_key, oidc, monkeypatch
+):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    exchange = broker._tokens
+
+    def racing_exchange(owner, subject, form):
+        tokens = exchange(owner, subject, form)
+        broker.store.upsert(
+            owner,
+            broker.provider,
+            secret={"access_token": "racing-subject-token", "expires_at": time.time() + 600},
+            metadata={"issuer": oidc.issuer, "subject": "racing-subject", "bearer_only": True},
+        )
+        return tokens
+
+    monkeypatch.setattr(broker, "_tokens", racing_exchange)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403, response.text
+    kept = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert kept.metadata["subject"] == "racing-subject"
+    assert kept.secret["access_token"] == "racing-subject-token"
+
+
+@pytest.mark.asyncio
+async def test_expired_bearer_only_grant_renews_for_its_subject(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret={"access_token": "expired-token", "expires_at": time.time() - 1},
+        metadata={"issuer": oidc.issuer, "subject": "human-subject", "bearer_only": True},
+    )
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    renewed = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert renewed.metadata == {
+        "issuer": oidc.issuer,
+        "subject": "human-subject",
+        "bearer_only": True,
+    }
+    assert renewed.secret["access_token"] != "expired-token"
+    assert broker.credential("person@example.test") == renewed.secret["access_token"]
+
+
 def test_bearer_only_grant_yields_to_a_conflicting_login_binding(login_app, oidc, monkeypatch):
     from omnigent.server.oidc_mcp import DelegationUnavailable
 
