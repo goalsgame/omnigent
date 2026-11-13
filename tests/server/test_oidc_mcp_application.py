@@ -521,6 +521,253 @@ async def test_upstream_scope_withheld_by_the_idp_skips_delegation(
         assert not isinstance(exc.value, DelegationNotEntitled)
 
 
+def _offline_session_refusal(form):
+    return httpx.Response(
+        400,
+        json={
+            "error": "invalid_request",
+            "error_description": (
+                "Refresh token not valid as requested_token_type because creating a new"
+                " session is needed"
+            ),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_offline_session_bearer_gets_a_bearer_only_grant(login_app, signing_key, oidc):
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    broker = login_app.state.test_identity_broker
+    grant = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert grant is not None and grant.metadata["bearer_only"] is True
+    assert "refresh_token" not in grant.secret
+    assert broker.credential("person@example.test") == grant.secret["access_token"]
+    with pytest.raises(DelegationUnavailable):
+        login_app.state.oidc_login_broker.state("person@example.test")
+
+    refusals = sum(
+        1
+        for form in idp.requests
+        if form.get("requested_token_type") == ["urn:ietf:params:oauth:token-type:refresh_token"]
+    )
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    assert (
+        sum(
+            1
+            for form in idp.requests
+            if form.get("requested_token_type")
+            == ["urn:ietf:params:oauth:token-type:refresh_token"]
+        )
+        == refusals
+    )
+    renewed = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert renewed is not None and renewed.metadata["bearer_only"] is True
+
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret={**renewed.secret, "expires_at": time.time() + 5},
+        metadata=renewed.metadata,
+    )
+    with pytest.raises(DelegationUnavailable):
+        broker.credential("person@example.test")
+
+
+@pytest.mark.asyncio
+async def test_bearer_only_grant_never_switches_subject(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    previous = {"access_token": "previous-subject-token", "expires_at": time.time() + 600}
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret=previous,
+        metadata={"issuer": oidc.issuer, "subject": "previous-subject", "bearer_only": True},
+    )
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403, response.text
+    kept = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert kept.metadata["subject"] == "previous-subject"
+    assert kept.secret["access_token"] == "previous-subject-token"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_capture_for_another_subject_wins_the_race(
+    login_app, signing_key, oidc, monkeypatch
+):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    exchange = broker._tokens
+
+    def racing_exchange(owner, subject, form):
+        tokens = exchange(owner, subject, form)
+        broker.store.upsert(
+            owner,
+            broker.provider,
+            secret={"access_token": "racing-subject-token", "expires_at": time.time() + 600},
+            metadata={"issuer": oidc.issuer, "subject": "racing-subject", "bearer_only": True},
+        )
+        return tokens
+
+    monkeypatch.setattr(broker, "_tokens", racing_exchange)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403, response.text
+    kept = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert kept.metadata["subject"] == "racing-subject"
+    assert kept.secret["access_token"] == "racing-subject-token"
+
+
+@pytest.mark.asyncio
+async def test_renewal_between_read_and_write_is_not_overwritten(
+    login_app, signing_key, oidc, monkeypatch
+):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    owner = "person@example.test"
+    stale = {
+        "issuer": oidc.issuer,
+        "subject": "other-subject",
+        "bearer_only": True,
+        "revision": "a",
+    }
+    broker.store.upsert(
+        owner,
+        broker.provider,
+        secret={"access_token": "expired-other-token", "expires_at": time.time() - 1},
+        metadata=stale,
+    )
+    publish = broker.store.upsert_if_metadata
+    renewed = []
+
+    def renew_first(*args, **kwargs):
+        if not renewed:
+            renewed.append(True)
+            broker.store.upsert(
+                owner,
+                broker.provider,
+                secret={"access_token": "renewed-other-token", "expires_at": time.time() + 600},
+                metadata={**stale, "revision": "b"},
+            )
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(broker.store, "upsert_if_metadata", renew_first)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403, response.text
+    kept = broker.store.get(owner, broker.provider, with_secret=True)
+    assert kept.metadata["subject"] == "other-subject"
+    assert kept.secret["access_token"] == "renewed-other-token"
+
+
+@pytest.mark.asyncio
+async def test_every_bearer_only_renewal_changes_the_stored_metadata(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    seen = []
+    for _ in range(2):
+        response = await _post_session(login_app, human_token(signing_key))
+        assert response.status_code in (404, 422), response.text
+        seen.append(broker.store.get("person@example.test", broker.provider).metadata)
+    assert seen[0]["subject"] == seen[1]["subject"] == "human-subject"
+    assert seen[0] != seen[1]
+
+
+@pytest.mark.asyncio
+async def test_expired_bearer_only_grant_renews_for_its_subject(login_app, signing_key, oidc):
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    idp.attach(login_app)
+    broker = login_app.state.test_identity_broker
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret={"access_token": "expired-token", "expires_at": time.time() - 1},
+        metadata={"issuer": oidc.issuer, "subject": "human-subject", "bearer_only": True},
+    )
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    renewed = broker.store.get("person@example.test", broker.provider, with_secret=True)
+    assert renewed.metadata["subject"] == "human-subject"
+    assert renewed.metadata["bearer_only"] is True
+    assert renewed.secret["access_token"] != "expired-token"
+    assert broker.credential("person@example.test") == renewed.secret["access_token"]
+
+
+def test_bearer_only_grant_yields_to_a_conflicting_login_binding(login_app, oidc, monkeypatch):
+    from omnigent.server.oidc_mcp import DelegationUnavailable
+
+    broker = login_app.state.test_identity_broker
+    broker.store.upsert(
+        "person@example.test",
+        broker.provider,
+        secret={"access_token": "bearer-only-token", "expires_at": time.time() + 600},
+        metadata={"issuer": oidc.issuer, "subject": "human-subject", "bearer_only": True},
+    )
+    assert broker.credential("person@example.test") == "bearer-only-token"
+    monkeypatch.setattr(
+        login_app.state.oidc_login_broker, "known_subject", lambda owner: "other-subject"
+    )
+    with pytest.raises(DelegationUnavailable):
+        broker.credential("person@example.test")
+
+
+@pytest.mark.asyncio
+async def test_goproxy_alone_captures_a_bearer_only_grant(
+    db_uri, tmp_path, monkeypatch, runtime_init, oidc, human, verifier, signing_key
+):
+    monkeypatch.setenv("OMNIGENT_OIDC_DELEGATION_TTL_HOURS", "1")
+    oidc = dataclasses.replace(oidc, scopes="openid email offline_access")
+    app = _goproxy_app(
+        db_uri,
+        tmp_path,
+        monkeypatch,
+        oidc,
+        human,
+        verifier,
+        {
+            "oidc_goproxy": {
+                "url": "https://go.example.test",
+                "audience": "tools-api",
+                "scope": "openid tools-api",
+            }
+        },
+    )
+    idp = _Idp(signing_key, oidc, login=_offline_session_refusal)
+    goproxy = app.state.goproxy_identity_broker
+    for broker in (goproxy, app.state.oidc_login_broker):
+        broker.client.close()
+        broker.client = httpx.Client(transport=httpx.MockTransport(idp.handler))
+    response = await _post_session(app, human_token(signing_key))
+    assert response.status_code in (404, 422), response.text
+    grant = goproxy.store.get("person@example.test", goproxy.provider)
+    assert grant is not None and grant.metadata["bearer_only"] is True
+    assert goproxy.credential("person@example.test")
+    goproxy.client.close()
+
+
+@pytest.mark.asyncio
+async def test_other_invalid_request_keeps_the_generic_refusal(login_app, signing_key, oidc):
+    idp = _Idp(
+        signing_key,
+        oidc,
+        login=lambda form: httpx.Response(400, json={"error": "invalid_request"}),
+    )
+    idp.attach(login_app)
+    response = await _post_session(login_app, human_token(signing_key))
+    assert response.status_code == 403
+    assert response.json()["detail"].endswith("renew your IdP session")
+    broker = login_app.state.test_identity_broker
+    assert broker.store.get("person@example.test", broker.provider) is None
+
+
 @pytest.mark.asyncio
 async def test_exchange_outage_returns_503(login_app, signing_key, oidc):
     idp = _Idp(signing_key, oidc, login=lambda form: httpx.Response(503))

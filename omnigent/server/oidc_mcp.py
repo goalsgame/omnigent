@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,10 @@ class DelegationUnavailable(Exception):
 
 class DelegationNotRenewable(DelegationUnavailable):
     """The caller's IdP session cannot yield an offline grant; the person must sign in again."""
+
+
+class DelegationOfflineSubject(DelegationUnavailable):
+    """The caller's token belongs to an offline IdP session, which yields no refresh grant."""
 
 
 class DelegationNotEntitled(DelegationUnavailable):
@@ -231,10 +236,88 @@ class MCPDelegationBroker:
         known = login.known_subject(owner)
         if known is not None and known != subject:
             raise DelegationUnavailable("Sign in again to renew identity delegation")
-        captured = login.capture_exchanged(owner, subject, token)
+        current = self.store.get(owner, self.provider)
+        if current is not None and current.metadata.get("bearer_only"):
+            self._capture_bearer_only(owner, subject, token)
+            return
+        try:
+            captured = login.capture_exchanged(owner, subject, token)
+        except DelegationOfflineSubject:
+            self._capture_bearer_only(owner, subject, token)
+            return
         self.credential(owner, generation=captured["generation"])
         if login.known_subject(owner) != subject:
             raise DelegationUnavailable("Sign in again to renew identity delegation")
+
+    def _capture_bearer_only(self, owner: str, subject: str, token: str) -> None:
+        """Store an access token exchanged from the caller's bearer, without a refresh grant.
+
+        Used when the bearer comes from an offline IdP session, from which no refresh
+        grant can be exchanged. The grant lasts as long as the exchanged access token,
+        and each later call carrying a fresh bearer replaces it. An unexpired grant for
+        a different subject is never replaced.
+        """
+
+        def conflicting(connection: ProviderConnection | None) -> bool:
+            return (
+                connection is not None
+                and connection.secret is not None
+                and connection.metadata.get("subject") != subject
+                and float(connection.secret.get("expires_at", 0)) > time.time()
+            )
+
+        if conflicting(self.store.get(owner, self.provider, with_secret=True)):
+            raise DelegationUnavailable("Sign in again to renew identity delegation")
+        tokens = self._tokens(
+            owner,
+            subject,
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token_type": _TOKEN_TYPE + "access_token",
+                "subject_token": token,
+                "requested_token_type": _TOKEN_TYPE + "access_token",
+                "scope": self.config.scope,
+            },
+        )
+        tokens.pop("refresh_token", None)
+        # A fresh revision makes every publication change the row, so a stale read never wins.
+        metadata = {
+            "issuer": self.oidc.issuer,
+            "subject": subject,
+            "bearer_only": True,
+            "revision": secrets.token_hex(16),
+        }
+        for _ in range(3):
+            current = self.store.get(owner, self.provider, with_secret=True)
+            if conflicting(current):
+                raise DelegationUnavailable("Sign in again to renew identity delegation")
+            if self.store.upsert_if_metadata(
+                owner,
+                self.provider,
+                secret=tokens,
+                metadata=metadata,
+                expected_metadata=current.metadata if current is not None else None,
+            ):
+                return
+        raise DelegationUnavailable("Sign in again to renew identity delegation")
+
+    def _bearer_only_credential(self, owner: str) -> str | None:
+        """The owner's unexpired bearer-only access token, if that is what is stored.
+
+        A grant whose subject differs from the owner's login binding is never returned.
+        """
+        current = self.store.get(owner, self.provider, with_secret=True)
+        known = self.login_broker.known_subject(owner) if self.login_broker else None
+        if (
+            current is None
+            or current.secret is None
+            or not current.metadata.get("bearer_only")
+            or current.metadata.get("issuer") != self.oidc.issuer
+            or (known is not None and current.metadata.get("subject") != known)
+            or float(current.secret.get("expires_at", 0)) <= time.time() + 30
+        ):
+            return None
+        return str(current.secret["access_token"])
 
     def credential(self, owner: str, *, generation: str | None = None) -> str:
         """Resolve only the stored owner's grant and serialize refresh across replicas.
@@ -243,7 +326,13 @@ class MCPDelegationBroker:
         """
         self._client_credentials(owner)
         if self.login_broker is not None and not owner.startswith("oidc-machine:"):
-            state = self.login_broker.state(owner, generation)
+            try:
+                state = self.login_broker.state(owner, generation)
+            except DelegationUnavailable:
+                bearer = self._bearer_only_credential(owner) if generation is None else None
+                if bearer is None:
+                    raise
+                return bearer
             # Only short-lived access tokens leave the shared offline login broker.
             current = self.store.get(owner, self.provider, with_secret=True)
             if (

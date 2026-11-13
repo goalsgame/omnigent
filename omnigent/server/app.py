@@ -2125,7 +2125,7 @@ def create_app(
         goproxy_broker.login_broker = login_broker
     app.state.goproxy_identity_broker = goproxy_broker
     delegation_brokers = [broker for broker in (mcp_broker, lore_broker) if broker is not None]
-    if delegation_brokers:
+    if delegation_brokers or goproxy_broker is not None:
 
         @app.middleware("http")
         async def capture_delegated_identity(request: Request, call_next):
@@ -2149,6 +2149,11 @@ def create_app(
                             await asyncio.to_thread(broker.capture_bearer, bearer[7:])
                         except DelegationNotEntitled as exc:
                             _logger.info("Skipping identity delegation: %s", exc)
+                    if goproxy_broker is not None:
+                        try:
+                            await asyncio.to_thread(goproxy_broker.capture_bearer, bearer[7:])
+                        except (DelegationUnavailable, DelegationTemporarilyUnavailable) as exc:
+                            _logger.info("Skipping Go proxy delegation: %s", exc)
                 except DelegationTemporarilyUnavailable:
                     return JSONResponse(
                         {"error": "temporarily_unavailable"},

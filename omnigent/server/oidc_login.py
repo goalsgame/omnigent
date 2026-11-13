@@ -15,7 +15,11 @@ import jwt
 from omnigent.db.group_authority import group_name, verified_groups
 from omnigent.server.oidc import OIDCConfig, mint_session_token
 from omnigent.server.oidc_machine_auth import _BoundedJWKClient
-from omnigent.server.oidc_mcp import DelegationNotRenewable, DelegationUnavailable
+from omnigent.server.oidc_mcp import (
+    DelegationNotRenewable,
+    DelegationOfflineSubject,
+    DelegationUnavailable,
+)
 from omnigent.stores.credential_store import CredentialStore
 
 PROVIDER = "oidc_login"
@@ -317,6 +321,10 @@ class OIDCLoginBroker(OIDCLoginRevoker):
         if response.status_code != 200:
             if body.get("error") in ("invalid_grant", "invalid_scope"):
                 raise DelegationNotRenewable("Sign in again with offline access")
+            if body.get("error") == "invalid_request" and "new session" in str(
+                body.get("error_description", "")
+            ):
+                raise DelegationOfflineSubject("The caller's IdP session is offline")
             raise DelegationUnavailable("Sign in again to renew identity delegation")
         scope = body.get("scope", self.config.scopes)
         if (

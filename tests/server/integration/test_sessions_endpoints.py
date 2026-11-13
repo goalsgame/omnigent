@@ -13020,3 +13020,16 @@ async def test_editor_cannot_forge_billing_baselines_before_real_runner_usage(
     assert usage["total_cost_usd"] == pytest.approx(1.1)
     assert usage["cumulative_input_high_water"] == 1000
     assert usage["cumulative_output_high_water"] == 100
+
+
+async def test_delegation_keepalive_acknowledges_an_editable_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """The keepalive accepts an existing session and refuses an unknown one."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    response = await client.post(f"/v1/sessions/{session['id']}/delegation")
+    assert response.status_code == 204, response.text
+    assert response.content == b""
+    missing = await client.post("/v1/sessions/0123456789abcdef0123456789abcdef/delegation")
+    assert missing.status_code == 404, missing.text
