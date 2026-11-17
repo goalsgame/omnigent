@@ -149,6 +149,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     RepoWorkspace,
     host_resume_supported,
+    host_sandbox_awaits_wake,
     host_sandbox_is_running,
     parse_repo_workspace,
     read_managed_repo_workspaces,
@@ -261,6 +262,7 @@ from omnigent.server.routes._sessions.helpers import (
     _extract_persistent_item_from_sse,
     _extract_user_text_for_routing,
     _extract_user_text_from_event,
+    _fail_managed_runner_connect,
     _find_codex_native_subagent_child,
     _find_devin_native_subagent_child,
     _find_subagent_child_by_title,
@@ -4248,7 +4250,10 @@ async def _bind_and_launch_managed_runner(
     generation, not a fresh one minted for this launch, so a failed
     generation is left alone (same reasoning as a failed wake: the
     identity is the user's, not this attempt's to destroy) rather than
-    torn down.
+    torn down. A runner that never connects because its resumable
+    sandbox stopped also leaves the host bound
+    (:func:`~omnigent.server.managed_hosts.host_sandbox_awaits_wake`), so
+    the next message resumes that sandbox and its workspace.
 
     :param session_id: Session/conversation identifier.
     :param managed: The provision result (host id + workspace).
@@ -4333,15 +4338,21 @@ async def _bind_and_launch_managed_runner(
             runner_id,
             tunnel_registry,
             tracker,
+            settle_on_failure=False,
         )
         if not connected:
-            # The runner never connected its tunnel; _wait_for_managed_runner_tunnel
-            # already settled the tracker and published the failure. Same
-            # first-launch-vs-relaunch reasoning as the branch above.
-            if relaunch_host is None:
-                host = await asyncio.to_thread(host_store.get_host, managed.host_id)
-                if host is not None:
-                    await terminate_managed_host(host, host_store, sandbox_config)
+            # Same first-launch-vs-relaunch reasoning as the branch above. The
+            # tracker stays claimed until the keep-or-teardown decision is done.
+            try:
+                if relaunch_host is None:
+                    host = await asyncio.to_thread(host_store.get_host, managed.host_id)
+                    # A stopped resumable sandbox stays bound so the next message wakes it.
+                    if host is not None and not await asyncio.to_thread(
+                        host_sandbox_awaits_wake, host, sandbox_config
+                    ):
+                        await terminate_managed_host(host, host_store, sandbox_config)
+            finally:
+                _fail_managed_runner_connect(session_id, tracker)
             return
     tracker.finish(session_id)
     _publish_sandbox_status(session_id, "ready")

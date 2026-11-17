@@ -55,6 +55,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     RepoWorkspace,
     host_resume_supported,
+    host_sandbox_awaits_wake,
     launch_managed_host,
     managed_repo_labels,
     parse_repo_workspace,
@@ -3544,6 +3545,46 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     )
     no_sandbox.sandbox_id = None
     assert host_resume_supported(no_sandbox, _injected_config(resumable)) is False
+
+
+class _StatusErrorIsloLauncher(_IsloFakeLauncher):
+    """Islo fake whose status check fails."""
+
+    def is_stopped(self, sandbox_id: str) -> bool | None:
+        raise click.ClickException("provider lookup failed")
+
+
+@pytest.mark.parametrize(
+    ("can_resume", "stopped", "expected"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (True, None, False),
+        (True, "raises", False),
+        (False, True, False),
+    ],
+    ids=["stopped-resumable", "not-stopped", "unknown-status", "status-error", "not-resumable"],
+)
+async def test_host_sandbox_awaits_wake_only_for_a_stopped_resumable_sandbox(
+    db_uri: str, can_resume: bool, stopped: bool | str | None, expected: bool
+) -> None:
+    """Only a resumable sandbox the provider reports as stopped is left for a wake."""
+    host = HostStore(db_uri).register_managed_host(
+        host_id="7d0f3c1a9b2e4f6a8c5d1e3f5a7b9c0d",
+        name="managed-awaits-wake",
+        user_id=_OWNER,
+        token="tok-awaits-wake",
+        provider="islo",
+        sandbox_id="sb-awaits-wake",
+        token_expires_at=now_epoch() + 3600,
+    )
+    launcher = (
+        _StatusErrorIsloLauncher(can_resume=can_resume)
+        if stopped == "raises"
+        else _IsloFakeLauncher(can_resume=can_resume, stopped=stopped)  # type: ignore[arg-type]
+    )
+    assert host_sandbox_awaits_wake(host, _injected_config(launcher)) is expected
+    assert host_sandbox_awaits_wake(host, None) is False
 
 
 async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri: str) -> None:

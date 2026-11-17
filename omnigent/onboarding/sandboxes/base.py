@@ -705,6 +705,22 @@ class SandboxLifecycle(ABC):
         del sandbox_id
         return None
 
+    def is_stopped(self, sandbox_id: str) -> bool | None:
+        """
+        Return whether the provider reports this sandbox as stopped and resumable.
+
+        Optional capability: ``True`` only for a stopped state that
+        :meth:`resume` restarts with the sandbox's filesystem intact. Terminal
+        or failed states, a missing sandbox, and a running sandbox are
+        ``False``. ``None`` means the launcher cannot cheaply answer.
+
+        :param sandbox_id: The sandbox to inspect, e.g. ``"sb-a1b2c3"``.
+        :returns: ``True`` when stopped and resumable, ``False`` otherwise, or
+            ``None`` when the provider status is unknown.
+        """
+        del sandbox_id
+        return None
+
     def _capability_error(self, action: str) -> SandboxCapabilityError:
         """
         Build the error for an optional primitive this provider lacks.
