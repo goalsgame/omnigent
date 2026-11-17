@@ -84,7 +84,16 @@ published_artifacts:
 Set `public_url` to the public HTTPS origin when runners reach the server through
 an internal service address. The application base path is appended automatically.
 If omitted, API links are relative and the native tool resolves them against its
-server address. The remaining values shown above are the defaults.
+server address. The remaining values shown above are the defaults, as is
+`enabled: true`.
+
+Set `enabled: false` to stop new publications while existing links keep working
+until they expire. The server then refuses `POST /v1/sessions/{id}/artifacts`
+and new read grants with 403. Reads, the owner's list, grant revocation, deletion
+and the cleanup collector continue. Runners withdraw `sys_publish_artifact` when
+their environment sets `OMNIGENT_PUBLISH_ARTIFACT_TOOL=0`; set it on the server
+and include it in the sandbox environment forwarded to managed runners. Runners
+started without it still offer the tool, and the server refuses their calls.
 
 A publish request may set `retention_days` within the configured maximum.
 Expiry or explicit deletion immediately denies subsequent reads. A periodic,

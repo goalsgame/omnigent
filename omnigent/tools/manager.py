@@ -453,9 +453,13 @@ class ToolManager:
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
         """
-        from omnigent.tools.builtins.publish_artifact import PublishArtifactTool
+        from omnigent.tools.builtins.publish_artifact import (
+            PublishArtifactTool,
+            publish_artifact_tool_enabled,
+        )
 
-        self._tools[PublishArtifactTool.name()] = PublishArtifactTool()
+        if publish_artifact_tool_enabled():
+            self._tools[PublishArtifactTool.name()] = PublishArtifactTool()
 
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()

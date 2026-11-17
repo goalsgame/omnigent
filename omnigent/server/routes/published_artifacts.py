@@ -31,6 +31,7 @@ from omnigent.stores.published_artifact_store import PublishedArtifact, Publishe
 
 _LOGGER = logging.getLogger(__name__)
 _UUID = re.compile(r"[a-f0-9]{32}")
+PUBLISHING_DISABLED = "Artifact publishing is disabled on this server"
 RENDERER_CSP = (
     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
     "img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; "
@@ -61,6 +62,7 @@ class PublicationLimits:
     retention_days: int = 90
     max_retention_days: int = 365
     public_url: str | None = None
+    enabled: bool = True
 
     @classmethod
     def parse(cls, raw: Any) -> PublicationLimits:
@@ -69,10 +71,12 @@ class PublicationLimits:
             return cls()
         if not isinstance(raw, dict) or set(raw) - set(cls.__dataclass_fields__):
             raise ValueError("published_artifacts must contain only supported limits")
+        if type(raw.get("enabled", True)) is not bool:
+            raise ValueError("published_artifacts.enabled must be a boolean")
         if any(
             type(value) is not int or value <= 0
             for key, value in raw.items()
-            if key != "public_url"
+            if key not in ("public_url", "enabled")
         ):
             raise ValueError("published_artifacts limits must be positive integers")
         public_url = raw.get("public_url")
@@ -176,6 +180,8 @@ def create_published_artifacts_router(
             request = Request(scope)
             user = actor(request)
             require_trusted_origin(request)
+            if scope["method"] == "POST" and not limits.enabled:
+                raise HTTPException(403, PUBLISHING_DISABLED)
             session_id = scope.get("path_params", {}).get("session_id")
             if scope["method"] == "POST" and session_id:
                 if not _UUID.fullmatch(session_id):
@@ -396,11 +402,12 @@ def create_published_artifacts_router(
                 entry["account_generation"] = target.account_generation if target else None
             if entry not in grants:
                 grants.append(entry)
-        sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
-        if sharing_mode == SharingMode.OFF and any(
-            entry not in json.loads(item.grants_json) for entry in grants
-        ):
-            raise HTTPException(403, "Sharing has been disabled for this server")
+        if any(entry not in json.loads(item.grants_json) for entry in grants):
+            if not limits.enabled:
+                raise HTTPException(403, PUBLISHING_DISABLED)
+            sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
+            if sharing_mode == SharingMode.OFF:
+                raise HTTPException(403, "Sharing has been disabled for this server")
         if not await asyncio.to_thread(
             store.mutate,
             item.id,

@@ -91,7 +91,10 @@ from omnigent.tools.builtins.os_env import (
     SysOsWriteTool,
 )
 from omnigent.tools.builtins.peer_messages import PEER_TOOL_NAMES, PEER_TOOL_TYPES
-from omnigent.tools.builtins.publish_artifact import PublishArtifactTool
+from omnigent.tools.builtins.publish_artifact import (
+    PublishArtifactTool,
+    publish_artifact_tool_enabled,
+)
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.session_search import (
     SESSION_SEARCH_TOOL_NAMES,
@@ -598,7 +601,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
         for _cls in (
-            PublishArtifactTool,
+            *((PublishArtifactTool,) if publish_artifact_tool_enabled() else ()),
             *PEER_TOOL_TYPES,
             *(GOOGLE_DRIVE_TOOL_TYPES if google_drive_tools_enabled() else ()),
             *((SearchSessionsTool,) if session_search_tool_enabled() else ()),
@@ -7494,6 +7497,8 @@ async def _execute_file_tool(
     files_path = f"/v1/sessions/{conversation_id}/resources/files"
 
     if tool_name == PublishArtifactTool.name():
+        if not publish_artifact_tool_enabled():
+            return "Error: artifact publishing is disabled for this deployment"
         path, title = args.get("path"), args.get("title")
         kind, days = args.get("kind", "file"), args.get("retention_days")
         if not isinstance(path, str) or not path or not isinstance(title, str) or not title:
@@ -7527,7 +7532,13 @@ async def _execute_file_tool(
                 timeout=60.0,
             )
             if response.status_code != 201:
-                return f"Error: publication rejected (HTTP {response.status_code})"
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = None
+                detail = body.get("detail") if isinstance(body, dict) else None
+                suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+                return f"Error: publication rejected (HTTP {response.status_code}){suffix}"
             result = response.json()
             # API paths are deployment-relative; agents need a pasteable absolute link.
             from urllib.parse import urljoin
