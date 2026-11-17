@@ -190,3 +190,52 @@ def test_publication_rejects_replaced_workspace_and_bounds_content(tmp_path):
     root.symlink_to(tmp_path / "old-workspace")
     with pytest.raises(OSError):
         read_publication_file("report.txt", root, 4)
+
+
+@pytest.mark.parametrize("spec", [None, AgentSpec(spec_version=1)])
+def test_disabled_deployment_withdraws_publish_tool(spec, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_PUBLISH_ARTIFACT_TOOL", "0")
+    names = {schema["name"] for schema in build_native_relay_tool_schemas(spec)}
+    assert PublishArtifactTool.name() not in names
+
+
+@pytest.mark.asyncio
+async def test_disabled_deployment_refuses_publish_without_upload(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_PUBLISH_ARTIFACT_TOOL", "0")
+    (tmp_path / "report.html").write_text("<h1>Report</h1>")
+    seen = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: seen.append(r)), base_url="https://server.example"
+    ) as client:
+        result = await _execute_file_tool(
+            PublishArtifactTool.name(),
+            {"path": "report.html", "title": "Report"},
+            client,
+            conversation_id="a" * 32,
+            runner_workspace=tmp_path,
+        )
+    assert result == "Error: artifact publishing is disabled for this deployment"
+    assert not seen
+
+
+@pytest.mark.asyncio
+async def test_server_refusal_detail_reaches_agent(tmp_path):
+    (tmp_path / "report.html").write_text("<h1>Report</h1>")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                403, json={"detail": "Artifact publishing is disabled on this server"}
+            )
+        ),
+        base_url="https://server.example",
+    ) as client:
+        result = await _execute_file_tool(
+            PublishArtifactTool.name(),
+            {"path": "report.html", "title": "Report"},
+            client,
+            conversation_id="a" * 32,
+            runner_workspace=tmp_path,
+        )
+    assert result == (
+        "Error: publication rejected (HTTP 403): Artifact publishing is disabled on this server"
+    )

@@ -8875,3 +8875,16 @@ def test_build_runner_env_forwards_server_mediated_tool_flags() -> None:
 
     assert env["OMNIGENT_GOOGLE_DRIVE_AUTH"] == "1"
     assert env["OMNIGENT_SESSION_SEARCH_TOOL"] == "1"
+
+
+def test_build_runner_env_forwards_publish_artifact_tool_flag() -> None:
+    env = _build_runner_env(
+        {"OMNIGENT_PUBLISH_ARTIFACT_TOOL": "0"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert env["OMNIGENT_PUBLISH_ARTIFACT_TOOL"] == "0"

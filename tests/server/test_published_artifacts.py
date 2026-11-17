@@ -42,24 +42,7 @@ class _Auth(AuthProvider):
         return user
 
 
-@pytest.fixture
-def publication_env(db_uri, tmp_path):
-    conversations = SqlAlchemyConversationStore(db_uri)
-    permissions = SqlAlchemyPermissionStore(db_uri)
-    store = PublishedArtifactStore(db_uri)
-    blobs = LocalArtifactStore(str(tmp_path / "published"))
-    session = conversations.create_conversation()
-    for user in (
-        "owner@example.test",
-        "reader@example.test",
-        "editor@example.test",
-        "oidc-machine:bot",
-    ):
-        permissions.ensure_user(user)
-    permissions.grant("owner@example.test", session.id, 4)
-    permissions.grant("reader@example.test", session.id, 1)
-    permissions.grant("editor@example.test", session.id, 2)
-    permissions.grant("oidc-machine:bot", session.id, 2)
+def _publication_app(store, blobs, conversations, permissions, **limits):
     app = FastAPI()
 
     @app.exception_handler(OmnigentError)
@@ -82,10 +65,32 @@ def publication_env(db_uri, tmp_path):
             conversations,
             permissions,
             _Auth(),
-            PublicationLimits(max_bytes=1000, max_html_bytes=500),
+            PublicationLimits(max_bytes=1000, max_html_bytes=500, **limits),
         ),
         prefix="/v1",
     )
+    return app
+
+
+@pytest.fixture
+def publication_env(db_uri, tmp_path):
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store = PublishedArtifactStore(db_uri)
+    blobs = LocalArtifactStore(str(tmp_path / "published"))
+    session = conversations.create_conversation()
+    for user in (
+        "owner@example.test",
+        "reader@example.test",
+        "editor@example.test",
+        "oidc-machine:bot",
+    ):
+        permissions.ensure_user(user)
+    permissions.grant("owner@example.test", session.id, 4)
+    permissions.grant("reader@example.test", session.id, 1)
+    permissions.grant("editor@example.test", session.id, 2)
+    permissions.grant("oidc-machine:bot", session.id, 2)
+    app = _publication_app(store, blobs, conversations, permissions)
     return app, store, blobs, conversations, session.id
 
 
@@ -288,6 +293,67 @@ async def test_tombstone_expiry_and_collector_retry(publication_env):
 def test_invalid_operator_limits(config):
     with pytest.raises(ValueError):
         PublicationLimits.parse(config)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_enabled_switch_parses(enabled):
+    assert PublicationLimits.parse({"enabled": enabled}).enabled is enabled
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_enabled_switch_requires_boolean(value):
+    with pytest.raises(ValueError):
+        PublicationLimits.parse({"enabled": value})
+
+
+@pytest.mark.asyncio
+async def test_disabled_publishing_keeps_existing_artifacts_read_only(publication_env):
+    app, store, blobs, conversations, sid = publication_env
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        item = (await _publish(client, sid)).json()
+        grant = {"grants": [{"principal_type": "user", "principal": "reader@example.test"}]}
+        path = f"/v1/artifacts/{item['id']}"
+        assert (
+            await _share(client, path + "/permissions", headers=_headers(), json=grant)
+        ).status_code == 200
+        other = (await _publish(client, sid)).json()
+
+    disabled = _publication_app(store, blobs, conversations, None, enabled=False)
+    consumed = []
+
+    async def body():
+        consumed.append(True)
+        yield b"not parsed"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=disabled), base_url="http://test"
+    ) as client:
+        refused = await client.post(
+            f"/v1/sessions/{sid}/artifacts",
+            headers={**_headers(), "Content-Type": "multipart/form-data; boundary=test"},
+            content=body(),
+        )
+        assert refused.status_code == 403
+        assert refused.json()["detail"] == "Artifact publishing is disabled on this server"
+        assert not consumed
+        reader = _headers("reader@example.test")
+        assert (await client.get(path, headers=reader)).status_code == 200
+        assert (await client.get(path + "/content", headers=reader)).content == b"<h1>report</h1>"
+        listed = (await client.get("/v1/artifacts", headers=_headers())).json()["data"]
+        assert {entry["id"] for entry in listed} == {item["id"], other["id"]}
+        new_grant = {"grants": [{"principal_type": "group", "principal": "engineering"}]}
+        assert (
+            await _share(client, path + "/permissions", headers=_headers(), json=new_grant)
+        ).status_code == 403
+        assert (
+            await _share(client, path + "/permissions", headers=_headers(), json={"grants": []})
+        ).status_code == 200
+        assert (await client.get(path, headers=reader)).status_code == 404
+        other_path = f"/v1/artifacts/{other['id']}"
+        assert (await client.delete(other_path, headers=_headers())).status_code == 204
+        assert (await client.get(other_path, headers=_headers())).status_code == 404
 
 
 @pytest.mark.asyncio

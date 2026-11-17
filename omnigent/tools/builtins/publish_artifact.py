@@ -1,8 +1,14 @@
 """Publish workspace outputs through the authenticated server artifact API."""
 
+import os
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+
+
+def publish_artifact_tool_enabled() -> bool:
+    """Whether this runner's deployment offers artifact publishing."""
+    return os.environ.get("OMNIGENT_PUBLISH_ARTIFACT_TOOL") != "0"
 
 
 class PublishArtifactTool(Tool):
