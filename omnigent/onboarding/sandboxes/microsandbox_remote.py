@@ -540,6 +540,17 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             return None
         return response.json().get("status") == "running"
 
+    def is_stopped(self, sandbox_id: str) -> bool | None:
+        try:
+            response = self._request("GET", f"/v1/sandboxes/{sandbox_id}")
+        except click.ClickException:
+            return None
+        if response.status_code == 404:
+            return False
+        if not response.is_success:
+            return None
+        return response.json().get("status") == "stopped"
+
     def terminate(self, sandbox_id: str) -> None:
         self._check(
             self._request("DELETE", f"/v1/sandboxes/{sandbox_id}", timeout=_CREATE_TIMEOUT_S),

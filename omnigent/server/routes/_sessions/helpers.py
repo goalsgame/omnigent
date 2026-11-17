@@ -6353,6 +6353,8 @@ async def _wait_for_managed_runner_tunnel(
     runner_id: str,
     tunnel_registry: TunnelRegistry,
     tracker: ManagedLaunchTracker,
+    *,
+    settle_on_failure: bool = True,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
@@ -6361,8 +6363,12 @@ async def _wait_for_managed_runner_tunnel(
     :param runner_id: Runner id returned by the host launch frame.
     :param tunnel_registry: Runner tunnel registry to wait on.
     :param tracker: Managed launch tracker to settle on failure.
-    :returns: ``True`` when the runner connected; ``False`` after publishing
-        and retaining a failed launch status.
+    :param settle_on_failure: ``False`` leaves the tracker unsettled and the
+        failure unpublished on timeout; the caller must then call
+        :func:`_fail_managed_runner_connect` itself.
+    :returns: ``True`` when the runner connected; ``False`` on timeout, after
+        publishing and retaining a failed launch status when
+        *settle_on_failure* is set.
     """
     from omnigent.server.routes import sessions as _facade
 
@@ -6382,10 +6388,21 @@ async def _wait_for_managed_runner_tunnel(
             error_code="runner_connect_timeout",
         ),
     )
+    if settle_on_failure:
+        _fail_managed_runner_connect(session_id, tracker)
+    return False
+
+
+def _fail_managed_runner_connect(session_id: str, tracker: ManagedLaunchTracker) -> None:
+    """
+    Settle a managed launch whose runner never connected and publish the failure.
+
+    :param session_id: Session/conversation identifier.
+    :param tracker: Managed launch tracker to settle.
+    """
     reason = "managed runner did not connect after launch"
     tracker.fail(session_id, reason)
     _publish_sandbox_status(session_id, "failed", reason)
-    return False
 
 
 async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:

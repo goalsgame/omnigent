@@ -4241,17 +4241,33 @@ def host_sandbox_awaits_wake(
     Whether this managed host's sandbox has stopped and a wake can resume it.
 
     ``True`` only when :func:`host_resume_supported` holds and the provider
-    reports the sandbox as not running. Such a sandbox keeps its workspace
-    for :func:`resume_managed_host`, so a failed launch must leave the host
-    and its session binding in place. ``False`` for a running sandbox, a
-    provider that cannot resume, or a provider whose status is unknown.
+    reports the sandbox as stopped and resumable
+    (:meth:`~omnigent.onboarding.sandboxes.base.SandboxLauncher.is_stopped`).
+    Such a sandbox keeps its workspace for :func:`resume_managed_host`, so a
+    failed launch must leave the host and its session binding in place.
+    ``False`` for a running, failed or missing sandbox, a provider that cannot
+    resume, a status the provider cannot report, or a status check that raises.
 
     :param host: The managed host bound to the session.
     :param config: The deployment's current sandbox config, or ``None``
         when the ``sandbox:`` section has been removed since launch.
     :returns: Whether the stopped sandbox should be left for a wake.
     """
-    return host_resume_supported(host, config) and host_sandbox_is_running(host, config) is False
+    if not host_resume_supported(host, config):
+        return False
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or host.sandbox_id is None:
+        return False
+    try:
+        return launcher.is_stopped(host.sandbox_id) is True
+    except Exception:  # noqa: BLE001 — an unknown status falls back to teardown.
+        _logger.warning(
+            "Could not read the status of managed sandbox %s for host %s",
+            host.sandbox_id,
+            host.host_id,
+            exc_info=True,
+        )
+        return False
 
 
 # ── Managed-host wake (resume a dormant host on demand) ─────────────────────

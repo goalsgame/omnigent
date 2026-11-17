@@ -406,16 +406,16 @@ async def test_runner_connect_timeout_failure_tears_down_managed_sandbox(
     del tunnels
 
 
-@pytest.mark.parametrize("running", [False, True], ids=["stopped", "running"])
+@pytest.mark.parametrize("stopped", [True, False], ids=["stopped", "not-stopped"])
 async def test_runner_connect_timeout_keeps_a_stopped_resumable_sandbox_bound(
     teardown_env: _Env,
     monkeypatch: pytest.MonkeyPatch,
-    running: bool,
+    stopped: bool,
 ) -> None:
     """
     A resumable sandbox that stopped before its first runner connected keeps
     its host and session binding for the next message's wake; one that is
-    still running is torn down like any other failed launch.
+    is not stopped is torn down like any other failed launch.
     """
     env = teardown_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
@@ -442,11 +442,11 @@ async def test_runner_connect_timeout_keeps_a_stopped_resumable_sandbox_bound(
         host_futures.append(asyncio.wrap_future(future, loop=loop))
 
     fake = FakeSandboxLauncher(
-        on_host_start=_start_fake_sandbox_host, can_resume=True, running=running
+        on_host_start=_start_fake_sandbox_host, can_resume=True, stopped=stopped
     )
     install_fake_modal_launcher(monkeypatch, fake)
 
-    agent = await create_test_agent(env.client, name=f"managed-stopped-{running}-agent")
+    agent = await create_test_agent(env.client, name=f"managed-stopped-{stopped}-agent")
     resp = await env.client.post(
         "/v1/sessions",
         json={"agent_id": agent["id"], "host_type": "managed"},
@@ -460,7 +460,7 @@ async def test_runner_connect_timeout_keeps_a_stopped_resumable_sandbox_bound(
     assert len(launched_host_ids) == 1
     host_id = launched_host_ids[0]
 
-    if running:
+    if not stopped:
         await _wait_for_sandbox_teardown(env, fake, host_id)
         assert fake.terminated == ["sb-fake-1"]
     else:

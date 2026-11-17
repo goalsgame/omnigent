@@ -3547,18 +3547,26 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     assert host_resume_supported(no_sandbox, _injected_config(resumable)) is False
 
 
+class _StatusErrorIsloLauncher(_IsloFakeLauncher):
+    """Islo fake whose status check fails."""
+
+    def is_stopped(self, sandbox_id: str) -> bool | None:
+        raise click.ClickException("provider lookup failed")
+
+
 @pytest.mark.parametrize(
-    ("can_resume", "running", "expected"),
+    ("can_resume", "stopped", "expected"),
     [
-        (True, False, True),
-        (True, True, False),
+        (True, True, True),
+        (True, False, False),
         (True, None, False),
-        (False, False, False),
+        (True, "raises", False),
+        (False, True, False),
     ],
-    ids=["stopped-resumable", "running", "unknown-status", "not-resumable"],
+    ids=["stopped-resumable", "not-stopped", "unknown-status", "status-error", "not-resumable"],
 )
 async def test_host_sandbox_awaits_wake_only_for_a_stopped_resumable_sandbox(
-    db_uri: str, can_resume: bool, running: bool | None, expected: bool
+    db_uri: str, can_resume: bool, stopped: bool | str | None, expected: bool
 ) -> None:
     """Only a resumable sandbox the provider reports as stopped is left for a wake."""
     host = HostStore(db_uri).register_managed_host(
@@ -3570,7 +3578,11 @@ async def test_host_sandbox_awaits_wake_only_for_a_stopped_resumable_sandbox(
         sandbox_id="sb-awaits-wake",
         token_expires_at=now_epoch() + 3600,
     )
-    launcher = _IsloFakeLauncher(can_resume=can_resume, running=running)
+    launcher = (
+        _StatusErrorIsloLauncher(can_resume=can_resume)
+        if stopped == "raises"
+        else _IsloFakeLauncher(can_resume=can_resume, stopped=stopped)  # type: ignore[arg-type]
+    )
     assert host_sandbox_awaits_wake(host, _injected_config(launcher)) is expected
     assert host_sandbox_awaits_wake(host, None) is False
 

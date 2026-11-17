@@ -55,8 +55,8 @@ _RUNNER_GATE_SITECUSTOMIZE = """\
 import os
 import time
 
-_gate = os.environ.get("E2E_RUNNER_GATE")
-if _gate and os.environ.get("RUNNER_SERVER_URL"):
+if os.environ.get("RUNNER_SERVER_URL"):
+    _gate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hold")
     while os.path.exists(_gate):
         time.sleep(0.1)
 """
@@ -240,7 +240,6 @@ class _Handler(BaseHTTPRequestHandler):
         gate = self.server.runner_gate
         if gate is not None:
             env["PYTHONPATH"] = os.pathsep.join([str(gate.parent), env["PYTHONPATH"]])
-            env["E2E_RUNNER_GATE"] = str(gate)
             env["OMNIGENT_RUNNER_ZYGOTE"] = "0"
         try:
             result = subprocess.run(

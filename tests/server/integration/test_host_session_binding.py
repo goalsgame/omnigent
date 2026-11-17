@@ -1007,7 +1007,7 @@ async def test_messages_after_a_lost_failed_launch_rebind_the_session_once(
     fake.fail_on_host_start = False
     fake._on_host_start = _start_fake_sandbox_host
 
-    async def _runner_connected(*args: object) -> bool:
+    async def _runner_connected(*args: object, **kwargs: object) -> bool:
         """Stand in for the runner tunnel the fake host never opens."""
         return True
 
@@ -1788,6 +1788,90 @@ async def test_managed_launch_fails_when_runner_never_connects(
     assert launch.error == "managed runner did not connect after launch"
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
     assert terminated == [sentinel_host]
+
+
+async def test_managed_launch_stays_claimed_until_the_keep_or_teardown_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner-connect failure settles the launch only after the sandbox
+    status check and teardown, so a retry cannot wake the sandbox meanwhile."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1a41e11887aca4570e42c0be40f24833"
+    host_id = "3c8cdcdb61903904849174c864620a5c"
+    conv = SimpleNamespace(id=session_id)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    stages: list[tuple[str, str | None]] = []
+    terminated: list[object] = []
+    sentinel_host = SimpleNamespace(sandbox_provider="modal", sandbox_id="sb-fake-1")
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
+
+    async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
+        terminated.append(host)
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
+            del timeout_s
+
+    class _HostStore:
+        def get_host(self, requested_id: str) -> object:
+            assert requested_id == host_id
+            return sentinel_host
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda _sid, stage, error=None: stages.append((stage, error)),
+    )
+    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
+    settled_during_probe: list[bool] = []
+
+    def _awaits_wake(*_args: object) -> bool:
+        launch = tracker.get(session_id)
+        assert launch is not None
+        settled_during_probe.append(launch.settled.is_set())
+        return False
+
+    monkeypatch.setattr(orchestration, "host_sandbox_awaits_wake", _awaits_wake)
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=session_id,
+        managed=ManagedHostLaunch(
+            host_id=host_id,
+            workspace="/root/workspace",
+        ),
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: FakeSandboxLauncher(),
+                token_ttl_s=3600,
+            )
+        ),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(
+            set_host_id=lambda _sid, _host_id, _workspace: conv,
+        ),
+        host_store=_HostStore(),  # type: ignore[arg-type]
+        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    launch = tracker.get(session_id)
+    assert launch is not None
+    assert launch.settled.is_set()
+    assert launch.error == "managed runner did not connect after launch"
+    assert stages[-1] == ("failed", "managed runner did not connect after launch")
+    assert terminated == [sentinel_host]
+    assert settled_during_probe == [False]
 
 
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(

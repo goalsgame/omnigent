@@ -185,6 +185,20 @@ def test_lifecycle_maps_missing_sandboxes(
         launcher.run(sandbox_id, "true")
 
 
+def test_is_stopped_is_true_only_for_a_stopped_sandbox(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    sandbox_id = launcher.provision("managed")
+    assert launcher.is_stopped(sandbox_id) is False
+    host.sandboxes[sandbox_id] = "stopped"
+    assert launcher.is_stopped(sandbox_id) is True
+    host.sandboxes[sandbox_id] = "failed"
+    assert launcher.is_running(sandbox_id) is False
+    assert launcher.is_stopped(sandbox_id) is False
+    launcher.terminate(sandbox_id)
+    assert launcher.is_stopped(sandbox_id) is False
+
+
 def test_lost_create_response_retries_the_same_name(
     launcher: RemoteMicrosandboxLauncher, host: FakeHost
 ) -> None:
@@ -260,6 +274,7 @@ def test_id_token_failures_become_lifecycle_errors(
         endpoint=ENDPOINT, audience="https://sandbox-host", transport=httpx.MockTransport(host)
     )
     assert launcher.is_running("any") is None
+    assert launcher.is_stopped("any") is None
     assert launcher.keep_alive("any") is False
     with pytest.raises(click.ClickException, match="metadata server unavailable"):
         launcher.prepare()
