@@ -62,10 +62,10 @@ def test_lore_checkout_wake_and_command_renewal(tmp_path: Path, db_uri, monkeypa
     binary = tmp_path / "bin/lore"
     binary.parent.mkdir()
     binary.write_text(f"""#!{sys.executable}
-import json, sys
+import json, os, sys
 from pathlib import Path
 args = sys.argv[1:]
-assert args[:2] == ['--identity-token', 'access']
+assert os.environ['LORE_IDENTITY_TOKEN'] == 'access' and '--identity-token' not in args
 if 'clone' in args:
     dest = Path(args[-1])
     (dest / '.lore').mkdir(parents=True)
@@ -231,10 +231,10 @@ def test_lore_prefix_entry_checkout_applies_configured_view(
     binary = tmp_path / "bin/lore"
     binary.parent.mkdir()
     binary.write_text(f"""#!{sys.executable}
-import sys
+import os, sys
 from pathlib import Path
 args = sys.argv[1:]
-assert args[:2] == ['--identity-token', 'access']
+assert os.environ['LORE_IDENTITY_TOKEN'] == 'access' and '--identity-token' not in args
 if 'clone' in args:
     dest = Path(args[-1])
     (dest / '.lore').mkdir(parents=True)

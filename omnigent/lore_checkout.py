@@ -49,6 +49,22 @@ class LoreClientUnavailable(LoreCheckoutError):
     exit_code = LORE_CLIENT_UNAVAILABLE_EXIT
 
 
+LORE_CREDENTIAL_ENV_VARS = ("LORE_TOKEN", "LORE_IDENTITY_TOKEN", "LORE_ACCESS_TOKEN")
+
+
+def _owner_environment(token: str) -> dict[str, str]:
+    """Return this process's environment with ``token`` as the only Lore credential.
+
+    The token goes in ``LORE_IDENTITY_TOKEN`` rather than on the command line,
+    which other processes can read.
+    """
+    environment = {
+        key: value for key, value in os.environ.items() if key not in LORE_CREDENTIAL_ENV_VARS
+    }
+    environment["LORE_IDENTITY_TOKEN"] = token
+    return environment
+
+
 def credential(server: str, host_id: str, remote: str, *, host_token: str | None = None) -> dict:
     token = host_token or os.environ.get(HOST_TOKEN_ENV_VAR, "")
     if not token:
@@ -307,7 +323,7 @@ def prepare(
         target.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".omnigent-lore-", dir=target.parent) as temporary:
             staging = Path(temporary)
-            args = [binary, "--identity-token", payload["token"], "clone"]
+            args = [binary, "clone"]
             if ref:
                 args += ["--revision", ref]
             if payload.get("view"):
@@ -315,7 +331,9 @@ def prepare(
                 view.write_text(payload["view"], encoding="utf-8")
                 args += ["--view", str(view)]
             args += [remote, str(staging / "clone")]
-            result = subprocess.run(args, capture_output=True, text=True)
+            result = subprocess.run(
+                args, capture_output=True, text=True, env=_owner_environment(payload["token"])
+            )
             if result.returncode:
                 raise LoreCheckoutError(
                     "Lore clone failed; verify access, revision, view and available disk space"
@@ -375,6 +393,7 @@ def execute(args: list[str]) -> int:
         if candidates:
             remote = max(candidates, key=lambda item: len(Path(item["path"]).parts))["remote"]
     command = [_binary()]
+    environment = None
     if remote:
         if any(
             arg.split("=", 1)[0] in ("--identity", "--identity-token", "--access-token")
@@ -390,8 +409,8 @@ def execute(args: list[str]) -> int:
                 "Managed clone requires 'lore clone' or 'lore repository clone'"
             )
         payload = relay_credential(config, remote)
-        command += ["--identity-token", payload["token"]]
-    return subprocess.call([*command, *args])
+        environment = _owner_environment(payload["token"])
+    return subprocess.call([*command, *args], env=environment)
 
 
 def main(argv: list[str] | None = None) -> int:

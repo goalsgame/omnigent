@@ -75,13 +75,21 @@ def test_each_command_renews_owner_credential(home, monkeypatch):
     tokens = iter(["first", "second"])
     monkeypatch.setattr(lore, "relay_credential", lambda *args: {"token": next(tokens)})
     monkeypatch.setattr(lore, "_binary", lambda: sys.executable)
+    monkeypatch.setenv("LORE_TOKEN", "planted")
+    monkeypatch.setenv("LORE_ACCESS_TOKEN", "planted")
     calls = []
-    monkeypatch.setattr(lore.subprocess, "call", lambda args: calls.append(args) or 0)
+    monkeypatch.setattr(
+        lore.subprocess,
+        "call",
+        lambda args, env: (
+            calls.append((args, {k: v for k, v in env.items() if k.startswith("LORE_")})) or 0
+        ),
+    )
     assert lore.execute(["status"]) == 0
     assert lore.execute(["sync"]) == 0
     assert calls == [
-        [sys.executable, "--identity-token", "first", "status"],
-        [sys.executable, "--identity-token", "second", "sync"],
+        ([sys.executable, "status"], {"LORE_IDENTITY_TOKEN": "first"}),
+        ([sys.executable, "sync"], {"LORE_IDENTITY_TOKEN": "second"}),
     ]
     with pytest.raises(lore.LoreCheckoutError, match="different repository"):
         lore.execute(["diff", "lores://other.test/game", "lores://third.test/game"])
@@ -122,7 +130,7 @@ def test_nested_checkouts_choose_their_own_repository(home, monkeypatch):
     monkeypatch.setattr(
         lore, "relay_credential", lambda config, remote: calls.append(remote) or {"token": "child"}
     )
-    monkeypatch.setattr(lore.subprocess, "call", lambda args: 0)
+    monkeypatch.setattr(lore.subprocess, "call", lambda args, env=None: 0)
     monkeypatch.chdir(child)
     assert lore.execute(["status"]) == 0
     assert calls == ["lores://lore.test/child"]

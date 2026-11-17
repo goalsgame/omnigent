@@ -6,8 +6,8 @@ unchanged. Git URLs retain existing behavior; Git clone options do not apply to
 Lore. Other managed providers reject Lore before provisioning. Local hosts can
 continue using their own Lore login and existing checkout.
 
-Install a Lore CLI supporting `--identity-token`, `clone --view` and
-`clone --revision` in the runner image. Configure the server:
+Install Lore 0.11.0 or later in the runner image: the CLI must read
+`LORE_IDENTITY_TOKEN` and support `clone --view` and `clone --revision`. Configure the server:
 
 ```yaml
 oidc_lore:
@@ -64,8 +64,10 @@ nested checkouts use the most specific registered root. The host capability stay
 memory; helper configuration contains no tokens. IdP refresh tokens stay on the
 backend. Local hosts are untouched, including Windows hosts with their own login.
 Login shell profiles must retain `$HOME/.omnigent/lore/bin` in `PATH` when
-the managed wrapper exists. The CLI receives its short-lived token through `--identity-token`, so processes
-inside the sandbox can inspect it while the command runs. The sandbox is the
+the managed wrapper exists. The CLI receives its short-lived token in `LORE_IDENTITY_TOKEN`, not on its
+command line; other Lore credential variables are removed from its environment.
+Processes running as the same user inside the sandbox can still read it while
+the command runs. The sandbox is the
 trust boundary. A long-running CLI command cannot renew its token midway through
 execution; validate intended checkout duration against token lifetime.
 
