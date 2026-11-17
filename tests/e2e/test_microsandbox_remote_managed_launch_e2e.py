@@ -5,7 +5,8 @@ against a stand-in sandbox host that implements the documented host API and runs
 each sandbox's commands as local processes in a private home directory. The
 server's real launch path provisions the sandbox, runs workspace setup and starts
 ``omnigent host`` through it; the host connects its tunnel and registers. Deleting
-the session removes the sandbox. No LLM turn runs.
+the session removes the sandbox, and a message to a session whose sandbox stopped
+wakes it with the server's current create spec. No LLM turn completes.
 """
 
 from __future__ import annotations
@@ -525,4 +526,119 @@ def test_preferred_provider_is_advertised_and_launches(tmp_path: Path) -> None:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
+        fake.shutdown()
+
+
+def test_waking_a_stopped_sandbox_sends_the_current_create_spec(tmp_path: Path) -> None:
+    """
+    A message to a session whose sandbox stopped restarts that sandbox with the
+    create spec configured now, not at launch, and the same host reconnects.
+    """
+    fake = FakeSandboxHost(tmp_path / "sandboxes")
+    threading.Thread(target=fake.serve_forever, daemon=True).start()
+    port = find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    proc, log_path = _spawn_server(tmp_path, port, fake.url, {})
+    launched_groups: list[int] = []
+
+    def server_log() -> str:
+        return log_path.read_text()[-4000:]
+
+    def wait_healthy() -> None:
+        def healthy() -> bool:
+            if proc.poll() is not None:
+                pytest.fail(f"server exited early:\n{server_log()}")
+            try:
+                return httpx.get(f"{base_url}/health", timeout=2.0).status_code == 200
+            except httpx.HTTPError:
+                return False
+
+        _wait_for(healthy, _HEALTH_TIMEOUT_S, lambda: f"server never healthy:\n{server_log()}")
+
+    def session() -> dict[str, object]:
+        return httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+
+    def stop_server() -> None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    try:
+        wait_healthy()
+        agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
+        [agent] = [a for a in agents if a["name"] == "sdk-chat-builtin"]
+        response = httpx.post(
+            f"{base_url}/v1/sessions",
+            json={"agent_id": agent["id"], "host_type": "managed"},
+            timeout=180.0,
+        )
+        assert response.status_code == 201, response.text[:500]
+        session_id = response.json()["id"]
+        launched = _wait_for(
+            lambda: (lambda s: s if s.get("runner_online") else None)(session()),
+            _REGISTER_TIMEOUT_S,
+            lambda: f"session runner never came online:\n{server_log()}",
+        )
+        host_id = launched["host_id"]
+        assert host_id
+        [create] = [c for c in fake.calls if c[0] == "PUT"]
+        name = create[1].rsplit("/", 1)[-1]
+        home = fake.sandboxes[name]["home"]
+        launched_groups.extend(_process_groups(home))  # type: ignore[arg-type]
+
+        stop_server()
+        stopped = httpx.post(
+            f"{fake.url}/v1/sandboxes/{name}/stop",
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+            timeout=30.0,
+        )
+        assert stopped.json()["status"] == "stopped"
+        upgraded_image = "registry.example/omnigent-host:e2e-next"
+        proc, log_path = _spawn_server(
+            tmp_path, port, fake.url, {"image": upgraded_image, "cpus": 4}
+        )
+        wait_healthy()
+        assert session()["host_id"] == host_id
+
+        def send_message() -> None:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.post(
+                    f"{base_url}/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hello"}],
+                        },
+                    },
+                    timeout=300.0,
+                )
+
+        threading.Thread(target=send_message, daemon=True).start()
+
+        def reconnected() -> bool:
+            hosts = httpx.get(f"{base_url}/v1/hosts", timeout=10.0).json()["hosts"]
+            return any(h["host_id"] == host_id and h.get("status") == "online" for h in hosts)
+
+        _wait_for(
+            reconnected,
+            _REGISTER_TIMEOUT_S,
+            lambda: (
+                f"host never reconnected after the wake; host API calls "
+                f"{[(c[0], c[1]) for c in fake.calls]}:\n{server_log()}"
+            ),
+        )
+        launched_groups.extend(_process_groups(home))  # type: ignore[arg-type]
+        starts = [c for c in fake.calls if c[0] == "POST" and c[1].endswith(f"/{name}/start")]
+        assert starts, [(c[0], c[1]) for c in fake.calls]
+        assert starts[0][2] == {**create[2], "image": upgraded_image, "cpus": 4}
+        assert [c for c in fake.calls if c[0] == "PUT"] == [create]
+        assert session()["host_id"] == host_id
+    finally:
+        _kill_groups(launched_groups)
+        for box in list(fake.sandboxes.values()):
+            _kill_groups(_process_groups(box["home"]))  # type: ignore[arg-type]
+        stop_server()
         fake.shutdown()
