@@ -1731,7 +1731,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
     tracker.begin(session_id)
     stages: list[tuple[str, str | None]] = []
     terminated: list[object] = []
-    sentinel_host = object()
+    sentinel_host = SimpleNamespace(sandbox_provider="modal", sandbox_id="sb-fake-1")
 
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")

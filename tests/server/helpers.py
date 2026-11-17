@@ -155,6 +155,8 @@ class FakeSandboxLauncher(SandboxLauncher):
     :param can_resume: Whether this fake advertises in-place sandbox resume.
     :param fail_on_resume: When ``True``, ``resume`` raises
         ``click.ClickException``.
+    :param running: What ``is_running`` reports for every sandbox; ``None``
+        reports an unknown status.
     :param provision_gate: When set, ``provision`` blocks until the
         event is set — a deterministic hold-the-launch-mid-provision
         point for tests of the background managed launch (``provision``
@@ -174,6 +176,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         home: str = "/root",
         can_resume: bool = False,
         fail_on_resume: bool = False,
+        running: bool | None = None,
         provision_gate: threading.Event | None = None,
     ) -> None:
         self._on_host_start = on_host_start
@@ -184,6 +187,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self._home = home
         self.can_resume = can_resume
         self.fail_on_resume = fail_on_resume
+        self.running = running
         self._provision_gate = provision_gate
         # Image reference / secret names / env names the production code
         # constructed the launcher with (captured by the
@@ -302,6 +306,11 @@ class FakeSandboxLauncher(SandboxLauncher):
         if self.fail_on_resume:
             raise click.ClickException("simulated provider resume failure")
         self.resumed.append(sandbox_id)
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """Report the configured ``running`` status."""
+        del sandbox_id
+        return self.running
 
 
 def _parse_host_start(command: str) -> HostStartInvocation:

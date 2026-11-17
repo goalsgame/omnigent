@@ -404,3 +404,72 @@ async def test_runner_connect_timeout_failure_tears_down_managed_sandbox(
     await _wait_for_sandbox_teardown(env, fake, launched_host_ids[0])
     assert fake.terminated == ["sb-fake-1"]
     del tunnels
+
+
+@pytest.mark.parametrize("running", [False, True], ids=["stopped", "running"])
+async def test_runner_connect_timeout_keeps_a_stopped_resumable_sandbox_bound(
+    teardown_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    running: bool,
+) -> None:
+    """
+    A resumable sandbox that stopped before its first runner connected keeps
+    its host and session binding for the next message's wake; one that is
+    still running is torn down like any other failed launch.
+    """
+    env = teardown_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+    launched_host_ids: list[str] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the confirming fake sandbox host when the launcher 'starts' it."""
+        launched_host_ids.append(invocation.host_id)
+        future = asyncio.run_coroutine_threadsafe(
+            _sandbox_host(
+                env.app,
+                invocation.host_id,
+                invocation.host_name,
+                invocation.token,
+                refuse_launch=False,
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(
+        on_host_start=_start_fake_sandbox_host, can_resume=True, running=running
+    )
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name=f"managed-stopped-{running}-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    status = await _wait_for_failed_launch(env, session_id)
+    assert "did not connect" in (status["error"] or ""), status
+    tunnels = [await future for future in host_futures]
+    assert len(launched_host_ids) == 1
+    host_id = launched_host_ids[0]
+
+    if running:
+        await _wait_for_sandbox_teardown(env, fake, host_id)
+        assert fake.terminated == ["sb-fake-1"]
+    else:
+        await asyncio.sleep(0.2)
+        assert fake.terminated == []
+        host = env.host_store.get_host(host_id)
+        assert host is not None
+        assert host.sandbox_id == "sb-fake-1"
+        conv = env.conv_store.get_conversation(session_id)
+        assert conv is not None
+        assert conv.host_id == host_id
+    del tunnels

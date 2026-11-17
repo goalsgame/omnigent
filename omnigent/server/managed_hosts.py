@@ -4233,6 +4233,27 @@ def host_sandbox_is_running(
     return launcher.is_running(host.sandbox_id)
 
 
+def host_sandbox_awaits_wake(
+    host: Host,
+    config: ManagedSandboxDeployment | None,
+) -> bool:
+    """
+    Whether this managed host's sandbox has stopped and a wake can resume it.
+
+    ``True`` only when :func:`host_resume_supported` holds and the provider
+    reports the sandbox as not running. Such a sandbox keeps its workspace
+    for :func:`resume_managed_host`, so a failed launch must leave the host
+    and its session binding in place. ``False`` for a running sandbox, a
+    provider that cannot resume, or a provider whose status is unknown.
+
+    :param host: The managed host bound to the session.
+    :param config: The deployment's current sandbox config, or ``None``
+        when the ``sandbox:`` section has been removed since launch.
+    :returns: Whether the stopped sandbox should be left for a wake.
+    """
+    return host_resume_supported(host, config) and host_sandbox_is_running(host, config) is False
+
+
 # ── Managed-host wake (resume a dormant host on demand) ─────────────────────
 
 # Per-host resume single-flight: one in-flight resume per host_id on this

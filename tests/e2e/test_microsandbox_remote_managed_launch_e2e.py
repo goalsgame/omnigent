@@ -6,7 +6,8 @@ each sandbox's commands as local processes in a private home directory. The
 server's real launch path provisions the sandbox, runs workspace setup and starts
 ``omnigent host`` through it; the host connects its tunnel and registers. Deleting
 the session removes the sandbox, and a message to a session whose sandbox stopped
-wakes it with the server's current create spec. No LLM turn completes.
+wakes it with the server's current create spec, including a sandbox that stopped
+before its first runner connected. No LLM turn completes.
 """
 
 from __future__ import annotations
@@ -50,6 +51,17 @@ def _pythonpath() -> str:
     )
 
 
+_RUNNER_GATE_SITECUSTOMIZE = """\
+import os
+import time
+
+_gate = os.environ.get("E2E_RUNNER_GATE")
+if _gate and os.environ.get("RUNNER_SERVER_URL"):
+    while os.path.exists(_gate):
+        time.sleep(0.1)
+"""
+
+
 def _process_groups(home: Path) -> list[int]:
     record = home / ".sandbox-process-groups"
     return [int(line) for line in record.read_text().split()] if record.exists() else []
@@ -80,6 +92,7 @@ class FakeSandboxHost(ThreadingHTTPServer):
         self.root = root
         self.tools = root / "bin"
         self.tools.mkdir(parents=True)
+        self.runner_gate: Path | None = None
         setsid = self.tools / "setsid"
         setsid.write_text(
             f"#!{sys.executable}\n"
@@ -140,6 +153,15 @@ class FakeSandboxHost(ThreadingHTTPServer):
         context.load_cert_chain(root / "cert.pem", root / "key.pem")
         self.socket = context.wrap_socket(self.socket, server_side=True)
         return pem
+
+    def hold_runners(self) -> Path:
+        """Make sandbox runners wait at startup while the returned file exists."""
+        shim = self.root / "runner-gate"
+        shim.mkdir()
+        (shim / "sitecustomize.py").write_text(_RUNNER_GATE_SITECUSTOMIZE)
+        self.runner_gate = shim / "hold"
+        self.runner_gate.touch()
+        return self.runner_gate
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -215,6 +237,11 @@ class _Handler(BaseHTTPRequestHandler):
             ),
             "PYTHONPATH": _pythonpath(),
         }
+        gate = self.server.runner_gate
+        if gate is not None:
+            env["PYTHONPATH"] = os.pathsep.join([str(gate.parent), env["PYTHONPATH"]])
+            env["E2E_RUNNER_GATE"] = str(gate)
+            env["OMNIGENT_RUNNER_ZYGOTE"] = "0"
         try:
             result = subprocess.run(
                 ["sh", "-c", str(body["command"])],
@@ -641,4 +668,114 @@ def test_waking_a_stopped_sandbox_sends_the_current_create_spec(tmp_path: Path) 
         for box in list(fake.sandboxes.values()):
             _kill_groups(_process_groups(box["home"]))  # type: ignore[arg-type]
         stop_server()
+        fake.shutdown()
+
+
+def test_waking_a_sandbox_that_stopped_before_its_runner_connected(tmp_path: Path) -> None:
+    """
+    A sandbox that stops after its host registers but before the session's
+    first runner connects stays bound to the session, and the next message
+    wakes that sandbox instead of creating a new one.
+    """
+    fake = FakeSandboxHost(tmp_path / "sandboxes")
+    gate = fake.hold_runners()
+    threading.Thread(target=fake.serve_forever, daemon=True).start()
+    port = find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    proc, log_path = _spawn_server(tmp_path, port, fake.url, {})
+    launched_groups: list[int] = []
+
+    def server_log() -> str:
+        return log_path.read_text()[-4000:]
+
+    def host_api_calls() -> list[tuple[str, str]]:
+        return [(c[0], c[1]) for c in fake.calls]
+
+    def session() -> dict[str, object]:
+        return httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+
+    try:
+
+        def healthy() -> bool:
+            if proc.poll() is not None:
+                pytest.fail(f"server exited early:\n{server_log()}")
+            try:
+                return httpx.get(f"{base_url}/health", timeout=2.0).status_code == 200
+            except httpx.HTTPError:
+                return False
+
+        _wait_for(healthy, _HEALTH_TIMEOUT_S, lambda: f"server never healthy:\n{server_log()}")
+        agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
+        [agent] = [a for a in agents if a["name"] == "sdk-chat-builtin"]
+        response = httpx.post(
+            f"{base_url}/v1/sessions",
+            json={"agent_id": agent["id"], "host_type": "managed"},
+            timeout=180.0,
+        )
+        assert response.status_code == 201, response.text[:500]
+        session_id = response.json()["id"]
+        bound = _wait_for(
+            lambda: (lambda s: s if s.get("host_id") else None)(session()),
+            _REGISTER_TIMEOUT_S,
+            lambda: f"session never bound to its managed host:\n{server_log()}",
+        )
+        host_id = bound["host_id"]
+        assert not bound.get("runner_online")
+        [create] = [c for c in fake.calls if c[0] == "PUT"]
+        name = create[1].rsplit("/", 1)[-1]
+        home = fake.sandboxes[name]["home"]
+        launched_groups.extend(_process_groups(home))  # type: ignore[arg-type]
+
+        stopped = httpx.post(
+            f"{fake.url}/v1/sandboxes/{name}/stop",
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+            timeout=30.0,
+        )
+        assert stopped.json()["status"] == "stopped"
+        _wait_for(
+            lambda: (session().get("sandbox_status") or {}).get("stage") == "failed",
+            _REGISTER_TIMEOUT_S,
+            lambda: f"first launch never settled after the stop:\n{server_log()}",
+        )
+        assert name in fake.sandboxes, host_api_calls()
+        assert session()["host_id"] == host_id
+        gate.unlink()
+
+        def send_message() -> None:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.post(
+                    f"{base_url}/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hello"}],
+                        },
+                    },
+                    timeout=300.0,
+                )
+
+        threading.Thread(target=send_message, daemon=True).start()
+        _wait_for(
+            lambda: session().get("runner_online"),
+            _REGISTER_TIMEOUT_S,
+            lambda: (
+                f"runner never came online after the wake; host API calls "
+                f"{host_api_calls()}:\n{server_log()}"
+            ),
+        )
+        launched_groups.extend(_process_groups(home))  # type: ignore[arg-type]
+        assert any(c == ("POST", f"/v1/sandboxes/{name}/start") for c in host_api_calls())
+        assert [c for c in fake.calls if c[0] == "PUT"] == [create]
+        assert not [c for c in fake.calls if c[0] == "DELETE"]
+        assert session()["host_id"] == host_id
+    finally:
+        _kill_groups(launched_groups)
+        for box in list(fake.sandboxes.values()):
+            _kill_groups(_process_groups(box["home"]))  # type: ignore[arg-type]
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         fake.shutdown()
