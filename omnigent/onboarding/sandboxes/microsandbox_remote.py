@@ -17,7 +17,8 @@ value of the environment variable named by ``token_env``.
 
 Stopped (idle-drained) sandboxes keep their filesystem and an optional per-sandbox
 workspace volume, so ``can_resume`` is ``True`` and the managed wake path restarts
-them in place.
+them in place. A start carries the current create spec, so a host that supports it
+can rebuild a stopped sandbox on a newer configured image around the same workspace.
 """
 
 from __future__ import annotations
@@ -301,8 +302,7 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
     def prepare(self) -> None:
         self._check(self._request("GET", "/v1/host"), "report its capacity")
 
-    def provision(self, name: str) -> str:
-        sandbox_id = sandbox_name(name)
+    def _create_body(self) -> dict[str, Any]:
         body: dict[str, Any] = {
             "image": self._image or DEFAULT_HOST_IMAGE,
             "cpus": self._cpus,
@@ -317,6 +317,11 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
             body["env"].setdefault("HOME", self._workspace_path)
         if self._user:
             body["user"] = self._user
+        return body
+
+    def provision(self, name: str) -> str:
+        sandbox_id = sandbox_name(name)
+        body = self._create_body()
         click.echo(f"▸ Creating remote microsandbox '{sandbox_id}'")
         failure: click.ClickException | None = None
         for _attempt in range(_CREATE_ATTEMPTS):
@@ -515,7 +520,10 @@ class RemoteMicrosandboxLauncher(ExecModelHostLauncher):
 
     def resume(self, sandbox_id: str) -> None:
         response = self._request(
-            "POST", f"/v1/sandboxes/{sandbox_id}/start", timeout=_CREATE_TIMEOUT_S
+            "POST",
+            f"/v1/sandboxes/{sandbox_id}/start",
+            json=self._create_body(),
+            timeout=_CREATE_TIMEOUT_S,
         )
         if response.status_code == 404:
             raise SandboxGoneError(f"remote microsandbox '{sandbox_id}' no longer exists")
