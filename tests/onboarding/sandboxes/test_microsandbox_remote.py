@@ -118,6 +118,33 @@ def test_provision_creates_a_sized_sandbox_with_workspace_and_env(
     }
 
 
+def test_resume_sends_the_current_create_spec(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    sandbox_id = launcher.provision("managed")
+    created = json.loads(host.requests[-1].content)
+    host.sandboxes[sandbox_id] = "stopped"
+    launcher._image = "registry.example/omnigent-host@sha256:" + "b" * 64
+    launcher.resume(sandbox_id)
+    start = host.requests[-1]
+    assert (start.method, start.url.path) == ("POST", f"/v1/sandboxes/{sandbox_id}/start")
+    assert json.loads(start.content) == {**created, "image": launcher._image}
+
+
+def test_an_unavailable_sandbox_fails_the_wake_without_counting_as_gone(
+    launcher: RemoteMicrosandboxLauncher, host: FakeHost
+) -> None:
+    sandbox_id = launcher.provision("managed")
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "its workspace is kept"})
+
+    launcher._transport = httpx.MockTransport(unavailable)
+    with pytest.raises(click.ClickException, match="HTTP 503 its workspace is kept") as caught:
+        launcher.resume(sandbox_id)
+    assert not isinstance(caught.value, SandboxGoneError)
+
+
 def test_run_returns_output_and_raises_on_failure_when_checked(
     launcher: RemoteMicrosandboxLauncher, host: FakeHost
 ) -> None:

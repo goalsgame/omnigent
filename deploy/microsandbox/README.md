@@ -168,12 +168,16 @@ The host service must implement this contract (JSON bodies, `Authorization: Bear
 |---|---|---|
 | `GET /v1/host` | — | `200` with capacity details |
 | `PUT /v1/sandboxes/{name}` | `image`, `cpus`, `memory_mib`, `max_memory_mib`, `idle_timeout_s`, `env`, optional `workspace_path`, `workspace_quota_mib`, `user` | `200` `{name, created, status}`; idempotent per name |
-| `GET /v1/sandboxes/{name}` | — | `200` `{name, status}` (`running`, `stopped`, …) or `404` |
-| `POST /v1/sandboxes/{name}/start` | — | `200` `{name, status}` or `404` |
+| `GET /v1/sandboxes/{name}` | — | `200` `{name, status}` (`running`, `stopped`, …), optionally with `image`, or `404` |
+| `POST /v1/sandboxes/{name}/start` | the `PUT` body, which hosts that do not upgrade may ignore | `200` `{name, status}`; `404` only when the sandbox and its workspace are gone |
 | `POST /v1/sandboxes/{name}/stop` | — | `200` `{name, status}` or `404` |
 | `POST /v1/sandboxes/{name}/touch` | — | `204`; `409` when not running; `404` |
 | `POST /v1/sandboxes/{name}/exec` | `command`, `timeout_s`, optional `env`, `cwd`, `detach` | `200` `{exit_code, stdout, stderr, timed_out}` or `{job_id}`; `409` when not running; `404` |
 | `DELETE /v1/sandboxes/{name}` | — | `204`, also when already gone |
 
 Names match `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`.
+
+The server sends its current create spec when it wakes a sandbox, so a host may rebuild a stopped sandbox on a newer configured `image` around the same workspace before starting it.
+Such a host must never rebuild a running sandbox, and must keep the workspace when a rebuild fails.
+A `404` from `start` tells the server the workspace is gone, and it launches a fresh sandbox with an empty one; a host that has kept the workspace without a startable VM must answer with a `5xx` instead, so the server reports the failed wake and retries on the next message.
 The host should only accept images it trusts, cap requested resources, and keep the VMs' egress away from private addresses, the metadata server and the host API.
