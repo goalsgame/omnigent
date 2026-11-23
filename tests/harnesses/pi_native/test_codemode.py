@@ -11,6 +11,34 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 
+#: First Pi release whose ``searchTools()`` ranks a tool named by the query first.
+NAME_RANKING_MIN_VERSION = (1, 5)
+
+
+def _minor_version(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("-")[0].split(".")[:2])
+
+
+def _verify_codemode_flags(version: str) -> list[str]:
+    """Extra ``verify_codemode.mjs`` arguments for the installed Pi ``version``."""
+    if _minor_version(version) < NAME_RANKING_MIN_VERSION:
+        return ["skip-name-ranking"]
+    return []
+
+
+@pytest.mark.parametrize(
+    ("version", "flags"),
+    [
+        ("1.3.0", ["skip-name-ranking"]),
+        ("1.4.9", ["skip-name-ranking"]),
+        ("1.5.0-beta.1", []),
+        ("1.5.2", []),
+        ("2.0.0", []),
+    ],
+)
+def test_name_ranking_checks_follow_pi_version(version: str, flags: list[str]) -> None:
+    assert _verify_codemode_flags(version) == flags
+
 
 def test_bridge_discovery_registration_and_legacy_fallback() -> None:
     node = shutil.which("node")
@@ -41,7 +69,7 @@ def _installed_pi_sdk() -> tuple[str, Path, str]:
     if package is None:
         pytest.skip("Native SDK integration requires the npm Pi distribution")
     version = json.loads((package / "package.json").read_text())["version"]
-    if tuple(int(part) for part in version.split(".")[:2]) < (1, 3):
+    if _minor_version(version) < (1, 3):
         pytest.skip("Native discovery integration requires Pi 1.3 or newer")
     return node, package, version
 
@@ -55,6 +83,7 @@ def test_native_codemode_sdk_preserves_authorization() -> None:
             str(package),
             str(ROOT / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"),
             version,
+            *_verify_codemode_flags(version),
         ],
         capture_output=True,
         text=True,

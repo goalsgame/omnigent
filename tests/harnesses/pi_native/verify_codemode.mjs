@@ -18,6 +18,7 @@ const extensionPath =
   "/build/omnigent/resources/pi_native/omnigent_pi_native_extension.js";
 const expectedVersion =
   process.argv[4] || fs.readFileSync("/opt/omnigent/pi-version", "utf8").trim();
+const checkNameRanking = process.argv[5] !== "skip-name-ranking";
 assert.equal(
   JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"))
     .version,
@@ -259,7 +260,7 @@ try {
   const found = await execute('text(await describeTool("docs__lookup_169"));');
   assert.match(text(found), /docs__lookup_169/);
   assert.equal(calls.length, 0, "Discovery must not execute the tool");
-  for (const query of ["tickets__read", "tickets_read"]) {
+  for (const query of checkNameRanking ? ["tickets__read", "tickets_read"] : []) {
     const ranked = await execute(
       `text(JSON.stringify((await searchTools(${JSON.stringify(query)})).map((tool) => tool.name)));`,
     );
