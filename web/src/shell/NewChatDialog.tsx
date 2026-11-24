@@ -160,6 +160,7 @@ import {
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
+import { findDeepLinkAgent, parseNewSessionDeepLink } from "./newSessionDeepLink";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
@@ -2115,6 +2116,7 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
+  const [deepLink] = useState(() => parseNewSessionDeepLink(searchParams));
   const [cacheUser, setCacheUser] = useState(getCurrentUserId);
   useEffect(() => {
     if (cacheUser !== null) return;
@@ -2272,7 +2274,9 @@ export function NewChatLandingScreen() {
           autoSeededBranch: "",
         };
 
-  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [message, setMessage] = useState<string>(
+    () => deepLink.prompt ?? restoredDraft?.message ?? "",
+  );
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -3000,6 +3004,24 @@ export function NewChatLandingScreen() {
     branchName,
     generateBranchName,
   ]);
+
+  // A deep-linked catalog agent is picked once the full list loads; an
+  // unknown name leaves the usual default in place.
+  const [deepLinkAgentId, setDeepLinkAgentId] = useState<string | null>(null);
+  const deepLinkAgentResolvedRef = useRef(deepLink.agent === null);
+  useEffect(() => {
+    if (deepLinkAgentResolvedRef.current) return;
+    if (agents === undefined || agentsArePlaceholder) return;
+    deepLinkAgentResolvedRef.current = true;
+    const linked = findDeepLinkAgent(agentList, deepLink.agent);
+    if (!linked) return;
+    agentExplicitlySelectedRef.current = true;
+    agentFromConfigRef.current = false;
+    setPickedAgentId(linked.id);
+    const remembered = readLastHarness(linked.id);
+    setPickedHarness(remembered === AUTO_NATIVE_HARNESS_ID ? null : remembered);
+    setDeepLinkAgentId(linked.id);
+  }, [agents, agentsArePlaceholder, agentList, deepLink.agent]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -4008,18 +4030,20 @@ export function NewChatLandingScreen() {
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
-  // A project-configured default model (Project settings) outranks the user's
-  // remembered per-harness pick — but only while the composer sits on the
-  // project's configured agent; switching to another agent falls back to the
-  // remembered pick / harness default.
+  // A deep-linked model, else a project-configured default model (Project
+  // settings), outranks the user's remembered per-harness pick — but only while
+  // the composer sits on the linked or configured agent; switching to another
+  // agent falls back to the remembered pick / harness default.
   const projectDefaultModel =
-    prefillConfig?.model != null &&
-    prefillConfig.agentId != null &&
-    effectiveAgentId === prefillConfig.agentId
-      ? prefillConfig.model
-      : prefillConfig === undefined && cachedPickerOptions?.agent.id === effectiveAgentId
-        ? cachedPickerOptions.model
-        : null;
+    deepLink.model !== null && deepLinkAgentId !== null && effectiveAgentId === deepLinkAgentId
+      ? deepLink.model
+      : prefillConfig?.model != null &&
+          prefillConfig.agentId != null &&
+          effectiveAgentId === prefillConfig.agentId
+        ? prefillConfig.model
+        : prefillConfig === undefined && cachedPickerOptions?.agent.id === effectiveAgentId
+          ? cachedPickerOptions.model
+          : null;
   // The same default validated against the selected harness's current vocab.
   // An unknown/retired stored id must behave as "no project default": the
   // model seed falls back to the remembered pick, and the remembered-routing
