@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { useSidebarData } from "./useSidebarData";
+import { AGENT_CATALOG_QUERY_KEY, AVAILABLE_AGENTS_STALE_MS } from "./agentCatalogQuery";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { filterToAgentCatalog } from "@/lib/agentGrouping";
@@ -446,13 +447,8 @@ function mergeAvailableAgents(
   return [...seeded, ...resolved];
 }
 
-// Catalog-only list backing the placeholder rows. Shared by the hook's
-// catalog query and the merged queryFn (via fetchQuery), so a picker mount
-// issues a single GET /v1/agents for both.
-const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
 // The caller's own agents (GET /v1/agents?scope=user); refetch after an install.
 export const USER_AGENTS_QUERY_KEY = ["available-agents-user"] as const;
-const AVAILABLE_AGENTS_STALE_MS = 30_000;
 
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
