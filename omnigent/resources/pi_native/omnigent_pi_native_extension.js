@@ -894,12 +894,117 @@ async function postEventChecked(config, body, signal) {
   return response;
 }
 
-async function postEvent(config, body) {
-  try {
-    await postEventChecked(config, body);
-  } catch (_err) {
-    // Keep Pi responsive even if Omnigent is temporarily unavailable.
+// Best-effort events share one ordered outbox with at most one POST in flight.
+// Events queued while a POST is in flight are sent together as one JSON array.
+const _EVENT_BATCH_MAX_EVENTS = 100;
+const _EVENT_BATCH_MAX_BYTES = 1024 * 1024;
+const eventOutbox = [];
+let eventPump = null;
+let lastQueuedEvent = null;
+
+function eventsConfigured(config) {
+  return !!(
+    config &&
+    config.serverUrl &&
+    config.sessionId &&
+    typeof fetch === "function"
+  );
+}
+
+/**
+ * Queue one event and return a promise that settles once its POST finishes.
+ *
+ * ``build`` runs when the event is sent and returns its body, or ``null`` to
+ * drop it. With ``merge``, a chunk whose key matches the newest unsent entry
+ * is appended to that entry's ``delta`` instead of creating a new one.
+ */
+function queueEvent(config, build, merge) {
+  if (!eventsConfigured(config)) return Promise.resolve();
+  const last = eventOutbox[eventOutbox.length - 1];
+  if (
+    merge &&
+    last &&
+    last.config === config &&
+    last.mergeKey === merge.key &&
+    last.body === undefined
+  ) {
+    last.delta += merge.delta;
+    return last.settled;
   }
+  let resolve;
+  const settled = new Promise((done) => {
+    resolve = done;
+  });
+  const entry = {
+    config,
+    build,
+    mergeKey: merge ? merge.key : null,
+    delta: merge ? merge.delta : "",
+    body: undefined,
+    size: 0,
+    settled,
+    resolve,
+  };
+  eventOutbox.push(entry);
+  lastQueuedEvent = entry;
+  if (!eventPump) eventPump = pumpEvents();
+  return settled;
+}
+
+function takeEventBatch() {
+  const batch = [];
+  let bytes = 2;
+  while (eventOutbox.length && batch.length < _EVENT_BATCH_MAX_EVENTS) {
+    const entry = eventOutbox[0];
+    if (batch.length && entry.config !== batch[0].config) break;
+    if (entry.body === undefined) {
+      entry.body = entry.build(entry.delta);
+      entry.size = entry.body
+        ? Buffer.byteLength(JSON.stringify(entry.body)) + 1
+        : 0;
+    }
+    if (!entry.body) {
+      eventOutbox.shift();
+      entry.resolve();
+      continue;
+    }
+    if (batch.length && bytes + entry.size > _EVENT_BATCH_MAX_BYTES) break;
+    eventOutbox.shift();
+    batch.push(entry);
+    bytes += entry.size;
+  }
+  return batch;
+}
+
+async function pumpEvents() {
+  try {
+    await null;
+    while (eventOutbox.length) {
+      const batch = takeEventBatch();
+      if (!batch.length) continue;
+      const bodies = batch.map((entry) => entry.body);
+      try {
+        await postEventChecked(
+          batch[0].config,
+          bodies.length === 1 ? bodies[0] : bodies,
+        );
+      } catch (_err) {
+        // Keep Pi responsive even if Omnigent is temporarily unavailable.
+      }
+      for (const entry of batch) entry.resolve();
+    }
+  } finally {
+    eventPump = null;
+  }
+}
+
+/** Resolve once every event queued so far has been posted. */
+function flushEvents() {
+  return lastQueuedEvent ? lastQueuedEvent.settled : Promise.resolve();
+}
+
+function postEvent(config, body) {
+  return queueEvent(config, () => body);
 }
 
 function isRetryableAssistantError(error) {
@@ -1587,11 +1692,8 @@ module.exports = function (pi) {
   // so a duplicate text_end (or a stray text_delta after end) can't reopen
   // or double-finalize the preview.
   const finalizedTextBlocks = new Set();
-  // Live deltas waiting to be posted, in arrival order. At most one delta POST
-  // is in flight; chunks for the same message or reasoning block that arrive
-  // meanwhile merge into one pending entry.
-  const pendingDeltas = [];
-  let deltaPump = null;
+  // message_ids with at least one queued text chunk.
+  const streamedTextMessages = new Set();
   const postedReasoningBlocks = new Set();
 
   // Names of the Omnigent tools registered via pi.registerTool below. Bridged
@@ -1949,7 +2051,7 @@ module.exports = function (pi) {
   // ``session.usage`` event. Cumulative (SET) semantics — the server overwrites
   // its stored totals each flush. Deduped so a flush with no advance is a
   // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
-  async function postSessionUsage() {
+  function postSessionUsage() {
     if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
     const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${cumulativeCacheWriteTokens}-${usageModel || ""}`;
     if (postKey === lastPostedUsageKey) return;
@@ -1961,7 +2063,7 @@ module.exports = function (pi) {
       cumulative_cache_creation_input_tokens: cumulativeCacheWriteTokens,
     };
     if (usageModel) data.model = usageModel;
-    await postEvent(config, { type: "external_session_usage", data });
+    return postEvent(config, { type: "external_session_usage", data });
   }
 
   function rememberContext(ctx) {
@@ -2025,7 +2127,7 @@ module.exports = function (pi) {
     pendingInterruptUntil = 0;
   }
 
-  async function postToolCall(toolCall, responseId) {
+  function postToolCall(toolCall, responseId) {
     if (!toolCall || typeof toolCall !== "object") return;
     const callId = String(toolCall.id || toolCall.toolCallId || "");
     const name = String(toolCall.name || toolCall.toolName || "");
@@ -2034,7 +2136,7 @@ module.exports = function (pi) {
     toolCallsById.set(callId, { key, responseId, name, parentCallId: toolCall.parentToolCallId });
     if (postedToolCalls.has(key)) return;
     postedToolCalls.add(key);
-    await postEvent(config, {
+    return postEvent(config, {
       type: "external_conversation_item",
       data: {
         response_id: responseId,
@@ -2052,7 +2154,7 @@ module.exports = function (pi) {
     });
   }
 
-  async function postToolResult(event, responseId) {
+  function postToolResult(event, responseId) {
     if (!event || typeof event !== "object") return;
     const callId = String(event.toolCallId || event.id || "");
     if (!callId) return;
@@ -2060,7 +2162,7 @@ module.exports = function (pi) {
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
     postedToolResults.add(key);
-    await postEvent(config, {
+    return postEvent(config, {
       type: "external_conversation_item",
       data: {
         response_id: known && known.responseId ? known.responseId : responseId,
@@ -2075,7 +2177,7 @@ module.exports = function (pi) {
     });
   }
 
-  async function postCompletedReasoning(text, responseId, keyHint, streamed) {
+  function postCompletedReasoning(text, responseId, keyHint, streamed) {
     if (typeof text !== "string" || !text.trim()) return;
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
@@ -2083,12 +2185,12 @@ module.exports = function (pi) {
     postedReasoning.add(key);
     postedReasoning.add(textKey);
     if (!streamed) {
-      await postEvent(config, {
+      postEvent(config, {
         type: "external_output_reasoning_delta",
         data: { delta: text, started: true },
       });
     }
-    await postEvent(config, {
+    return postEvent(config, {
       type: "external_conversation_item",
       data: {
         response_id: responseId,
@@ -2107,35 +2209,20 @@ module.exports = function (pi) {
   }
 
   function queueDelta(kind, key, delta) {
-    const last = pendingDeltas[pendingDeltas.length - 1];
-    if (last && last.kind === kind && last.key === key) last.delta += delta;
-    else pendingDeltas.push({ kind, key, delta });
-    if (!deltaPump) deltaPump = pumpDeltas();
+    const build =
+      kind === "text"
+        ? (merged) => outputTextDeltaBody(key, merged)
+        : (merged) => reasoningChunkBody(key, merged);
+    queueEvent(config, build, { key: `${kind}:${key}`, delta });
   }
 
-  async function pumpDeltas() {
-    try {
-      while (pendingDeltas.length) {
-        const next = pendingDeltas.shift();
-        if (next.kind === "text") await postOutputTextDelta(next.key, next.delta);
-        else await postReasoningChunk(next.key, next.delta);
-      }
-    } finally {
-      deltaPump = null;
-    }
-  }
-
-  async function flushDeltas() {
-    while (deltaPump) await deltaPump;
-  }
-
-  async function postReasoningChunk(blockKey, delta) {
+  function reasoningChunkBody(blockKey, delta) {
     const started = !postedReasoningBlocks.has(blockKey);
     postedReasoningBlocks.add(blockKey);
-    await postEvent(config, {
+    return {
       type: "external_output_reasoning_delta",
       data: { delta, started },
-    });
+    };
   }
 
   function postReasoningDelta(update, responseId) {
@@ -2156,18 +2243,18 @@ module.exports = function (pi) {
     return `${responseId}:msg:${streamingMessageOrdinal}`;
   }
 
-  async function postOutputTextDelta(messageId, delta, options) {
+  function outputTextDeltaBody(messageId, delta, options) {
     // Transient assistant-text chunk for live preview (Responses-style
     // response.output_text.delta on the wire). Not persisted; the
     // authoritative final text arrives separately via
     // external_conversation_item. A blank, non-final delta carries no
     // signal — skip it so an empty token can't churn the UI buffer.
     const final = !!(options && options.final);
-    if (typeof delta !== "string") return;
-    if (!delta && !final) return;
+    if (typeof delta !== "string") return null;
+    if (!delta && !final) return null;
     const index = streamedTextIndex.get(messageId) || 0;
     streamedTextIndex.set(messageId, index + 1);
-    await postEvent(config, {
+    return {
       type: "external_output_text_delta",
       data: {
         delta,
@@ -2175,7 +2262,7 @@ module.exports = function (pi) {
         index,
         final,
       },
-    });
+    };
   }
 
   function postTextDelta(update, responseId) {
@@ -2185,35 +2272,37 @@ module.exports = function (pi) {
     if (!update || typeof update.delta !== "string" || !update.delta) return;
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
+    streamedTextMessages.add(messageId);
     queueDelta("text", messageId, update.delta);
   }
 
-  async function finalizeStreamingMessage(responseId) {
+  function finalizeStreamingMessage(responseId) {
     // Emit a final-marker delta so the web UI knows no further chunks will
     // arrive for this message_id and can stop the live buffer. The marker
     // carries no new text (the running preview already holds the full
     // message); message_end posts the authoritative item that replaces the
     // preview in place. Only finalize a message we actually streamed (a
     // message with no text_delta has no live preview to close).
-    await flushDeltas();
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
-    if (!streamedTextIndex.has(messageId)) return;
+    if (!streamedTextMessages.has(messageId)) return;
     finalizedTextBlocks.add(messageId);
-    await postOutputTextDelta(messageId, "", { final: true });
+    queueEvent(config, () =>
+      outputTextDeltaBody(messageId, "", { final: true }),
+    );
   }
 
-  async function mirrorAssistantMessage(message, responseId) {
+  function mirrorAssistantMessage(message, responseId) {
     const blocks = contentBlocks(message);
     for (let index = 0; index < blocks.length; index += 1) {
       const block = blocks[index];
       if (!block || typeof block !== "object") continue;
-      if (block.type === "toolCall") await postToolCall(block, responseId);
+      if (block.type === "toolCall") postToolCall(block, responseId);
       if (block.type === "thinking") {
         const text = typeof block.thinking === "string" ? block.thinking : "";
         const key = block.thinkingSignature || `${turnOrdinal}:${index}`;
         const blockKey = reasoningBlockKey(responseId, index);
-        await postCompletedReasoning(
+        postCompletedReasoning(
           text,
           responseId,
           key,
@@ -2441,6 +2530,7 @@ module.exports = function (pi) {
     automaticPeerActorFailed = false;
     truncatedCompletion = false;
     setOmnigentStatus(config, ctx, "running");
+    await flushEvents();
     activeResponseId = null;
     turnOrdinal = 0;
     postedToolCalls.clear();
@@ -2451,6 +2541,7 @@ module.exports = function (pi) {
     postedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
+    streamedTextMessages.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
     // Pin the status response_id for this agent loop through agent_end.
@@ -2481,14 +2572,17 @@ module.exports = function (pi) {
     for (const message of messages) {
       if (accumulateUsage(message)) changed = true;
     }
-    if (changed) await postSessionUsage();
+    if (changed) postSessionUsage();
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
     // Manual compact aborts the turn first; its own completion publishes idle.
-    if (compacting) return;
+    if (compacting) {
+      await flushEvents();
+      return;
+    }
     await postEvent(config, {
       type: "external_session_status",
       data: { status: truncatedCompletion ? "failed" : "idle", response_id: endResponseId },
@@ -2520,15 +2614,14 @@ module.exports = function (pi) {
       postReasoningDelta(update, responseId);
       return;
     }
-    await flushDeltas();
     if (update.type === "toolcall_end") {
-      await postToolCall(update.toolCall, responseId);
+      postToolCall(update.toolCall, responseId);
       return;
     }
     if (update.type === "thinking_end") {
       const key = `${turnOrdinal}:${update.contentIndex}`;
       const blockKey = reasoningBlockKey(responseId, update.contentIndex);
-      await postCompletedReasoning(
+      postCompletedReasoning(
         update.content,
         responseId,
         key,
@@ -2548,7 +2641,7 @@ module.exports = function (pi) {
     try { await peerActorBinding; } catch (_err) { automaticPeerActorFailed = true; }
     if (automaticPeerActorFailed) return { block: true, reason: "Automatic peer turn identity is unavailable" };
     const responseId = currentResponseId();
-    await postToolCall(
+    postToolCall(
       {
         id: event && event.toolCallId,
         name: event && event.toolName,
@@ -2557,6 +2650,7 @@ module.exports = function (pi) {
       },
       responseId,
     );
+    await flushEvents();
     if (blocked) {
       return { block: true, reason: "Interrupted by user" };
     }
@@ -2651,13 +2745,14 @@ module.exports = function (pi) {
     // ordinal advances here (not on message_start) so the deltas just
     // posted and this finalize agree on the id regardless of whether Pi
     // fires message_start.
-    await finalizeStreamingMessage(responseId);
-    await mirrorAssistantMessage(message, responseId);
+    finalizeStreamingMessage(responseId);
+    mirrorAssistantMessage(message, responseId);
     streamingMessageOrdinal += 1;
     // ``message_end`` is the primary usage-capture site (one completed
     // assistant message per LLM call); fold its token counts into the
     // cumulative session totals and flush to the server for pricing.
-    if (accumulateUsage(message)) await postSessionUsage();
+    if (accumulateUsage(message)) postSessionUsage();
+    await flushEvents();
     // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
     // unsupported API types) as visible error items in the web UI so users
     // aren't left staring at an empty turn.
@@ -2727,16 +2822,17 @@ module.exports = function (pi) {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
     const responseId = currentResponseId();
-    await mirrorAssistantMessage(event && event.message, responseId);
+    mirrorAssistantMessage(event && event.message, responseId);
     // Fallback usage capture: if Pi attached usage to the turn's final
     // assistant message but no ``message_end`` carried it, fold it in here.
     // Deduped by fingerprint, so a message already counted on ``message_end``
     // is a no-op.
-    if (accumulateUsage(event && event.message)) await postSessionUsage();
+    if (accumulateUsage(event && event.message)) postSessionUsage();
     const results =
       event && Array.isArray(event.toolResults) ? event.toolResults : [];
     for (const result of results) {
-      await postToolResult(result, responseId);
+      postToolResult(result, responseId);
     }
+    await flushEvents();
   });
 };

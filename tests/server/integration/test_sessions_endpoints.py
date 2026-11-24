@@ -1514,6 +1514,119 @@ async def test_session_event_batch_is_ordered_and_idempotent(
     ]
 
 
+def _native_turn_events() -> list[dict[str, Any]]:
+    """One native turn's events in the order a native extension posts them."""
+    calls = [("call_a", "a.py"), ("call_b", "b.py")]
+    return [
+        {"type": "external_session_status", "data": {"status": "running", "response_id": "r"}},
+        {"type": "external_output_reasoning_delta", "data": {"delta": "plan", "started": True}},
+        {
+            "type": "external_output_text_delta",
+            "data": {"delta": "Reading", "message_id": "r:msg:0", "index": 0, "final": False},
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "response_id": "r",
+                "item_type": "reasoning",
+                "item_data": {
+                    "agent": "Pi",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "plan"}],
+                },
+            },
+        },
+        *(
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "response_id": "r",
+                    "item_type": "function_call",
+                    "item_data": {
+                        "agent": "Pi",
+                        "name": "read",
+                        "arguments": json.dumps({"path": path}),
+                        "call_id": call_id,
+                    },
+                },
+            }
+            for call_id, path in calls
+        ),
+        {
+            "type": "external_session_usage",
+            "data": {"cumulative_input_tokens": 120, "cumulative_output_tokens": 30},
+        },
+        *(
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "response_id": "r",
+                    "item_type": "function_call_output",
+                    "item_data": {"call_id": call_id, "output": f"contents of {path}"},
+                },
+            }
+            for call_id, path in calls
+        ),
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": "pi:assistant:response:r",
+                "response_id": "r",
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "Pi",
+                    "content": [{"type": "output_text", "text": "Reading"}],
+                },
+            },
+        },
+        {"type": "external_session_status", "data": {"status": "idle", "response_id": "r"}},
+    ]
+
+
+async def test_native_event_array_matches_individual_posts(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One array POST persists and publishes what the same events posted singly do."""
+    published: dict[str, list[dict[str, Any]]] = {}
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.setdefault(session_id, []).append(event),
+    )
+    agent = await create_test_agent(client)
+    single = await _create_session(client, agent["id"])
+    batched = await _create_session(client, agent["id"])
+    events = _native_turn_events()
+
+    for event in events:
+        response = await client.post(f"/v1/sessions/{single['id']}/events", json=event)
+        assert response.status_code == 202, response.text
+    response = await client.post(f"/v1/sessions/{batched['id']}/events", json=events)
+    assert response.status_code == 202, response.text
+    assert len(response.json()) == len(events)
+
+    def comparable(item: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in item.items() if k not in {"id", "created_at"}}
+
+    single_items = (await client.get(f"/v1/sessions/{single['id']}/items")).json()["data"]
+    batched_items = (await client.get(f"/v1/sessions/{batched['id']}/items")).json()["data"]
+    assert [item["type"] for item in single_items] == [
+        "reasoning",
+        "function_call",
+        "function_call",
+        "function_call_output",
+        "function_call_output",
+        "message",
+    ]
+    assert [comparable(item) for item in batched_items] == [
+        comparable(item) for item in single_items
+    ]
+    published_types = [event.get("type") for event in published[single["id"]]]
+    assert "response.output_text.delta" in published_types
+    assert [event.get("type") for event in published[batched["id"]]] == published_types
+
+
 async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
     client: httpx.AsyncClient,
     app: FastAPI,
