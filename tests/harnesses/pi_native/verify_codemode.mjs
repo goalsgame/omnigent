@@ -18,6 +18,7 @@ const extensionPath =
   "/build/omnigent/resources/pi_native/omnigent_pi_native_extension.js";
 const expectedVersion =
   process.argv[4] || fs.readFileSync("/opt/omnigent/pi-version", "utf8").trim();
+const checkNameRanking = process.argv[5] !== "skip-name-ranking";
 assert.equal(
   JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"))
     .version,
@@ -50,6 +51,24 @@ const tools = Array.from({ length: 170 }, (_, i) => ({
   },
   exposure: "codemode",
 }));
+const ticketTool = (name, description) => ({
+  name,
+  description,
+  parameters: {
+    type: "object",
+    properties: { id: { type: "string", description: "Ticket to read" } },
+    required: ["id"],
+    additionalProperties: false,
+  },
+  exposure: "codemode",
+});
+tools.push(
+  ticketTool(
+    "tickets__read_comments",
+    "Read the comments on a ticket. Use this after tickets__read when you need the discussion, not the ticket itself.",
+  ),
+  ticketTool("tickets__read", "Fetch one ticket by id."),
+);
 let relayToken = "smoke-relay-first";
 const bridgeConfig = {
   serverUrl: "http://server.invalid",
@@ -241,6 +260,21 @@ try {
   const found = await execute('text(await describeTool("docs__lookup_169"));');
   assert.match(text(found), /docs__lookup_169/);
   assert.equal(calls.length, 0, "Discovery must not execute the tool");
+  for (const query of checkNameRanking ? ["tickets__read", "tickets_read"] : []) {
+    const ranked = await execute(
+      `text(JSON.stringify((await searchTools(${JSON.stringify(query)})).map((tool) => tool.name)));`,
+    );
+    assert.equal(
+      JSON.parse(text(ranked).match(/\[.*\]/)[0])[0],
+      "tickets__read",
+      `searchTools(${JSON.stringify(query)}) must rank the named tool first`,
+    );
+  }
+  const misspelled = await execute(
+    'try { tools.tickets_read; } catch (error) { text(error.message); }',
+  );
+  assert.match(text(misspelled), /Did you mean tools\.tickets__read\b/);
+  assert.equal(calls.length, 0, "Discovery must not execute the tool");
   const result = await execute(
     'text(await tools.docs__lookup_169({ query: "smoke" }));',
   );
@@ -299,7 +333,7 @@ try {
     "Relay credentials must refresh between calls",
   );
   console.log(
-    "Pi version, bounded catalog, discovery, relay identity, allow/deny/approval and nested native policy smoke passed",
+    "Pi version, bounded catalog, discovery ranking, relay identity, allow/deny/approval and nested native policy smoke passed",
   );
 } finally {
   await session?.dispose();
