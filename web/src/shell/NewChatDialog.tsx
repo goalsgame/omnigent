@@ -4050,16 +4050,10 @@ export function NewChatLandingScreen() {
   const userPickedModelRef = useRef(false);
   // A query-only navigation to another deep link is a new prefill visit.
   const deepLinkSignatureRef = useRef(deepLinkSignature);
-  const previousDeepLinkModelRef = useRef(deepLink.model);
   useEffect(() => {
     if (deepLinkSignatureRef.current === deepLinkSignature) return;
     deepLinkSignatureRef.current = deepLinkSignature;
-    const previousModel = previousDeepLinkModelRef.current;
-    previousDeepLinkModelRef.current = deepLink.model;
     if (deepLink.prompt !== null) setMessage(deepLink.prompt);
-    if (previousModel !== null && !userPickedModelRef.current && pickedModel === previousModel) {
-      setPickedModel("");
-    }
     userPickedModelRef.current = false;
     setDeepLinkAgentId(null);
     setDeepLinkAgentResolved(deepLink.agent === null);
@@ -4257,12 +4251,35 @@ export function NewChatLandingScreen() {
     deepLink.model !== null && deepLinkAgentId !== null && effectiveAgentId === deepLinkAgentId
       ? deepLink.model
       : null;
-  const deepLinkModelOffered =
-    deepLinkModel !== null && pickerModelOptions.some((option) => option.id === deepLinkModel);
+  const pickerOffersModel = (model: string) =>
+    pickerModelOptions.some(
+      (option) =>
+        option.id === model || option.fusion?.combos.some((combo) => combo.modelUid === model),
+    );
+  const deepLinkModelOffered = deepLinkModel !== null && pickerOffersModel(deepLinkModel);
+  const rememberedPickerOptions = previewHarness ? readHarnessOptions(previewHarness) : null;
+  const rememberedPickerModel =
+    rememberedPickerOptions?.routing !== "on" &&
+    rememberedPickerOptions?.model != null &&
+    pickerOffersModel(rememberedPickerOptions.model)
+      ? rememberedPickerOptions.model
+      : "";
+  // The model the link seeded; leaving the link's scope restores the
+  // remembered (or default) model unless the user picked one since.
+  const deepLinkSeededModelRef = useRef<string | null>(null);
   useEffect(() => {
-    if (deepLinkModel === null || !deepLinkModelOffered || userPickedModelRef.current) return;
-    if (pickedModel !== deepLinkModel) setPickedModel(deepLinkModel);
-  }, [deepLinkModel, deepLinkModelOffered, pickedModel, setPickedModel]);
+    if (deepLinkModel !== null) {
+      if (!deepLinkModelOffered || userPickedModelRef.current) return;
+      deepLinkSeededModelRef.current = deepLinkModel;
+      if (pickedModel !== deepLinkModel) setPickedModel(deepLinkModel);
+      return;
+    }
+    const seeded = deepLinkSeededModelRef.current;
+    if (seeded === null) return;
+    deepLinkSeededModelRef.current = null;
+    if (userPickedModelRef.current || pickedModel !== seeded) return;
+    setPickedModel(rememberedPickerModel);
+  }, [deepLinkModel, deepLinkModelOffered, pickedModel, rememberedPickerModel, setPickedModel]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
   // (which resolves after mount — this must reseed when it lands). A stored
@@ -4592,7 +4609,7 @@ export function NewChatLandingScreen() {
       );
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
-    if (writes.agentId !== undefined) {
+    if (writes.agentId !== undefined && !agentExplicitlySelectedRef.current) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
       if (pickedAgentId === null) {
         setPickedHarness(readLastHarness(writes.agentId));

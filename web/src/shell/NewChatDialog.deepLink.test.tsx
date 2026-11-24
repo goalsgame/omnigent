@@ -168,9 +168,13 @@ const BASE_INFO: ServerInfo = {
   dictation_available: false,
 };
 
-function renderLanding(overrides: Partial<ServerInfo> = {}): { rerender: () => void } {
+function renderLanding(
+  overrides: Partial<ServerInfo> = {},
+  cachedCatalog?: AvailableAgent[],
+): { rerender: () => void } {
   const info: ServerInfo = { ...BASE_INFO, ...overrides };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  if (cachedCatalog) client.setQueryData(["available-agents-catalog"], { agents: cachedCatalog });
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
@@ -210,6 +214,47 @@ function setAgents(
 
 function setCatalog(agents: AvailableAgent[]): void {
   vi.mocked(fetchAgentCatalog).mockResolvedValue({ agents });
+}
+
+function selectAgent(agentId: string): void {
+  fireEvent.pointerDown(agentSelect(), { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+  }
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+  const selectedRow = screen.queryByTestId(`new-chat-landing-agent-${agentId}`);
+  if (selectedRow) fireEvent.keyDown(selectedRow, { key: "Escape" });
+}
+
+const SANDBOX_CATALOG = {
+  configured: true,
+  status: "ready" as const,
+  models: [
+    { id: "private/default", displayName: "Gateway default", isDefault: true },
+    { id: "private/alternate", displayName: "Gateway alternate" },
+  ],
+  configuration_revision: "profile-revision-1",
+  provider_label: "Gateway",
+  default_model: "private/default",
+};
+
+const SANDBOX_INFO: Partial<ServerInfo> = {
+  managed_sandboxes_enabled: true,
+  sandbox_provider: "kubernetes",
+  sandbox_provider_capabilities: { kubernetes: { inference_models: true } },
+};
+
+function fusionCombo(modelUid: string, effort: string) {
+  return {
+    modelUid,
+    lead: "lead-1",
+    leadLabel: "Lead 1",
+    effort,
+    fast: false,
+    sidekick: "side-1",
+    sidekickLabel: "Side 1",
+    priority: false,
+  };
 }
 
 function agentSelect(): HTMLElement {
@@ -476,6 +521,81 @@ describe("NewChatLandingScreen new-session deep link", () => {
     expect(body.agent_id).toBe("ag_sdk");
     expect(body.host_type).toBe("managed");
     expect(body.model_override).toBe("private/alternate");
+  });
+
+  it("keeps the linked agent when a cached project visit also configures one", async () => {
+    localStorage.setItem("omnigent:last-harness-by-agent", JSON.stringify({ ag_hello: "auto" }));
+    vi.mocked(useProjects).mockReturnValue({
+      data: [{ id: "proj_alpha", name: "Alpha" }],
+      isLoading: false,
+    } as ReturnType<typeof useProjects>);
+    vi.mocked(useProjectConfig).mockReturnValue({
+      data: { host_id: "host_1", workspace: RECENT_WORKSPACE, agent_id: "ag_hello" },
+      isLoading: false,
+    } as ReturnType<typeof useProjectConfig>);
+    searchParams = deepLink({ project: "Alpha", agent: "claude-native-ui", prompt: "Go" });
+    renderLanding({}, [HELLO, CLAUDE]);
+
+    await waitFor(() => expect(agentSelect()).toHaveAccessibleName(/Claude Code/));
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe(CLAUDE_AGENT_ID);
+    expect(body.harness_override).toBeUndefined();
+  });
+
+  it("prefills and sends a linked Devin Fusion combo", async () => {
+    const devin = agent({
+      id: "ag_devin",
+      name: "devin-native-ui",
+      display_name: "Devin",
+      harness: "devin-native",
+    });
+    setAgents([HELLO, devin], { catalog: [HELLO, devin] });
+    setCatalog([HELLO, devin]);
+    const lowCombo = "fusion-lead-1-low-sidekick-side-1";
+    const highCombo = "fusion-lead-1-high-sidekick-side-1";
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "swe-2", displayName: "SWE-2" },
+        {
+          id: "fusion",
+          displayName: "Fusion",
+          fusion: {
+            combos: [fusionCombo(lowCombo, "low"), fusionCombo(highCombo, "high")],
+            default: lowCombo,
+          },
+        },
+      ],
+    } as ReturnType<typeof useHostModelOptions>);
+    searchParams = deepLink({ agent: "devin-native-ui", model: highCombo, prompt: "Go" });
+    renderLanding();
+
+    await waitFor(() => expect(agentSelect()).toHaveAccessibleName(/Devin/));
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe("ag_devin");
+    expect(body.model_override).toBe(highCombo);
+  });
+
+  it("drops the linked model when switching to another sandbox agent", async () => {
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data: SANDBOX_CATALOG,
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+    vi.mocked(useHosts).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useHosts>);
+    const sdk = agent({ id: "ag_sdk", name: "sdk-agent", display_name: "SDK Agent" });
+    const other = agent({ id: "ag_other", name: "other-agent", display_name: "Other Agent" });
+    setAgents([HELLO, sdk, other], { catalog: [HELLO, sdk, other] });
+    setCatalog([HELLO, sdk, other]);
+    searchParams = deepLink({ agent: "sdk-agent", model: "private/alternate", prompt: "Go" });
+    renderLanding(SANDBOX_INFO);
+    await waitFor(() => expect(agentSelect()).toHaveAccessibleName(/SDK Agent/));
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+
+    selectAgent("ag_other");
+    await waitFor(() => expect(agentSelect()).toHaveAccessibleName(/Other Agent/));
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe("ag_other");
+    expect(body.model_override).not.toBe("private/alternate");
   });
 
   it("keeps a model the user picks after the link seeded one", async () => {
