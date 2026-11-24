@@ -464,6 +464,34 @@ async def test_info_includes_server_version(
     assert body["server_version"] == VERSION
 
 
+@pytest.mark.asyncio
+async def test_info_reports_publishing_disabled_without_publication_store(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """A file store with no database URI leaves publishing unavailable even when enabled."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    file_store = SqlAlchemyFileStore(db_uri)
+    file_store.storage_location = None  # type: ignore[assignment]
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = server_app.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=file_store,
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        server_config={"published_artifacts": {"enabled": True}},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        info = await client.get("/v1/info")
+        catalog = await client.get("/v1/artifacts")
+    assert info.status_code == 200, info.text
+    assert info.json()["published_artifacts_enabled"] is False
+    assert catalog.status_code == 404
+
+
 def _branding_png(color: tuple[int, int, int, int]) -> bytes:
     output = BytesIO()
     Image.new("RGBA", (2, 2), color).save(output, format="PNG")
