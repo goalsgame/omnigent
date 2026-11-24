@@ -1023,6 +1023,23 @@ describe("Sidebar session list", () => {
     expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("shows Artifacts navigation by default", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/", undefined, FALLBACK_SERVER_INFO);
+
+    expect(screen.getByTestId("artifacts-nav")).toHaveAttribute("href", "/artifacts");
+  });
+
+  it("hides Artifacts navigation when the server disables published artifacts", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      published_artifacts_enabled: false,
+    });
+
+    expect(screen.queryByTestId("artifacts-nav")).toBeNull();
+  });
+
   it("hides Usage navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

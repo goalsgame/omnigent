@@ -158,7 +158,12 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isPublishedArtifactsEnabled,
+  isSingleUserMode,
+  sandboxOptionLabel,
+} from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
@@ -618,6 +623,7 @@ function SidebarImpl({
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  const artifactsEnabled = isPublishedArtifactsEnabled(serverInfo);
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -1190,15 +1196,17 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
-              <PrimaryNavLink
-                to="/artifacts"
-                label="Artifacts"
-                icon={FolderOpenIcon}
-                active={isArtifactsPage}
-                onClick={onNavClick}
-                componentId="sidebar.artifacts"
-                testId="artifacts-nav"
-              />
+              {artifactsEnabled && (
+                <PrimaryNavLink
+                  to="/artifacts"
+                  label="Artifacts"
+                  icon={FolderOpenIcon}
+                  active={isArtifactsPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.artifacts"
+                  testId="artifacts-nav"
+                />
+              )}
               {canvasEnabled && (
                 <PrimaryNavLink
                   to="/canvas"

@@ -5306,6 +5306,11 @@
             "title": "Public Sharing Enabled",
             "type": "boolean"
           },
+          "published_artifacts_enabled": {
+            "default": true,
+            "title": "Published Artifacts Enabled",
+            "type": "boolean"
+          },
           "sandbox_provider": {
             "anyOf": [
               {

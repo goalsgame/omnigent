@@ -205,6 +205,9 @@ class ServerInfoResponse(BaseModel):
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
+    # Whether new artifact publications and read grants are accepted. Existing
+    # artifact links stay readable either way; absent on older servers (on).
+    published_artifacts_enabled: bool = True
     branding: BrandingInfo
 
 
@@ -3422,6 +3425,8 @@ def create_app(
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
+                "published_artifacts_enabled": publication_store is not None
+                and publication_limits.enabled,
                 "branding": branding_snapshot.config(),
             }
         )

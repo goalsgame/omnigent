@@ -32,6 +32,8 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
+import { isPublishedArtifactsEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionSearch } from "@/hooks/useSessionSearch";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -113,6 +115,7 @@ export function CommandPalette({
   onToggleRightSidebar,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const artifactsEnabled = isPublishedArtifactsEnabled(useServerInfo());
   const isMobile = useIsMobileViewport();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
@@ -150,13 +153,17 @@ export function CommandPalette({
         keywords: ["notifications", "comments", "needs response"],
         run: () => navigate("/inbox"),
       },
-      {
-        id: "go-artifacts",
-        label: "Go to Artifacts",
-        icon: InboxIcon,
-        keywords: ["published", "files", "reports", "presentations"],
-        run: () => navigate("/artifacts"),
-      },
+      ...(artifactsEnabled
+        ? [
+            {
+              id: "go-artifacts",
+              label: "Go to Artifacts",
+              icon: InboxIcon,
+              keywords: ["published", "files", "reports", "presentations"],
+              run: () => navigate("/artifacts"),
+            },
+          ]
+        : []),
       {
         id: "go-tasks",
         label: "Go to Automations",
@@ -186,7 +193,7 @@ export function CommandPalette({
         run: onToggleRightSidebar,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [artifactsEnabled, navigate, onToggleLeftSidebar, onToggleRightSidebar],
   );
 
   const filteredActions = useMemo(() => {

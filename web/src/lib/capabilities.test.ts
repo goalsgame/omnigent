@@ -7,7 +7,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import {
+  isPublishedArtifactsEnabled,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "./capabilities";
 import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
@@ -246,6 +250,20 @@ describe("resolveServerInfo archive_worktree_cleanup", () => {
 
   it("is off for an older server that omits it", async () => {
     expect((await probe({})).archive_worktree_cleanup).toBe(false);
+  });
+});
+
+describe("resolveServerInfo published_artifacts_enabled", () => {
+  it("reads an explicit false", async () => {
+    const parsed = await probe({ published_artifacts_enabled: false });
+    expect(parsed.published_artifacts_enabled).toBe(false);
+    expect(isPublishedArtifactsEnabled(parsed)).toBe(false);
+  });
+
+  it("is on for an older server that omits it", async () => {
+    const parsed = await probe({});
+    expect(parsed.published_artifacts_enabled).toBe(true);
+    expect(isPublishedArtifactsEnabled(parsed)).toBe(true);
   });
 });
 
