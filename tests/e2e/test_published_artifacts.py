@@ -170,6 +170,7 @@ def test_disabled_publishing_keeps_existing_links_after_restart(tmp_path):
     upload = {"file": ("report.html", content)}
     form = {"title": "Report", "kind": "html"}
     with _isolated_server(tmp_path, {}) as server:
+        assert server.get("/v1/info").json()["published_artifacts_enabled"] is True
         name = register_inline_agent(
             server,
             name=f"publisher-{uuid.uuid4().hex[:8]}",
@@ -187,6 +188,7 @@ def test_disabled_publishing_keeps_existing_links_after_restart(tmp_path):
         assert _grant(server, publication["id"], "engineering").status_code == 200
 
     with _isolated_server(tmp_path, {"published_artifacts": {"enabled": False}}) as server:
+        assert server.get("/v1/info").json()["published_artifacts_enabled"] is False
         refused = server.post(f"/v1/sessions/{sid}/artifacts", data=form, files=upload)
         assert refused.status_code == 403
         assert refused.json()["detail"] == "Artifact publishing is disabled on this server"
