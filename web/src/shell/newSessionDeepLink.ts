@@ -1,4 +1,7 @@
-import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { useQuery } from "@tanstack/react-query";
+
+import { AGENT_CATALOG_QUERY_KEY, AVAILABLE_AGENTS_STALE_MS } from "@/hooks/agentCatalogQuery";
+import { fetchAgentCatalog, type AvailableAgent } from "@/hooks/useAvailableAgents";
 
 export const NEW_SESSION_DEEP_LINK_PROMPT_MAX_LENGTH = 4000;
 
@@ -30,11 +33,28 @@ export function parseNewSessionDeepLink(params: URLSearchParams): NewSessionDeep
   };
 }
 
-/** The catalog agent a deep link names, or undefined when it names none. */
+/** The `GET /v1/agents` catalog row a deep link names, or undefined when it names none. */
 export function findDeepLinkAgent(
-  agents: readonly AvailableAgent[],
+  catalog: readonly AvailableAgent[],
   name: string | null,
 ): AvailableAgent | undefined {
   if (name === null) return undefined;
-  return agents.find((agent) => !agent.mine && agent.name === name);
+  return catalog.find((agent) => agent.name === name);
+}
+
+/**
+ * The catalog agent a deep link names: `undefined` while the catalog loads,
+ * `null` when the link names no agent, the catalog has none by that name, or
+ * the catalog fails to load.
+ */
+export function useDeepLinkCatalogAgent(name: string | null): AvailableAgent | null | undefined {
+  const { data, isError } = useQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: () => fetchAgentCatalog(),
+    enabled: name !== null,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+  if (name === null || isError) return null;
+  if (data === undefined) return undefined;
+  return findDeepLinkAgent(data.agents, name) ?? null;
 }

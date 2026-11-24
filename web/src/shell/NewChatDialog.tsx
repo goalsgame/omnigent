@@ -160,7 +160,11 @@ import {
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
-import { findDeepLinkAgent, parseNewSessionDeepLink } from "./newSessionDeepLink";
+import {
+  type NewSessionDeepLink,
+  parseNewSessionDeepLink,
+  useDeepLinkCatalogAgent,
+} from "./newSessionDeepLink";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
@@ -2116,7 +2120,12 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
-  const [deepLink] = useState(() => parseNewSessionDeepLink(searchParams));
+  const deepLinkSignature = JSON.stringify(parseNewSessionDeepLink(searchParams));
+  const deepLink = useMemo(
+    () => JSON.parse(deepLinkSignature) as NewSessionDeepLink,
+    [deepLinkSignature],
+  );
+  const deepLinkCatalogAgent = useDeepLinkCatalogAgent(deepLink.agent);
   const [cacheUser, setCacheUser] = useState(getCurrentUserId);
   useEffect(() => {
     if (cacheUser !== null) return;
@@ -2187,7 +2196,10 @@ export function NewChatLandingScreen() {
     isError: agentsError,
     isPlaceholderData: agentsArePlaceholder,
   } = useAvailableAgents({
-    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+    pinnedAgentIds: [
+      ...(prefillConfig?.agentId != null ? [prefillConfig.agentId] : []),
+      ...(deepLinkCatalogAgent != null ? [deepLinkCatalogAgent.id] : []),
+    ],
   });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
@@ -3006,22 +3018,34 @@ export function NewChatLandingScreen() {
   ]);
 
   // A deep-linked catalog agent is picked once the full list loads; an
-  // unknown name leaves the usual default in place.
+  // unknown name leaves the usual default in place. Until then no agent is
+  // selected, so Send cannot create the session on the default agent.
   const [deepLinkAgentId, setDeepLinkAgentId] = useState<string | null>(null);
-  const deepLinkAgentResolvedRef = useRef(deepLink.agent === null);
+  const [deepLinkAgentResolved, setDeepLinkAgentResolved] = useState(deepLink.agent === null);
   useEffect(() => {
-    if (deepLinkAgentResolvedRef.current) return;
+    if (deepLinkAgentResolved || deepLinkCatalogAgent === undefined) return;
+    if (deepLinkCatalogAgent === null || agentsError) {
+      setDeepLinkAgentResolved(true);
+      return;
+    }
     if (agents === undefined || agentsArePlaceholder) return;
-    deepLinkAgentResolvedRef.current = true;
-    const linked = findDeepLinkAgent(agentList, deepLink.agent);
-    if (!linked) return;
+    setDeepLinkAgentResolved(true);
+    if (!agentList.some((a) => a.id === deepLinkCatalogAgent.id)) return;
     agentExplicitlySelectedRef.current = true;
     agentFromConfigRef.current = false;
-    setPickedAgentId(linked.id);
-    const remembered = readLastHarness(linked.id);
+    setPickedAgentId(deepLinkCatalogAgent.id);
+    const remembered = readLastHarness(deepLinkCatalogAgent.id);
     setPickedHarness(remembered === AUTO_NATIVE_HARNESS_ID ? null : remembered);
-    setDeepLinkAgentId(linked.id);
-  }, [agents, agentsArePlaceholder, agentList, deepLink.agent]);
+    setDeepLinkAgentId(deepLinkCatalogAgent.id);
+  }, [
+    deepLinkAgentResolved,
+    deepLinkCatalogAgent,
+    agents,
+    agentsError,
+    agentsArePlaceholder,
+    agentList,
+  ]);
+  const deepLinkAgentPending = !deepLinkAgentResolved;
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -3072,8 +3096,9 @@ export function NewChatLandingScreen() {
     rememberedHarnessResolution.source === "fallback"
       ? rememberedHarnessResolution
       : null;
-  const defaultEffectiveAgentId =
-    pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
+  const defaultEffectiveAgentId = deepLinkAgentPending
+    ? null
+    : pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
@@ -3518,6 +3543,7 @@ export function NewChatLandingScreen() {
           ? hostDevinModelsError
           : null;
   const pickerDataLoading =
+    deepLinkAgentPending ||
     sandboxCatalogPending ||
     agentsLoading ||
     (cachedPickerOptions !== null && (hostsLoading || info === "loading")) ||
@@ -4022,6 +4048,23 @@ export function NewChatLandingScreen() {
   // cache refresh must not reseed the project default over the user's choice;
   // an agent switch starts a fresh visit and re-arms the seed.
   const userPickedModelRef = useRef(false);
+  // A query-only navigation to another deep link is a new prefill visit.
+  const deepLinkSignatureRef = useRef(deepLinkSignature);
+  const previousDeepLinkModelRef = useRef(deepLink.model);
+  useEffect(() => {
+    if (deepLinkSignatureRef.current === deepLinkSignature) return;
+    deepLinkSignatureRef.current = deepLinkSignature;
+    const previousModel = previousDeepLinkModelRef.current;
+    previousDeepLinkModelRef.current = deepLink.model;
+    if (deepLink.prompt !== null) setMessage(deepLink.prompt);
+    if (previousModel !== null && !userPickedModelRef.current && pickedModel === previousModel) {
+      setPickedModel("");
+    }
+    userPickedModelRef.current = false;
+    setDeepLinkAgentId(null);
+    setDeepLinkAgentResolved(deepLink.agent === null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkSignature]);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
@@ -4208,6 +4251,18 @@ export function NewChatLandingScreen() {
     pickedModel,
     setPickedModel,
   ]);
+  // The linked model on every picker path (native harnesses, Devin, and
+  // sandbox agents without a native harness), once that path offers it.
+  const deepLinkModel =
+    deepLink.model !== null && deepLinkAgentId !== null && effectiveAgentId === deepLinkAgentId
+      ? deepLink.model
+      : null;
+  const deepLinkModelOffered =
+    deepLinkModel !== null && pickerModelOptions.some((option) => option.id === deepLinkModel);
+  useEffect(() => {
+    if (deepLinkModel === null || !deepLinkModelOffered || userPickedModelRef.current) return;
+    if (pickedModel !== deepLinkModel) setPickedModel(deepLinkModel);
+  }, [deepLinkModel, deepLinkModelOffered, pickedModel, setPickedModel]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
   // (which resolves after mount — this must reseed when it lands). A stored

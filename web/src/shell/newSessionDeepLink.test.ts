@@ -60,9 +60,8 @@ describe("findDeepLinkAgent", () => {
     expect(findDeepLinkAgent([agent({ id: "ag_other", name: "other" }), pi], "pi")).toBe(pi);
   });
 
-  it("ignores unknown names and the user's own session agents", () => {
+  it("ignores unknown names", () => {
     expect(findDeepLinkAgent([agent()], "missing")).toBeUndefined();
     expect(findDeepLinkAgent([agent()], null)).toBeUndefined();
-    expect(findDeepLinkAgent([agent({ mine: true })], "pi")).toBeUndefined();
   });
 });
