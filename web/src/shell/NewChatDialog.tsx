@@ -2120,9 +2120,9 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
-  const deepLinkSignature = JSON.stringify([projectParam, parseNewSessionDeepLink(searchParams)]);
+  const deepLinkSignature = JSON.stringify(parseNewSessionDeepLink(searchParams));
   const deepLink = useMemo(
-    () => (JSON.parse(deepLinkSignature) as [string, NewSessionDeepLink])[1],
+    () => JSON.parse(deepLinkSignature) as NewSessionDeepLink,
     [deepLinkSignature],
   );
   const deepLinkCatalogAgent = useDeepLinkCatalogAgent(deepLink.agent);
@@ -3542,15 +3542,8 @@ export function NewChatLandingScreen() {
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
           : null;
-  // The linked model on every picker path (native harnesses, Devin, and
-  // sandbox agents without a native harness), once that path offers it.
-  const deepLinkModel =
-    deepLink.model !== null && deepLinkAgentId !== null && effectiveAgentId === deepLinkAgentId
-      ? deepLink.model
-      : null;
   const pickerDataLoading =
     deepLinkAgentPending ||
-    (deepLinkModel !== null && (hostsLoading || info === "loading" || pickerModelsLoading)) ||
     sandboxCatalogPending ||
     agentsLoading ||
     (cachedPickerOptions !== null && (hostsLoading || info === "loading")) ||
@@ -4252,6 +4245,12 @@ export function NewChatLandingScreen() {
     pickedModel,
     setPickedModel,
   ]);
+  // The linked model on every picker path (native harnesses, Devin, and
+  // sandbox agents without a native harness), once that path offers it.
+  const deepLinkModel =
+    deepLink.model !== null && deepLinkAgentId !== null && effectiveAgentId === deepLinkAgentId
+      ? deepLink.model
+      : null;
   const pickerOffersModel = (model: string) =>
     pickerModelOptions.some(
       (option) =>
@@ -4265,14 +4264,12 @@ export function NewChatLandingScreen() {
     pickerOffersModel(rememberedPickerOptions.model)
       ? rememberedPickerOptions.model
       : "";
-  // The model the link seeded. Once the current catalog settles, leaving the
-  // link's scope or losing the linked model restores the remembered (or
-  // default) model unless the user picked one since.
+  // The model the link seeded; leaving the link's scope restores the
+  // remembered (or default) model unless the user picked one since.
   const deepLinkSeededModelRef = useRef<string | null>(null);
   useEffect(() => {
-    if (pickerModelsLoading) return;
-    if (deepLinkModel !== null && deepLinkModelOffered) {
-      if (userPickedModelRef.current) return;
+    if (deepLinkModel !== null) {
+      if (!deepLinkModelOffered || userPickedModelRef.current) return;
       deepLinkSeededModelRef.current = deepLinkModel;
       if (pickedModel !== deepLinkModel) setPickedModel(deepLinkModel);
       return;
@@ -4282,14 +4279,7 @@ export function NewChatLandingScreen() {
     deepLinkSeededModelRef.current = null;
     if (userPickedModelRef.current || pickedModel !== seeded) return;
     setPickedModel(rememberedPickerModel);
-  }, [
-    pickerModelsLoading,
-    deepLinkModel,
-    deepLinkModelOffered,
-    pickedModel,
-    rememberedPickerModel,
-    setPickedModel,
-  ]);
+  }, [deepLinkModel, deepLinkModelOffered, pickedModel, rememberedPickerModel, setPickedModel]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
   // (which resolves after mount — this must reseed when it lands). A stored
