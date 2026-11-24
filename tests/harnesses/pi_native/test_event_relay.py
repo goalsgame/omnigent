@@ -66,3 +66,52 @@ async def test_events_relay_uses_runner_client_and_fixed_session(
                 assert seen == [body]
         finally:
             relay.close()
+
+
+@pytest.mark.asyncio
+async def test_events_relay_forwards_an_ordered_array_as_one_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.delenv("OMNIGENT_BRIDGE_BIND_HOST", raising=False)
+    bridge_dir = bridge.prepare_bridge_dir("relay-session")
+    seen = []
+
+    def upstream(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(202, json=[{"queued": False}, {"queued": False}])
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(upstream)
+    ) as runner_client:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[],
+            tool_executor=AsyncMock(),
+            loop=asyncio.get_running_loop(),
+            policy_client=runner_client,
+            session_id="relay-session",
+        )
+        try:
+            info = json.loads((bridge_dir / "tool_relay.json").read_text())
+            url = info["url"] + "/events"
+            headers = {"Authorization": "Bearer " + info["token"]}
+            batch = [
+                {"type": "external_conversation_item", "data": {"item_type": "function_call"}},
+                {"type": "external_session_usage", "data": {"cumulative_input_tokens": 1}},
+            ]
+            async with httpx.AsyncClient(trust_env=False) as local:
+                for invalid in (
+                    [],
+                    [*batch, {"type": "stop_session", "data": {}}],
+                    [batch[0]] * 101,
+                ):
+                    refused = await local.post(url, headers=headers, json=invalid)
+                    assert refused.status_code == 400
+                assert not seen
+                response = await local.post(url, headers=headers, json=batch)
+                assert response.status_code == 202
+                assert response.json() == {}
+                assert seen == [batch]
+                mcp = await local.post(info["url"] + "/mcp", headers=headers, json=batch)
+                assert mcp.status_code == 400
+        finally:
+            relay.close()

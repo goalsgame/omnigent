@@ -76,6 +76,7 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.session_event_batch import MAX_SESSION_EVENT_BATCH_EVENTS
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -6542,6 +6543,34 @@ _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 _FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
 
 
+_RELAYABLE_NATIVE_EVENT_TYPES = frozenset(
+    {
+        "external_conversation_item",
+        "external_compaction_status",
+        "external_reasoning_effort_change",
+        "external_model_options",
+        "external_session_todos",
+        "external_session_usage",
+        "external_output_reasoning_delta",
+        "external_output_text_delta",
+        "external_session_status",
+        "external_model_change",
+    }
+)
+
+
+def _is_relayable_native_event(event: object) -> bool:
+    """Whether *event* is a native telemetry event the relay may forward."""
+    if not isinstance(event, dict):
+        return False
+    event_type = event.get("type")
+    return (
+        isinstance(event_type, str)
+        and event_type in _RELAYABLE_NATIVE_EVENT_TYPES
+        and isinstance(event.get("data"), dict)
+    )
+
+
 def _tool_relay_handler_factory(
     token: str,
     tool_executor: ToolExecutor,
@@ -6603,15 +6632,15 @@ def _tool_relay_handler_factory(
             if self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
+            if self.path == "/events":
+                self._handle_native_event(self._read_json_value())
+                return
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
             if self.path == "/mcp":
                 self._handle_mcp(payload)
-                return
-            if self.path == "/events":
-                self._handle_native_event(payload)
                 return
             if self.path == "/peer-notifications/actor":
                 self._handle_peer_actor(payload)
@@ -6804,28 +6833,20 @@ def _tool_relay_handler_factory(
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _handle_native_event(self, payload: _JsonObject) -> None:
-            """Forward native telemetry through the runner's refresh-capable client."""
+        def _handle_native_event(self, payload: object) -> None:
+            """Forward native telemetry through the runner's refresh-capable client.
+
+            The body is one event object or an ordered array of up to
+            ``MAX_SESSION_EVENT_BATCH_EVENTS`` events, forwarded as one request.
+            """
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            event_type = payload.get("type")
+            events = payload if isinstance(payload, list) else [payload]
             if (
-                not isinstance(event_type, str)
-                or event_type
-                not in {
-                    "external_conversation_item",
-                    "external_compaction_status",
-                    "external_reasoning_effort_change",
-                    "external_model_options",
-                    "external_session_todos",
-                    "external_session_usage",
-                    "external_output_reasoning_delta",
-                    "external_output_text_delta",
-                    "external_session_status",
-                    "external_model_change",
-                }
-                or not isinstance(payload.get("data"), dict)
+                not events
+                or len(events) > MAX_SESSION_EVENT_BATCH_EVENTS
+                or not all(_is_relayable_native_event(event) for event in events)
             ):
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
@@ -6941,6 +6962,16 @@ def _tool_relay_handler_factory(
             :returns: Parsed JSON object, or ``None`` when the body
                 is malformed.
             """
+            payload = self._read_json_value()
+            return payload if isinstance(payload, dict) else None
+
+        def _read_json_value(self) -> object:
+            """
+            Read and decode a JSON request body of any JSON type.
+
+            :returns: Parsed JSON value, or ``None`` when the body is
+                malformed.
+            """
             length_raw = self.headers.get("Content-Length", "0")
             try:
                 length = int(length_raw)
@@ -6953,10 +6984,9 @@ def _tool_relay_handler_factory(
             if self.path == "/hook/observe-tool" and not 0 <= length <= 1_048_576:
                 return None
             try:
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                return json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 return None
-            return payload if isinstance(payload, dict) else None
 
         def _send_json(self, payload: _JsonObject) -> None:
             """

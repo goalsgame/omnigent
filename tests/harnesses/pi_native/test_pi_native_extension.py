@@ -530,8 +530,11 @@ fs.writeFileSync(
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
 const posted = [];
-global.fetch = async (_url, request) => {
-  posted.push(JSON.parse(request.body));
+const requests = [];
+global.fetch = async (url, request) => {
+  const body = JSON.parse(request.body);
+  requests.push({ url: String(url), body });
+  if (String(url).endsWith("/events")) posted.push(...[].concat(body));
   return { ok: true, async json() { return { result: "" }; } };
 };
 global.setInterval = () => ({ fakeInterval: true });
@@ -743,15 +746,15 @@ let maxInFlight = 0;
 let release;
 const gate = new Promise((resolve) => { release = resolve; });
 global.fetch = async (_url, request) => {
-  const body = JSON.parse(request.body);
-  if (!body.type.startsWith("external_output_")) {
-    posted.push(body);
+  const events = [].concat(JSON.parse(request.body));
+  if (!events.some((event) => event.type.startsWith("external_output_"))) {
+    posted.push(...events);
     return { ok: true, status: 200, async json() { return { result: "" }; } };
   }
   inFlight += 1;
   maxInFlight = Math.max(maxInFlight, inFlight);
   await gate;
-  posted.push(body);
+  posted.push(...events);
   inFlight -= 1;
   return { ok: true, status: 200, async json() { return { result: "" }; } };
 };
@@ -801,6 +804,113 @@ global.fetch = async (_url, request) => {
     result = _run_node(script, str(_extension_path()), str(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "coalesce-complete" in result.stdout, result.stdout + result.stderr
+
+
+def test_parallel_tool_events_share_ordered_posts(tmp_path: Path) -> None:
+    """A message with parallel tool calls posts its items in a few ordered batches.
+
+    Every function_call is delivered before the first policy evaluation, each
+    tool still gets its own evaluation, at most one event POST is in flight,
+    and the flattened events are the same items, in the same order, that
+    individual posts would carry.
+    """
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+let inFlight = 0;
+let maxInFlight = 0;
+const order = [];
+global.fetch = async (url, request) => {
+  url = String(url);
+  const body = JSON.parse(request.body);
+  if (url.endsWith("/policies/evaluate")) {
+    order.push({ evaluate: body.event.data.arguments.path });
+    return { ok: true, status: 200, async json() { return { result: "POLICY_ACTION_ALLOW" }; } };
+  }
+  inFlight += 1;
+  maxInFlight = Math.max(maxInFlight, inFlight);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  inFlight -= 1;
+  requests.push({ url, body });
+  for (const event of [].concat(body)) {
+    posted.push(event);
+    order.push({ event });
+  }
+  return { ok: true, status: 202, async json() { return {}; } };
+};
+
+(async () => {
+  const count = 12;
+  const calls = Array.from({ length: count }, (_, i) => ({
+    type: "toolCall", id: `call_${i}`, name: "read", arguments: { path: `f${i}` },
+  }));
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  for (const [i, call] of calls.entries()) {
+    await feed({ type: "toolcall_start", contentIndex: i });
+    await feed({ type: "toolcall_end", contentIndex: i, toolCall: call });
+  }
+  const message = {
+    role: "assistant",
+    responseId: "resp-1",
+    content: calls,
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+  };
+  await handlers.message_end({ message }, ctx);
+  for (const call of calls) {
+    await handlers.tool_execution_start({ toolCallId: call.id, toolName: "read" }, ctx);
+    const verdict = await handlers.tool_call(
+      { toolCallId: call.id, toolName: "read", input: call.arguments }, ctx,
+    );
+    assert.equal(verdict, undefined);
+  }
+  const results = await Promise.all(calls.map(async (call, i) => {
+    const result = {
+      toolCallId: call.id,
+      toolName: "read",
+      content: [{ type: "text", text: `contents ${i}` }],
+      isError: false,
+    };
+    await handlers.tool_result(result, ctx);
+    await handlers.tool_execution_end(result, ctx);
+    return result;
+  }));
+  await handlers.turn_end({ message, toolResults: results }, ctx);
+  await handlers.agent_end({ messages: [] }, ctx);
+
+  assert.equal(maxInFlight, 1);
+  assert.equal(order.filter((entry) => entry.evaluate).length, count);
+  const firstEvaluate = order.findIndex((entry) => entry.evaluate);
+  const callsBeforeEvaluate = order
+    .slice(0, firstEvaluate)
+    .filter((entry) => entry.event && entry.event.data.item_type === "function_call");
+  assert.equal(callsBeforeEvaluate.length, count);
+
+  const summary = posted.map((event) =>
+    event.type === "external_conversation_item"
+      ? `${event.data.item_type}:${event.data.item_data.call_id}`
+      : `${event.type}:${event.data.status || ""}`);
+  assert.deepEqual(summary, [
+    "external_session_status:running",
+    ...calls.map((call) => `function_call:${call.id}`),
+    "external_session_usage:",
+    ...calls.map((call) => `function_call_output:${call.id}`),
+    "external_session_status:idle",
+  ]);
+  for (const [i, call] of calls.entries()) {
+    const output = posted.find((event) =>
+      event.data.item_type === "function_call_output" && event.data.item_data.call_id === call.id);
+    assert.equal(output.data.item_data.output, `contents ${i}`);
+  }
+  const eventPosts = requests.filter((request) => request.url.endsWith("/events")).length;
+  assert.ok(eventPosts <= 6, `expected batched posts, got ${eventPosts}`);
+  console.log(`batched ${posted.length} events into ${eventPosts} posts`);
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "batched" in result.stdout, result.stdout + result.stderr
 
 
 def test_successive_messages_in_turn_get_distinct_ids(tmp_path: Path) -> None:
