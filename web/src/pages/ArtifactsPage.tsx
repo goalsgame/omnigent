@@ -4,6 +4,8 @@ import { withBasePath } from "@/lib/basePath";
 import { copyText } from "@/lib/clipboard";
 import { getOmnigentTransformShareLink, resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
+import { isPublishedArtifactsEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 
@@ -32,6 +34,7 @@ export function ArtifactsPage() {
 function ArtifactContents({ artifactId }: { artifactId?: string }) {
   const navigate = useNavigate();
   const rebasePath = useRebasePath();
+  const grantsEnabled = isPublishedArtifactsEnabled(useServerInfo());
   const [searchParams] = useSearchParams();
   const fullPage = !!artifactId && searchParams.get("view") === "full";
   const alive = useRef(true);
@@ -305,36 +308,38 @@ function ArtifactContents({ artifactId }: { artifactId?: string }) {
                 </li>
               ))}
             </ul>
-            <form
-              className="mt-2 flex flex-wrap gap-2"
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (principal.trim())
-                  void share([
-                    ...(artifact.grants ?? []),
-                    { principal_type: principalType, principal: principal.trim() },
-                  ]);
-              }}
-            >
-              <select
-                aria-label="Principal type"
-                value={principalType}
-                onChange={(e) => setPrincipalType(e.target.value as "user" | "group")}
+            {grantsEnabled && (
+              <form
+                className="mt-2 flex flex-wrap gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (principal.trim())
+                    void share([
+                      ...(artifact.grants ?? []),
+                      { principal_type: principalType, principal: principal.trim() },
+                    ]);
+                }}
               >
-                <option value="user">User</option>
-                <option value="group">Group</option>
-              </select>
-              <input
-                aria-label="User identity or group name"
-                className="rounded border bg-background px-2"
-                value={principal}
-                onChange={(e) => setPrincipal(e.target.value)}
-                required
-              />
-              <Button type="submit" disabled={saving}>
-                Grant read access
-              </Button>
-            </form>
+                <select
+                  aria-label="Principal type"
+                  value={principalType}
+                  onChange={(e) => setPrincipalType(e.target.value as "user" | "group")}
+                >
+                  <option value="user">User</option>
+                  <option value="group">Group</option>
+                </select>
+                <input
+                  aria-label="User identity or group name"
+                  className="rounded border bg-background px-2"
+                  value={principal}
+                  onChange={(e) => setPrincipal(e.target.value)}
+                  required
+                />
+                <Button type="submit" disabled={saving}>
+                  Grant read access
+                </Button>
+              </form>
+            )}
           </details>
         )}
         {preview !== null && !rendererUrl && (

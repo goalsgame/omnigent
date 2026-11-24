@@ -219,6 +219,12 @@ export interface ServerInfo {
    * and the Import bundle button. Absent on older servers (off).
    */
   agent_install?: boolean;
+  /**
+   * Whether the server accepts new artifact publications and read grants.
+   * Existing ``/artifacts/{id}`` links stay readable either way. Absent on
+   * older servers, which publish (on).
+   */
+  published_artifacts_enabled?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -392,6 +398,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           agent_install: data.agent_install === true,
+          published_artifacts_enabled: data.published_artifacts_enabled !== false,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;
@@ -416,6 +423,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
  */
 export function getCachedServerInfo(): ServerInfo | null {
   return cachedServerInfo;
+}
+
+/** Whether to offer published-artifact browsing and sharing; on until the server says otherwise. */
+export function isPublishedArtifactsEnabled(info: ServerInfo | "loading"): boolean {
+  return info === "loading" || info.published_artifacts_enabled !== false;
 }
 
 /**

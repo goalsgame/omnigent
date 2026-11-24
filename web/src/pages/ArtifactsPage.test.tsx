@@ -5,6 +5,8 @@ import { basenamedRouting, Link, RoutingProvider } from "@/lib/routing";
 import { ArtifactsPage } from "./ArtifactsPage";
 import { getOmnigentTransformShareLink, resolveArtifactRendererUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 vi.mock("@/lib/host", () => ({
   resolveArtifactRendererUrl: vi.fn(),
@@ -187,6 +189,29 @@ it("grants exact group read access and exposes no agent-side permission bridge",
       }),
     ),
   );
+});
+
+it("keeps an existing artifact viewable but offers no new grants when publishing is disabled", async () => {
+  vi.mocked(authenticatedFetch)
+    .mockResolvedValueOnce(
+      json({ ...artifact, grants: [{ principal_type: "group", principal: "engineering" }] }),
+    )
+    .mockResolvedValueOnce(new Response("<h1>x</h1>"));
+  render(
+    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, published_artifacts_enabled: false }}>
+      <MemoryRouter initialEntries={[`/artifacts/${artifact.id}`]}>
+        <Routes>
+          <Route path="/artifacts/:artifactId?" element={<ArtifactsPage />} />
+        </Routes>
+      </MemoryRouter>
+    </CapabilitiesProvider>,
+  );
+  expect(await screen.findByTitle("Published HTML artifact")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Download" })).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Sharing"));
+  expect(screen.getByRole("button", { name: "Remove access" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Grant read access" })).toBeNull();
+  expect(screen.queryByLabelText("User identity or group name")).toBeNull();
 });
 
 it("shows unavailable metadata without rendering any preview", async () => {

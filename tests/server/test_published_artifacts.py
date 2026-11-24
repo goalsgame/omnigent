@@ -519,6 +519,30 @@ async def test_app_uses_operator_publication_config_when_no_override(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "config,expected",
+    [
+        ({}, True),
+        ({"published_artifacts": {"enabled": True}}, True),
+        ({"published_artifacts": {"enabled": False}}, False),
+    ],
+)
+async def test_info_reports_whether_publishing_is_enabled(
+    db_uri, tmp_path, monkeypatch, config, expected
+):
+    from tests.server.routes.test_sessions_sharing_mode import _build_app
+
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: config)
+    app = _build_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://internal"
+    ) as client:
+        response = await client.get("/v1/info")
+    assert response.status_code == 200, response.text
+    assert response.json()["published_artifacts_enabled"] is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "user,sid,declared,expected",
     [
         ("owner@example.test", None, "100000", 413),

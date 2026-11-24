@@ -49,8 +49,9 @@ HTML reports must contain their own scripts/styles/data. No provider access is n
 - HTML is self-contained; external assets, API calls and multi-file sites are unsupported.
 - Publishing a new version creates a new immutable link.
 - `published_artifacts.enabled: false` refuses new publications and grants but keeps
-  existing links readable until expiry; `OMNIGENT_PUBLISH_ARTIFACT_TOOL=0` withdraws
-  the agent tool from runners.
+  existing links readable until expiry; `/v1/info.published_artifacts_enabled` lets
+  the web UI hide the Artifacts navigation and grant form;
+  `OMNIGENT_PUBLISH_ARTIFACT_TOOL=0` withdraws the agent tool from runners.
 - The server's publication retention and artifact-store lifecycle determine lifetime,
   independently of sandbox PVC cleanup.
 - Browser-contract tests use a sealed mock backend. API tests verify actual SQL

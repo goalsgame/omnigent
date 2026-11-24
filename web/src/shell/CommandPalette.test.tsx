@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -38,7 +40,10 @@ function labelRow(text: string) {
   return screen.getByText((_content, el) => el?.tagName === "SPAN" && el.textContent === text);
 }
 
-function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>> = {}) {
+function renderPalette(
+  overrides: Partial<ComponentProps<typeof CommandPalette>> = {},
+  info?: ServerInfo,
+) {
   const props = {
     open: true,
     onOpenChange: vi.fn(),
@@ -46,7 +51,8 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onToggleRightSidebar: vi.fn(),
     ...overrides,
   };
-  render(<CommandPalette {...props} />);
+  const palette = <CommandPalette {...props} />;
+  render(info ? <CapabilitiesProvider info={info}>{palette}</CapabilitiesProvider> : palette);
   return props;
 }
 
@@ -509,6 +515,20 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
+  });
+
+  it("offers Go to Artifacts by default", () => {
+    renderPalette({}, FALLBACK_SERVER_INFO);
+
+    fireEvent.click(screen.getByText("Go to Artifacts"));
+    expect(navigate).toHaveBeenCalledWith("/artifacts");
+  });
+
+  it("omits Go to Artifacts when the server disables published artifacts", () => {
+    renderPalette({}, { ...FALLBACK_SERVER_INFO, published_artifacts_enabled: false });
+
+    expect(screen.queryByText("Go to Artifacts")).toBeNull();
+    expect(screen.getByText("Go to Inbox")).toBeTruthy();
   });
 
   it("runs a navigation action and closes the palette", () => {

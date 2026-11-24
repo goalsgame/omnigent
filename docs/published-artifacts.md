@@ -90,7 +90,10 @@ server address. The remaining values shown above are the defaults, as is
 Set `enabled: false` to stop new publications while existing links keep working
 until they expire. The server then refuses `POST /v1/sessions/{id}/artifacts`
 and new read grants with 403. Reads, the owner's list, grant revocation, deletion
-and the cleanup collector continue. Runners withdraw `sys_publish_artifact` when
+and the cleanup collector continue. `GET /v1/info` reports
+`published_artifacts_enabled: false`, and the web UI hides the Artifacts
+navigation entry, its command-palette action and the grant form, while
+`/artifacts/{id}` links still open. Runners withdraw `sys_publish_artifact` when
 their environment sets `OMNIGENT_PUBLISH_ARTIFACT_TOOL=0`; set it on the server
 and include it in the sandbox environment forwarded to managed runners. Runners
 started without it still offer the tool, and the server refuses their calls.
